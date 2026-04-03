@@ -5,6 +5,8 @@
 - **Affected model:** gpt-oss-120b
 - **Date:** 2026-03-18
 - **Branch:** `fix-zombie-worker-health-check`
+- **PR:** [#12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718)
+- **Status:** In review — CI passing after fix-up commits
 
 ---
 
@@ -130,6 +132,9 @@ queue unprocessed, and return 503 so the orchestrator stops routing traffic.
   set fatal error, trigger shutdown, return `False`
 - Add `_error_monitor_loop()` daemon thread: every ~5 seconds checks MPI futures
   and error queue, triggers shutdown on detection
+- Join `_error_monitor_thread` during `shutdown()` (before joining other
+  threads) with a 5-second timeout to prevent thread leaks detected by
+  `pytest-threadleak`
 
 **Why this helps:** Even if no health checks or `generate()` calls arrive, the
 monitor thread auto-detects worker crash within ~5 seconds and shuts down.
@@ -162,12 +167,15 @@ It self-terminates instead of silently failing every batch.
 **Why this helps:** Final backstop ensuring the process terminates and the pod
 restarts, even if the orchestrator keeps polling health.
 
-### Supporting Change: Wire `_check_health()` and gRPC
+### Supporting Changes
 
 - **`tensorrt_llm/llmapi/llm.py`**: Change `_check_health()` to call
   `self._executor.check_health()` instead of `not self._executor.is_shutdown()`
 - **`tensorrt_llm/grpc/grpc_request_manager.py`**: Change `health_check()` to
   use `check_health()` and report `_fatal_error` details in the error message
+- **`tests/unittest/llmapi/apps/_test_openai_metrics.py`**: Update existing
+  `test_health` to patch `check_health()` instead of `is_shutdown()` to match
+  the new delegation path
 
 ---
 
@@ -192,18 +200,40 @@ T+0s    Executor loop breaks, shutdown proceeds
 
 ---
 
-## Testing Plan
+## Test Coverage
 
-1. **Unit tests for `check_health()`**: Mock `_error_queue` with an exception,
-   verify returns `False` and `_fatal_error` is set
-2. **Unit tests for MPI future check**: Mock completed future with exception,
-   verify proxy `check_health()` returns `False`
-3. **Unit tests for `_is_fatal_error()`**: Verify CUDA OOM, NCCL error, etc.
-   are detected; verify benign errors are not
-4. **Unit tests for consecutive error threshold**: Call `_handle_errors()` N
-   times, verify shutdown triggered at threshold
-5. **Integration test**: Start serving, kill MPI worker externally, verify
-   `/health` returns 503 within ~10 seconds
+All unit tests are in
+`tests/unittest/executor/test_fatal_error_health_check.py` (52 tests total).
+
+| Test class | Count | What's covered |
+|---|---|---|
+| `TestIsFatalError` | 15 | Pattern matching for CUDA OOM, NCCL, device-side assert, launch failure, case insensitivity; non-fatal errors (tokenizer, KV cache, timeout, etc.) correctly pass through |
+| `TestHandleErrors` | 6 | Fatal errors fail all active requests and enqueue shutdown; non-fatal only fails specified requests; consecutive threshold promotion; counter reset; edge cases (no active requests, default error message) |
+| `TestSetFatalError` | 2 | First-error-wins semantics; initial `None` state |
+| `TestCheckHealth` | 5 | Healthy default; unhealthy after fatal error, shutdown, or error queue item; healthy with empty queue |
+| `TestIsShutdown` | 3 | Returns `True` for `doing_shutdown` or `_fatal_error` set |
+| `TestProxyCheckHealth` | 6 | Running workers healthy; crashed/exited/cancelled workers detected; no mpi_futures; parent unhealthy short-circuits |
+| `TestErrorMonitorLoop` | 3 | Background thread detects worker crash, error queue items, and stops on shutdown flag |
+| `TestGrpcHealthCheck` | 5 | Healthy executor, fatal error message surfaced, no executor, no LLM, shutdown state |
+| `TestOpenAIHealthEndpoint` | 4 | 200 when healthy, 503 when unhealthy, SIGINT raised on fatal error, no SIGINT without fatal error |
+| `TestBaseLLMCheckHealth` | 3 | Delegation to executor `check_health()`; no executor returns `False` |
+
+### CI Findings
+
+During CI validation (PR #12718, build 32444), two issues surfaced:
+
+1. **Thread leak (`proxy_error_monitor`)**: `pytest-threadleak` detected the
+   daemon thread surviving past test teardown. **Fix:** join the thread during
+   `shutdown()` with a 5-second timeout.
+2. **`test_health[False-503]` assertion failure**: The existing test patched
+   `is_shutdown()` to simulate an unhealthy executor, but `BaseLLM._check_health()`
+   now delegates to `check_health()`. **Fix:** patch `check_health` instead.
+
+### Remaining Test Gap
+
+- **Integration test**: Start serving, kill MPI worker externally, verify
+  `/health` returns 503 within ~10 seconds. Not yet automated — requires
+  multi-GPU environment with K8s liveness probes.
 
 ---
 
