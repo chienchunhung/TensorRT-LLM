@@ -1,5 +1,17 @@
 # Phase 2: Pipelined Prefill-Transfer
 
+[< Back to Overview](README.md)
+
+| | |
+|---|---|
+| **JIRA** | [TRTLLM-11608](https://jirasw.nvidia.com/browse/TRTLLM-11608) |
+| **PRs** | TBD |
+| **Author** | Chien-Chun Hung |
+| **Created** | 2026-03-24 |
+| **Last Updated** | 2026-04-03 |
+| **Status** | Design only |
+| **Depends on** | [Phase 1](phase1-early-block-release.md) |
+
 ## Problem Statement
 
 ### Background

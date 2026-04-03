@@ -1,5 +1,16 @@
 # Phase 1: Chunked KV Transfer with Early Block Release
 
+[< Back to Overview](README.md)
+
+| | |
+|---|---|
+| **JIRA** | [TRTLLM-11608](https://jirasw.nvidia.com/browse/TRTLLM-11608) |
+| **PRs** | [#12602](https://github.com/NVIDIA/TensorRT-LLM/pull/12602) (shared infra + V1), [#12469](https://github.com/NVIDIA/TensorRT-LLM/pull/12469) (V2 follow-up) |
+| **Author** | Chien-Chun Hung |
+| **Created** | 2026-03-24 |
+| **Last Updated** | 2026-04-03 |
+| **Status** | In review |
+
 ## Problem Statement
 
 ### Background
@@ -476,7 +487,7 @@ This is not a practical limitation since disaggregated serving context-only requ
 ### Potential Follow-Up Work
 
 1. **Per-chunk retry.** Currently, if any chunk fails, the entire session fails (fail-fast). Per-chunk retry could improve resilience for transient RDMA errors without restarting the full transfer.
-2. **Pipelined prefill-transfer.** Overlap chunk N's RDMA with chunk N+1's prefill computation. See [Phase 2 design](chunked-kv-transfer-phase2.md) for the detailed design.
+2. **Pipelined prefill-transfer.** Overlap chunk N's RDMA with chunk N+1's prefill computation. See [Phase 2 design](phase2-pipelined-transfer.md) for the detailed design.
 3. **Adaptive chunk sizing.** Dynamically adjust `chunk_size_blocks` based on real-time `free_num_blocks` pressure. When memory is abundant, use larger chunks (less overhead); when memory is tight, use smaller chunks (faster reclamation).
 4. **Receiver-side chunking.** The current design is sender-only. Receiver-side chunking could enable the generation server to start decode on partial KV data (speculative prefix decode), but this requires significant changes to the attention kernel and scheduler.
 5. **Multi-threaded slice distribution.** Currently, all slices for a request are routed to the same sender worker thread via `unique_rid % num_threads`. Distributing slices across threads was considered but deferred — NIC bandwidth is typically the bottleneck, not Python thread overhead.

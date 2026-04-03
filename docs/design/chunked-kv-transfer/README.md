@@ -1,5 +1,14 @@
 # Chunked KV Transfer: Early Block Release and Prefill-Transfer Pipelining
 
+| | |
+|---|---|
+| **JIRA** | [TRTLLM-11608](https://jirasw.nvidia.com/browse/TRTLLM-11608) |
+| **PRs** | [#12602](https://github.com/NVIDIA/TensorRT-LLM/pull/12602) (shared infra + V1), [#12469](https://github.com/NVIDIA/TensorRT-LLM/pull/12469) (V2 follow-up) |
+| **Author** | Chien-Chun Hung |
+| **Created** | 2026-03-24 |
+| **Last Updated** | 2026-04-03 |
+| **Status** | Phase 1 in review; Phase 2 design only |
+
 ## Problem
 
 In disaggregated serving, the context server holds all KV cache blocks for a request from prefill start until the RDMA transfer to the generation server completes. For long-context requests (e.g., 128K tokens, 256 blocks), this creates GPU memory pressure that blocks new prefill requests and degrades throughput.
@@ -138,5 +147,5 @@ Start transferring each chunk's KV immediately after its prefill completes, over
 
 ## Detailed Design Documents
 
-- [Phase 1: Chunked KV Transfer with Early Block Release](chunked-kv-transfer-phase1.md)
-- [Phase 2: Pipelined Prefill-Transfer](chunked-kv-transfer-phase2.md)
+- [Phase 1: Chunked KV Transfer with Early Block Release](phase1-early-block-release.md)
+- [Phase 2: Pipelined Prefill-Transfer](phase2-pipelined-transfer.md)
