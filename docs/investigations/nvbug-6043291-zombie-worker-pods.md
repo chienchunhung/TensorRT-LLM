@@ -112,10 +112,13 @@ regardless of which detection mechanism fires first.
 **File:** `tensorrt_llm/executor/executor.py`
 
 - Add `_fatal_error: Optional[BaseException]` field to track unrecoverable errors
-- Add `_set_fatal_error(error)`: records the first fatal error
+- Add `_set_fatal_error(error)`: records the first fatal error (first-error-wins)
 - Add `check_health() -> bool`: returns `False` if `doing_shutdown` or
-  `_fatal_error` is set; also **drains `_error_queue`** by calling
-  `_handle_background_error()` when the queue is non-empty
+  `_fatal_error` is set; drains `_error_queue` directly via `get_nowait()`
+  (not via `_handle_background_error()` which is documented for main-thread
+  use and would cause re-entrancy issues from health-check / event-loop threads)
+- Per-request errors (`RequestError`, `str`) in the queue are skipped — a single
+  bad request should not crash the server
 - Modify `_handle_background_error()`: call `_set_fatal_error(error)` before
   `self.shutdown()` for serious errors and errors drained from the queue
 - Update `is_shutdown()` to also return `True` when `_fatal_error` is set
@@ -134,7 +137,8 @@ queue unprocessed, and return 503 so the orchestrator stops routing traffic.
   and error queue, triggers shutdown on detection
 - The monitor drains the error queue directly (`get_nowait`) instead of calling
   `_handle_background_error()` (which is documented for main-thread use and
-  calls `shutdown()` + `raise`, creating re-entrancy risk)
+  calls `shutdown()` + `raise`, creating re-entrancy risk); per-request errors
+  (`RequestError`, `str`) are skipped with `continue`
 - Join `_error_monitor_thread` during `shutdown()` with a 5-second timeout,
   guarded by `threading.current_thread() is not self._error_monitor_thread`
   to prevent a self-join deadlock when the monitor thread initiates shutdown
@@ -144,7 +148,8 @@ monitor thread auto-detects worker crash within ~5 seconds and shuts down.
 
 ### Layer 3: Fatal Error Detection in PyExecutor
 
-**File:** `tensorrt_llm/_torch/pyexecutor/py_executor.py`
+**Files:** `tensorrt_llm/_torch/pyexecutor/error_classification.py` (standalone,
+no CUDA/C++ dependencies) and `tensorrt_llm/_torch/pyexecutor/py_executor.py`
 
 Three-tier error classification with token-bucket error budget:
 
@@ -166,6 +171,13 @@ hour" (fine) and "10 errors in 100ms" (engine is broken).  CUDA OOM is
 classified as severe (not immediate-fatal) because the CUDA context remains
 valid after a failed allocation — the engine can recover if the next batch
 is smaller.
+
+On the fatal path, `_handle_errors()` also:
+- Sets `is_shutdown = True` immediately (prevents the executor loop from
+  scheduling more requests on a corrupted CUDA context)
+- Copies `active_requests` to a local list before calling `clear()` (fixes an
+  aliased-list bug where `_terminate_request` never ran because the list was
+  emptied first)
 
 **Why this helps:** PyExecutor stops looping forever on corrupted CUDA context.
 It self-terminates instead of silently failing every batch.
@@ -226,33 +238,40 @@ T+0s    Budget exhausted -> _fatal_error set, shutdown
 ## Test Coverage
 
 All unit tests are in
-`tests/unittest/executor/test_fatal_error_health_check.py` (59 tests total,
-heavily parametrized).
+`tests/unittest/executor/test_fatal_error_health_check.py` (55 tests total,
+heavily parametrized).  `TestClassifyError` tests the **real**
+`classify_error()` function directly (imported from `error_classification.py`
+via `importlib` to avoid triggering C++ extension loading).
 
 | Test class | Count | What's covered |
 |---|---|---|
-| `TestClassifyError` | 20 | Three-tier classification (immediate-fatal / severe / transient), case insensitivity, `_is_fatal_error` convenience method |
-| `TestErrorBudget` | 8 | Token-bucket budget: immediate-fatal bypasses budget, severe exhausts in 2, transient exhausts with custom cost, time-based recovery, request handling (fail specified vs. fail all), shutdown enqueue |
-| `TestGenerationExecutor` | 10 | `_set_fatal_error` first-wins, `is_shutdown` (parametrized 4 states), `check_health` (parametrized 4 states including error queue) |
+| `TestClassifyError` | 15 | Tests the real `classify_error()` function: three-tier classification, case insensitivity |
+| `TestErrorBudget` | 9 | Token-bucket budget: immediate-fatal bypass, severe exhausts in 2, transient exhaustion, time recovery, aliased-list fix (all requests terminated on fatal), `is_shutdown` set on fatal, shutdown enqueue |
+| `TestGenerationExecutor` | 10 | `_set_fatal_error` first-wins, `is_shutdown` (4 states), `check_health` (4 states incl. queue drain) |
 | `TestProxyCheckHealth` | 6 | MPI worker future states (running / crashed / exited / cancelled), empty futures, parent-unhealthy short-circuit |
-| `TestErrorMonitorLoop` | 3 | Background thread detects worker crash, error queue items, stops on shutdown flag |
+| `TestErrorMonitorLoop` | 4 | Worker crash, error queue, per-request string error skip, shutdown flag stop |
 | `TestGrpcHealthCheck` | 5 | Parametrized: healthy, fatal, no executor, no LLM, shutdown |
-| `TestOpenAIHealthEndpoint` | 3 | Parametrized: 200 healthy, 503 unhealthy, 503+SIGINT on fatal |
+| `TestOpenAIHealthEndpoint` | 3 | Parametrized: 200, 503, 503+SIGINT |
 | `TestBaseLLMCheckHealth` | 4 | Parametrized delegation: healthy, fatal, no executor, missing attr |
 
-### CI Findings
+### Issues Found During Development
 
-During CI validation (PR #12718, build 32444), three issues surfaced:
+During CI validation and code review, five issues were found and fixed:
 
 1. **Thread leak (`proxy_error_monitor`)**: `pytest-threadleak` detected the
    daemon thread surviving past test teardown. **Fix:** join the thread during
    `shutdown()` with a 5-second timeout.
 2. **`test_health[False-503]` assertion failure**: The existing test patched
-   `is_shutdown()` to simulate an unhealthy executor, but `BaseLLM._check_health()`
-   now delegates to `check_health()`. **Fix:** patch `check_health` instead.
-3. **Self-join deadlock**: Code review discovered that `_error_monitor_loop`
-   calls `shutdown()`, which joins the monitor thread — a self-join. **Fix:**
-   guard with `threading.current_thread() is not self._error_monitor_thread`.
+   `is_shutdown()`, but `BaseLLM._check_health()` now delegates to
+   `check_health()`. **Fix:** patch `check_health` instead.
+3. **Self-join deadlock**: `_error_monitor_loop` calls `shutdown()`, which joins
+   the monitor thread. **Fix:** `threading.current_thread()` guard.
+4. **Aliased-list bug in `_handle_errors()`** (pre-existing, made worse by PR):
+   `failed_requests` aliased `self.active_requests`, then `clear()` emptied it
+   before `_terminate_request` ran. **Fix:** `list(self.active_requests)` copy.
+5. **Per-request errors treated as fatal**: Monitor loop and `check_health()`
+   promoted `RequestError`/string errors from the queue to fatal. **Fix:** skip
+   with `isinstance(e, (str, RequestError))` check.
 
 ### Remaining Test Gap
 
