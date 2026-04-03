@@ -120,7 +120,8 @@ regardless of which detection mechanism fires first.
 - Per-request errors (`RequestError`, `str`) in the queue are skipped — a single
   bad request should not crash the server
 - Modify `_handle_background_error()`: call `_set_fatal_error(error)` before
-  `self.shutdown()` for serious errors and errors drained from the queue
+  `self.shutdown()` for serious errors; the queue drain path also filters
+  `RequestError`/`str` to avoid poisoning `_fatal_error` from per-request errors
 - Update `is_shutdown()` to also return `True` when `_fatal_error` is set
 
 **Why this helps:** Health probes now detect errors that were sitting in the
@@ -132,13 +133,15 @@ queue unprocessed, and return 503 so the orchestrator stops routing traffic.
 
 - Override `check_health()` in `GenerationExecutorProxy`: after the base check,
   verify MPI worker futures — if any future is `.done()`, extract its exception,
-  set fatal error, trigger shutdown, return `False`
+  set fatal error, call `pre_shutdown()` (not `shutdown()`, which would block
+  on `f.result()` for surviving workers), return `False`
 - Add `_error_monitor_loop()` daemon thread: every ~5 seconds checks MPI futures
-  and error queue, triggers shutdown on detection
-- The monitor drains the error queue directly (`get_nowait`) instead of calling
-  `_handle_background_error()` (which is documented for main-thread use and
-  calls `shutdown()` + `raise`, creating re-entrancy risk); per-request errors
-  (`RequestError`, `str`) are skipped with `continue`
+  and error queue, calls `pre_shutdown()` on detection
+- Both `check_health()` and the monitor drain the error queue directly
+  (`get_nowait`) instead of calling `_handle_background_error()` (documented for
+  main-thread use); per-request errors (`RequestError`, `str`) are skipped
+- Fix `pre_shutdown()` sentinel condition: `all(not f.done())` → `any(not
+  f.done())` so surviving workers still get the quit signal when one has died
 - Join `_error_monitor_thread` during `shutdown()` with a 5-second timeout,
   guarded by `threading.current_thread() is not self._error_monitor_thread`
   to prevent a self-join deadlock when the monitor thread initiates shutdown
@@ -239,7 +242,7 @@ T+0s    Budget exhausted -> _fatal_error set, shutdown
 ## Test Coverage
 
 All unit tests are in
-`tests/unittest/executor/test_fatal_error_health_check.py` (55 tests total,
+`tests/unittest/executor/test_fatal_error_health_check.py` (56 tests total,
 heavily parametrized).  `TestClassifyError` tests the **real**
 `classify_error()` function directly (imported from `error_classification.py`
 via `importlib` to avoid triggering C++ extension loading).
@@ -257,7 +260,7 @@ via `importlib` to avoid triggering C++ extension loading).
 
 ### Issues Found During Development
 
-During CI validation and code review, five issues were found and fixed:
+During CI validation and code review, seven issues were found and fixed:
 
 1. **Thread leak (`proxy_error_monitor`)**: `pytest-threadleak` detected the
    daemon thread surviving past test teardown. **Fix:** join the thread during
@@ -273,6 +276,12 @@ During CI validation and code review, five issues were found and fixed:
 5. **Per-request errors treated as fatal**: Monitor loop and `check_health()`
    promoted `RequestError`/string errors from the queue to fatal. **Fix:** skip
    with `isinstance(e, (str, RequestError))` check.
+6. **`check_health`/monitor called `shutdown()` inline**: `shutdown()` blocks
+   on `f.result()` for surviving workers.  **Fix:** use `pre_shutdown()` which
+   is non-blocking.
+7. **`pre_shutdown` sentinel used `all()`**: When one worker was already dead,
+   `all(not f.done())` was False, so the quit sentinel was never sent to
+   surviving workers. **Fix:** `any(not f.done())`.
 
 ### Remaining Test Gap
 
