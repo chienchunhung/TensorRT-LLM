@@ -155,8 +155,8 @@ Three-tier error classification with token-bucket error budget:
 
 | Tier | Patterns | Behavior |
 |------|----------|----------|
-| **Immediate fatal** | `cudaErrorIllegalAddress`, `cudaErrorLaunchFailure`, `device-side assert`, `unrecoverable` | Crash on first occurrence — CUDA context is corrupted |
-| **Severe** | `CUDA out of memory`, `CUDA error`, `NCCL error` | Costs 5× budget (0.5) per error — two rapid OOMs crash, one recoverable OOM is tolerated |
+| **Immediate fatal** | `cudaErrorIllegalAddress`, `cudaErrorLaunchFailure`, `illegal memory access`, `device-side assert`, `unrecoverable` | Crash on first occurrence — CUDA context is corrupted |
+| **Severe** | `CUDA out of memory`, `CUDA error` (excluding illegal memory access), `NCCL error` | Costs 5× budget (0.5) per error — two rapid OOMs crash, one recoverable OOM is tolerated |
 | **Transient** | Everything else | Costs 1× budget (0.1) per error — ~10 rapid errors before crash |
 
 Token-bucket parameters (hardcoded, not user-facing):
@@ -198,7 +198,8 @@ restarts, even if the orchestrator keeps polling health.
 - **`tensorrt_llm/llmapi/llm.py`**: Change `_check_health()` to call
   `self._executor.check_health()` instead of `not self._executor.is_shutdown()`
 - **`tensorrt_llm/grpc/grpc_request_manager.py`**: Change `health_check()` to
-  use `check_health()` and report `_fatal_error` details in the error message
+  use `check_health()` and report a sanitized `_fatal_error` summary
+  (`"TypeName: first line"`) to gRPC clients; full error logged server-side
 - **`tests/unittest/llmapi/apps/_test_openai_metrics.py`**: Update existing
   `test_health` to patch `check_health()` instead of `is_shutdown()` to match
   the new delegation path
