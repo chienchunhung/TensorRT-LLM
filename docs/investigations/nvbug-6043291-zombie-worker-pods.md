@@ -132,9 +132,12 @@ queue unprocessed, and return 503 so the orchestrator stops routing traffic.
   set fatal error, trigger shutdown, return `False`
 - Add `_error_monitor_loop()` daemon thread: every ~5 seconds checks MPI futures
   and error queue, triggers shutdown on detection
-- Join `_error_monitor_thread` during `shutdown()` (before joining other
-  threads) with a 5-second timeout to prevent thread leaks detected by
-  `pytest-threadleak`
+- The monitor drains the error queue directly (`get_nowait`) instead of calling
+  `_handle_background_error()` (which is documented for main-thread use and
+  calls `shutdown()` + `raise`, creating re-entrancy risk)
+- Join `_error_monitor_thread` during `shutdown()` with a 5-second timeout,
+  guarded by `threading.current_thread() is not self._error_monitor_thread`
+  to prevent a self-join deadlock when the monitor thread initiates shutdown
 
 **Why this helps:** Even if no health checks or `generate()` calls arrive, the
 monitor thread auto-detects worker crash within ~5 seconds and shuts down.
@@ -143,15 +146,26 @@ monitor thread auto-detects worker crash within ~5 seconds and shuts down.
 
 **File:** `tensorrt_llm/_torch/pyexecutor/py_executor.py`
 
-- Add `_is_fatal_error(error_msg) -> bool`: pattern-matches against known CUDA
-  fatal errors (OOM, illegal address, launch failure, NCCL error, device-side
-  assert)
-- Modify `_handle_errors()`: if `_is_fatal_error()` returns true, set
-  `_fatal_error` and call `enqueue_shutdown_request()` to break the executor
-  loop
-- Add consecutive error counting: if `_max_consecutive_errors` (default 10)
-  errors occur in a row without a successful iteration, treat as fatal
-- Reset counter on successful iteration completion
+Three-tier error classification with token-bucket error budget:
+
+| Tier | Patterns | Behavior |
+|------|----------|----------|
+| **Immediate fatal** | `cudaErrorIllegalAddress`, `cudaErrorLaunchFailure`, `device-side assert`, `unrecoverable` | Crash on first occurrence — CUDA context is corrupted |
+| **Severe** | `CUDA out of memory`, `CUDA error`, `NCCL error` | Costs 5× budget (0.5) per error — two rapid OOMs crash, one recoverable OOM is tolerated |
+| **Transient** | Everything else | Costs 1× budget (0.1) per error — ~10 rapid errors before crash |
+
+Token-bucket parameters (hardcoded, not user-facing):
+- `_error_budget`: starts at 1.0, capped at 1.0
+- `_error_budget_cost`: 0.1 per transient error, 0.5 per severe error
+- `_error_budget_recovery_rate`: 0.1 per second of error-free wall time
+- Immediate-fatal errors bypass the budget entirely
+
+**Design rationale:** A simple consecutive counter (crash after N errors) was
+replaced because it couldn't distinguish between "10 transient errors over an
+hour" (fine) and "10 errors in 100ms" (engine is broken).  CUDA OOM is
+classified as severe (not immediate-fatal) because the CUDA context remains
+valid after a failed allocation — the engine can recover if the next batch
+is smaller.
 
 **Why this helps:** PyExecutor stops looping forever on corrupted CUDA context.
 It self-terminates instead of silently failing every batch.
@@ -190,12 +204,21 @@ T+next  Health endpoint raises SIGINT -> uvicorn shutdown -> pod terminates
 T+k8s   Kubernetes detects unhealthy pod -> restarts
 ```
 
-For PyExecutor (in-process):
+For PyExecutor (in-process, immediate-fatal error):
 ```
-T+0s    CUDA OOM in _forward_step() -> _handle_errors() called
-T+0s    _is_fatal_error("CUDA out of memory") returns True
+T+0s    cudaErrorIllegalAddress in _forward_step() -> _handle_errors()
+T+0s    _classify_error() returns "immediate_fatal" -> budget bypassed
 T+0s    _fatal_error set, enqueue_shutdown_request() called
 T+0s    Executor loop breaks, shutdown proceeds
+```
+
+For PyExecutor (in-process, severe error / budget exhaustion):
+```
+T+0s    CUDA OOM in _forward_step() -> _handle_errors()
+T+0s    _classify_error() returns "severe" -> budget -= 0.5 (budget=0.5)
+T+0s    Engine retries next iteration (budget > 0)
+T+0s    CUDA OOM again -> budget -= 0.5 (budget=0.0)
+T+0s    Budget exhausted -> _fatal_error set, shutdown
 ```
 
 ---
@@ -203,24 +226,23 @@ T+0s    Executor loop breaks, shutdown proceeds
 ## Test Coverage
 
 All unit tests are in
-`tests/unittest/executor/test_fatal_error_health_check.py` (52 tests total).
+`tests/unittest/executor/test_fatal_error_health_check.py` (59 tests total,
+heavily parametrized).
 
 | Test class | Count | What's covered |
 |---|---|---|
-| `TestIsFatalError` | 15 | Pattern matching for CUDA OOM, NCCL, device-side assert, launch failure, case insensitivity; non-fatal errors (tokenizer, KV cache, timeout, etc.) correctly pass through |
-| `TestHandleErrors` | 6 | Fatal errors fail all active requests and enqueue shutdown; non-fatal only fails specified requests; consecutive threshold promotion; counter reset; edge cases (no active requests, default error message) |
-| `TestSetFatalError` | 2 | First-error-wins semantics; initial `None` state |
-| `TestCheckHealth` | 5 | Healthy default; unhealthy after fatal error, shutdown, or error queue item; healthy with empty queue |
-| `TestIsShutdown` | 3 | Returns `True` for `doing_shutdown` or `_fatal_error` set |
-| `TestProxyCheckHealth` | 6 | Running workers healthy; crashed/exited/cancelled workers detected; no mpi_futures; parent unhealthy short-circuits |
-| `TestErrorMonitorLoop` | 3 | Background thread detects worker crash, error queue items, and stops on shutdown flag |
-| `TestGrpcHealthCheck` | 5 | Healthy executor, fatal error message surfaced, no executor, no LLM, shutdown state |
-| `TestOpenAIHealthEndpoint` | 4 | 200 when healthy, 503 when unhealthy, SIGINT raised on fatal error, no SIGINT without fatal error |
-| `TestBaseLLMCheckHealth` | 3 | Delegation to executor `check_health()`; no executor returns `False` |
+| `TestClassifyError` | 20 | Three-tier classification (immediate-fatal / severe / transient), case insensitivity, `_is_fatal_error` convenience method |
+| `TestErrorBudget` | 8 | Token-bucket budget: immediate-fatal bypasses budget, severe exhausts in 2, transient exhausts with custom cost, time-based recovery, request handling (fail specified vs. fail all), shutdown enqueue |
+| `TestGenerationExecutor` | 10 | `_set_fatal_error` first-wins, `is_shutdown` (parametrized 4 states), `check_health` (parametrized 4 states including error queue) |
+| `TestProxyCheckHealth` | 6 | MPI worker future states (running / crashed / exited / cancelled), empty futures, parent-unhealthy short-circuit |
+| `TestErrorMonitorLoop` | 3 | Background thread detects worker crash, error queue items, stops on shutdown flag |
+| `TestGrpcHealthCheck` | 5 | Parametrized: healthy, fatal, no executor, no LLM, shutdown |
+| `TestOpenAIHealthEndpoint` | 3 | Parametrized: 200 healthy, 503 unhealthy, 503+SIGINT on fatal |
+| `TestBaseLLMCheckHealth` | 4 | Parametrized delegation: healthy, fatal, no executor, missing attr |
 
 ### CI Findings
 
-During CI validation (PR #12718, build 32444), two issues surfaced:
+During CI validation (PR #12718, build 32444), three issues surfaced:
 
 1. **Thread leak (`proxy_error_monitor`)**: `pytest-threadleak` detected the
    daemon thread surviving past test teardown. **Fix:** join the thread during
@@ -228,6 +250,9 @@ During CI validation (PR #12718, build 32444), two issues surfaced:
 2. **`test_health[False-503]` assertion failure**: The existing test patched
    `is_shutdown()` to simulate an unhealthy executor, but `BaseLLM._check_health()`
    now delegates to `check_health()`. **Fix:** patch `check_health` instead.
+3. **Self-join deadlock**: Code review discovered that `_error_monitor_loop`
+   calls `shutdown()`, which joins the monitor thread — a self-join. **Fix:**
+   guard with `threading.current_thread() is not self._error_monitor_thread`.
 
 ### Remaining Test Gap
 
@@ -237,12 +262,38 @@ During CI validation (PR #12718, build 32444), two issues surfaced:
 
 ---
 
-## Open Questions
+## Open Questions (Resolved)
 
-- Should `_max_consecutive_errors` be configurable via `TorchLlmArgs`?
-- Should we also add a CUDA context health probe (e.g.,
-  `torch.cuda.is_available()` or a small allocation test) to `check_health()`?
+- ~~Should `_max_consecutive_errors` be configurable via `TorchLlmArgs`?~~
+  **Resolved:** Replaced with token-bucket error budget. Configuration is not
+  exposed — most open-source inference engines (vLLM, TGI, Triton) follow a
+  "crash fast, let the orchestrator restart" pattern with no user-facing error
+  tolerance knobs. If a specific customer needs tuning, a simple
+  `fail_fast_on_error: bool` flag can be added later.
+
+## Open Questions (Deferred)
+
+- Should we add a CUDA context health probe (e.g., small allocation test) to
+  `check_health()`? **Deferred** — the current pattern matching catches known
+  fatal CUDA errors; a runtime probe adds latency to health checks.
 - Should the `/health` endpoint distinguish between "shutting down gracefully"
-  (503) and "engine crashed" (500)?
+  (503) and "engine crashed" (500)? **Deferred** — this is a TRT-LLM-side
+  change (in `openai_server.py`'s `health()` method). Implementation is
+  straightforward but value depends on whether Dynamo inspects the status code
+  difference for routing decisions.
 - Dynamo-side fix: Dynamo should implement circuit-breaker / health-aware
   routing independently. This TRT-LLM fix is defensive only.
+
+## Backend Coverage
+
+| Backend | Executor class | Layer 1 | Layer 2 | Layer 3 | Layer 4 |
+|---|---|---|---|---|---|
+| **PyTorch (default)** | `GenerationExecutorProxy` | Yes | Yes | Yes | Yes |
+| **PyTorch + RPC** | `GenerationExecutorRpcProxy` | Base only | No | Yes | Yes |
+| **PyTorch + Ray** | `RayExecutor` | Base only | No | Yes | Yes |
+| **TensorRT (legacy)** | `GenerationExecutorProxy` | Yes | Yes | No (C++ executor) | Yes |
+| **AutoDeploy** | Same as PyTorch | Same | Same | Same | Same |
+| **ModelRunnerCpp** | No `GenerationExecutor` | No | No | No | No |
+
+Primary use case (PyTorch backend via `trtllm-serve` with MPI) has all four
+layers active — this is the configuration that hit the original zombie pod.
