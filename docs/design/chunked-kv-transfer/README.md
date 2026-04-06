@@ -6,7 +6,7 @@
 | **PRs** | [#12602](https://github.com/NVIDIA/TensorRT-LLM/pull/12602) (shared infra + V1), [#12469](https://github.com/NVIDIA/TensorRT-LLM/pull/12469) (V2 follow-up) |
 | **Author** | Chien-Chun Hung |
 | **Created** | 2026-03-24 |
-| **Last Updated** | 2026-04-03 |
+| **Last Updated** | 2026-04-06 |
 | **Status** | Phase 1 in review; Phase 2 design only |
 
 ## Problem

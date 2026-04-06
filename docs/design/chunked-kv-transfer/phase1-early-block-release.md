@@ -8,7 +8,7 @@
 | **PRs** | [#12602](https://github.com/NVIDIA/TensorRT-LLM/pull/12602) (shared infra + V1), [#12469](https://github.com/NVIDIA/TensorRT-LLM/pull/12469) (V2 follow-up) |
 | **Author** | Chien-Chun Hung |
 | **Created** | 2026-03-24 |
-| **Last Updated** | 2026-04-03 |
+| **Last Updated** | 2026-04-06 |
 | **Status** | In review |
 
 ## Problem Statement
@@ -133,7 +133,7 @@ A reassembly assertion verifies every block appears exactly once across all slic
 
 The receiver always sends a single monolithic `RecvReqInfo` with all destination block IDs. Only the sender chunks. In `_build_kv_write_meta`, each sender task uses `chunk_block_offset` to slice the receiver's full destination block list to extract the matching subset. One `RecvReqInfo` arrival triggers one `_respond_with_kv` invocation that dispatches N correctly-paired tasks.
 
-On the receiver side, the sender maps all chunks to `receiver_slice_id=0`. Only the last chunk carries `is_last_slice=True` so the receiver knows when all data has arrived.
+On the receiver side, the sender maps all chunks to `receiver_slice_id=0`. Only the last chunk carries `is_last_slice=True` so the receiver knows when all data has arrived. Intermediate chunk results (`is_last_slice=False`) are intentionally sent (not suppressed) so that RDMA failures propagate to the receiver immediately rather than requiring a timeout.
 
 See **Alternatives Considered** below for the detailed rationale behind sender-only chunking, including the N-squared dispatch bug that rules out receiver-side chunking.
 
@@ -466,8 +466,10 @@ The V1 C++ implementation uses a shared `mNumFrontBlocksRemoved` counter on `Gen
 
 Both V1 and V2 early release assume `beam_width == 1`:
 
-- V1: `detachFrontBlock` (and by extension `releasePrefixBlocks`) asserts `beamWidth == 1`.
+- V1: `detachFrontBlock` (and by extension `releasePrefixBlocks`) asserts `beamWidth == 1` in C++.
 - V2: `release_prefix` iterates `block.pages` which contains per-beam entries, so it handles multi-beam in principle, but disaggregated context requests are always `beam_width == 1`.
+
+A Python-side guard in `respond_and_send_async` sets the early-release callback to `None` for `beam_width > 1`, so chunked transfer still works (reduced descriptor pressure) but early release is skipped. This prevents the C++ assertion from crashing the process if beam search is ever combined with chunked transfer.
 
 This is not a practical limitation since disaggregated serving context-only requests always use beam width 1.
 
@@ -495,14 +497,19 @@ This is not a practical limitation since disaggregated serving context-only requ
 
 ### Test Coverage
 
+All unit tests call real production methods (via mock transceivers), not reimplemented logic.
+
 | Test | Description |
 |------|-------------|
-| `test_create_kv_slices_basic` | 5 parametrized cases for chunking logic (no_chunking, even_split, uneven_split, empty_blocks, chunk_larger_than_total) |
+| `test_create_kv_slices_basic` | 5 parametrized cases calling real `_create_kv_slices` (no_chunking, even_split, uneven_split, empty_blocks, chunk_larger_than_total) |
 | `test_create_kv_slices_integrity_check` | Reassembled block IDs match original across layer groups |
 | `test_create_kv_slices_multiple_layer_groups` | Asymmetric layer groups produce correct chunking |
 | `test_transfer_worker_chunked[v1_tp1_pp1_chunked]` | E2E GPU test with actual NIXL transfer (V1) |
 | `test_transfer_worker_chunked[v2_tp1_pp1_chunked]` | E2E GPU test with actual NIXL transfer (V2) |
-| `test_chunked_transfer.py` | 19 tests for session state machine, callbacks, release queue, mid-transfer failure |
-| `test_make_chunk_callback_conditions` | 4 parametrized cases for `hasattr` gate (no_release_api, no_chunking, neither, with_release_and_chunking) |
+| `test_chunked_transfer.py` | 19 tests for session state machine using real `TxSession`/`RxSession` classes |
+| `test_make_chunk_callback_conditions` | 4 parametrized cases calling real `KvCacheTransceiverV2._make_chunk_callback` |
+| `test_chunk_callback_enqueues_release` | Real callback from `_make_chunk_callback` enqueues correct entries |
+| `test_chunk_callback_then_drain` | End-to-end: real `_make_chunk_callback` + real `_drain_pending_releases` |
+| `test_drain_pending_releases` | Real `_drain_pending_releases` calls `release_prefix_blocks` correctly |
 | `test_cache_transceiver_config_chunk_size_blocks` | Config field validation (valid, None, default, zero, negative) |
 | `test_release_prefix_*` (V2 follow-up) | 7 unit tests for `_KVCache.release_prefix` (basic, zero, clamped, cumulative, close-after-release, negative) |
