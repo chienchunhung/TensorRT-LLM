@@ -587,14 +587,17 @@ class OpenAIServer:
         else:
             # If the engine has a fatal error, trigger server shutdown so the
             # pod doesn't linger as a zombie that accepts connections but never
-            # produces tokens.
+            # produces tokens.  The doing_shutdown guard ensures we only send
+            # SIGINT once — repeated health probes hitting this path won't
+            # stack signals during an in-progress teardown.
             executor = getattr(self.generator, '_executor', None)
             if executor is not None and getattr(executor, '_fatal_error',
                                                 None) is not None:
-                logger.error(
-                    "Health check detected fatal engine error, initiating "
-                    f"server shutdown: {executor._fatal_error}")
-                signal.raise_signal(signal.SIGINT)
+                if not getattr(executor, 'doing_shutdown', True):
+                    logger.error(
+                        "Health check detected fatal engine error, initiating "
+                        f"server shutdown: {executor._fatal_error}")
+                    signal.raise_signal(signal.SIGINT)
             return Response(
                 status_code=503,
                 content=

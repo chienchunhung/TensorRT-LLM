@@ -114,6 +114,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         # Create RPC client after workers are started (worker starts RPC server)
         self.rpc_client = RPCClient(self.rpc_addr, hmac_key=self.hmac_key)
 
+        # Event used to wake the error monitor thread for a clean shutdown
+        # instead of polling with sleep loops.
+        self._shutdown_event = threading.Event()
+
         # Start a background thread that monitors for fatal errors (e.g. MPI
         # worker crash) and triggers shutdown even when no health checks or
         # generate() calls are in flight.
@@ -173,6 +177,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         (not ``shutdown()``, which would block on ``f.result()`` for
         surviving workers).  The thread exits when ``doing_shutdown`` or
         ``_fatal_error`` is set.
+
+        Uses ``_shutdown_event`` for clean wakeup instead of a sleep loop,
+        so shutdown is immediate rather than waiting up to 5 seconds.
         """
         while not self.doing_shutdown and self._fatal_error is None:
             try:
@@ -214,11 +221,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             except Exception:
                 pass  # monitor should never crash itself
 
-            # Sleep in small increments to respond to shutdown quickly
-            for _ in range(50):  # 50 * 0.1s = 5s
-                if self.doing_shutdown or self._fatal_error is not None:
-                    return
-                time.sleep(0.1)
+            # Wait up to 5s, but wake immediately if _shutdown_event is set
+            self._shutdown_event.wait(timeout=5.0)
 
     def _setup_queues(self) -> WorkerCommIpcAddrs:
 
@@ -391,6 +395,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             return
         else:
             self.doing_shutdown = True
+
+        # Wake the error monitor thread immediately so it exits cleanly
+        if hasattr(self, '_shutdown_event'):
+            self._shutdown_event.set()
 
         self._abort_all_requests()
 

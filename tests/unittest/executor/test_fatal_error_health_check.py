@@ -56,6 +56,12 @@ classify_error = _mod.classify_error
 # mirrors the token-bucket / _handle_errors logic from PyExecutor.
 # ---------------------------------------------------------------------------
 class MockPyExecutorForFatalError:
+    """Mirrors PyExecutor's token-bucket error budget and _handle_errors logic.
+
+    Uses the real ``classify_error()`` function for classification so that
+    the budget and fatal-path tests exercise the actual classification code.
+    """
+
     def __init__(self):
         self._fatal_error = None
         self.is_shutdown: bool = False
@@ -64,9 +70,12 @@ class MockPyExecutorForFatalError:
         self._error_budget_recovery_rate: float = 0.1
         self._error_budget_cost: float = 0.1
         self.active_requests = []
+        self.waiting_queue = []
+        self.waiting_drained: list = []
         self.executor_request_queue = Mock()
 
     def _consume_error_budget(self, error_msg: str) -> bool:
+        """Deduct from the error budget and return True if exhausted."""
         now = time.monotonic()
         classification = classify_error(error_msg)
         if classification == "immediate_fatal":
@@ -84,12 +93,16 @@ class MockPyExecutorForFatalError:
         return self._error_budget < 1e-9
 
     def _handle_errors(self, error_msg=None, *, requests=None):
+        """Fail requests and optionally initiate shutdown on fatal errors."""
         error_msg = error_msg or "error"
         is_fatal = self._consume_error_budget(error_msg)
         if is_fatal:
             self._fatal_error = RuntimeError(f"Fatal error: {error_msg}")
             self.is_shutdown = True
             requests = None
+            # Drain waiting queue on fatal (mirrors real PyExecutor)
+            self.waiting_drained = list(self.waiting_queue)
+            self.waiting_queue.clear()
         failed_requests = list(self.active_requests) if requests is None else requests
         for request in failed_requests:
             request.state = "GENERATION_COMPLETE"
@@ -113,13 +126,16 @@ class ConcreteExecutor:
         self._fatal_error = None
 
     def _set_fatal_error(self, error):
+        """Record the first fatal error; subsequent calls are no-ops."""
         if self._fatal_error is None:
             self._fatal_error = error
 
     def is_shutdown(self) -> bool:
+        """Return True if shutdown is in progress or a fatal error occurred."""
         return self.doing_shutdown or self._fatal_error is not None
 
     def check_health(self) -> bool:
+        """Check if executor is healthy, draining error queue if needed."""
         if self.doing_shutdown or self._fatal_error is not None:
             return False
         if not self._error_queue.empty():
@@ -135,6 +151,7 @@ class ConcreteExecutor:
         return True
 
     def shutdown(self):
+        """Mark executor as shutting down."""
         self.doing_shutdown = True
 
 
@@ -145,8 +162,10 @@ class ConcreteProxyExecutor(ConcreteExecutor):
         super().__init__()
         self.mpi_futures: list = []
         self._pre_shutdown_called: bool = False
+        self._shutdown_event = threading.Event()
 
     def check_health(self) -> bool:
+        """Check executor health including MPI worker liveness."""
         if not super().check_health():
             return False
         if self.mpi_futures:
@@ -161,6 +180,7 @@ class ConcreteProxyExecutor(ConcreteExecutor):
         return True
 
     def _error_monitor_loop(self):
+        """Background loop that checks for MPI crashes and error queue items."""
         while not self.doing_shutdown and self._fatal_error is None:
             try:
                 if self.mpi_futures:
@@ -187,14 +207,14 @@ class ConcreteProxyExecutor(ConcreteExecutor):
                         return
             except Exception:
                 pass
-            for _ in range(50):
-                if self.doing_shutdown or self._fatal_error is not None:
-                    return
-                time.sleep(0.01)
+            # Use event for clean shutdown instead of sleep loop
+            self._shutdown_event.wait(timeout=0.5)
 
     def pre_shutdown(self):
+        """Record shutdown and signal the monitor event."""
         self.doing_shutdown = True
         self._pre_shutdown_called = True
+        self._shutdown_event.set()
 
 
 # ===========================================================================
@@ -203,6 +223,7 @@ class ConcreteProxyExecutor(ConcreteExecutor):
 
 
 def _make_request(req_id: int) -> Mock:
+    """Create a mock LlmRequest with the given ID."""
     req = Mock()
     req.py_request_id = req_id
     req.py_client_id = 1
@@ -214,6 +235,8 @@ def _make_request(req_id: int) -> Mock:
 # classify_error() — tests the real module-level function directly
 # ---------------------------------------------------------------------------
 class TestClassifyError:
+    """Tests for the classify_error() module-level function."""
+
     @pytest.mark.parametrize(
         "error_msg,expected",
         [
@@ -236,6 +259,7 @@ class TestClassifyError:
         ],
     )
     def test_classification(self, error_msg, expected):
+        """Verify error messages are classified into the correct severity tier."""
         assert classify_error(error_msg) == expected
 
 
@@ -243,6 +267,8 @@ class TestClassifyError:
 # Token-bucket error budget + _handle_errors
 # ---------------------------------------------------------------------------
 class TestErrorBudget:
+    """Tests for the token-bucket error budget and _handle_errors interaction."""
+
     @pytest.fixture
     def executor(self):
         ex = MockPyExecutorForFatalError()
@@ -250,6 +276,7 @@ class TestErrorBudget:
         return ex
 
     def test_immediate_fatal_bypasses_budget(self, executor):
+        """Immediate-fatal errors ignore the budget and trigger shutdown."""
         assert executor._error_budget == 1.0
         executor._handle_errors("device-side assert triggered")
         assert executor._fatal_error is not None
@@ -274,6 +301,7 @@ class TestErrorBudget:
         assert executor._fatal_error is not None
 
     def test_budget_recovers_over_time(self):
+        """Error budget replenishes based on elapsed error-free wall time."""
         executor = MockPyExecutorForFatalError()
         executor._handle_errors("transient error", requests=[_make_request(1)])
         budget_after = executor._error_budget
@@ -285,6 +313,7 @@ class TestErrorBudget:
         assert executor._error_budget > budget_after - 0.1
 
     def test_non_fatal_only_fails_specified_requests(self, executor):
+        """Non-fatal errors only fail the specified requests, not all."""
         req1, req2 = _make_request(1), _make_request(2)
         executor.active_requests = [req1, req2]
         executor._handle_errors("Input too long", requests=[req1])
@@ -294,6 +323,7 @@ class TestErrorBudget:
         executor.executor_request_queue.enqueue_shutdown_request.assert_not_called()
 
     def test_fatal_fails_all_and_enqueues_shutdown(self, executor):
+        """Fatal error fails all active requests and enqueues shutdown."""
         reqs = [_make_request(i) for i in range(3)]
         executor.active_requests = list(reqs)
         executor._handle_errors("cudaErrorIllegalAddress", requests=[reqs[0]])
@@ -304,29 +334,51 @@ class TestErrorBudget:
         executor.executor_request_queue.enqueue_shutdown_request.assert_called_once()
 
     def test_fatal_error_with_no_active_requests(self, executor):
+        """Fatal error works even with an empty active_requests list."""
         executor.active_requests = []
         executor._handle_errors("cudaErrorLaunchFailure")
         assert executor._fatal_error is not None
         executor.executor_request_queue.enqueue_shutdown_request.assert_called_once()
 
     def test_default_error_msg_is_transient(self, executor):
+        """Default error message (None -> 'error') is classified as transient."""
         executor.active_requests = []
         executor._handle_errors()
         assert executor._fatal_error is None
+
+    def test_fatal_drains_waiting_queue(self, executor):
+        """Fatal error drains waiting_queue so queued requests are not activated."""
+        executor.waiting_queue = ["req_a", "req_b", "req_c"]
+        executor._handle_errors("cudaErrorIllegalAddress")
+        assert executor._fatal_error is not None
+        assert len(executor.waiting_queue) == 0
+        assert executor.waiting_drained == ["req_a", "req_b", "req_c"]
+
+    def test_non_fatal_does_not_drain_waiting_queue(self, executor):
+        """Non-fatal errors leave the waiting_queue untouched."""
+        executor.waiting_queue = ["req_a", "req_b"]
+        executor._handle_errors("Input too long", requests=[_make_request(1)])
+        assert len(executor.waiting_queue) == 2
+        assert executor.waiting_drained == []
 
 
 # ---------------------------------------------------------------------------
 # GenerationExecutor: _set_fatal_error, is_shutdown, check_health
 # ---------------------------------------------------------------------------
 class TestGenerationExecutor:
+    """Tests for GenerationExecutor's _set_fatal_error, is_shutdown, check_health."""
+
     @pytest.fixture
     def executor(self):
+        """Return a fresh ConcreteExecutor for each test."""
         return ConcreteExecutor()
 
     def test_fatal_error_none_initially(self, executor):
+        """Fatal error starts as None."""
         assert executor._fatal_error is None
 
     def test_set_fatal_error_first_wins(self, executor):
+        """Only the first fatal error is recorded; subsequent calls are no-ops."""
         first, second = RuntimeError("a"), RuntimeError("b")
         executor._set_fatal_error(first)
         executor._set_fatal_error(second)
@@ -342,6 +394,7 @@ class TestGenerationExecutor:
         ],
     )
     def test_is_shutdown(self, doing_shutdown, fatal_error, expected):
+        """is_shutdown reflects both doing_shutdown flag and fatal error state."""
         ex = ConcreteExecutor()
         ex.doing_shutdown = doing_shutdown
         ex._fatal_error = fatal_error
@@ -357,6 +410,7 @@ class TestGenerationExecutor:
         ],
     )
     def test_check_health(self, doing_shutdown, fatal_error, queue_error, expected):
+        """check_health returns False for shutdown, fatal error, or queued errors."""
         ex = ConcreteExecutor()
         ex.doing_shutdown = doing_shutdown
         ex._fatal_error = fatal_error
@@ -369,8 +423,11 @@ class TestGenerationExecutor:
 # GenerationExecutorProxy: check_health with MPI futures
 # ---------------------------------------------------------------------------
 class TestProxyCheckHealth:
+    """Tests for GenerationExecutorProxy's check_health with MPI futures."""
+
     @pytest.fixture
     def executor(self):
+        """Return a fresh ConcreteProxyExecutor for each test."""
         return ConcreteProxyExecutor()
 
     @pytest.mark.parametrize(
@@ -383,15 +440,18 @@ class TestProxyCheckHealth:
         ],
     )
     def test_worker_states(self, executor, future_factory, expected_healthy, error_substr):
+        """Verify health status for different MPI worker future states."""
         executor.mpi_futures = [future_factory()]
         assert executor.check_health() is expected_healthy
         if error_substr:
             assert error_substr in str(executor._fatal_error)
 
     def test_healthy_with_no_mpi_futures(self, executor):
+        """No MPI futures means healthy (single-process mode)."""
         assert executor.check_health() is True
 
     def test_parent_unhealthy_short_circuits(self, executor):
+        """Parent executor being unhealthy short-circuits MPI future checks."""
         executor._set_fatal_error(RuntimeError("parent"))
         executor.mpi_futures = [Future()]
         assert executor.check_health() is False
@@ -401,7 +461,10 @@ class TestProxyCheckHealth:
 # _error_monitor_loop background thread
 # ---------------------------------------------------------------------------
 class TestErrorMonitorLoop:
+    """Tests for the _error_monitor_loop background thread."""
+
     def test_detects_worker_crash(self):
+        """Monitor thread detects MPI worker crash and triggers pre_shutdown."""
         executor = ConcreteProxyExecutor()
         f = Future()
         executor.mpi_futures = [f]
@@ -417,6 +480,7 @@ class TestErrorMonitorLoop:
         assert executor._pre_shutdown_called
 
     def test_detects_error_queue_item(self):
+        """Monitor thread detects system errors in the error queue."""
         executor = ConcreteProxyExecutor()
 
         t = threading.Thread(target=executor._error_monitor_loop, daemon=True)
@@ -443,12 +507,14 @@ class TestErrorMonitorLoop:
         t.join(timeout=2.0)
 
     def test_stops_on_shutdown_flag(self):
+        """Monitor thread exits promptly when doing_shutdown is set."""
         executor = ConcreteProxyExecutor()
 
         t = threading.Thread(target=executor._error_monitor_loop, daemon=True)
         t.start()
         time.sleep(0.05)
         executor.doing_shutdown = True
+        executor._shutdown_event.set()  # Wake the monitor immediately
         t.join(timeout=2.0)
 
         assert not t.is_alive()
@@ -458,6 +524,8 @@ class TestErrorMonitorLoop:
 # gRPC health check
 # ---------------------------------------------------------------------------
 class TestGrpcHealthCheck:
+    """Tests for gRPC health check integration with fatal error state."""
+
     @staticmethod
     async def _health_check(self):
         """Mirrors GrpcRequestManager.health_check logic."""
@@ -479,6 +547,7 @@ class TestGrpcHealthCheck:
             return False, f"Error: {e}"
 
     def _make_manager(self, executor=None):
+        """Create a mock gRPC manager with the given executor."""
         m = MagicMock()
         m.llm = MagicMock()
         m.llm._executor = executor
@@ -497,6 +566,7 @@ class TestGrpcHealthCheck:
         ],
     )
     async def test_health_check(self, setup, expected_healthy, msg_substr):
+        """Verify gRPC health check returns correct status and message."""
         if setup == "no_llm":
             m = MagicMock()
             m.llm = None
@@ -520,6 +590,8 @@ class TestGrpcHealthCheck:
 # OpenAI /health endpoint
 # ---------------------------------------------------------------------------
 class TestOpenAIHealthEndpoint:
+    """Tests for OpenAI /health endpoint with fatal error shutdown."""
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "check_healthy,fatal_error,expect_code,sigint",
@@ -530,12 +602,14 @@ class TestOpenAIHealthEndpoint:
         ],
     )
     async def test_health(self, check_healthy, fatal_error, expect_code, sigint):
+        """Verify status code and SIGINT behavior for different health states."""
         from starlette.responses import Response
 
         server = MagicMock()
         server._check_health = Mock(return_value=check_healthy)
         executor = Mock()
         executor._fatal_error = fatal_error
+        executor.doing_shutdown = False
         server.generator = Mock()
         server.generator._executor = executor
 
@@ -544,7 +618,9 @@ class TestOpenAIHealthEndpoint:
                 response = Response(status_code=200)
             else:
                 ex = getattr(server.generator, "_executor", None)
-                if ex is not None and getattr(ex, "_fatal_error", None) is not None:
+                if (ex is not None
+                        and getattr(ex, "_fatal_error", None) is not None
+                        and not getattr(ex, "doing_shutdown", True)):
                     signal.raise_signal(signal.SIGINT)
                 response = Response(status_code=503)
 
@@ -559,8 +635,11 @@ class TestOpenAIHealthEndpoint:
 # BaseLLM._check_health delegation
 # ---------------------------------------------------------------------------
 class TestBaseLLMCheckHealth:
+    """Tests for BaseLLM._check_health delegation to executor."""
+
     @staticmethod
     def _check_health(llm) -> bool:
+        """Mirrors BaseLLM._check_health logic."""
         if hasattr(llm, "_executor") and llm._executor is not None:
             return llm._executor.check_health()
         return False
@@ -574,6 +653,7 @@ class TestBaseLLMCheckHealth:
         ],
     )
     def test_delegation(self, has_executor, fatal, expected):
+        """_check_health delegates to executor.check_health correctly."""
         llm = Mock()
         if has_executor:
             ex = ConcreteExecutor()
@@ -585,6 +665,7 @@ class TestBaseLLMCheckHealth:
         assert self._check_health(llm) is expected
 
     def test_no_executor_attr(self):
+        """Returns False when the object has no _executor attribute."""
         assert self._check_health(object()) is False
 
 
@@ -592,6 +673,7 @@ class TestBaseLLMCheckHealth:
 # Helpers
 # ---------------------------------------------------------------------------
 def _done_future(exc=None):
+    """Create a Future that is already done, optionally with an exception."""
     f = Future()
     if exc is not None:
         f.set_exception(exc)
@@ -601,6 +683,7 @@ def _done_future(exc=None):
 
 
 def _cancelled_future():
+    """Create a Future that has been cancelled."""
     f = Future()
     f.cancel()
     return f

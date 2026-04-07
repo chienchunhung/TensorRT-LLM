@@ -3462,6 +3462,26 @@ class PyExecutor:
                 f"Fatal error detected, initiating shutdown: {error_msg}")
             requests = None
 
+            # Drain waiting_queue so that queued-but-not-yet-activated
+            # requests don't get picked up on the next iteration.
+            # These are RequestQueueItems (not yet LlmRequests), so we
+            # fail them via the result_wait_queues directly.
+            waiting_ids = set()
+            while len(self.waiting_queue) > 0:
+                item = self.waiting_queue.pop_request()
+                waiting_ids.add(item.id)
+                if (self.gather_all_responses
+                        or self.dist.rank == 0) and item.request is not None:
+                    waiting_response = LlmResponse(
+                        request_id=item.id,
+                        error_msg=error_msg,
+                        client_id=getattr(item.request, 'client_id', None))
+                    self._enqueue_responses([(item.id, waiting_response)])
+            if waiting_ids:
+                logger.info(
+                    f"Drained {len(waiting_ids)} waiting requests on fatal error"
+                )
+
         failed_requests = (list(self.active_requests)
                            if requests is None else requests)
         for request in failed_requests:
