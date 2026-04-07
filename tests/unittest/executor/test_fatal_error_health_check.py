@@ -618,9 +618,11 @@ class TestOpenAIHealthEndpoint:
                 response = Response(status_code=200)
             else:
                 ex = getattr(server.generator, "_executor", None)
-                if (ex is not None
-                        and getattr(ex, "_fatal_error", None) is not None
-                        and not getattr(ex, "doing_shutdown", True)):
+                if (
+                    ex is not None
+                    and getattr(ex, "_fatal_error", None) is not None
+                    and not getattr(ex, "doing_shutdown", True)
+                ):
                     signal.raise_signal(signal.SIGINT)
                 response = Response(status_code=503)
 

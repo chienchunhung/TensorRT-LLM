@@ -3472,10 +3472,11 @@ class PyExecutor:
                 waiting_ids.add(item.id)
                 if (self.gather_all_responses
                         or self.dist.rank == 0) and item.request is not None:
-                    waiting_response = LlmResponse(
-                        request_id=item.id,
-                        error_msg=error_msg,
-                        client_id=getattr(item.request, 'client_id', None))
+                    waiting_response = LlmResponse(request_id=item.id,
+                                                   error_msg=error_msg,
+                                                   client_id=getattr(
+                                                       item.request,
+                                                       'client_id', None))
                     self._enqueue_responses([(item.id, waiting_response)])
             if waiting_ids:
                 logger.info(
