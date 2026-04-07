@@ -72,6 +72,8 @@ class MockPyExecutorForFatalError:
         self.active_requests = []
         self.waiting_queue = []
         self.waiting_drained: list = []
+        self.request_queue_items: list = []
+        self.request_queue_drained: list = []
         self.executor_request_queue = Mock()
 
     def _consume_error_budget(self, error_msg: str) -> bool:
@@ -103,6 +105,9 @@ class MockPyExecutorForFatalError:
             # Drain waiting queue on fatal (mirrors real PyExecutor)
             self.waiting_drained = list(self.waiting_queue)
             self.waiting_queue.clear()
+            # Drain executor_request_queue on fatal
+            self.request_queue_drained = list(self.request_queue_items)
+            self.request_queue_items.clear()
         failed_requests = list(self.active_requests) if requests is None else requests
         for request in failed_requests:
             request.state = "GENERATION_COMPLETE"
@@ -384,6 +389,21 @@ class TestErrorBudget:
         executor._handle_errors("Input too long", requests=[_make_request(1)])
         assert len(executor.waiting_queue) == 2
         assert executor.waiting_drained == []
+
+    def test_fatal_drains_executor_request_queue(self, executor):
+        """Fatal error drains executor_request_queue items."""
+        executor.request_queue_items = ["queued_1", "queued_2"]
+        executor._handle_errors("cudaErrorIllegalAddress")
+        assert executor._fatal_error is not None
+        assert len(executor.request_queue_items) == 0
+        assert executor.request_queue_drained == ["queued_1", "queued_2"]
+
+    def test_non_fatal_does_not_drain_executor_request_queue(self, executor):
+        """Non-fatal errors leave executor_request_queue untouched."""
+        executor.request_queue_items = ["queued_1"]
+        executor._handle_errors("Input too long", requests=[_make_request(1)])
+        assert len(executor.request_queue_items) == 1
+        assert executor.request_queue_drained == []
 
 
 # ---------------------------------------------------------------------------

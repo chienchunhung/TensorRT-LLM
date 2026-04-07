@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import weakref
+from queue import Empty
 from typing import Dict, List, Optional
 
 import torch
@@ -159,7 +160,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                     self._set_fatal_error(e)
                     if not self.doing_shutdown:
                         self.pre_shutdown()
-            except Exception:
+            except Empty:
                 pass
             return self._fatal_error is None and not self.doing_shutdown
 
@@ -228,7 +229,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                             f"{repr(e)}")
                         if not self.doing_shutdown:
                             self.pre_shutdown()
-                    except Exception:
+                    except Empty:
                         pass
                     if self._fatal_error is not None:
                         return

@@ -7,7 +7,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from enum import IntEnum
-from queue import Queue
+from queue import Empty, Queue
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -3480,11 +3480,30 @@ class PyExecutor:
                                      error_msg=error_msg,
                                      client_id=getattr(item.request,
                                                        'client_id', None))))
+            # Also drain executor_request_queue so items already queued
+            # but not yet fetched by the main loop are not scheduled
+            # after the CUDA context is corrupted.
+            try:
+                while True:
+                    item = (self.executor_request_queue.get_request_queue().
+                            get_nowait())
+                    if item.is_shutdown_request:
+                        continue
+                    if ((self.gather_all_responses or self.dist.rank == 0)
+                            and item.request is not None):
+                        waiting_responses.append(
+                            (item.id,
+                             LlmResponse(request_id=item.id,
+                                         error_msg=error_msg,
+                                         client_id=getattr(
+                                             item.request, 'client_id', None))))
+            except Empty:
+                pass
+
             if waiting_responses:
                 self._enqueue_responses(waiting_responses)
-                logger.info(
-                    f"Drained {len(waiting_responses)} waiting requests "
-                    "on fatal error")
+                logger.info(f"Drained {len(waiting_responses)} queued requests "
+                            "on fatal error")
 
         failed_requests = (list(self.active_requests)
                            if requests is None else requests)
