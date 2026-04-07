@@ -178,8 +178,7 @@ class GrpcRequestManager:
                     if self.llm._executor._fatal_error is not None:
                         exc = self.llm._executor._fatal_error
                         lines = str(exc).splitlines()
-                        short = (lines[0]
-                                 if lines else type(exc).__name__)[:200]
+                        short = (lines[0] if lines else type(exc).__name__)[:200]
                         error_msg = f"{type(exc).__name__}: {short}"
                         logger.error(f"Health check fatal error: {repr(exc)}")
                     return False, error_msg
