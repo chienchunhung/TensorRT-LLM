@@ -138,17 +138,32 @@ class GenerationExecutorProxy(GenerationExecutor):
     def check_health(self) -> bool:
         """Check executor health including MPI worker liveness.
 
-        Extends the base ``check_health()`` with MPI worker future
-        inspection.  If any worker future has completed (indicating a
-        crash or unexpected exit), the error is recorded and
-        ``pre_shutdown()`` is called (not ``shutdown()``, which would
-        block on ``f.result()`` for surviving workers).
+        Inlines the base ``check_health()`` logic instead of calling
+        ``super().check_health()`` so that fatal queue items trigger
+        ``pre_shutdown()`` (non-blocking) rather than ``shutdown()``
+        (which blocks on ``f.result()`` for surviving MPI workers).
 
         Returns:
             True if the executor and all MPI workers are healthy.
         """
-        if not super().check_health():
+        if self.doing_shutdown or self._fatal_error is not None:
             return False
+
+        # Drain error queue — same logic as base check_health() but
+        # routes through pre_shutdown() to avoid blocking on workers.
+        if not self._error_queue.empty():
+            try:
+                e = self._error_queue.get_nowait()
+                self._error_queue.task_done()
+                if not isinstance(e, (str, RequestError)):
+                    self._set_fatal_error(e)
+                    if not self.doing_shutdown:
+                        self.pre_shutdown()
+            except Exception:
+                pass
+            return self._fatal_error is None and not self.doing_shutdown
+
+        # Check MPI worker futures for unexpected exits.
         if hasattr(self, 'mpi_futures') and self.mpi_futures:
             for f in self.mpi_futures:
                 if f.done():

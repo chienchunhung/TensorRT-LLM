@@ -135,18 +135,22 @@ class ConcreteExecutor:
         return self.doing_shutdown or self._fatal_error is not None
 
     def check_health(self) -> bool:
-        """Check if executor is healthy, draining error queue if needed."""
+        """Check if executor is healthy, draining all queued errors."""
         if self.doing_shutdown or self._fatal_error is not None:
             return False
-        if not self._error_queue.empty():
+        drained = False
+        while True:
             try:
                 e = self._error_queue.get_nowait()
                 self._error_queue.task_done()
+                drained = True
                 if not isinstance(e, str):
                     self._set_fatal_error(e)
                     self.doing_shutdown = True
+                    break
             except Empty:
-                pass
+                break
+        if drained:
             return self._fatal_error is None and not self.doing_shutdown
         return True
 
@@ -165,9 +169,29 @@ class ConcreteProxyExecutor(ConcreteExecutor):
         self._shutdown_event = threading.Event()
 
     def check_health(self) -> bool:
-        """Check executor health including MPI worker liveness."""
-        if not super().check_health():
+        """Check executor health including MPI worker liveness.
+
+        Inlines base logic and uses pre_shutdown() instead of shutdown().
+        """
+        if self.doing_shutdown or self._fatal_error is not None:
             return False
+        # Drain error queue (inlined, not via super)
+        drained = False
+        while True:
+            try:
+                e = self._error_queue.get_nowait()
+                self._error_queue.task_done()
+                drained = True
+                if not isinstance(e, str):
+                    self._set_fatal_error(e)
+                    if not self.doing_shutdown:
+                        self.pre_shutdown()
+                    break
+            except Empty:
+                break
+        if drained:
+            return self._fatal_error is None and not self.doing_shutdown
+        # Check MPI worker futures
         if self.mpi_futures:
             for f in self.mpi_futures:
                 if f.done():
@@ -500,10 +524,13 @@ class TestErrorMonitorLoop:
         t.start()
         time.sleep(0.05)
         executor._error_queue.put("per-request error string")
-        time.sleep(0.2)
+        # Wait past one full poll cycle (0.5s) so the monitor processes
+        # the string error and loops back, proving it didn't go fatal.
+        time.sleep(0.7)
 
         assert executor._fatal_error is None
         executor.doing_shutdown = True
+        executor._shutdown_event.set()
         t.join(timeout=2.0)
 
     def test_stops_on_shutdown_flag(self):

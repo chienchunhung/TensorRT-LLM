@@ -8,7 +8,7 @@ import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from typing import (TYPE_CHECKING, AsyncIterable, Dict, Generator, List,
                     Optional, Union)
 
@@ -291,11 +291,13 @@ class GenerationExecutor(ABC):
                 self.shutdown()
             raise error
 
-        # Drain the first error from the queue.  Per-request errors
+        # Drain the first error from the queue using get_nowait() to
+        # avoid blocking if another thread consumed the item between
+        # the empty() check and the get() call.  Per-request errors
         # (str / RequestError) are re-raised without marking the executor
         # fatal; only system-level errors trigger shutdown.
-        if not self._error_queue.empty():
-            e = self._error_queue.get()
+        try:
+            e = self._error_queue.get_nowait()
             self._error_queue.task_done()
             if isinstance(e, str):
                 e = RequestError(e)
@@ -305,6 +307,8 @@ class GenerationExecutor(ABC):
                 self._set_fatal_error(e)
                 self.shutdown()
             raise e
+        except Empty:
+            pass
 
     def _set_fatal_error(self, error: BaseException) -> None:
         """Record an unrecoverable engine error.
@@ -344,17 +348,21 @@ class GenerationExecutor(ABC):
         """
         if self.doing_shutdown or self._fatal_error is not None:
             return False
-        # Drain the error queue so that background errors (e.g. MPI worker
-        # crash) are detected even when no generate() calls are in flight.
-        if not self._error_queue.empty():
+        # Drain *all* queued errors so that a fatal error queued behind
+        # a RequestError is not hidden until the next health check.
+        drained = False
+        while True:
             try:
                 e = self._error_queue.get_nowait()
                 self._error_queue.task_done()
+                drained = True
                 if not isinstance(e, (str, RequestError)):
                     self._set_fatal_error(e)
                     self.shutdown()
-            except Exception:
-                pass
+                    break  # No need to drain further after fatal
+            except Empty:
+                break
+        if drained:
             return self._fatal_error is None and not self.doing_shutdown
         return True
 
