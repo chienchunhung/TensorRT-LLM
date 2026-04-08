@@ -3,11 +3,11 @@
 | | |
 |---|---|
 | **JIRA** | [TRTLLM-11608](https://jirasw.nvidia.com/browse/TRTLLM-11608) |
-| **PRs** | [#12602](https://github.com/NVIDIA/TensorRT-LLM/pull/12602) (shared infra + V1), [#12469](https://github.com/NVIDIA/TensorRT-LLM/pull/12469) (V2 follow-up) |
+| **PRs** | [#12602](https://github.com/NVIDIA/TensorRT-LLM/pull/12602) (shared infra + V1), [#12469](https://github.com/NVIDIA/TensorRT-LLM/pull/12469) (V2 follow-up), [#12781](https://github.com/NVIDIA/TensorRT-LLM/pull/12781) (Phase 2 pipelined) |
 | **Author** | Chien-Chun Hung |
 | **Created** | 2026-03-24 |
-| **Last Updated** | 2026-04-06 |
-| **Status** | Phase 1 in review; Phase 2 design only |
+| **Last Updated** | 2026-04-08 |
+| **Status** | Phase 1 in review; Phase 2 prototype |
 
 ## Problem
 
@@ -77,20 +77,38 @@ Start transferring each chunk's KV immediately after its prefill completes, over
 
 | | Phase 1 | Phase 2 |
 |---|---------|---------|
-| V1 KV cache (C++) | Supported (PR #12602) | Supported (future) |
-| V2 KV cache (Py) | Follow-up PR (#12469) | Supported (future) |
+| V1 KV cache (C++) | Supported (PR #12602) | Prototype (PR #12781) |
+| V2 KV cache (Py) | Follow-up PR (#12469) | Prototype (PR #12781) |
 | Complexity | Moderate | Higher |
 | Dependencies | None | Phase 1 |
+
+## Architecture: KV Cache Manager vs Transceiver
+
+The chunking work spans two independent components:
+
+- **KV Cache Manager** (V1 C++ or V2 Python): owns GPU memory blocks, provides `release_prefix_blocks` API for early block release. This API is transceiver-agnostic.
+- **Transceiver** (C++ default or Python): handles RDMA transfer of KV data. Chunking logic (slice creation, `chunk_block_offset`, per-chunk callbacks) lives in the transceiver.
+
+| | C++ Transceiver (default) | Python Transceiver |
+|---|---|---|
+| **V1 KV Cache (default)** | Production default. No chunking support yet. | Chunking + early release (this work). |
+| **V2 KV Cache** | No chunking support yet. | Chunking + early release (follow-up). |
+
+The Python transceiver is **auto-selected** when `chunk_size_blocks` is set and the backend is NIXL/DEFAULT. It also avoids the contiguous staging buffer that the C++ transceiver allocates, eliminating an additional source of memory pressure. The Python transceiver only supports NIXL backend; UCX/MPI/MOONCAKE require the C++ transceiver.
+
+C++ transceiver chunking support (~500 lines, 3-5 days) is planned as future work. The `releasePrefixBlocks` C++ API is already in place for it.
 
 ## Implementation Roadmap
 
 ### Phase 1 (Foundation) — Two PRs
 
 **PR #12602 (V1 + shared infrastructure):**
-- All shared chunking infrastructure ported to `transceiver.py` layout
+- All shared chunking infrastructure in `transceiver.py`
 - V1 C++ `releasePrefixBlocks` on `WindowBlockManager` / `BlockManager` / `KVCacheManager`
 - Nanobind binding + Python wrapper
 - `hasattr`-based callback gate (activates V1 immediately, V2 when follow-up lands)
+- Auto-selection of Python transceiver when `chunk_size_blocks` is set (NIXL/DEFAULT only)
+- Warning when `chunk_size_blocks` is set with unsupported backend
 - All tests (chunking logic, session state machine, V1+V2 e2e)
 
 **PR #12469 (V2 follow-up, ~170 lines):**
@@ -99,11 +117,13 @@ Start transferring each chunk's KV immediately after its prefill completes, over
 - V2 type stubs + release_prefix unit tests
 - No shared infrastructure changes needed
 
-### Phase 2 (Extension)
+### Phase 2 (Extension) — PR #12781
 
 - CUDA event recording after each chunk's forward
-- Incremental session creation (post-first-chunk, not post-full-prefill)
-- Integration with generation-first scheduling mode
+- `send_prefill_chunk()` for incremental session creation
+- `_maybe_send_prefill_chunk()` hook in executor loop after `move_to_next_context_chunk()`
+- `enable_pipelined_transfer` config field
+- Best paired with generation-first scheduling
 
 ### Dependency
 
@@ -139,7 +159,8 @@ Start transferring each chunk's KV immediately after its prefill completes, over
 
 | Risk | Phase | Mitigation |
 |------|-------|------------|
-| VSWA counter sharing in V1 C++ | 1 | Assert non-variable-window; disagg doesn't use VSWA |
+| VSWA counter sharing in V1 C++ | 1 | Assert non-variable-window; disagg doesn't use VSWA; documented at call site |
+| Python transceiver only (NIXL) | 1 | Auto-select when `chunk_size_blocks` set; warning for unsupported backends; C++ transceiver support planned |
 | Stale RDMA reads from GPU memory | 2 | CUDA event synchronization before RDMA |
 | Receiver not ready (context-first mode) | 2 | Pair with generation-first; defer context-first to follow-up |
 | Request cancellation mid-pipeline | 2 | Existing fail-fast session semantics |

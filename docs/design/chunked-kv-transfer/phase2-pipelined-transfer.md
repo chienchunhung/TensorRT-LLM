@@ -5,11 +5,11 @@
 | | |
 |---|---|
 | **JIRA** | [TRTLLM-11608](https://jirasw.nvidia.com/browse/TRTLLM-11608) |
-| **PRs** | TBD |
+| **PRs** | [#12781](https://github.com/NVIDIA/TensorRT-LLM/pull/12781) |
 | **Author** | Chien-Chun Hung |
 | **Created** | 2026-03-24 |
-| **Last Updated** | 2026-04-03 |
-| **Status** | Design only |
+| **Last Updated** | 2026-04-08 |
+| **Status** | Prototype |
 | **Depends on** | [Phase 1](phase1-early-block-release.md) |
 
 ## Problem Statement

@@ -8,7 +8,7 @@
 | **PRs** | [#12602](https://github.com/NVIDIA/TensorRT-LLM/pull/12602) (shared infra + V1), [#12469](https://github.com/NVIDIA/TensorRT-LLM/pull/12469) (V2 follow-up) |
 | **Author** | Chien-Chun Hung |
 | **Created** | 2026-03-24 |
-| **Last Updated** | 2026-04-06 |
+| **Last Updated** | 2026-04-08 |
 | **Status** | In review |
 
 ## Problem Statement
@@ -180,7 +180,25 @@ This follows the open/closed principle: adding early release to a new manager ty
 
 #### Configuration
 
-`CacheTransceiverConfig.chunk_size_blocks` (optional `PositiveInt`, default `None`): consumed by the Python transceiver only, intentionally omitted from the C++ `_to_pybind()` conversion. `None` produces identical single-slice behavior (backward compatible).
+`CacheTransceiverConfig.chunk_size_blocks` (optional `PositiveInt`, default `None`). When set with NIXL/DEFAULT backend, the Python transceiver is auto-selected. `None` produces identical single-slice behavior (backward compatible).
+
+Enable via YAML config:
+
+    cache_transceiver_config:
+      backend: "DEFAULT"
+      chunk_size_blocks: 64
+
+Or via Python API:
+
+    config = CacheTransceiverConfig(backend="NIXL", chunk_size_blocks=64)
+
+| `chunk_size_blocks` | Backend | Effect |
+|---------------------|---------|--------|
+| `None` (default) | Any | No chunking, C++ transceiver (unchanged) |
+| 64 | NIXL / DEFAULT | Python transceiver auto-selected, chunked transfer + early release |
+| 64 | UCX / MPI / MOONCAKE | Warning logged, ignored (C++ transceiver has no chunking support) |
+
+Recommended chunk sizes:
 
 | `chunk_size_blocks` | Granularity | RDMA Overhead | Recommendation |
 |-------------------|-------------|---------------|----------------|
@@ -486,6 +504,17 @@ This is not a practical limitation since disaggregated serving context-only requ
 - **Partial release on failure.** If chunks 0-2 succeed but chunk 3 fails, blocks from chunks 0-2 are already released. The remaining blocks (chunk 3) are freed during `removeSequence` / `close()` cleanup. No blocks are leaked.
 - **Race with `removeSequence`.** `releasePrefixBlocks` acquires `mSequencesMtx` (V1) or checks `kv_cache_map` (V2) and returns early if the sequence was already removed. The release queue may contain stale entries for completed requests; these are harmlessly skipped.
 
+### Python vs C++ Transceiver
+
+Chunking is currently implemented in the Python transceiver only (`KvCacheTransceiverV2`). The C++ transceiver (`BindKvCacheTransceiver` / `CacheTransceiver`) is the production default but has no chunking support. The Python transceiver is auto-selected when `chunk_size_blocks` is set with NIXL/DEFAULT backend.
+
+Key differences:
+
+- **Python transceiver:** GPUDirect RDMA directly from KV cache blocks (no staging buffer). Fully extensible for chunking, callbacks, release queue. Only supports NIXL backend.
+- **C++ transceiver:** Allocates a contiguous staging buffer of `max_tokens_in_buffer` size per transfer. Supports all backends (NIXL, UCX, MPI, MOONCAKE). Monolithic `respondAndSendAsync` with no per-chunk hook points.
+
+The `releasePrefixBlocks` C++ API is transceiver-agnostic — adding chunking to the C++ transceiver (~500 lines) would call it directly. This is planned as future work.
+
 ### Potential Follow-Up Work
 
 1. **Per-chunk retry.** Currently, if any chunk fails, the entire session fails (fail-fast). Per-chunk retry could improve resilience for transient RDMA errors without restarting the full transfer.
@@ -493,7 +522,8 @@ This is not a practical limitation since disaggregated serving context-only requ
 3. **Adaptive chunk sizing.** Dynamically adjust `chunk_size_blocks` based on real-time `free_num_blocks` pressure. When memory is abundant, use larger chunks (less overhead); when memory is tight, use smaller chunks (faster reclamation).
 4. **Receiver-side chunking.** The current design is sender-only. Receiver-side chunking could enable the generation server to start decode on partial KV data (speculative prefix decode), but this requires significant changes to the attention kernel and scheduler.
 5. **Multi-threaded slice distribution.** Currently, all slices for a request are routed to the same sender worker thread via `unique_rid % num_threads`. Distributing slices across threads was considered but deferred — NIC bandwidth is typically the bottleneck, not Python thread overhead.
-6. **C++ transceiver support.** The chunking infrastructure is Python-transceiver only (`transceiver_runtime="PYTHON"`). Extending to the C++ transceiver would require mirroring the chunking logic in C++.
+6. **C++ transceiver support.** The chunking infrastructure is Python-transceiver only (auto-selected for NIXL/DEFAULT when `chunk_size_blocks` is set). Extending to the C++ transceiver (~500 lines) would require modifying `CacheFormatter::format` to partition blocks into chunk ranges and adding per-chunk callbacks in `CacheSender` that call the existing `releasePrefixBlocks` API. This would enable chunking for UCX/MPI/MOONCAKE backends.
+7. **VSWA support.** The `mNumFrontBlocksRemoved` counter is shared across window managers. Supporting VSWA would require making it per-window-size.
 
 ### Test Coverage
 
