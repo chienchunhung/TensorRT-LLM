@@ -2,6 +2,57 @@
 
 [< Back to Overview](README.md)
 
+**Last Updated:** 2026-04-08
+
+---
+
+## Integration Approach
+
+### Relationship to Existing Prototypes
+
+This plan treats MX and GMS as **library dependencies**, not things to reimplement. The existing prototypes demonstrate that the core functionality already works:
+
+- **MX (ModelExpress)**: The [`modelexpress`](https://github.com/ai-dynamo/modelexpress) library provides a gRPC server, Python client SDK, and NIXL-based GPU-to-GPU transfer. vLLM's `--load-format mx` integration is a thin loader (~500 lines) that calls the MX client API. TRT-LLM should follow the same pattern.
+- **GMS (GPU Memory Service)**: The [`gpu_memory_service`](https://github.com/ai-dynamo/dynamo/pull/7053) library provides the CUDA VMM allocator, RW/RO client, and socket-based locking. PR #7053 shows a working TRT-LLM integration (~300 lines of TRT-LLM-specific model loading code) that calls the GMS client.
+
+**What TRT-LLM needs to implement:**
+
+| Area | TRT-LLM-side work | Dynamo-side work (external) |
+|:-----|:-------------------|:---------------------------|
+| MX weight loading | `CheckpointLoader` that calls MX client APIs at TRT-LLM lifecycle points | Maintain `modelexpress` library |
+| GMS weight sharing | Weight loader mode in `ModelLoader.load()` that calls GMS `materialize_module_from_gms` | Maintain `gpu_memory_service` library |
+| Configuration | `load_format` field in `TorchLlmArgs`, CLI flags | None |
+| Sleep/wake | Map `release_with_tag("kv_cache")` to GMS tag operations (already demonstrated in PR #7053) | None |
+| Shadow failover | `PyExecutor` shadow mode with GMS-backed activation | None |
+| Testing | TRT-LLM CI with MX/GMS enabled | GMS integration tests in Dynamo repo |
+
+**What TRT-LLM does NOT need to implement:**
+- NIXL wrapper (use `modelexpress` client directly)
+- CUDA VMM FD import/export (use `gpu_memory_service` client directly)
+- GMS allocator internals (use `gpu_memory_service.client.torch.module.materialize_module_from_gms`)
+- gRPC server/client for MX (use `modelexpress` SDK)
+
+### Target Backend Scope
+
+All implementation targets the **PyTorch backend** with:
+- **KV Cache Manager V1** (the default `KVCacheManager`, not V2)
+- **C++ transceiver** (the default NIXL/UCX-based `CacheTransceiver`)
+- **`trtllm-serve`** as the primary serving surface
+
+The TensorRT (legacy) backend is out of scope. AutoDeploy inherits PyTorch backend behavior and should work without additional changes.
+
+### Glossary
+
+| Term | Meaning |
+|:-----|:--------|
+| **MX** | ModelExpress — GPU-to-GPU model weight streaming service |
+| **GMS** | GPU Memory Service — out-of-process GPU memory management for zero-copy sharing and crash resilience |
+| **GDS** | GPUDirect Storage — NVIDIA technology for direct DMA between NVMe storage and GPU memory, bypassing CPU |
+| **NIXL** | NVIDIA Inference eXchange Library — unified transfer API used by both MX and TRT-LLM's disaggregated serving |
+| **KVBM** | KV Block Manager — tiered KV cache management in Dynamo |
+
+---
+
 ## Phased Approach
 
 ```mermaid
@@ -11,86 +62,74 @@ gantt
     axisFormat %b %d
 
     section Phase 1: MX (P1)
-    API design & tensor enumeration    :p1a, 2026-04-14, 2w
-    NIXL wrapper implementation        :p1b, after p1a, 2w
-    MX loader + gRPC client            :p1c, after p1b, 2w
-    Testing, docs, vLLM comparison     :p1d, after p1c, 2w
+    MX checkpoint loader + config      :p1a, 2026-04-14, 2w
+    Testing + vLLM comparison           :p1b, after p1a, 2w
 
     section Phase 2: GMS (P2)
-    Pluggable allocator hook           :p2a, after p1d, 2w
-    GMS loader + CUDA VMM import       :p2b, after p2a, 2w
-    Sleep/wake integration             :p2c, after p2b, 2w
-    Shadow failover + testing          :p2d, after p2c, 2w
+    GMS weight loader + sleep/wake     :p2a, after p1b, 2w
+    Shadow failover + testing          :p2b, after p2a, 2w
 
     section Phase 3: Combined (P2)
-    Combined loader + config           :p3a, after p2d, 2w
-    Disagg interaction + KV extension  :p3b, after p3a, 2w
-    E2E testing + hardening            :p3c, after p3b, 2w
+    Combined loader + disagg + E2E     :p3a, after p2b, 2w
 ```
 
 ---
 
-## Phase 1: MX + TRT-LLM (Cross-Node P2P) — 6-8 Weeks
+## Phase 1: MX + TRT-LLM (Cross-Node P2P) — 3-4 Weeks
 
 **Priority:** P1 (Tier 1) — competitive catch-up with vLLM
 **Objective:** Enable P2P weight transfer across nodes via `--load-format mx`
 
 ### Deliverables
 
-| # | Deliverable | Description | Files |
+| # | Deliverable | Description | TRT-LLM Files |
 |:--|:-----------|:-----------|:------|
-| 1.1 | `WeightLoaderProtocol` | Base protocol for custom weight loaders | `_torch/weight_loaders/base.py` |
-| 1.2 | Tensor enumeration API | Enumerate model tensors for P2P registration | `_torch/utils/tensor_utils.py` |
-| 1.3 | NIXL/TransferEngine wrapper | Adapt NIXL for TRT-LLM's tensor layout | `_torch/weight_loaders/nixl_wrapper.py` |
-| 1.4 | MX weight loader | `@register_weight_loader("mx")` implementation | `_torch/weight_loaders/mx_loader.py` |
-| 1.5 | MX gRPC client integration | Source registration, discovery, heartbeat | `_torch/weight_loaders/mx_client.py` |
-| 1.6 | Configuration schema | `load_format`, `mx_server_url`, etc. in `TorchLlmArgs` | `llmapi/llm_args.py` |
-| 1.7 | Three-tier fallback | P2P -> GDS -> Disk with graceful degradation | `_torch/weight_loaders/mx_loader.py` |
-| 1.8 | Tests and documentation | Unit tests, integration tests, user guide | `tests/`, `docs/` |
+| 1.1 | MX checkpoint loader | `@register_checkpoint_loader("mx")` that calls MX client SDK | `_torch/models/checkpoints/mx/` |
+| 1.2 | Configuration schema | `load_format: "mx"`, `mx_server_url` in `TorchLlmArgs` | `llmapi/llm_args.py` |
+| 1.3 | Tensor enumeration for P2P | Enumerate loaded model tensors for MX source registration | Inside MX loader |
+| 1.4 | Fallback logic | MX P2P -> GPUDirect Storage -> disk, with graceful degradation | Inside MX loader |
+| 1.5 | Tests and documentation | Unit tests, 2-node integration test, user guide | `tests/`, `docs/` |
 
-### Week-by-Week Plan
+### Implementation Details
 
-**Weeks 1-2: API Design & Tensor Enumeration**
-- Define `WeightLoaderProtocol` (see [API Design](05-api-design.md))
-- Implement `enumerate_model_tensors()` handling:
-  - Parameters and buffers
-  - Tied weights (deduplicated by `data_ptr`)
-  - Non-contiguous views (report underlying storage)
-  - Quantization scales (`weight_scale_inv`, etc.)
-- Add `post_load_callback` to `ModelLoader`
-- **Gate:** API spec reviewed and approved
+**Weeks 1-2: MX Checkpoint Loader + Configuration**
 
-**Weeks 3-4: NIXL Wrapper**
-- Study vLLM's MX loader implementation (`vllm/model_executor/model_loader/mx_loader.py`) — learn what works, what's tricky
-- Implement NIXL wrapper for TRT-LLM tensor registration
-- Handle TP rank matching in source discovery
-- Handle PP layer subsetting
-- Handle EP expert distribution
-- **Gate:** NIXL wrapper can register and transfer a single tensor P2P
+The MX loader follows the same `BaseCheckpointLoader` pattern as the existing HF loader. The key difference is the weight source:
 
-**Weeks 5-6: MX Loader + gRPC Client**
-- Implement `ModelExpressWeightLoader`:
-  ```python
-  class ModelExpressWeightLoader(BaseWeightLoader):
-      def load_weights(self, model, mapping, config):
-          sources = self.mx_client.list_sources(identity, status=READY)
-          candidates = [s for s in sources if self._rank_matches(s)]
-          if candidates:
-              self._p2p_receive(candidates[0], model)
-          else:
-              self._load_from_disk_and_publish(model)
-  ```
-- Integrate with MX gRPC client (source registration, heartbeat)
-- Implement `SourceIdentity` with quantization config hash
-- Implement three-tier fallback (P2P -> GDS -> Disk)
-- **Gate:** P2P transfer working between 2 nodes with Llama-8B
+```python
+class MXCheckpointLoader(BaseCheckpointLoader):
+    def load_weights(self, checkpoint_dir, mapping, **kwargs):
+        # 1. Query MX server for existing sources with matching identity
+        sources = self.mx_client.list_sources(self._build_identity(mapping))
+        compatible = [s for s in sources if self._rank_matches(s, mapping)]
 
-**Weeks 7-8: Testing & Documentation**
-- Unit tests: tensor enumeration, rank matching, fallback logic
-- Integration tests: 2-node P2P, multi-rank TP, cold-start benchmark
-- Compare performance against vLLM's `--load-format mx`
-- User guide: setup, configuration, troubleshooting
-- **Gate:** All tests passing; cold-start benchmark within 20% of vLLM MX
+        if compatible:
+            # 2a. P2P receive from existing source (fast path)
+            return self._p2p_receive(compatible[0], mapping)
+        else:
+            # 2b. Load from disk normally, then register as MX source
+            weights = self._fallback_loader.load_weights(checkpoint_dir, mapping)
+            self._register_as_source(weights, mapping)
+            return weights
+```
+
+The MX client SDK (`modelexpress.client`) handles:
+- gRPC connection to MX server
+- Source registration and discovery
+- NIXL-based P2P transfer
+- Heartbeat and lifecycle
+
+TRT-LLM only needs to:
+- Call the client at the right time (inside `load_weights`)
+- Build the `SourceIdentity` with TRT-LLM's parallelism config (TP/PP/EP ranks)
+- Handle the config plumbing (`TorchLlmArgs.load_format`, `TorchLlmArgs.mx_server_url`)
+
+**Weeks 3-4: Testing + Comparison**
+
+- Unit tests: identity matching, fallback logic
+- Integration test: 2-node cluster, cold-start with MX vs baseline
+- Benchmark comparison against vLLM's `--load-format mx`
+- **Gate:** Cold-start within 20% of vLLM MX for same model
 
 ### Phase 1 Success Criteria
 
@@ -103,75 +142,59 @@ gantt
 
 ---
 
-## Phase 2: GMS + TRT-LLM (Within-Node Sharing) — 6-8 Weeks
+## Phase 2: GMS + TRT-LLM (Within-Node Sharing) — 3-4 Weeks
 
 **Priority:** P2 (Tier 2) — differentiation; enables fault tolerance
 **Objective:** Enable zero-copy weight sharing and crash-resilient failover
 
 ### Deliverables
 
-| # | Deliverable | Description | Files |
+| # | Deliverable | Description | TRT-LLM Files |
 |:--|:-----------|:-----------|:------|
-| 2.1 | Pluggable GPU memory allocator | `CUDAPluggableAllocator` routing to GMS | `_torch/memory/gms_allocator.py` |
-| 2.2 | CUDA VMM FD import/export | Import external memory via file descriptor | `_torch/memory/external_memory.py` |
-| 2.3 | GMS weight loader | `@register_weight_loader("gms")` with RW/RO modes | `_torch/weight_loaders/gms_loader.py` |
-| 2.4 | Sleep/wake GMS mapping | Map `release_with_tag` / `materialize_with_tag` to GMS | `_torch/weight_loaders/gms_loader.py` |
-| 2.5 | Shadow failover integration | PyExecutor shadow mode with GMS-backed takeover | `_torch/pyexecutor/py_executor.py` |
-| 2.6 | Configuration schema | `gms_socket_path`, `gms_mode`, etc. | `llmapi/llm_args.py` |
-| 2.7 | Tests and documentation | Unit tests, failover tests, user guide | `tests/`, `docs/` |
+| 2.1 | GMS weight loader mode | RW/RO modes in `ModelLoader.load()` calling `materialize_module_from_gms` | `_torch/pyexecutor/model_loader.py` |
+| 2.2 | Sleep/wake GMS tag mapping | Map `release_with_tag("kv_cache")` to GMS-safe operations | `_torch/pyexecutor/py_executor_creator.py` |
+| 2.3 | Shadow failover integration | PyExecutor shadow mode with GMS-backed activation | `_torch/pyexecutor/py_executor.py` |
+| 2.4 | Configuration schema | `gms_socket_path`, `gms_mode` in `TorchLlmArgs` | `llmapi/llm_args.py` |
+| 2.5 | Tests and documentation | Failover tests, memory sharing verification | `tests/`, `docs/` |
 
-### Week-by-Week Plan
+### Implementation Details
 
-**Weeks 1-2: Pluggable Allocator + CUDA VMM**
-- Implement `GMSAllocator` using `torch.cuda.memory.CUDAPluggableAllocator`:
-  ```python
-  class GMSAllocator:
-      def malloc(self, size, device, stream) -> int:
-          ptr = self.gms_client.create_mapping(size=size)
-          return ptr
-      def free(self, ptr, size, device, stream):
-          self.gms_client.destroy_mapping(ptr)
-  ```
-- Implement `import_cuda_memory(fd, size, device)` and `export_cuda_memory(tensor)`
-- Handle allocation/deallocation lifecycle correctly
-- **Risk mitigation:** Start with simple contiguous allocations; handle edge cases incrementally
-- **Gate:** Can allocate a tensor via GMS allocator and read it from another process
+**Weeks 1-2: GMS Weight Loader + Sleep/Wake**
 
-**Weeks 3-4: GMS Loader + RW/RO Modes**
-- Implement `GMSWeightLoader`:
-  ```python
-  class GMSWeightLoader(BaseWeightLoader):
-      def load_weights(self, model, mapping, config):
-          if self._should_use_ro_mode():
-              self._import_from_gms(model)  # Zero-copy, ~100ms
-          else:
-              self._load_normally_and_commit(model)  # Full load, commit to GMS
-  ```
-- RW mode: Load weights normally, then commit tensor storage to GMS pool
-- RO mode: Import GMS memory via FD, reconstruct tensors with correct shapes/dtypes
-- Handle module path resolution (fix aliased layer issues from PR #7053 prototype)
-- **Gate:** Two workers sharing weights on same GPU with correct inference results
+The GMS integration follows the pattern validated in [PR #7053](https://github.com/ai-dynamo/dynamo/pull/7053):
 
-**Weeks 5-6: Sleep/Wake + Shadow Failover**
-- Map GMS operations to existing TRT-LLM sleep/wake:
-  | TRT-LLM Operation | GMS Mapping |
-  |:-------------------|:------------|
-  | `release_with_tag("model_weights")` | Release RW lock, keep GMS memory |
-  | `materialize_with_tag("model_weights")` | Re-import from GMS (RO or RW) |
-  | `release_with_tag("kv_cache")` | Release KV cache memory (standard) |
-  | `materialize_with_tag("kv_cache")` | Re-allocate KV cache (standard) |
-- Implement shadow mode in PyExecutor (see [Executor Failover](06-executor-failover.md)):
-  - Shadow worker starts with GMS RO import
-  - Maintains model weights in memory but no KV cache allocation
-  - On primary failure: upgrade to RW, allocate KV cache, register with router
-- **Gate:** Shadow takeover completes in <5s on primary crash
+```python
+# Inside ModelLoader.load() — add GMS mode
+if load_format == LoadFormat.GMS:
+    if gms_client.has_committed_weights(tag="model_weights"):
+        # RO mode: zero-copy import from existing GMS pool (~100ms)
+        model = AutoModelForCausalLM.from_config(config)  # meta init
+        model.post_load_weights()  # Fix module aliases (PR #7053 fix)
+        materialize_module_from_gms(gms_client, model)
+    else:
+        # RW mode: load normally, commit to GMS for sharing
+        model = self._load_standard(checkpoint_dir, checkpoint_loader)
+        gms_client.commit(tag="model_weights")
+```
 
-**Weeks 7-8: Testing & Hardening**
-- Unit tests: GMS allocator, import/export, RW/RO transitions
+The GMS client library (`gpu_memory_service.client`) handles:
+- CUDA VMM allocation and FD-based sharing
+- RW/RO locking semantics
+- `materialize_module_from_gms()` for zero-copy tensor import
+
+TRT-LLM only needs to:
+- Call `materialize_module_from_gms` at the right lifecycle point (after `post_load_weights()`)
+- Map sleep/wake tags to GMS operations: `release_with_tag("kv_cache")` frees KV cache via virtual-memory tagged operations while keeping GMS-managed weights untouched
+- Handle configuration (`TorchLlmArgs.gms_socket_path`, `TorchLlmArgs.gms_mode`)
+
+**Weeks 3-4: Shadow Failover + Testing**
+
+- Implement shadow mode in PyExecutor:
+  - Shadow worker starts with GMS RO import (weights only, no KV cache)
+  - On primary failure: upgrade GMS lock (RO -> RW), allocate KV cache, start serving
 - Failover tests: primary crash -> shadow takeover -> continued serving
-- Memory tests: N workers, 1x memory footprint verified
-- Edge cases: multi-rank GMS sharing, GMS server crash
-- **Gate:** All tests passing; failover < 5s; memory sharing verified
+- Memory tests: N workers, 1x memory footprint
+- **Gate:** Shadow takeover < 5s; memory sharing verified
 
 ### Phase 2 Success Criteria
 
@@ -184,51 +207,38 @@ gantt
 
 ---
 
-## Phase 3: Combined MX+GMS + Extensions — 4-6 Weeks
+## Phase 3: Combined MX+GMS + Extensions — 2-3 Weeks
 
 **Priority:** P2 (Tier 2) — full solution
 **Objective:** Unified cross-node P2P + within-node sharing + extension paths
 
 ### Deliverables
 
-| # | Deliverable | Description | Files |
+| # | Deliverable | Description | TRT-LLM Files |
 |:--|:-----------|:-----------|:------|
-| 3.1 | Combined weight loader | `@register_weight_loader("mx-gms")` | `_torch/weight_loaders/mx_gms_loader.py` |
-| 3.2 | Unified configuration | `enable_weight_sharing` shorthand | `llmapi/llm_args.py` |
-| 3.3 | Disagg interaction | MX/GMS behavior for context vs. generation workers | Integration code |
-| 3.4 | KV cache extension design | Detailed design for GMS-backed KV cache persistence | Design doc |
-| 3.5 | E2E tests | Multi-node, multi-worker, failover, disagg scenarios | `tests/` |
-| 3.6 | Benchmarks | Cold-start, failover, memory, throughput regression | `tests/benchmarks/` |
+| 3.1 | Combined weight loader | `load_format: "mx-gms"` with priority cascade | `_torch/pyexecutor/model_loader.py` |
+| 3.2 | Disagg interaction | MX/GMS behavior for context vs. generation workers | Integration code |
+| 3.3 | E2E tests | Multi-node, multi-worker, failover, disagg scenarios | `tests/` |
+| 3.4 | Startup benchmarks | Cold-start benchmarks using the [startup profiling framework](10-startup-profiling.md) | `tests/benchmarks/` |
 
-### Week-by-Week Plan
+### Implementation Details
 
-**Weeks 1-2: Combined Loader + Configuration**
-- Implement `MXGMSWeightLoader` with priority cascade:
-  1. Local GMS (if committed weights exist) — fastest
-  2. Remote MX source (P2P to local GMS) — fast
-  3. Disk/HuggingFace (seed, commit to GMS, publish to MX) — slow
-- Unified config: `enable_weight_sharing=True` auto-configures MX+GMS
-- **Gate:** Full cascade working in 3-node cluster
+**Weeks 1-2: Combined Loader + Disagg**
 
-**Weeks 3-4: Disagg Interaction + KV Extension Design**
-- Define MX/GMS behavior for disaggregated serving (see [Disagg Interaction](08-disagg-interaction.md))
-- Write detailed KV cache extension design (see [KV Cache Extension](07-kv-cache-extension.md))
-- Implement startup profiling framework (see [Startup Profiling](10-startup-profiling.md))
-- **Gate:** Disagg scenario tests passing; KV extension design reviewed
+Priority cascade for `load_format: "mx-gms"`:
+1. Local GMS (if committed weights exist) — fastest (~100ms)
+2. Remote MX source (P2P to local GPU, then commit to GMS) — fast (~15-30s)
+3. Disk/HuggingFace (seed load, commit to GMS, register as MX source) — slow (minutes)
 
-**Weeks 5-6: E2E Testing + Hardening**
-- E2E test matrix:
-  | Scenario | Config | Validation |
-  |:---------|:-------|:-----------|
-  | 3-node scale-out | MX P2P | Cold-start < 30s |
-  | 4-worker same-GPU | GMS sharing | Memory 1x |
-  | Primary crash | GMS shadow | Failover < 5s |
-  | Disagg P/D | MX+GMS | Context + generation workers |
-  | TP=8, PP=2 | MX rank-matched | Correct inference |
-  | FP8 quantized | MX identity hash | Bit-exact results |
-- Performance regression baselines
-- Documentation: architecture guide, user guide, troubleshooting
-- **Gate:** All E2E tests passing; no throughput regression
+**Weeks 2-3: E2E Testing + Benchmarks**
+
+| Scenario | Config | Validation |
+|:---------|:-------|:-----------|
+| 3-node scale-out | MX P2P | Cold-start < 30s |
+| 4-worker same-GPU | GMS sharing | Memory 1x |
+| Primary crash | GMS shadow | Failover < 5s |
+| Disagg P/D | MX+GMS | Context + generation workers |
+| TP=8, PP=2 | MX rank-matched | Correct inference |
 
 ### Phase 3 Success Criteria
 
@@ -239,4 +249,15 @@ gantt
 | Memory per worker (same GPU) | 1x weights |
 | Failover time | < 5s |
 | Throughput regression | < 2% vs. standard loading |
-| Multi-node scale-out | Near-constant time (P2P tree) |
+
+---
+
+## Total Timeline
+
+| Phase | Duration | Cumulative |
+|:------|:---------|:-----------|
+| Phase 1: MX | 3-4 weeks | 3-4 weeks |
+| Phase 2: GMS | 3-4 weeks | 6-8 weeks |
+| Phase 3: Combined | 2-3 weeks | 8-11 weeks |
+
+This is compressed from the original 18-22 week estimate because TRT-LLM is integrating with existing MX/GMS libraries, not building them from scratch.
