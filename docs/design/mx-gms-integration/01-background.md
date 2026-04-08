@@ -36,9 +36,13 @@ GMS is an out-of-process GPU memory manager that decouples memory ownership from
 - **Socket-based locking**: Connection IS the lock; automatic release on crash
 - **CUDA VMM integration**: Uses `cuMemExportToShareableHandle` / `cuMemImportFromShareableHandle` for FD-based memory sharing
 
-> **Terminology note:** "GPU Memory Service" (GMS) appears to be an internal/pre-release name. In public Dynamo documentation, the closest equivalent is the **KV Block Manager (KVBM)** memory management layer combined with NIXL's memory registration APIs. The prototype in PR #7053 uses the GMS name. This proposal uses "GMS" as the working name but the actual integration should target whatever stable API the Dynamo team publishes. **API stability is a key risk — see [Risk Assessment](12-risks.md).**
+> **Terminology note:** "GPU Memory Service" (GMS) is the name used by the Dynamo team for the out-of-process GPU memory management component. The [prototype integration with TRT-LLM](https://github.com/ai-dynamo/dynamo/pull/7053) (PR #7053) demonstrates RW/RO weight loading, sleep/wake KV cache release, and shadow failover using the GMS client API. That PR also surfaced a concrete `post_load_weights()` / module-path-resolution bug when importing weights for models with aliased layers (e.g., `LlamaForCausalLM.next_attn`) — see [Challenges](09-challenges.md) section 7. This proposal uses "GMS" consistently to refer to this GPU Memory Service component. **API stability remains a key risk — see [Risk Assessment](12-risks.md).**
 
-**Prototype:** https://github.com/ai-dynamo/dynamo/pull/7053
+**Prototype:** https://github.com/ai-dynamo/dynamo/pull/7053 — demonstrates:
+- GMS-backed weight loading for TRT-LLM (`_load_read_mode` with `materialize_module_from_gms`)
+- Sleep/wake with `release_with_tag("kv_cache")` / `materialize_with_tag("kv_cache")` for KV cache release without affecting GMS-managed weights
+- Shadow failover e2e test (`test_gms_shadow_failover_trtllm.py`)
+- Local sleep/wake fallback for non-Ray executors when collective RPC is unavailable
 
 ## Dynamo Ecosystem Context
 

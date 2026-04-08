@@ -95,7 +95,7 @@ class PyExecutor:
 
 ### Mapping to Existing Sleep/Wake
 
-TRT-LLM already has `release_with_tag()` / `materialize_with_tag()` for memory lifecycle. GMS maps onto this:
+TRT-LLM already has `release_with_tag()` / `materialize_with_tag()` for memory lifecycle. The [GMS prototype PR #7053](https://github.com/ai-dynamo/dynamo/pull/7053) validates this mapping: sleep releases the `kv_cache` tag via virtual-memory tagged operations while keeping GMS-managed weights untouched, and wake re-materializes the KV cache. The PR also adds a local fallback path for non-Ray executors when collective RPC is unavailable. GMS maps onto this:
 
 ```python
 # Shadow worker initialization (Phase 2 startup)

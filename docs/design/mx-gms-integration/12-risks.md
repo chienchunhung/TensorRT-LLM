@@ -26,14 +26,15 @@
 - Automated integration tests in CI
 - Regular sync with MX/GMS teams
 
-### 2. GMS Naming and API Stability
+### 2. GMS (GPU Memory Service) API Stability
 
-**Risk:** "GPU Memory Service" does not appear in public Dynamo documentation. The component may be renamed, restructured, or have its API changed before GA.
+**Risk:** The GPU Memory Service (GMS) API demonstrated in the [prototype PR #7053](https://github.com/ai-dynamo/dynamo/pull/7053) is functional but may evolve before GA. The PR validates `materialize_module_from_gms`, RW/RO lock semantics, and sleep/wake with tagged KV cache release, but the public API surface has not been formally stabilized.
 
 **Specific concerns:**
-- PR #7053 is a prototype — the API may not be finalized
+- PR #7053 is a prototype — the API may evolve (though it already works end-to-end with `trtllm-serve` and `trtllm-bench`)
 - KVBM (KV Block Manager) in public docs may subsume GMS functionality
 - The socket-based locking protocol may change
+- The `post_load_weights()` / module-path-resolution fix discovered in PR #7053 needs to be upstreamed
 
 **Mitigation:**
 - Verify component name and API stability with Dynamo team before Phase 2

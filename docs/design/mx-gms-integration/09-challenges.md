@@ -101,17 +101,19 @@ candidates = [s for s in sources if s.worker_rank == my_rank]
 
 ## 7. Module Path Resolution (GMS-Specific)
 
-**Challenge:** TRT-LLM's `post_load_weights()` creates layer aliases (e.g., shared embedding/LM head). When importing from GMS, the module path used to find tensors may not match the storage path.
+**Challenge:** TRT-LLM's `post_load_weights()` creates layer aliases (e.g., `LlamaForCausalLM` assigns `layer.next_attn = self.model.layers[idx + 1].self_attn`). Because `self_attn` is an `nn.Module`, PyTorch's `__setattr__` registers it in `layer._modules['next_attn']`. This causes GMS to store duplicate keys for the same physical tensor (e.g., both `model.layers.0.next_attn.o_proj.weight` and `model.layers.1.self_attn.o_proj.weight` point to the same tensor). On the read path, if `post_load_weights()` has not been called before `materialize_module_from_gms()`, the `next_attn` attribute is still `None` and resolution fails with `AttributeError: Cannot resolve 'o_proj' in 'model.layers.0.next_attn.o_proj.weight'`.
 
-**Mitigation:**
-- Build a module-path-to-storage-path mapping during RW commit
-- Store this mapping as GMS metadata alongside the tensors
-- During RO import, use the mapping to reconstruct aliases
-- Test with all models that use `post_load_weights()` aliases
+**This bug was discovered and fixed in the [GMS prototype PR #7053](https://github.com/ai-dynamo/dynamo/pull/7053#discussion_r2105412837).**
+
+**Mitigation (proven in PR #7053):**
+- Call `model.post_load_weights()` (top-level only) **before** `materialize_module_from_gms()` to set up structural cross-references
+- This is safe because `post_load_weights()` only performs Python pointer assignments at meta-init time — no tensor operations
+- The duplicate GMS keys are harmless after the fix: both resolve to the same `nn.Module` object, and the second assignment is a no-op
+- Test with all models that use `post_load_weights()` aliases, especially `LlamaForCausalLM`, `DeepSeek`, and any model with shared embedding/LM head
 
 ## 8. GMS API Stability
 
-**Challenge:** "GPU Memory Service" does not appear as a formally named component in public Dynamo documentation. The prototype in PR #7053 may be using an internal/pre-release API that could change.
+**Challenge:** The GPU Memory Service (GMS) API used in the [prototype PR #7053](https://github.com/ai-dynamo/dynamo/pull/7053) may evolve before GA. The prototype demonstrates a working integration including `materialize_module_from_gms`, RW/RO lock semantics, and tagged memory operations, but the public API surface has not been formally stabilized.
 
 **Mitigation:**
 - Define a thin abstraction layer between TRT-LLM and GMS:
