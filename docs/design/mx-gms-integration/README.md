@@ -2,7 +2,7 @@
 
 **Status:** Draft (Revised)
 **Created:** 2026-04-01
-**Last Updated:** 2026-04-06
+**Last Updated:** 2026-04-08
 
 ---
 
@@ -30,7 +30,7 @@ The integration targets three critical production pain points simultaneously: sl
 7. [KV Cache Extension Path](07-kv-cache-extension.md) — Future extension to KV cache persistence via GMS/KVBM
 8. [Disaggregated Serving Interaction](08-disagg-interaction.md) — How MX/GMS interact with P/D separation
 9. [Challenges and Mitigations](09-challenges.md) — FP8 compatibility, non-contiguous tensors, TP/PP/EP rank matching
-10. [Startup Performance Profiling](10-startup-profiling.md) — Bottleneck analysis, profiling framework, instrumentation
+10. [Startup Performance Profiling](10-startup-profiling.md) — **Implemented.** Hierarchical profiler, benchmark workflow, real DeepSeek results
 11. [Performance Expectations and Benchmarks](11-performance.md) — Target metrics, benchmark plan, regression detection
 12. [Risk Assessment](12-risks.md) — Technical risks, strategic concerns, GMS API stability, vLLM comparison
 13. [Strategic Alignment](13-strategic-alignment.md) — How this fits into the TRT-LLM opportunity roadmap
