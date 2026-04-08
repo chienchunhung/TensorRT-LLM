@@ -6,7 +6,7 @@
 - **Date:** 2026-03-18
 - **Branch:** `fix-zombie-worker-health-check`
 - **PR:** [#12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718)
-- **Status:** In review — CI passing after fix-up commits
+- **Status:** In review — all reviewer comments addressed, squashed to 2 commits
 
 ---
 
@@ -131,15 +131,13 @@ queue unprocessed, and return 503 so the orchestrator stops routing traffic.
 
 **File:** `tensorrt_llm/executor/proxy.py`
 
-- Override `check_health()` in `GenerationExecutorProxy`: after the base check,
-  verify MPI worker futures — if any future is `.done()`, extract its exception,
-  set fatal error, call `pre_shutdown()` (not `shutdown()`, which would block
-  on `f.result()` for surviving workers), return `False`
-- Add `_error_monitor_loop()` daemon thread: every ~5 seconds checks MPI futures
-  and error queue, calls `pre_shutdown()` on detection
-- Both `check_health()` and the monitor drain the error queue directly
-  (`get_nowait`) instead of calling `_handle_background_error()` (documented for
-  main-thread use); per-request errors (`RequestError`, `str`) are skipped
+- Extract shared `_check_mpi_futures()` and `_drain_error_queue()` helpers,
+  used by both `check_health()` and `_error_monitor_loop()` to avoid code
+  duplication
+- Both helpers use `pre_shutdown()` (non-blocking, not `shutdown()` which
+  blocks on `f.result()`) and drain-all patterns (all queued errors processed
+  in one call, so a fatal behind per-request errors is detected immediately)
+- Per-request errors (`RequestError`, `str`) are skipped in the drain
 - Fix `pre_shutdown()` sentinel condition: `all(not f.done())` → `any(not
   f.done())` so surviving workers still get the quit signal when one has died
 - Join `_error_monitor_thread` during `shutdown()` with a 5-second timeout,
@@ -162,10 +160,12 @@ Three-tier error classification with token-bucket error budget:
 | **Severe** | `CUDA out of memory`, `CUDA error` (excluding illegal memory access), `NCCL error` | Costs 5× budget (0.5) per error — two rapid OOMs crash, one recoverable OOM is tolerated |
 | **Transient** | Everything else | Costs 1× budget (0.1) per error — ~10 rapid errors before crash |
 
-Token-bucket parameters (hardcoded, not user-facing):
-- `_error_budget`: starts at 1.0, capped at 1.0
-- `_error_budget_cost`: 0.1 per transient error, 0.5 per severe error
-- `_error_budget_recovery_rate`: 0.1 per second of error-free wall time
+The `ErrorBudget` dataclass (`error_classification.py`) encapsulates the
+token-bucket state:
+- `budget`: starts at 1.0, capped at 1.0
+- `cost`: 0.1 per transient error, 0.5 (5×) per severe error
+- `recovery_rate`: 0.1 per second of error-free wall time
+- `consume(error_msg)`: classifies and deducts; returns True if exhausted
 - Immediate-fatal errors bypass the budget entirely
 
 **Design rationale:** A simple consecutive counter (crash after N errors) was
@@ -181,6 +181,8 @@ On the fatal path, `_handle_errors()` also:
 - Copies `active_requests` to a local list before calling `clear()` (fixes an
   aliased-list bug where `_terminate_request` never ran because the list was
   emptied first)
+- Drains both `waiting_queue` and `executor_request_queue` so queued-but-not-
+  yet-activated requests are failed immediately
 
 **Why this helps:** PyExecutor stops looping forever on corrupted CUDA context.
 It self-terminates instead of silently failing every batch.
@@ -223,7 +225,7 @@ T+k8s   Kubernetes detects unhealthy pod -> restarts
 For PyExecutor (in-process, immediate-fatal error):
 ```
 T+0s    cudaErrorIllegalAddress in _forward_step() -> _handle_errors()
-T+0s    _classify_error() returns "immediate_fatal" -> budget bypassed
+T+0s    ErrorBudget.consume() -> classify_error() returns "immediate_fatal"
 T+0s    _fatal_error set, enqueue_shutdown_request() called
 T+0s    Executor loop breaks, shutdown proceeds
 ```
@@ -231,7 +233,7 @@ T+0s    Executor loop breaks, shutdown proceeds
 For PyExecutor (in-process, severe error / budget exhaustion):
 ```
 T+0s    CUDA OOM in _forward_step() -> _handle_errors()
-T+0s    _classify_error() returns "severe" -> budget -= 0.5 (budget=0.5)
+T+0s    ErrorBudget.consume() -> "severe" -> budget -= 0.5 (budget=0.5)
 T+0s    Engine retries next iteration (budget > 0)
 T+0s    CUDA OOM again -> budget -= 0.5 (budget=0.0)
 T+0s    Budget exhausted -> _fatal_error set, shutdown
@@ -242,25 +244,26 @@ T+0s    Budget exhausted -> _fatal_error set, shutdown
 ## Test Coverage
 
 All unit tests are in
-`tests/unittest/executor/test_fatal_error_health_check.py` (56 tests total,
-heavily parametrized).  `TestClassifyError` tests the **real**
-`classify_error()` function directly (imported from `error_classification.py`
-via `importlib` to avoid triggering C++ extension loading).
+`tests/unittest/executor/test_fatal_error_health_check.py` (60 tests total,
+heavily parametrized).  Tests use the **real** `classify_error()` function and
+`ErrorBudget` dataclass imported from `error_classification.py` via `importlib`
+(avoids C++ extension loading).
 
 | Test class | Count | What's covered |
 |---|---|---|
-| `TestClassifyError` | 15 | Tests the real `classify_error()` function: three-tier classification, case insensitivity |
-| `TestErrorBudget` | 9 | Token-bucket budget: immediate-fatal bypass, severe exhausts in 2, transient exhaustion, time recovery, aliased-list fix (all requests terminated on fatal), `is_shutdown` set on fatal, shutdown enqueue |
-| `TestGenerationExecutor` | 10 | `_set_fatal_error` first-wins, `is_shutdown` (4 states), `check_health` (4 states incl. queue drain) |
-| `TestProxyCheckHealth` | 6 | MPI worker future states (running / crashed / exited / cancelled), empty futures, parent-unhealthy short-circuit |
-| `TestErrorMonitorLoop` | 4 | Worker crash, error queue, per-request string error skip, shutdown flag stop |
+| `TestClassifyError` | 15 | Real `classify_error()`: three-tier classification, case insensitivity |
+| `TestErrorBudget` | 11 | Real `ErrorBudget` dataclass: immediate-fatal bypass, severe/transient exhaustion, time recovery, aliased-list fix, `is_shutdown` set on fatal, `waiting_queue` drain, `executor_request_queue` drain |
+| `TestGenerationExecutor` | 10 | `_set_fatal_error` first-wins, `is_shutdown` (4 states), `check_health` drain-all with per-request skip |
+| `TestProxyCheckHealth` | 6 | MPI future states via shared `_check_mpi_futures`/`_drain_error_queue` helpers |
+| `TestErrorMonitorLoop` | 4 | Worker crash, error queue, per-request string skip, shutdown flag |
 | `TestGrpcHealthCheck` | 5 | Parametrized: healthy, fatal, no executor, no LLM, shutdown |
 | `TestOpenAIHealthEndpoint` | 3 | Parametrized: 200, 503, 503+SIGINT |
-| `TestBaseLLMCheckHealth` | 4 | Parametrized delegation: healthy, fatal, no executor, missing attr |
+| `TestBaseLLMCheckHealth` | 4 | Parametrized delegation |
 
 ### Issues Found During Development
 
-During CI validation and code review, seven issues were found and fixed:
+During CI validation and code review (Superjomn, hchings, CodeRabbit), eleven
+issues were found and fixed:
 
 1. **Thread leak (`proxy_error_monitor`)**: `pytest-threadleak` detected the
    daemon thread surviving past test teardown. **Fix:** join the thread during
@@ -282,6 +285,17 @@ During CI validation and code review, seven issues were found and fixed:
 7. **`pre_shutdown` sentinel used `all()`**: When one worker was already dead,
    `all(not f.done())` was False, so the quit sentinel was never sent to
    surviving workers. **Fix:** `any(not f.done())`.
+8. **Duplicate MPI future / queue drain code**: `check_health()` and
+   `_error_monitor_loop` had near-identical logic.  **Fix:** extract shared
+   `_check_mpi_futures()` and `_drain_error_queue()` helpers.
+9. **Error budget fields loose on PyExecutor**: 4 separate float/Optional
+   fields cluttered the class.  **Fix:** `ErrorBudget` dataclass in
+   `error_classification.py` with a `consume()` method.
+10. **Proxy single-drain vs base drain-all**: Proxy drained one item per call
+    while the base class drained all.  **Fix:** both proxy helpers now use
+    drain-all `while True` loops.
+11. **Silent `except Exception: pass` in monitor**: Hard to debug.  **Fix:**
+    `logger.debug(...)` instead of silent pass.
 
 ### Remaining Test Gap
 
