@@ -120,10 +120,10 @@ flowchart LR
         E --> F["nn.Module on GPU"]
     end
 
-    subgraph "MX/GMS Extension Points"
-        D1["WeightLoaderProtocol<br/>MX: P2P receive<br/>GMS: Import from shared memory"]
-        D2["Post-load callback<br/>MX: Register as source<br/>GMS: Commit to GMS"]
-        D3["Custom allocator<br/>GMS: Route allocs to GMS pool"]
+    subgraph "MX/GMS Integration Points"
+        D1["MX: New MXCheckpointLoader<br/>(TRT-LLM code, calls MX SDK)<br/>GMS RO: Call materialize_module_from_gms<br/>(GMS library function)"]
+        D2["Post-load (TRT-LLM orchestration):<br/>MX: mx_client.register_as_source()<br/>GMS: gms_client.commit()"]
+        D3["GMS RW: wrap with<br/>torch.cuda.use_mem_pool(gms_pool)<br/>(GMS library provides allocator)"]
     end
 
     D -.->|"Replace with"| D1

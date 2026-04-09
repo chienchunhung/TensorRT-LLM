@@ -87,12 +87,12 @@ candidates = [s for s in sources if s.worker_rank == my_rank]
 **Challenge:** GMS uses CUDA Virtual Memory Management (VMM) with file descriptor passing. TRT-LLM uses PyTorch's default CUDA allocator. Mixing these requires careful lifecycle management.
 
 **Mitigation:**
-- Use `torch.cuda.memory.CUDAPluggableAllocator` API
-- Implement `GMSAllocator` that routes alloc/free to GMS
-- Handle allocation/deallocation lifecycle:
-  - RW mode: allocator creates mappings in GMS pool
-  - RO mode: allocator imports existing mappings via FD
-  - Shutdown: release all GMS handles before process exit
+- Use `torch.cuda.memory.CUDAPluggableAllocator` API (provided by the GMS client library)
+- The GMS library already implements the allocator (`CUDAPluggableAllocator` + `MemPool`), the CUDA VMM FD import/export (`cuda_utils.py`), and zero-copy tensor construction (`materialize_module_from_gms`). **TRT-LLM does not reimplement any of this** — it only wraps model loading inside `torch.cuda.use_mem_pool(gms_pool)` for the RW path, or calls `materialize_module_from_gms()` for the RO path. See [API Design](05-api-design.md) Section 5.5 for a full inventory.
+- Handle allocation/deallocation lifecycle at TRT-LLM orchestration level:
+  - RW mode: wrap model loading in GMS memory pool context manager
+  - RO mode: call `materialize_module_from_gms()` after `post_load_weights()`
+  - Shutdown: release GMS client connection (GMS handles cleanup)
 - **Risk mitigation:** Start with simple contiguous allocations; handle edge cases (views, in-place ops) incrementally
 
 **Known complexity from PR #7053:**
@@ -116,17 +116,20 @@ candidates = [s for s in sources if s.worker_rank == my_rank]
 **Challenge:** The GPU Memory Service (GMS) API used in the [prototype PR #7053](https://github.com/ai-dynamo/dynamo/pull/7053) may evolve before GA. The prototype demonstrates a working integration including `materialize_module_from_gms`, RW/RO lock semantics, and tagged memory operations, but the public API surface has not been formally stabilized.
 
 **Mitigation:**
-- Define a thin abstraction layer between TRT-LLM and GMS:
+- Define a thin `GPUMemoryBackend` protocol in TRT-LLM (see [API Design](05-api-design.md) Section 5.4) to insulate TRT-LLM from GMS API changes:
   ```python
   class GPUMemoryBackend(Protocol):
-      def create_mapping(self, size: int, tag: str) -> MemoryHandle: ...
-      def import_mapping(self, tag: str) -> MemoryHandle: ...
+      def has_committed_weights(self, tag: str) -> bool: ...
+      def get_mem_pool(self) -> torch.cuda.MemPool: ...
+      def materialize_module(self, model: torch.nn.Module) -> None: ...
+      def finalize_write(self, model: torch.nn.Module) -> None: ...
       def commit(self, tag: str) -> None: ...
       def release(self, tag: str) -> None: ...
+      def upgrade_lock(self) -> None: ...
   ```
 - GMS client implements this protocol; if the API changes, only the adapter changes
 - Verify API stability with Dynamo team before Phase 2 starts
-- Have a fallback plan: if GMS API is unstable, Phase 2 can use CUDA IPC directly (less featured but stable)
+- Have a fallback plan: if GMS API is unstable, a `CudaIpcBackend` could implement the same protocol (less featured — no crash resilience or zero-copy, but uses stable CUDA IPC APIs)
 
 ## 9. Transfer Backend Selection
 
@@ -137,20 +140,22 @@ candidates = [s for s in sources if s.worker_rank == my_rank]
 | **NIXL** | vLLM-proven; MX default; broader fabric support | — |
 | **Mooncake TransferEngine** | MX proto suggests this for TRT-LLM; TRT-LLM already uses Mooncake for disagg | Less mature for weight transfer |
 
-**Recommendation:** Start with NIXL for Phase 1 (proven, matches vLLM). Evaluate Mooncake as an alternative backend in Phase 3. The `WeightLoaderProtocol` abstraction allows swapping transfer backends without changing the loader logic.
+**Recommendation:** Start with NIXL for Phase 1 (proven, matches vLLM). Evaluate Mooncake as an alternative backend in Phase 3. Note that the transfer backend selection is largely **transparent to TRT-LLM** — it is handled inside the MX client library. TRT-LLM calls `client.receive()` and `client.register_source()`; the MX library handles the underlying transfer mechanism (NIXL, Mooncake, etc.).
 
 ## Complexity Summary
 
-| Area | Complexity | Phase | Risk |
-|:-----|:----------|:------|:-----|
-| Tensor enumeration | Medium | 1 | Low |
-| NIXL wrapper | Medium | 1 | Medium |
-| TP/PP/EP rank matching | Medium | 1 | Low |
-| MX gRPC integration | Low | 1 | Low |
-| Non-contiguous tensors | Medium | 1 | Medium |
-| CUDA VMM / GMS allocator | **High** | 2 | **High** |
-| Module path resolution | Medium | 2 | Medium |
-| Sleep/wake mapping | Medium | 2 | Low |
-| Shadow failover executor | **High** | 2 | **High** |
-| Combined loader | Low | 3 | Low |
-| Disagg interaction | Medium | 3 | Medium |
+| Area | Complexity | Phase | Owner | Risk |
+|:-----|:----------|:------|:------|:-----|
+| MX checkpoint loader | Medium | 1 | TRT-LLM | Low |
+| MX identity/rank matching | Medium | 1 | TRT-LLM | Low |
+| MX fallback logic | Low | 1 | TRT-LLM (orchestration); MX library (transfer) | Low |
+| Non-contiguous tensors | Medium | 1 | MX library handles NIXL registration | Medium |
+| NIXL/RDMA transfer | Medium | 1 | MX library (transparent to TRT-LLM) | Medium |
+| GMS weight loader mode | Medium | 2 | TRT-LLM (orchestration); GMS library (allocator, VMM) | Medium |
+| CUDA VMM / GMS allocator | **High** | 2 | GMS library (TRT-LLM wraps with context manager) | **High** |
+| Module path resolution | Medium | 2 | TRT-LLM (call `post_load_weights()` before GMS import) | Medium |
+| Sleep/wake GMS tag mapping | Medium | 2 | TRT-LLM | Low |
+| Shadow failover executor | **High** | 2 | TRT-LLM (new code; GMS provides only `upgrade_lock()`) | **High** |
+| GMS API stability protocol | Low | 2 | TRT-LLM | Low |
+| Combined loader | Low | 3 | TRT-LLM | Low |
+| Disagg interaction | Medium | 3 | TRT-LLM | Medium |

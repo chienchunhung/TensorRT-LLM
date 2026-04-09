@@ -2,7 +2,7 @@
 
 [< Back to Overview](README.md)
 
-> **This section is new** — the original proposal underspecified how shadow failover interacts with TRT-LLM's executor loop. This is the hardest part of the integration and requires careful design.
+> **This section is new** — the original proposal underspecified how shadow failover interacts with TRT-LLM's executor loop. This is the hardest part of the integration and requires careful design. Unlike the weight loading integration where much of the functionality is provided by MX/GMS libraries, **the executor integration is almost entirely new TRT-LLM code** — the GMS library only provides the lock upgrade API (`gms_client.upgrade_lock()`); all shadow lifecycle management, health checking, and executor state transitions are TRT-LLM responsibilities.
 
 ## The Challenge
 
@@ -73,6 +73,7 @@ class PyExecutor:
         t0 = time.perf_counter()
 
         # Step 1: Upgrade GMS lock (RO -> RW) — ~10ms
+        # (This is the only GMS API call; rest is TRT-LLM code)
         if self._gms_client:
             self._gms_client.upgrade_lock()
 
@@ -117,12 +118,12 @@ def _init_shadow_with_gms(self):
     # On deactivation, release_with_tag("model_weights") = release GMS RW lock
 ```
 
-| TRT-LLM Sleep/Wake | GMS Operation | When |
-|:-------------------|:-------------|:-----|
-| `materialize_with_tag("model_weights")` | `gms_client.import(tag="model_weights")` | Shadow init, activation |
-| `release_with_tag("model_weights")` | `gms_client.release_lock()` | Demotion, shutdown |
-| `materialize_with_tag("kv_cache")` | `resource_manager.allocate_kv_cache()` | Activation only |
-| `release_with_tag("kv_cache")` | `resource_manager.release_kv_cache()` | Demotion, shutdown |
+| TRT-LLM Sleep/Wake | GMS Library Call | TRT-LLM Code | When |
+|:-------------------|:----------------|:-------------|:-----|
+| `materialize_with_tag("model_weights")` | `gms_client.import(tag=...)` | Orchestration only | Shadow init, activation |
+| `release_with_tag("model_weights")` | `gms_client.release_lock()` | Orchestration only | Demotion, shutdown |
+| `materialize_with_tag("kv_cache")` | None (pure TRT-LLM) | `resource_manager.allocate_kv_cache()` | Activation only |
+| `release_with_tag("kv_cache")` | None (pure TRT-LLM) | `resource_manager.release_kv_cache()` | Demotion, shutdown |
 
 ## In-Flight Request Handling During Failover
 

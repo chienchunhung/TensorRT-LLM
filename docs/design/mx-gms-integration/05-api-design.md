@@ -1,286 +1,113 @@
-# 5. API Design
+# 5. API Design: TRT-LLM Changes
 
 [< Back to Overview](README.md)
 
-## 1. Weight Loader Protocol
+> **Scope clarification:** This section covers only the code that needs to be written or modified in TRT-LLM. The MX and GMS client libraries provide substantial functionality that TRT-LLM calls but does not reimplement. See [Section 5.5](#5-what-mx-and-gms-client-libraries-already-provide) for a full inventory of what each library already provides.
+
+## 1. MX Checkpoint Loader (New TRT-LLM Code)
+
+A new `MXCheckpointLoader` subclassing TRT-LLM's existing `BaseCheckpointLoader`. This follows the same pattern as `HfCheckpointLoader` and `MistralCheckpointLoader` — the only difference is the weight source.
 
 ```python
-# tensorrt_llm/_torch/weight_loaders/base.py
+# tensorrt_llm/_torch/models/checkpoints/mx/checkpoint_loader.py
 
-from typing import Protocol, Dict, Optional, Tuple
-from dataclasses import dataclass
-import torch
+@register_checkpoint_loader("MX")
+class MXCheckpointLoader(BaseCheckpointLoader):
+    """Loads model weights via MX P2P transfer from existing replicas."""
 
-@dataclass
-class TensorDescriptor:
-    """Describes a GPU tensor for P2P registration."""
-    name: str
-    data_ptr: int
-    size_bytes: int
-    dtype: torch.dtype
-    shape: Tuple[int, ...]
-    is_contiguous: bool
-    storage_offset: int = 0
-    # View reconstruction metadata (for non-contiguous tensors)
-    storage_name: Optional[str] = None
-    view_shape: Optional[Tuple[int, ...]] = None
-    view_stride: Optional[Tuple[int, ...]] = None
+    def __init__(self, mx_server_url: str, fallback_loader=None):
+        self._mx_client = modelexpress.client.connect(mx_server_url)
+        self._fallback_loader = fallback_loader or HfCheckpointLoader()
 
-class WeightLoaderProtocol(Protocol):
-    """Interface for custom weight loading backends."""
+    def load_weights(self, checkpoint_dir, mapping, **kwargs):
+        identity = self._build_identity(mapping, checkpoint_dir)
+        sources = self._mx_client.list_sources(identity)
+        compatible = [s for s in sources
+                      if s.worker_rank == mapping.tp_rank
+                      and s.extra_params["pp_rank"] == str(mapping.pp_rank)]
 
-    def load_weights(
-        self,
-        model: torch.nn.Module,
-        mapping: "Mapping",
-        config: "PretrainedConfig",
-    ) -> None:
-        """Load weights into model from custom source."""
-        ...
-
-    def get_tensor_descriptors(
-        self,
-        model: torch.nn.Module,
-    ) -> Dict[str, TensorDescriptor]:
-        """Return tensor metadata for P2P registration."""
-        ...
-
-    def supports_source_mode(self) -> bool:
-        """Whether this loader can act as P2P source."""
-        ...
-
-    def cleanup(self) -> None:
-        """Release any resources held by the loader."""
-        ...
-```
-
-## 2. Tensor Enumeration API
-
-```python
-# tensorrt_llm/_torch/utils/tensor_utils.py
-
-def enumerate_model_tensors(
-    model: torch.nn.Module,
-    include_buffers: bool = True,
-    include_quantization_scales: bool = True,
-    deduplicate_by_storage: bool = True,
-) -> Dict[str, TensorDescriptor]:
-    """
-    Enumerate all GPU tensors in a model for P2P registration.
-
-    Handles:
-        - Parameters and buffers
-        - Tied weights (deduplicated by data_ptr)
-        - Non-contiguous views (reports underlying storage + view metadata)
-        - Quantization scales (weight_scale_inv, etc.)
-        - Aliased layers from post_load_weights()
-
-    Returns:
-        Dictionary mapping tensor names to descriptors
-    """
-    descriptors = {}
-    seen_data_ptrs = {}  # data_ptr -> canonical name
-
-    for name, param in model.named_parameters():
-        ptr = param.data.data_ptr()
-
-        if deduplicate_by_storage and ptr in seen_data_ptrs:
-            # Tied weight — record alias, skip duplicate registration
-            descriptors[name] = TensorDescriptor(
-                name=name,
-                data_ptr=ptr,
-                size_bytes=0,  # Alias — no additional memory
-                dtype=param.dtype,
-                shape=param.shape,
-                is_contiguous=param.is_contiguous(),
-                storage_name=seen_data_ptrs[ptr],
-            )
-            continue
-
-        seen_data_ptrs[ptr] = name
-
-        if param.is_contiguous():
-            descriptors[name] = TensorDescriptor(
-                name=name,
-                data_ptr=ptr,
-                size_bytes=param.nelement() * param.element_size(),
-                dtype=param.dtype,
-                shape=param.shape,
-                is_contiguous=True,
-            )
+        if compatible:
+            # Fast path: P2P receive from existing source
+            return self._mx_client.receive(compatible[0])
         else:
-            # Non-contiguous: register underlying storage
-            storage = param.untyped_storage()
-            descriptors[name] = TensorDescriptor(
-                name=name,
-                data_ptr=storage.data_ptr(),
-                size_bytes=storage.nbytes(),
-                dtype=param.dtype,
-                shape=param.shape,
-                is_contiguous=False,
-                view_shape=param.shape,
-                view_stride=param.stride(),
-            )
+            # Seed path: load from disk, then register as source
+            weights = self._fallback_loader.load_weights(
+                checkpoint_dir, mapping, **kwargs)
+            self._register_as_source(weights, mapping)
+            return weights
 
-    if include_buffers:
-        for name, buf in model.named_buffers():
-            if buf.device.type != 'cuda':
-                continue
-            ptr = buf.data.data_ptr()
-            if deduplicate_by_storage and ptr in seen_data_ptrs:
-                continue
-            seen_data_ptrs[ptr] = name
-            descriptors[name] = TensorDescriptor(
-                name=name,
-                data_ptr=ptr,
-                size_bytes=buf.nelement() * buf.element_size(),
-                dtype=buf.dtype,
-                shape=buf.shape,
-                is_contiguous=buf.is_contiguous(),
-            )
-
-    return descriptors
-```
-
-## 3. Memory Allocator Hook
-
-```python
-# Addition to tensorrt_llm/_torch/pyexecutor/model_loader.py
-
-from typing import Callable, Optional
-
-AllocatorFn = Callable[[int, torch.dtype, str], torch.Tensor]
-
-class ModelLoader:
-    def __init__(
-        self,
-        llm_args: "TorchLlmArgs",
-        mapping: "Mapping",
-        *,
-        custom_allocator: Optional[AllocatorFn] = None,
-        post_load_callback: Optional[Callable[[torch.nn.Module], None]] = None,
-        **kwargs,
-    ):
-        """
-        Args:
-            custom_allocator: Function(size_bytes, dtype, tag) -> torch.Tensor
-                             Routes GPU allocation through custom backend (e.g., GMS)
-            post_load_callback: Called after model loaded and post_load_weights()
-                               completed. Use for P2P tensor registration.
-        """
-        self._custom_allocator = custom_allocator
-        self._post_load_callback = post_load_callback
-```
-
-## 4. External Memory Import/Export
-
-```python
-# tensorrt_llm/_torch/memory/external_memory.py
-
-def import_cuda_memory(
-    fd: int,
-    size: int,
-    device: int,
-) -> torch.Tensor:
-    """
-    Import external CUDA memory via file descriptor (cuMemImportFromShareableHandle).
-    Used by GMS to import memory allocated by the GMS server.
-    """
-    ...
-
-def export_cuda_memory(
-    tensor: torch.Tensor,
-) -> Tuple[int, int]:
-    """
-    Export CUDA memory as file descriptor (cuMemExportToShareableHandle).
-    Used by GMS to share memory with other processes.
-    """
-    ...
-```
-
-## 5. GMS Allocator
-
-```python
-# tensorrt_llm/_torch/memory/gms_allocator.py
-
-class GMSAllocator:
-    """Routes PyTorch GPU allocations through GMS for out-of-process memory management."""
-
-    def __init__(self, gms_client, tag: str = "model_weights"):
-        self.gms_client = gms_client
-        self.tag = tag
-        self._allocations = {}  # ptr -> (size, gms_handle)
-
-    def malloc(self, size: int, device: int, stream) -> int:
-        handle = self.gms_client.create_mapping(size=size, tag=self.tag)
-        ptr = handle.data_ptr
-        self._allocations[ptr] = (size, handle)
-        return ptr
-
-    def free(self, ptr: int, size: int, device: int, stream):
-        if ptr in self._allocations:
-            _, handle = self._allocations.pop(ptr)
-            # Only destroy if we're the RW owner
-            if self.mode == "rw":
-                self.gms_client.destroy_mapping(handle)
-            # In RO mode, just release our reference
-
-    def commit(self):
-        """Commit all allocations to GMS for sharing."""
-        self.gms_client.commit(tag=self.tag)
-
-    def as_torch_allocator(self):
-        """Return a torch.cuda.memory.CUDAPluggableAllocator."""
-        return torch.cuda.memory.CUDAPluggableAllocator(
-            self.malloc, self.free
-        )
-```
-
-## 6. MX Source Identity
-
-```python
-# tensorrt_llm/_torch/weight_loaders/mx_loader.py
-
-@dataclass
-class MXSourceIdentity:
-    """Content-addressed identity for MX source matching."""
-    model_name: str
-    dtype: str
-    quantization: Optional[str]
-    tp_size: int
-    pp_size: int
-    ep_size: int
-    worker_rank: int
-    pp_rank: int
-    ep_rank: int
-    quant_config_hash: Optional[str]  # SHA256 of serialized quant config
-
-    def to_mx_identity(self) -> "mx_proto.SourceIdentity":
-        """Convert to MX protobuf SourceIdentity."""
+    def _build_identity(self, mapping, checkpoint_dir):
+        """Map TRT-LLM's Mapping to MX's SourceIdentity protobuf."""
         return mx_proto.SourceIdentity(
-            model_name=self.model_name,
-            dtype=self.dtype,
+            model_name=checkpoint_dir,
+            dtype=str(mapping.dtype),
             extra_params={
-                "quantization": self.quantization or "",
-                "tp_size": str(self.tp_size),
-                "pp_size": str(self.pp_size),
-                "ep_size": str(self.ep_size),
-                "worker_rank": str(self.worker_rank),
-                "quant_config_hash": self.quant_config_hash or "",
+                "tp_size": str(mapping.tp_size),
+                "pp_size": str(mapping.pp_size),
+                "ep_size": str(mapping.moe_ep_size),
+                "worker_rank": str(mapping.tp_rank),
+                "pp_rank": str(mapping.pp_rank),
             },
         )
 ```
 
-## 7. Configuration Schema
+**What TRT-LLM implements:** The loader class (~200 lines), identity mapping from `Mapping` to MX protobuf, fallback logic.
+
+**What the MX client SDK provides:** gRPC connection, source discovery (`list_sources`), NIXL-based P2P transfer (`receive`), source registration, heartbeat.
+
+## 2. GMS Weight Loading Mode (New TRT-LLM Code)
+
+A new `LoadFormat.GMS` branch in the existing `ModelLoader.load()` method. This orchestrates calls to the GMS client library at the right TRT-LLM lifecycle points.
+
+```python
+# Additions to tensorrt_llm/_torch/pyexecutor/model_loader.py
+
+# In ModelLoader.load():
+if load_format == LoadFormat.GMS:
+    gms_client = get_gms_client(self.llm_args)
+
+    if gms_client.has_committed_weights(tag="model_weights"):
+        # RO path: zero-copy import from existing GMS pool
+        model = AutoModelForCausalLM.from_config(config)   # meta init
+        model.post_load_weights()      # Set up module aliases first
+        materialize_module_from_gms(gms_client, model)     # GMS library call
+    else:
+        # RW path: load normally under GMS memory pool, then commit
+        gms_pool = gms_client.get_mem_pool()               # GMS library call
+        with torch.cuda.use_mem_pool(gms_pool, device=device):
+            model = self._load_standard(checkpoint_dir, checkpoint_loader)
+        gms_client.finalize_write(model)                   # GMS library call
+```
+
+**What TRT-LLM implements:** The `LoadFormat.GMS` branch in `ModelLoader.load()` (~50 lines), the `get_gms_client()` helper that reads config and creates the client connection.
+
+**What the GMS client library provides:**
+- `CUDAPluggableAllocator` + `MemPool` (intercepts `torch` allocations via CUDA VMM)
+- `materialize_module_from_gms()` (creates zero-copy tensors from shared GPU memory using `torch._C._construct_storage_from_data_pointer`)
+- `register_module_tensors()` (walks model params/buffers, records metadata in GMS)
+- `finalize_write()` / `commit()` (publishes memory for RO readers)
+- RW/RO lock management via Unix domain socket connection
+
+## 3. Configuration Schema (New TRT-LLM Code)
+
+New fields on `TorchLlmArgs` and corresponding CLI options:
 
 ```python
 # Additions to tensorrt_llm/llmapi/llm_args.py
 
+class LoadFormat(Enum):
+    AUTO = 0
+    DUMMY = 1
+    VISION_ONLY = 2
+    MX = 3          # New
+    GMS = 4         # New
+    MX_GMS = 5      # New
+
 class TorchLlmArgs(BaseLlmArgs):
     # ... existing fields ...
 
-    # Weight loading format
-    load_format: Literal["auto", "hf", "dummy", "mx", "gms", "mx-gms"] = "auto"
+    # Weight loading format (extend existing field)
+    load_format: Union[str, LoadFormat] = LoadFormat.AUTO
 
     # MX-specific configuration
     mx_server_url: Optional[str] = None
@@ -291,23 +118,72 @@ class TorchLlmArgs(BaseLlmArgs):
     gms_socket_path: Optional[str] = None  # Default: /tmp/gms-{device_id}.sock
     gms_mode: Literal["auto", "rw", "ro"] = "auto"
     gms_tag: str = "model_weights"
-
-    # Shorthand
-    enable_weight_sharing: bool = False  # Equivalent to load_format="mx-gms"
 ```
 
 **CLI usage:**
+
 ```bash
 # MX only (P2P across nodes)
-trtllm-serve meta-llama/Llama-3.1-70B --load-format mx --mx-server-url http://mx:8001
+trtllm-serve meta-llama/Llama-3.1-70B --load-format mx \
+    --mx-server-url http://mx:8001
 
 # GMS only (sharing within node)
-trtllm-serve meta-llama/Llama-3.1-70B --load-format gms --gms-socket-path /tmp/gms-0.sock
+trtllm-serve meta-llama/Llama-3.1-70B --load-format gms \
+    --gms-socket-path /tmp/gms-0.sock
 
 # Combined
 trtllm-serve meta-llama/Llama-3.1-70B --load-format mx-gms \
     --mx-server-url http://mx:8001 --gms-socket-path /tmp/gms-0.sock
-
-# Shorthand
-trtllm-serve meta-llama/Llama-3.1-70B --enable-weight-sharing
 ```
+
+## 4. GMS API Stability Abstraction (New TRT-LLM Code)
+
+A thin protocol to insulate TRT-LLM from potential GMS API changes. This is the only abstraction layer TRT-LLM should own — everything below it is the GMS library's responsibility.
+
+```python
+# tensorrt_llm/_torch/memory/gpu_memory_backend.py
+
+class GPUMemoryBackend(Protocol):
+    """Thin abstraction over GMS client for API stability."""
+    def has_committed_weights(self, tag: str) -> bool: ...
+    def get_mem_pool(self) -> torch.cuda.MemPool: ...
+    def materialize_module(self, model: torch.nn.Module) -> None: ...
+    def finalize_write(self, model: torch.nn.Module) -> None: ...
+    def commit(self, tag: str) -> None: ...
+    def release(self, tag: str) -> None: ...
+    def upgrade_lock(self) -> None: ...
+```
+
+**Why this exists:** The GMS API ([PR #7053](https://github.com/ai-dynamo/dynamo/pull/7053)) is functional but not formally stabilized. If the API changes, only this adapter needs updating. If GMS proves unstable, a `CudaIpcBackend` could implement the same protocol as a fallback (less featured — no crash resilience or zero-copy, but uses stable CUDA IPC APIs).
+
+## 5. What MX and GMS Client Libraries Already Provide
+
+The following functionality is provided by the MX and GMS client libraries and should **not** be reimplemented in TRT-LLM:
+
+### MX Client Library (`modelexpress.client`)
+
+| Capability | MX API | TRT-LLM Calls It From |
+|:-----------|:-------|:----------------------|
+| gRPC connection to MX server | `modelexpress.client.connect(url)` | `MXCheckpointLoader.__init__` |
+| Source discovery by identity | `client.list_sources(identity)` | `MXCheckpointLoader.load_weights` |
+| NIXL-based P2P GPU-to-GPU transfer | `client.receive(source)` | `MXCheckpointLoader.load_weights` |
+| Source registration (make weights available) | `client.register_source(tensors, identity)` | `MXCheckpointLoader._register_as_source` |
+| Heartbeat and lifecycle | `client.heartbeat()` | Background thread |
+| Three-tier fallback (RDMA -> GDS -> Disk) | Built into `client.receive()` | Transparent to TRT-LLM |
+
+### GMS Client Library (`gpu_memory_service.client`)
+
+| Capability | GMS API | TRT-LLM Calls It From |
+|:-----------|:--------|:----------------------|
+| CUDA VMM allocation (cuMemCreate + FD export) | `memory_manager.create_mapping()` | Via `MemPool` during RW loading |
+| CUDA VMM import (cuMemImportFromShareableHandle + cuMemMap) | `memory_manager.import_mapping()` | Via `materialize_module_from_gms` |
+| CUDAPluggableAllocator + MemPool | `allocator.get_mem_pool()` | `ModelLoader.load()` RW path |
+| Zero-copy tensor creation from GPU pointer | `tensor._tensor_from_pointer()` using `torch._C._construct_storage_from_data_pointer` | Via `materialize_module_from_gms` |
+| Module tensor registration (walks params/buffers) | `module.register_module_tensors()` | Via `finalize_write()` |
+| Module materialization (meta -> GPU tensors) | `module.materialize_module_from_gms()` | `ModelLoader.load()` RO path |
+| RW/RO socket-based locking | `client.connect(mode=RW\|RO)` | `get_gms_client()` |
+| Lock upgrade (RO -> RW) | `client.upgrade_lock()` | Shadow activation |
+| Tagged memory commit/release | `client.commit(tag)` / `client.release(tag)` | Post-load / sleep-wake |
+| Sleep/wake (unmap/remap VMM VAs) | `manager.unmap_all_vas()` / `manager.remap_all_vas()` | Executor sleep/wake |
+
+> **Key takeaway:** TRT-LLM's role is **orchestration** — calling these library APIs at the correct points in TRT-LLM's model loading and executor lifecycle. The heavy lifting (CUDA VMM, RDMA transfer, tensor construction from pointers, FD passing) is entirely in the external libraries.

@@ -97,8 +97,11 @@ TRT-LLM's PyTorch backend provides several hooks that MX/GMS can leverage:
 | `ModelLoader` with configurable weight loading | `model_loader.py` | Pluggable weight loading pipeline |
 | KV Cache Connector API | `kv-cache-connector.md` | Custom KV cache load/save/transfer |
 
-**Missing extension points (to be added):**
-- Pluggable GPU memory allocator
-- Tensor enumeration API for P2P registration
-- Post-load callback for external registration
-- External memory import (CUDA VMM FD import)
+**Extension points to be added in TRT-LLM:**
+- Post-load callback for MX source registration (notify MX that weights are ready for P2P)
+- `LoadFormat.MX` / `LoadFormat.GMS` branches in `ModelLoader.load()` to invoke MX/GMS client APIs
+
+> **Note:** Several capabilities that might appear to require new TRT-LLM code are actually already provided by the MX and GMS client libraries:
+> - **GPU memory allocator**: GMS provides a `CUDAPluggableAllocator` + `MemPool` via `torch.cuda.use_mem_pool()`; TRT-LLM only needs to wrap the model loading call inside this context manager.
+> - **Tensor enumeration for P2P**: GMS's `register_module_tensors()` already walks model parameters/buffers and records metadata during its write-path commit. For MX, the MX client SDK handles NIXL registration given tensor pointers.
+> - **CUDA VMM FD import/export**: GMS's `cuda_utils.py` already implements `cuMemImportFromShareableHandle` / `cuMemExportToShareableHandle`. TRT-LLM should not reimplement these.

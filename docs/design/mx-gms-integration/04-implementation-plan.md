@@ -26,11 +26,16 @@ This plan treats MX and GMS as **library dependencies**, not things to reimpleme
 | Shadow failover | `PyExecutor` shadow mode with GMS-backed activation | None |
 | Testing | TRT-LLM CI with MX/GMS enabled | GMS integration tests in Dynamo repo |
 
-**What TRT-LLM does NOT need to implement:**
-- NIXL wrapper (use `modelexpress` client directly)
-- CUDA VMM FD import/export (use `gpu_memory_service` client directly)
-- GMS allocator internals (use `gpu_memory_service.client.torch.module.materialize_module_from_gms`)
+**What TRT-LLM does NOT need to implement** (provided by MX/GMS libraries):
+- NIXL wrapper or RDMA transfer logic (use `modelexpress` client directly)
+- CUDA VMM FD import/export (use `gpu_memory_service.client` directly — `cuda_utils.py`)
+- GPU memory allocator (use GMS's `CUDAPluggableAllocator` + `MemPool`)
+- Tensor enumeration for GMS commit (GMS's `register_module_tensors()` walks the model)
+- Zero-copy tensor construction from GPU pointers (GMS's `materialize_module_from_gms()`)
 - gRPC server/client for MX (use `modelexpress` SDK)
+- Socket-based RW/RO locking (GMS client handles this transparently)
+
+See [API Design](05-api-design.md) Section 5 for a full inventory of what each library provides.
 
 ### Target Backend Scope
 
