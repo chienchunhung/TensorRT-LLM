@@ -6,7 +6,7 @@
 - **Date:** 2026-03-18
 - **Branch:** `fix-zombie-worker-health-check`
 - **PR:** [#12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718)
-- **Status:** In review — all reviewer comments addressed, squashed to 2 commits
+- **Status:** In review — all reviewer comments addressed, squashed to 3 commits
 
 ---
 
@@ -175,6 +175,18 @@ classified as severe (not immediate-fatal) because the CUDA context remains
 valid after a failed allocation — the engine can recover if the next batch
 is smaller.
 
+`_handle_errors()` accepts a `charge_budget` flag (default `True`).  Request-
+scoped call sites pass `charge_budget=False`:
+- `_validate_request()` failures (parameter/format errors)
+- `_check_cache_transfer_errors()` (KV-transfer errors)
+- KV cache transfer timeout in `_handle_responses()`
+- `_handle_guided_decoder_errors()` (guided decoding failures)
+
+These per-request errors only fail the affected request and are propagated
+back to the client — they don't consume the error budget or affect server
+health.  System-level call sites (forward, decode, sample, hang detector)
+keep the default `True`.
+
 On the fatal path, `_handle_errors()` also:
 - Sets `is_shutdown = True` immediately (prevents the executor loop from
   scheduling more requests on a corrupted CUDA context)
@@ -244,7 +256,7 @@ T+0s    Budget exhausted -> _fatal_error set, shutdown
 ## Test Coverage
 
 All unit tests are in
-`tests/unittest/executor/test_fatal_error_health_check.py` (60 tests total,
+`tests/unittest/executor/test_fatal_error_health_check.py` (63 tests total,
 heavily parametrized).  Tests use the **real** `classify_error()` function and
 `ErrorBudget` dataclass imported from `error_classification.py` via `importlib`
 (avoids C++ extension loading).
@@ -252,7 +264,7 @@ heavily parametrized).  Tests use the **real** `classify_error()` function and
 | Test class | Count | What's covered |
 |---|---|---|
 | `TestClassifyError` | 15 | Real `classify_error()`: three-tier classification, case insensitivity |
-| `TestErrorBudget` | 11 | Real `ErrorBudget` dataclass: immediate-fatal bypass, severe/transient exhaustion, time recovery, aliased-list fix, `is_shutdown` set on fatal, `waiting_queue` drain, `executor_request_queue` drain |
+| `TestErrorBudget` | 14 | Real `ErrorBudget` dataclass: immediate-fatal bypass, severe/transient exhaustion, time recovery, aliased-list fix, `is_shutdown` set on fatal, `waiting_queue` drain, `executor_request_queue` drain, `charge_budget=False` skips budget / never triggers fatal |
 | `TestGenerationExecutor` | 10 | `_set_fatal_error` first-wins, `is_shutdown` (4 states), `check_health` drain-all with per-request skip |
 | `TestProxyCheckHealth` | 6 | MPI future states via shared `_check_mpi_futures`/`_drain_error_queue` helpers |
 | `TestErrorMonitorLoop` | 4 | Worker crash, error queue, per-request string skip, shutdown flag |
@@ -262,8 +274,8 @@ heavily parametrized).  Tests use the **real** `classify_error()` function and
 
 ### Issues Found During Development
 
-During CI validation and code review (Superjomn, hchings, CodeRabbit), eleven
-issues were found and fixed:
+During CI validation and code review (Superjomn, hchings, pcastonguay,
+CodeRabbit), twelve issues were found and fixed:
 
 1. **Thread leak (`proxy_error_monitor`)**: `pytest-threadleak` detected the
    daemon thread surviving past test teardown. **Fix:** join the thread during
@@ -296,6 +308,10 @@ issues were found and fixed:
     drain-all `while True` loops.
 11. **Silent `except Exception: pass` in monitor**: Hard to debug.  **Fix:**
     `logger.debug(...)` instead of silent pass.
+12. **Request-scoped errors consumed the error budget** (pcastonguay): A burst
+    of malformed requests could exhaust the budget and crash a healthy server.
+    **Fix:** `charge_budget=False` on validation, KV-transfer timeout,
+    guided-decoder, and cache-transfer call sites.
 
 ### Remaining Test Gap
 
