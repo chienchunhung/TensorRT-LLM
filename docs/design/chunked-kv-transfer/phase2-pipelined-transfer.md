@@ -8,9 +8,10 @@
 | **PRs** | [#12781](https://github.com/NVIDIA/TensorRT-LLM/pull/12781) |
 | **Author** | Chien-Chun Hung |
 | **Created** | 2026-03-24 |
-| **Last Updated** | 2026-04-08 |
+| **Last Updated** | 2026-04-09 |
 | **Status** | Prototype |
 | **Depends on** | [Phase 1](phase1-early-block-release.md) |
+| **Transceiver** | Python only (gen-first flow required) |
 
 ## Problem Statement
 
@@ -129,11 +130,17 @@ The most critical correctness concern. The GPU writes KV data on the default CUD
 
 `event.synchronize()` blocks only the sender worker thread, not the GPU or the main executor thread. Chunk N+1's forward runs on the GPU concurrently.
 
+### Why Python Transceiver Only (No C++ Transceiver)
+
+The C++ transceiver uses context-first flow exclusively. In context-first, the generation executor is not allocated until the full context forward pass completes — there is no receiver to send to during prefill. Pipelining requires gen-first flow where the receiver is ready before the sender starts, and gen-first is only supported in the Python transceiver.
+
+Phase 1 (chunked transfer without pipelining) applies to both transceivers. Phase 2 (pipelined) is Python transceiver only.
+
 ### Scheduling Mode Interaction
 
-**Generation-first (recommended pairing):** The generation server receives the request simultaneously with the context server. It allocates KV blocks and sends `RecvReqInfo` before the context server finishes prefill. By the time chunk 0's prefill completes, the receiver may already be ready.
+**Generation-first (required):** The generation server receives the request simultaneously with the context server. It allocates KV blocks and sends `RecvReqInfo` before the context server finishes prefill. By the time chunk 0's prefill completes, the receiver may already be ready.
 
-**Context-first (requires additional changes):** The orchestrator only sends the gen request after full context completion. Pipelining requires either:
+**Context-first (not supported for pipelining):** The orchestrator only sends the gen request after full context completion. Pipelining requires either:
 
 - The context server proactively notifying the gen server after the first chunk
 - The orchestrator sending a "prepare" signal earlier

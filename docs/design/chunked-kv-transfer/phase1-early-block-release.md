@@ -5,11 +5,11 @@
 | | |
 |---|---|
 | **JIRA** | [TRTLLM-11608](https://jirasw.nvidia.com/browse/TRTLLM-11608) |
-| **PRs** | [#12602](https://github.com/NVIDIA/TensorRT-LLM/pull/12602) (shared infra + V1), [#12469](https://github.com/NVIDIA/TensorRT-LLM/pull/12469) (V2 follow-up) |
+| **PRs** | [#12602](https://github.com/NVIDIA/TensorRT-LLM/pull/12602) (Phase 1a: V1 + Python transceiver), [#12469](https://github.com/NVIDIA/TensorRT-LLM/pull/12469) (Phase 1c: V2 + Python transceiver) |
 | **Author** | Chien-Chun Hung |
 | **Created** | 2026-03-24 |
-| **Last Updated** | 2026-04-08 |
-| **Status** | In review |
+| **Last Updated** | 2026-04-09 |
+| **Status** | Phase 1a in review; Phase 1b (C++ transceiver) planned; Phase 1c follow-up |
 
 ## Problem Statement
 
