@@ -58,8 +58,9 @@
 **Risk:** Deep integration with Dynamo ecosystem may reduce TRT-LLM's independence.
 
 **Mitigation:**
-- MX and GMS are optional — `--load-format hf` remains the default
-- Abstraction layers (`WeightLoaderProtocol`, `GPUMemoryBackend`) allow alternative backends
+- MX and GMS are optional — defaults (`checkpoint_format="HF"`, `LoadFormat.AUTO`) preserve current behavior
+- The two-axis design (see [API Design](05-api-design.md) Section 5.1) keeps MX and GMS decoupled — each can be used independently or removed without affecting the other
+- `GPUMemoryBackend` protocol allows alternative GMS implementations
 - Both MX and GMS are open-source
 
 ### 5. Timeline Risk

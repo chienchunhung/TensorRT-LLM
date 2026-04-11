@@ -25,7 +25,7 @@ The integration targets three critical production pain points simultaneously: sl
 2. [Problem Statement and Goals](02-problem-and-goals.md) — Pain points, target use cases, goals and non-goals
 3. [Proposed Architecture](03-architecture.md) — High-level design, data flows, component responsibilities
 4. [Implementation Plan](04-implementation-plan.md) — Three-phase approach with detailed deliverables and timelines
-5. [API Design](05-api-design.md) — Weight loader protocol, tensor enumeration, memory allocator hook, configuration
+5. [API Design](05-api-design.md) — Two-axis integration model, MX checkpoint loader, GMS loading mode, configuration, library inventory
 6. [Executor Integration and Failover](06-executor-failover.md) — Shadow failover mechanics, sleep/wake mapping, in-flight request handling
 7. [KV Cache Extension Path](07-kv-cache-extension.md) — Future extension to KV cache persistence via GMS/KVBM
 8. [Disaggregated Serving Interaction](08-disagg-interaction.md) — How MX/GMS interact with P/D separation

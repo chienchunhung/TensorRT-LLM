@@ -87,19 +87,25 @@ graph TB
 
 ## TensorRT-LLM Current Architecture (Relevant Extension Points)
 
-TRT-LLM's PyTorch backend provides several hooks that MX/GMS can leverage:
+TRT-LLM's `ModelLoader.load()` has two independent axes that MX and GMS map onto naturally (see [API Design](05-api-design.md) Section 5.1 for full rationale):
 
-| Extension Point | Location | What It Does |
-|:---------------|:---------|:-------------|
-| `@register_checkpoint_loader(format)` | `model_loader.py` | Custom checkpoint format registration |
-| `virtual_memory_scope(tag)` | Memory management | Tagged memory allocation for lifecycle control |
-| `release_with_tag()` / `materialize_with_tag()` | Memory management | Sleep/wake memory release and restoration |
-| `ModelLoader` with configurable weight loading | `model_loader.py` | Pluggable weight loading pipeline |
-| KV Cache Connector API | `kv-cache-connector.md` | Custom KV cache load/save/transfer |
+| Axis | Controlled by | Current values | MX/GMS maps to |
+|:-----|:-------------|:---------------|:----------------|
+| **Weight source** | `checkpoint_format` → `@register_checkpoint_loader` | `"HF"`, `"mistral"` | MX: new `"MX"` checkpoint format |
+| **Loading mode** | `LoadFormat` enum → branches in `ModelLoader.load()` | `AUTO`, `DUMMY`, `VISION_ONLY` | GMS: new `LoadFormat.GMS` branch |
+
+Additional existing hooks:
+
+| Extension Point | Location | Used by |
+|:---------------|:---------|:--------|
+| `virtual_memory_scope(tag)` | Memory management | GMS sleep/wake tag mapping |
+| `release_with_tag()` / `materialize_with_tag()` | Memory management | GMS KV cache lifecycle |
+| KV Cache Connector API | `kv-cache-connector.md` | Future KV cache persistence |
 
 **Extension points to be added in TRT-LLM:**
-- Post-load callback for MX source registration (notify MX that weights are ready for P2P)
-- `LoadFormat.MX` / `LoadFormat.GMS` branches in `ModelLoader.load()` to invoke MX/GMS client APIs
+- `@register_checkpoint_loader("MX")` — new MX checkpoint loader (weight source axis)
+- `LoadFormat.GMS` branch in `ModelLoader.load()` — GMS memory management (loading mode axis)
+- Post-load callback for MX source registration (between `model.load_weights()` and `post_load_weights()`)
 
 > **Note:** Several capabilities that might appear to require new TRT-LLM code are actually already provided by the MX and GMS client libraries:
 > - **GPU memory allocator**: GMS provides a `CUDAPluggableAllocator` + `MemPool` via `torch.cuda.use_mem_pool()`; TRT-LLM only needs to wrap the model loading call inside this context manager.

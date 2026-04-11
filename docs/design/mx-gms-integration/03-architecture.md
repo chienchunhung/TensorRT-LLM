@@ -120,13 +120,21 @@ flowchart LR
         E --> F["nn.Module on GPU"]
     end
 
-    subgraph "MX/GMS Integration Points"
-        D1["MX: New MXCheckpointLoader<br/>(TRT-LLM code, calls MX SDK)<br/>GMS RO: Call materialize_module_from_gms<br/>(GMS library function)"]
-        D2["Post-load (TRT-LLM orchestration):<br/>MX: mx_client.register_as_source()<br/>GMS: gms_client.commit()"]
-        D3["GMS RW: wrap with<br/>torch.cuda.use_mem_pool(gms_pool)<br/>(GMS library provides allocator)"]
+    subgraph "Weight Source Axis (checkpoint_format)"
+        D1["MX: @register_checkpoint_loader('MX')<br/>(TRT-LLM code, calls MX SDK)<br/>Sets _weights_presharded when P2P"]
     end
 
-    D -.->|"Replace with"| D1
-    E -.->|"Add"| D2
-    C -.->|"Inject"| D3
+    subgraph "Memory Mgmt Axis (LoadFormat)"
+        D3["GMS RW: wrap with<br/>torch.cuda.use_mem_pool(gms_pool)<br/>(GMS library provides allocator)"]
+        D4["GMS RO: materialize_module_from_gms<br/>(GMS library function, bypasses<br/>checkpoint_loader entirely)"]
+    end
+
+    subgraph "Post-Load Hooks (TRT-LLM orchestration)"
+        D2["MX: publish_as_source() BEFORE post_load_weights<br/>GMS: finalize_write() after loading"]
+    end
+
+    D -.->|"checkpoint_format=MX"| D1
+    C -.->|"LoadFormat.GMS (RW)"| D3
+    C -.->|"LoadFormat.GMS (RO)"| D4
+    E -.->|"Add hooks"| D2
 ```

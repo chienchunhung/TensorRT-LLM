@@ -142,20 +142,34 @@ candidates = [s for s in sources if s.worker_rank == my_rank]
 
 **Recommendation:** Start with NIXL for Phase 1 (proven, matches vLLM). Evaluate Mooncake as an alternative backend in Phase 3. Note that the transfer backend selection is largely **transparent to TRT-LLM** — it is handled inside the MX client library. TRT-LLM calls `client.receive()` and `client.register_source()`; the MX library handles the underlying transfer mechanism (NIXL, Mooncake, etc.).
 
+## 10. Coordination with MX Prototype (PR #12898)
+
+**Challenge:** [PR #12898](https://github.com/NVIDIA/TensorRT-LLM/pull/12898) from the MX team adds `LoadFormat.PRESHARDED = 3` as a prototype MX integration. This conflates weight source and memory management into a single `LoadFormat` value, which prevents clean composition with GMS. Specific conflicts:
+- `LoadFormat.PRESHARDED = 3` occupies the enum slot we need for `LoadFormat.GMS`
+- The `MODEL_EXPRESS_SOURCE` env var bypasses `TorchLlmArgs` configuration
+- Source publish logic is split between `model_loader.py` and `worker.py` with a fragile `getattr` chain
+
+**Mitigation:**
+- Coordinate with MX team to refactor toward the two-axis model: MX as `checkpoint_format="MX"` (weight source), not a `LoadFormat` (see [API Design](05-api-design.md) Section 5.1)
+- Adopt PR #12898's validated insights: pre-`post_load_weights()` publish timing, `_weights_presharded` TP-skip on Linear modules
+- If PR #12898 lands first: build on top of it incrementally — extract the `PRESHARDED` logic into an `MXCheckpointLoader`, migrate env var to `TorchLlmArgs` field, and add `LoadFormat.GMS` at the next available enum slot
+
 ## Complexity Summary
 
-| Area | Complexity | Phase | Owner | Risk |
-|:-----|:----------|:------|:------|:-----|
-| MX checkpoint loader | Medium | 1 | TRT-LLM | Low |
-| MX identity/rank matching | Medium | 1 | TRT-LLM | Low |
-| MX fallback logic | Low | 1 | TRT-LLM (orchestration); MX library (transfer) | Low |
-| Non-contiguous tensors | Medium | 1 | MX library handles NIXL registration | Medium |
-| NIXL/RDMA transfer | Medium | 1 | MX library (transparent to TRT-LLM) | Medium |
-| GMS weight loader mode | Medium | 2 | TRT-LLM (orchestration); GMS library (allocator, VMM) | Medium |
-| CUDA VMM / GMS allocator | **High** | 2 | GMS library (TRT-LLM wraps with context manager) | **High** |
-| Module path resolution | Medium | 2 | TRT-LLM (call `post_load_weights()` before GMS import) | Medium |
-| Sleep/wake GMS tag mapping | Medium | 2 | TRT-LLM | Low |
-| Shadow failover executor | **High** | 2 | TRT-LLM (new code; GMS provides only `upgrade_lock()`) | **High** |
-| GMS API stability protocol | Low | 2 | TRT-LLM | Low |
-| Combined loader | Low | 3 | TRT-LLM | Low |
-| Disagg interaction | Medium | 3 | TRT-LLM | Medium |
+| Area | Integration Axis | Complexity | Phase | Owner | Risk |
+|:-----|:----------------|:----------|:------|:------|:-----|
+| MX checkpoint loader | `checkpoint_format` | Medium | 1 | TRT-LLM | Low |
+| MX identity/rank matching | `checkpoint_format` | Medium | 1 | TRT-LLM | Low |
+| Pre-sharded TP skip | Cross-cutting | Low | 1 | TRT-LLM (adopt from [PR #12898](https://github.com/NVIDIA/TensorRT-LLM/pull/12898)) | Low |
+| MX fallback logic | `checkpoint_format` | Low | 1 | TRT-LLM (orchestration); MX library (transfer) | Low |
+| Non-contiguous tensors | `checkpoint_format` | Medium | 1 | MX library handles NIXL registration | Medium |
+| NIXL/RDMA transfer | `checkpoint_format` | Medium | 1 | MX library (transparent to TRT-LLM) | Medium |
+| PR #12898 coordination | Both | Low | 1 | TRT-LLM + MX team | Medium |
+| GMS loading mode (`LoadFormat.GMS`) | `LoadFormat` | Medium | 2 | TRT-LLM (orchestration); GMS library (allocator, VMM) | Medium |
+| CUDA VMM / GMS allocator | `LoadFormat` | **High** | 2 | GMS library (TRT-LLM wraps with context manager) | **High** |
+| Module path resolution | `LoadFormat` | Medium | 2 | TRT-LLM (call `post_load_weights()` before GMS import) | Medium |
+| Sleep/wake GMS tag mapping | `LoadFormat` | Medium | 2 | TRT-LLM | Low |
+| Shadow failover executor | `LoadFormat` | **High** | 2 | TRT-LLM (new code; GMS provides only `upgrade_lock()`) | **High** |
+| GMS API stability protocol | `LoadFormat` | Low | 2 | TRT-LLM | Low |
+| Combined mode validation | Both (composition) | Low | 3 | TRT-LLM | Low |
+| Disagg interaction | Both | Medium | 3 | TRT-LLM | Medium |
