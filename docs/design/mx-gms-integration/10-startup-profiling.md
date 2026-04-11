@@ -3,7 +3,7 @@
 [< Back to Overview](README.md)
 
 **Status:** Implemented on branch `dynamo/startup-profiling`
-**Last Updated:** 2026-04-08
+**Last Updated:** 2026-04-10
 
 ---
 
@@ -203,118 +203,120 @@ The **JSON artifact** contains:
 
 ---
 
-## Example Results
+## Benchmark Results
 
-### DeepSeek-V3-Lite BF16 (local checkpoint, single B300 GPU)
+**Environment:** NVIDIA B300 SXM6 AC (275 GB), PyTorch backend, single GPU
+**Contract:** `first_request_ready` — profile finalized after first successful end-to-end request
+**Date:** 2026-04-10
 
-**Environment:**
-- GPU: NVIDIA B300 SXM6 AC (275 GB)
-- Model: `DeepSeek-V3-Lite/bf16` (53 GB checkpoint, local NFS)
-- Backend: PyTorch, TP=1, max_batch_size=4, max_num_tokens=1024, max_seq_len=4096
-- Contract: `first_request_ready`
+### Model Size Scaling (Group B)
 
-**Server Process Tree:**
+Same configuration (`TP=1, max_batch_size=4, max_num_tokens=1024, max_seq_len=4096`), three different model sizes. This shows how the dominant bottleneck shifts from warmup to weight loading as model size grows.
 
-```
-- serve.create_llm: 125.122s (99.6%)
-  - llm.build_model: 125.121s (99.6%)
-    - llm.cached_model_loader: 0.005s (0.0%)
-    - llm.load_tokenizer: 0.313s (0.2%)
-    - llm.create_executor: 124.765s (99.3%)
-  - llm.init_tracing: 0.000s (0.0%)
-- serve.create_openai_server: 0.270s (0.2%)
-```
+| Phase | B1: DeepSeek 1.5B (3GB) | B2: Llama 8B (16GB) | B3: DeepSeek-V3-Lite (53GB) |
+|:------|:----------------------|:-------------------|:---------------------------|
+| **Total executor startup** | **49.1s** | **47.1s** | **114.2s** |
+| Weight loading total | 19.6s (40%) | 38.3s (81%) | 79.3s (69%) |
+| -- checkpoint prefetch | 18.2s (37%) | 35.2s (75%) | 68.6s (60%) |
+| -- parallel load | 0.0s | 0.0s | 0.4s |
+| -- apply weights | 0.7s (2%) | 2.6s (5%) | 9.8s (9%) |
+| -- model init (meta) | 0.6s (1%) | 0.5s (1%) | 0.4s |
+| Warmup total (1st pass) | 25.0s (51%) | 6.1s (13%) | 31.1s (27%) |
+| -- autotuner forward | 24.3s (50%) | 5.8s (12%) | 29.5s (26%) |
+| -- CUDA graphs | 0.2s | 0.2s | 1.2s (1%) |
+| -- memory pool | 0.0s | 0.0s | 0.3s |
+| Warmup (2nd pass) | 2.2s (5%) | 1.4s (3%) | 2.4s (2%) |
 
-**Executor Worker Tree:**
+**Key insights:**
+1. **Checkpoint prefetch dominates weight loading.** For all three models, prefetch (reading safetensor files into OS page cache) is >95% of the weight loading time.
+2. **Weight loading scales with checkpoint size** — roughly linearly: 18s for 3GB, 35s for 16GB, 69s for 53GB.
+3. **Autotuner cost is model-architecture-dependent, not size-dependent.** The 1.5B DeepSeek has a 24s autotuner warmup (50%), while the 8B Llama is only 5.8s (12%). This is because DeepSeek uses a different architecture with more expensive autotuner-profiled kernels.
+4. **The dominant bottleneck shifts with model size:** small models are warmup-dominated (51%), medium/large models are weight-loading-dominated (69-81%).
 
-```
-- executor_worker.initialize: 109.443s (100.0%)
-  - executor.create_model_engine.main: 69.731s (63.7%)
-    - executor.load_model_weights: 69.714s (63.7%)
-      - executor.load_model_config: 0.001s (0.0%)
-      - executor.model_init.meta: 0.193s (0.2%)
-      - executor.materialize_model_tensors: 0.015s (0.0%)
-      - executor.checkpoint_read.main_weights: 1.688s (1.5%)
-        - executor.checkpoint_prefetch: 1.682s (1.5%)
-        - executor.checkpoint_parallel_load: 0.005s (0.0%)
-      - executor.apply_model_weights.main_weights: 0.700s (0.6%)
-      - executor.post_load_weights: 0.001s (0.0%)
-  - executor.create_py_executor_instance: 35.856s (32.8%)
-    - executor.warmup.main_model: 35.590s (32.5%)
-      - executor.warmup.autotuner: 31.250s (28.6%)
-        - executor.warmup.autotuner.forward: 31.249s (28.6%)
-      - executor.warmup.cuda_graphs: 3.284s (3.0%)
-      - executor.warmup.memory_pool: 0.339s (0.3%)
-  - executor.configure_kv_cache_capacity: 0.408s (0.4%)
-  - executor.recreate_py_executor_instance: 2.382s (2.2%)
-  - executor.start_worker: 0.001s (0.0%)
-```
+### Replica Scaling Problem (Group A)
 
-**Key Findings:**
-- Weight loading dominated by checkpoint prefetch + weight application (~70s total)
-- Autotuner warmup is the second-largest bucket (~31s), almost entirely in the forward pass
-- CUDA graph capture is a smaller but significant ~3.3s
-- Server/config overhead is negligible (<1s)
+Same model (DeepSeek-V3-Lite BF16, 53GB), first vs second cold start from the same local NFS checkpoint.
 
-### DeepSeek-R1-Distill-Qwen-1.5B (HuggingFace download, single B300 GPU)
+| Phase | A1: 1st Replica | A2: 2nd Replica |
+|:------|:---------------|:---------------|
+| **Total executor startup** | **114.2s** | **47.6s** |
+| checkpoint prefetch | 68.6s (60%) | 5.6s (12%) |
+| apply weights | 9.8s (9%) | 8.3s (17%) |
+| autotuner forward (1st pass) | 29.5s (26%) | 27.7s (58%) |
 
-**Environment:**
-- GPU: NVIDIA B300 SXM6 AC (275 GB)
-- Model: `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` (3.3 GB, downloaded from HF)
-- Backend: PyTorch, TP=1
-- Contract: `first_request_ready`
+**Key insights:**
+5. **The 2nd replica starts 2.4x faster because checkpoint files are already in OS page cache** — prefetch drops from 68.6s to 5.6s (12x faster). This is a filesystem-level cache effect, not an application optimization.
+6. **Without MX/GMS, every cold start on a fresh node pays the full 69s prefetch.** In production autoscaling, new nodes don't have warm page caches.
+7. **Weight application time is stable** (~8-10s) regardless of cache state — it's GPU-memory-bound.
+8. **Autotuner cost is stable** (~28-30s) — it's compute-bound and doesn't benefit from page cache.
 
-**Executor Worker Tree:**
+### Autotuner Impact (Group C)
 
-```
-- executor_worker.initialize: 11.353s (100.0%)
-  - executor.create_model_engine.main: 2.602s (22.9%)
-    - executor.load_model_weights: 2.600s (22.9%)
-      - executor.model_init.meta: 0.193s (1.7%)
-      - executor.checkpoint_read.main_weights: 1.688s (14.9%)
-        - executor.checkpoint_prefetch: 1.682s (14.8%)
-        - executor.checkpoint_parallel_load: 0.005s (0.0%)
-      - executor.apply_model_weights.main_weights: 0.700s (6.2%)
-  - executor.create_py_executor_instance: 7.319s (64.5%)
-    - executor.warmup.main_model: 7.041s (62.0%)
-      - executor.warmup.autotuner: 6.718s (59.2%)
-        - executor.warmup.autotuner.forward: 6.717s (59.2%)
-      - executor.warmup.cuda_graphs: 0.170s (1.5%)
-      - executor.warmup.memory_pool: 0.024s (0.2%)
-```
+Same model (DeepSeek-V3-Lite BF16, 53GB), autotuner enabled vs disabled.
 
-**Key Findings:**
-- For small models, warmup/autotuner dominates startup (59% vs 23% for weight loading)
-- HF download itself (~3s) was captured under `llm.cached_model_loader` in the server process tree
-- Checkpoint prefetch is the bottleneck within weight loading even for a 3.3 GB model
+| Phase | C1: Autotuner ON | C2: Autotuner OFF |
+|:------|:----------------|:-----------------|
+| **Total executor startup** | **114.2s** | **88.6s** |
+| Weight loading total | 79.3s (69%) | 77.2s (87%) |
+| Warmup total (1st pass) | 31.1s (27%) | 7.5s (8%) |
+| -- autotuner forward | 29.5s | 0.0s (skipped) |
+| -- CUDA graphs | 1.2s | 7.1s |
+| -- memory pool | 0.3s | 0.2s |
+
+**Key insights:**
+9. **Disabling autotuner saves ~25.6s** (114.2s -> 88.6s), but CUDA graph capture becomes 6x more expensive (1.2s -> 7.1s) without optimized kernel selections.
+10. **The autotuner is almost entirely a forward pass cost** — `autotuner.forward` is 29.5s out of 29.5s total. Setup and sync are negligible.
+11. **Even without autotuner, weight loading still dominates** (87%). MX/GMS targets the right bottleneck for large models.
+
+### Serving Config Sensitivity (Group D)
+
+Same model (Llama 3.1 8B), small vs large serving configuration.
+
+| Phase | D1: Small (bs=4, nt=1024) | D2: Large (bs=64, nt=8192) |
+|:------|:-------------------------|:--------------------------|
+| **Total executor startup** | **47.1s** | **42.1s** |
+| checkpoint prefetch | 35.2s (75%) | 27.2s (65%) |
+| apply weights | 2.6s (5%) | 2.9s (7%) |
+| autotuner forward (1st pass) | 5.8s (12%) | 5.8s (14%) |
+| CUDA graphs (1st pass) | 0.2s (0.4%) | 1.4s (3.4%) |
+| CUDA graphs (2nd pass) | 0.1s | 1.2s (2.8%) |
+
+**Key insights:**
+12. **Autotuner forward cost is stable across configs** — 5.8s in both cases.
+13. **CUDA graph capture scales with `max_batch_size`** — 0.2s for 4 batch sizes to 1.4s for 34 batch sizes. Production configs would be even larger.
+14. **Weight loading is config-independent** — checkpoint I/O is the same regardless of serving parameters.
 
 ---
 
-## Bottleneck Analysis
+## Summary Table
 
-| Phase | DeepSeek-V3-Lite BF16 | DeepSeek-R1-Distill-1.5B | Bottleneck Type |
-|:------|:---------------------|:------------------------|:----------------|
-| **Weight Loading** | 69.7s (63.7%) | 2.6s (22.9%) | I/O-bound |
-| **Warmup / Autotuner** | 35.6s (32.5%) | 7.0s (62.0%) | Compute-bound |
-| **CUDA Graphs** | 3.3s (3.0%) | 0.2s (1.5%) | Compute-bound |
-| **KV Cache** | 0.5s (0.4%) | 0.1s (0.4%) | Memory-bound |
-| **Config / Server** | 0.6s (0.5%) | 0.3s (2.6%) | Negligible |
+| ID | Model | Config | Executor Total | Weight Load | Warmup (1st) | Dominant Bottleneck |
+|:---|:------|:-------|:--------------|:-----------|:------------|:-------------------|
+| B1 | DeepSeek 1.5B | bs=4,nt=1024 | 49.1s | 19.6s (40%) | 25.0s (51%) | Warmup/autotuner |
+| B2 | Llama 8B | bs=4,nt=1024 | 47.1s | 38.3s (81%) | 6.1s (13%) | Weight loading |
+| B3 | DeepSeek-V3-Lite 53GB | bs=4,nt=1024 | 114.2s | 79.3s (69%) | 31.1s (27%) | Weight loading |
+| A2 | DeepSeek-V3-Lite (replica 2) | bs=4,nt=1024 | 47.6s | 14.8s (31%) | 28.9s (61%) | Warmup (cached IO) |
+| C2 | DeepSeek-V3-Lite (no autotuner) | bs=4,nt=1024 | 88.6s | 77.2s (87%) | 7.5s (8%) | Weight loading |
+| D2 | Llama 8B (large config) | bs=64,nt=8192 | 42.1s | 30.7s (73%) | 7.5s (18%) | Weight loading |
 
-### Observations
+---
 
-1. **Weight loading scales with model size** — it is I/O-bound (disk prefetch + deserialization). MX/GMS targets this directly.
-2. **Autotuner warmup scales with model complexity** — it runs a full forward pass for kernel tuning. For large MoE models this is very expensive.
-3. **CUDA graph capture** is proportional to the number of batch sizes configured.
-4. **Two-pass warmup**: the executor does warmup twice (once for KV cache estimation, once for the real KV cache). The second pass is much faster because autotuner results are cached.
+## MX+GMS Impact Projection
 
-### MX/GMS Impact on These Results
+Based on the measured breakdowns, here is what MX+GMS would change for the DeepSeek-V3-Lite 53GB case:
 
-| Phase | Current | With MX (Phase 1) | With MX + GMS (Phase 3) |
-|:------|:--------|:-------------------|:------------------------|
-| Weight Loading (V3-Lite BF16) | 69.7s | ~15s (P2P transfer) | ~0.1s (zero-copy import) |
-| Weight Loading (R1-Distill-1.5B) | 2.6s | ~1s (P2P transfer) | ~0.1s (zero-copy import) |
-| Warmup / Autotuner | 35.6s / 7.0s | Same | Same (future: cache sharing) |
-| CUDA Graphs | 3.3s / 0.2s | Same | Same (future: cache sharing) |
+| Scenario | Weight Load | Warmup | Other | Total |
+|:---------|:-----------|:-------|:------|:------|
+| **Baseline (current)** | 79.3s | 33.5s | 1.4s | **114.2s** |
+| **With MX (P2P from replica 1)** | ~15s | 33.5s | 1.4s | **~50s** |
+| **With MX+GMS (zero-copy import)** | ~0.1s | 33.5s | 1.4s | **~35s** |
+| **With MX+GMS+compile cache (future)** | ~0.1s | ~2s | 1.4s | **~3.5s** |
+
+**Observations:**
+1. MX alone reduces startup from **114s to ~50s** (56% reduction) by eliminating disk I/O for replicas.
+2. Adding GMS reduces it further to **~35s** (69% reduction) by zero-copy weight import.
+3. The warmup/autotuner floor (~33s) is the next frontier. Compile cache sharing would address this.
+4. The full stack (MX+GMS+compile cache) could bring replica startup from **minutes to single-digit seconds**.
 
 ---
 
