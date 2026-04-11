@@ -331,6 +331,91 @@ Same model (DeepSeek-R1-Distill-Qwen-1.5B), local checkpoint vs fresh HF downloa
 21. **The autotuner takes longer in the F1 run** (30.8s vs 24.3s) — this is likely due to different system load conditions rather than a fundamental difference. Autotuner cost varies by ~20% between runs.
 22. **For the HF download case, warmup completely dominates** (77% of executor time) because the weight loading is already fast from warm cache.
 
+### True Remote-Cold Download Protocol (Group G)
+
+To fairly compare local checkpoints vs remote HuggingFace fetch, the HF cache must be isolated and empty before the run. Otherwise `llm.cached_model_loader` can silently reuse a previous local cache hit.
+
+**Objective:** measure startup from a truly remote-cold model source.
+
+**Run controls:**
+- Use a unique, empty HF cache directory per run (`HF_HOME` + `HUGGINGFACE_HUB_CACHE`).
+- Use a fresh result directory per run.
+- Keep model/config fixed (`TP=1, max_batch_size=4, max_num_tokens=1024, max_seq_len=4096`).
+- If allowed by host policy, drop Linux page cache before run to avoid file-cache carryover.
+
+**Protocol (single-run G1):**
+```bash
+# 1) Isolated cache roots (guarantees no HF cache hit)
+export TEST_ROOT=/tmp/trtllm-startup-g1
+export HF_HOME=$TEST_ROOT/hf-home
+export HUGGINGFACE_HUB_CACHE=$TEST_ROOT/hf-hub
+export TRANSFORMERS_CACHE=$TEST_ROOT/transformers
+rm -rf "$TEST_ROOT"
+mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$TRANSFORMERS_CACHE" "$TEST_ROOT/results"
+
+# 2) Optional but recommended for strict cold filesystem state
+#    (requires sudo/admin privileges on most systems)
+# sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
+
+# 3) Start server with startup profiling enabled
+TRTLLM_PROFILE_STARTUP=1 \
+TRTLLM_STARTUP_PROFILE_OUTPUT=$TEST_ROOT/results/startup_profile_g1.json \
+trtllm-serve deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+    --backend pytorch \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --tensor_parallel_size 1 \
+    --max_batch_size 4 \
+    --max_num_tokens 1024 \
+    --max_seq_len 4096
+
+# 4) Run startup benchmark collection
+python tensorrt_llm/serve/scripts/benchmark_serving.py \
+    --backend openai \
+    --base-url http://127.0.0.1:8000 \
+    --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+    --tokenizer deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+    --dataset-name random --random-ids \
+    --num-prompts 1 \
+    --random-input-len 16 --random-output-len 8 \
+    --request-rate inf \
+    --save-result \
+    --save-startup-metrics \
+    --startup-timeout 600 \
+    --result-dir $TEST_ROOT/results
+```
+
+**What to report for G1:**
+- `llm.cached_model_loader` (primary remote download/caching cost)
+- `llm.load_tokenizer`, `llm.load_hf_model_config`, `llm.load_generation_config` (auxiliary metadata fetch costs)
+- Worker `executor.checkpoint_prefetch` (local file-read warmup after download)
+- Worker `executor.checkpoint_parallel_load` and `executor.apply_model_weights`
+- Worker warmup blocks (`executor.warmup.*`) for end-to-end startup attribution
+
+**G1 measured results (2026-04-10, true remote-cold cache):**
+
+| Phase | G1: HF Remote-Cold (isolated empty cache) |
+|:------|:------------------------------------------|
+| **Total startup (server, first-request-ready)** | **38.4s** |
+| `llm.cached_model_loader` (server) | 3.4s (8.8%) |
+| `llm.load_tokenizer` (server) | 0.9s (2.2%) |
+| `llm.create_executor` (server) | 33.6s (87.4%) |
+| **Total executor startup (worker rank 0)** | **14.1s** |
+| Weight loading total (worker) | 2.9s (20.9%) |
+| -- checkpoint prefetch | 1.7s (12.1%) |
+| -- checkpoint parallel load | 0.006s (0.04%) |
+| -- apply weights | 0.8s (5.5%) |
+| Warmup total (1st pass) | 7.4s (52.7%) |
+| -- autotuner forward | 7.1s (50.4%) |
+| -- CUDA graphs | 0.17s (1.2%) |
+| Warmup (2nd pass) | 2.1s (15.1%) |
+
+**Key insights:**
+23. **True remote-cold fetch is captured in `llm.cached_model_loader`** at 3.4s for this 1.5B model on current network/storage.
+24. **`checkpoint_prefetch` remains low (1.7s)** because files are immediately local after download and warm in page cache.
+25. **Worker startup is warmup-dominated** even in remote-cold mode (7.4s first-pass warmup vs 2.9s weight loading).
+26. **For small models, remote download does not dominate startup**; for larger models, this block is expected to grow substantially and become the main MX target.
+
 ---
 
 ## Summary Table
@@ -345,6 +430,7 @@ Same model (DeepSeek-R1-Distill-Qwen-1.5B), local checkpoint vs fresh HF downloa
 | D2 | Llama 8B (large config) | TP=1,bs=64,nt=8192 | 42.1s | 30.7s (73%) | 7.5s (18%) | Weight loading |
 | **E1** | **DeepSeek-V3-Lite 53GB** | **TP=8,bs=4,nt=1024** | **108.6s** | **54.4s (50%)** | **46.0s (42%)** | **Both (balanced)** |
 | **F1** | **DeepSeek 1.5B (HF download)** | **TP=1,bs=4,nt=1024** | **40.5s** | **3.1s (8%)** | **31.1s (77%)** | **Warmup/autotuner** |
+| **G1** | **DeepSeek 1.5B (HF remote-cold)** | **TP=1,bs=4,nt=1024** | **14.1s** | **2.9s (21%)** | **7.4s (53%)** | **Warmup/autotuner** |
 
 ---
 
