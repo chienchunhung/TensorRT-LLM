@@ -205,7 +205,7 @@ The **JSON artifact** contains:
 
 ## Benchmark Results
 
-**Environment:** NVIDIA B300 SXM6 AC (275 GB), PyTorch backend, single GPU
+**Environment:** NVIDIA B300 SXM6 AC (275 GB), 8x GPUs available, PyTorch backend
 **Contract:** `first_request_ready` — profile finalized after first successful end-to-end request
 **Date:** 2026-04-10
 
@@ -286,18 +286,65 @@ Same model (Llama 3.1 8B), small vs large serving configuration.
 13. **CUDA graph capture scales with `max_batch_size`** — 0.2s for 4 batch sizes to 1.4s for 34 batch sizes. Production configs would be even larger.
 14. **Weight loading is config-independent** — checkpoint I/O is the same regardless of serving parameters.
 
+### Multi-GPU Scaling (Group E)
+
+Same model (DeepSeek-V3-Lite BF16, 53GB), TP=1 vs TP=8 across 8 B300 GPUs.
+
+| Phase | B3: TP=1 (1 GPU) | E1: TP=8 (8 GPUs) |
+|:------|:----------------|:-----------------|
+| **Total executor startup (rank 0)** | **114.2s** | **108.6s** |
+| Weight loading total | 79.3s (69%) | 54.4s (50%) |
+| -- checkpoint prefetch | 68.6s (60%) | 32.1s (30%) |
+| -- checkpoint parallel load | 0.4s | 0.4s |
+| -- apply weights | 9.8s (9%) | 2.9s (3%) |
+| -- model init (meta) | 0.4s | 1.3s (1%) |
+| Warmup total (1st pass) | 31.1s (27%) | 46.0s (42%) |
+| -- autotuner forward | 29.5s (26%) | 42.2s (39%) |
+| -- CUDA graphs | 1.2s (1%) | 2.7s (3%) |
+| Warmup (2nd pass) | 2.4s (2%) | 3.0s (3%) |
+| Other (sampler, config, kv) | 1.4s | 5.2s (5%) |
+
+**Key insights:**
+15. **Weight loading is faster per-rank with TP=8** — each rank loads/applies only its shard of the weights. Prefetch drops from 68.6s to 32.1s because each rank only needs a subset of the safetensor data.
+16. **But autotuner is significantly more expensive with TP=8** — 42.2s vs 29.5s (43% longer). Multi-GPU NCCL collective ops (allreduce, allgather) during the synthetic forward pass add substantial overhead.
+17. **Overall startup is only marginally faster** (108.6s vs 114.2s) because the weight loading savings are offset by the increased warmup cost. TP does not meaningfully reduce total startup time.
+18. **MX/GMS benefit is amplified for multi-GPU** — eliminating weight loading for 8 ranks simultaneously would save 8x the per-rank I/O cost. GMS zero-copy import would reduce the 54.4s weight loading block to ~0.1s across all ranks.
+
+### HuggingFace Remote Download (Group F)
+
+Same model (DeepSeek-R1-Distill-Qwen-1.5B), local checkpoint vs fresh HF download.
+
+| Phase | B1: Local Checkpoint | F1: HF Download (fresh cache) |
+|:------|:--------------------|:-----------------------------|
+| **Total executor startup** | **49.1s** | **40.5s** |
+| `llm.cached_model_loader` (server) | 6.9s (HF cached) | 3.5s (HF fresh download) |
+| `llm.load_tokenizer` (server) | 0.9s | 0.8s |
+| Weight loading (worker) | 19.6s (40%) | 3.1s (8%) |
+| -- checkpoint prefetch | 18.2s (37%) | 1.6s (4%) |
+| -- apply weights | 0.7s (2%) | 0.6s (2%) |
+| Warmup total (1st pass) | 25.0s (51%) | 31.1s (77%) |
+| -- autotuner forward | 24.3s (50%) | 30.8s (76%) |
+
+**Key insights:**
+19. **HF download adds ~3.5s** for a 1.8 GB model (`llm.cached_model_loader` captures the download time). For larger models (70B+), this would be minutes — exactly what MX eliminates by P2P transfer from an existing replica.
+20. **Checkpoint prefetch is much faster after download** (1.6s vs 18.2s) because HF writes to local disk and the data is already warm in page cache.
+21. **The autotuner takes longer in the F1 run** (30.8s vs 24.3s) — this is likely due to different system load conditions rather than a fundamental difference. Autotuner cost varies by ~20% between runs.
+22. **For the HF download case, warmup completely dominates** (77% of executor time) because the weight loading is already fast from warm cache.
+
 ---
 
 ## Summary Table
 
 | ID | Model | Config | Executor Total | Weight Load | Warmup (1st) | Dominant Bottleneck |
 |:---|:------|:-------|:--------------|:-----------|:------------|:-------------------|
-| B1 | DeepSeek 1.5B | bs=4,nt=1024 | 49.1s | 19.6s (40%) | 25.0s (51%) | Warmup/autotuner |
-| B2 | Llama 8B | bs=4,nt=1024 | 47.1s | 38.3s (81%) | 6.1s (13%) | Weight loading |
-| B3 | DeepSeek-V3-Lite 53GB | bs=4,nt=1024 | 114.2s | 79.3s (69%) | 31.1s (27%) | Weight loading |
-| A2 | DeepSeek-V3-Lite (replica 2) | bs=4,nt=1024 | 47.6s | 14.8s (31%) | 28.9s (61%) | Warmup (cached IO) |
-| C2 | DeepSeek-V3-Lite (no autotuner) | bs=4,nt=1024 | 88.6s | 77.2s (87%) | 7.5s (8%) | Weight loading |
-| D2 | Llama 8B (large config) | bs=64,nt=8192 | 42.1s | 30.7s (73%) | 7.5s (18%) | Weight loading |
+| B1 | DeepSeek 1.5B | TP=1,bs=4,nt=1024 | 49.1s | 19.6s (40%) | 25.0s (51%) | Warmup/autotuner |
+| B2 | Llama 8B | TP=1,bs=4,nt=1024 | 47.1s | 38.3s (81%) | 6.1s (13%) | Weight loading |
+| B3 | DeepSeek-V3-Lite 53GB | TP=1,bs=4,nt=1024 | 114.2s | 79.3s (69%) | 31.1s (27%) | Weight loading |
+| A2 | DeepSeek-V3-Lite (replica 2) | TP=1,bs=4,nt=1024 | 47.6s | 14.8s (31%) | 28.9s (61%) | Warmup (cached IO) |
+| C2 | DeepSeek-V3-Lite (no autotuner) | TP=1,bs=4,nt=1024 | 88.6s | 77.2s (87%) | 7.5s (8%) | Weight loading |
+| D2 | Llama 8B (large config) | TP=1,bs=64,nt=8192 | 42.1s | 30.7s (73%) | 7.5s (18%) | Weight loading |
+| **E1** | **DeepSeek-V3-Lite 53GB** | **TP=8,bs=4,nt=1024** | **108.6s** | **54.4s (50%)** | **46.0s (42%)** | **Both (balanced)** |
+| **F1** | **DeepSeek 1.5B (HF download)** | **TP=1,bs=4,nt=1024** | **40.5s** | **3.1s (8%)** | **31.1s (77%)** | **Warmup/autotuner** |
 
 ---
 
