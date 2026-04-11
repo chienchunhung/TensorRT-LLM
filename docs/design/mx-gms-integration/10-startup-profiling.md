@@ -386,7 +386,9 @@ python tensorrt_llm/serve/scripts/benchmark_serving.py \
 ```
 
 **What to report for G1:**
-- `llm.cached_model_loader` (primary remote download/caching cost)
+- `llm.hf.cache_probe` (local cache lookup cost)
+- `llm.hf.remote_download` (true remote HF transfer cost)
+- `llm.cached_model_loader` (aggregate loader block that includes cache probe + remote download + local resolution)
 - `llm.load_tokenizer`, `llm.load_hf_model_config`, `llm.load_generation_config` (auxiliary metadata fetch costs)
 - Worker `executor.checkpoint_prefetch` (local file-read warmup after download)
 - Worker `executor.checkpoint_parallel_load` and `executor.apply_model_weights`
@@ -411,10 +413,36 @@ python tensorrt_llm/serve/scripts/benchmark_serving.py \
 | Warmup (2nd pass) | 2.1s (15.1%) |
 
 **Key insights:**
-23. **True remote-cold fetch is captured in `llm.cached_model_loader`** at 3.4s for this 1.5B model on current network/storage.
+23. **For small models, remote-cold download is short** (1.5B model), and most startup still sits in executor warmup.
 24. **`checkpoint_prefetch` remains low (1.7s)** because files are immediately local after download and warm in page cache.
 25. **Worker startup is warmup-dominated** even in remote-cold mode (7.4s first-pass warmup vs 2.9s weight loading).
 26. **For small models, remote download does not dominate startup**; for larger models, this block is expected to grow substantially and become the main MX target.
+
+**G3 measured results (2026-04-10, large-model remote-cold):**
+
+Model: `Qwen/Qwen2.5-72B-Instruct` (`TP=8, max_batch_size=4, max_num_tokens=1024, max_seq_len=4096`)
+
+| Phase | G3: 72B HF Remote-Cold (isolated empty cache) |
+|:------|:-----------------------------------------------|
+| **Total startup (server, first-request-ready)** | **96.4s** |
+| `llm.hf.cache_probe` | 0.00035s |
+| `llm.hf.remote_download` (rank 0) | 44.0s |
+| `llm.cached_model_loader` (server aggregate) | 64.0s (66.4%) |
+| `llm.create_executor` (server) | 31.2s (32.4%) |
+| **Total executor startup (worker rank 0)** | **75.7s** |
+| Weight loading total (worker rank 0) | 8.7s (11.5%) |
+| -- checkpoint prefetch | 3.4s (4.5%) |
+| -- checkpoint parallel load | 0.15s (0.2%) |
+| -- apply weights | 3.8s (5.0%) |
+| Warmup total (1st pass, rank 0) | 14.7s (19.4%) |
+| -- autotuner forward | 13.9s (18.3%) |
+| -- CUDA graphs | 0.56s (0.7%) |
+
+**G3 key insights:**
+27. **The explicit split timer makes remote transfer unambiguous:** `llm.hf.remote_download = 44.0s` for the 72B model.
+28. **`llm.cached_model_loader` now cleanly acts as an aggregate stage** (`cache_probe + remote_download + local resolution`) rather than the only download proxy.
+29. **Large-model remote download dominates server startup** (44.0s out of 96.4s total), which aligns with MX motivation.
+30. **Even for large models, rank-0 worker warmup remains non-trivial** (~14.7s), making compile/warmup caching a separate optimization target.
 
 ---
 
@@ -431,6 +459,7 @@ python tensorrt_llm/serve/scripts/benchmark_serving.py \
 | **E1** | **DeepSeek-V3-Lite 53GB** | **TP=8,bs=4,nt=1024** | **108.6s** | **54.4s (50%)** | **46.0s (42%)** | **Both (balanced)** |
 | **F1** | **DeepSeek 1.5B (HF download)** | **TP=1,bs=4,nt=1024** | **40.5s** | **3.1s (8%)** | **31.1s (77%)** | **Warmup/autotuner** |
 | **G1** | **DeepSeek 1.5B (HF remote-cold)** | **TP=1,bs=4,nt=1024** | **14.1s** | **2.9s (21%)** | **7.4s (53%)** | **Warmup/autotuner** |
+| **G3** | **Qwen2.5-72B (HF remote-cold)** | **TP=8,bs=4,nt=1024** | **75.7s** | **8.7s (11%)** | **14.7s (19%)** | **HF remote download (server)** |
 
 ---
 
