@@ -102,6 +102,37 @@ executor_worker.initialize
 └── executor.start_worker
 ```
 
+### Warmup and Compilation Semantics (What Each Component Means)
+
+The following clarifies what each warmup-related timer actually measures and why it costs time.
+
+- `executor.warmup.torch_compile`
+  - **What it does:** runs shape-specialization warmup for the model path when torch compile is enabled.
+  - **What it is not:** this is not "compile to a standalone executable binary". It is runtime graph/kernel specialization and caching for the current workload shapes.
+  - **Primary cost drivers:** first-time graph specialization, codegen/JIT overhead, and initial kernel materialization.
+  - **Code reference:** `tensorrt_llm/_torch/pyexecutor/model_engine.py` (`PyTorchModelEngine._run_torch_compile_warmup`, `PyTorchModelEngine._general_warmup`).
+
+- `executor.warmup.autotuner` (especially `executor.warmup.autotuner.forward`)
+  - **What it does:** executes a synthetic forward pass under autotune mode so candidate kernels/configs can be profiled and selected.
+  - **Why it costs time:** the forward pass runs real GPU compute and may include distributed communication (for multi-GPU), plus tuner bookkeeping and cache population.
+  - **Code reference:** `tensorrt_llm/_torch/pyexecutor/model_engine.py` (`PyTorchModelEngine._run_autotuner_warmup`).
+
+- `executor.warmup.cuda_graphs`
+  - **What it does:** captures generation execution into CUDA Graphs for selected batch sizes (and draft-length variants when applicable), so later iterations replay a pre-captured graph with lower launch overhead.
+  - **How it differs from torch compile/autotune:** this is graph-capture/replay optimization of launch behavior, not kernel-choice search (`autotuner`) and not high-level graph specialization (`torch_compile`).
+  - **Why it runs after compile/autotune:** capture should record the already-specialized/selected execution path to avoid capturing suboptimal pre-warmup behavior.
+  - **Code reference:** `tensorrt_llm/_torch/pyexecutor/model_engine.py` (`PyTorchModelEngine._run_cuda_graph_warmup`, `PyTorchModelEngine._capture_generation_cuda_graphs`).
+
+- `executor.warmup.memory_pool`
+  - **What it does:** runs additional general warmup requests to pre-touch allocator paths and reduce runtime memory fragmentation.
+  - **Clarification:** this is not the same as creating KV cache capacity; KV cache manager creation/rebuild happens in `executor.create_kv_cache`, `executor.configure_kv_cache_capacity`, and `executor.rebuild_kv_cache`.
+  - **Code reference:** `tensorrt_llm/_torch/pyexecutor/model_engine.py` (`PyTorchModelEngine.warmup`, `PyTorchModelEngine._general_warmup`), plus KV cache setup in `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py` (`KvCacheCreator.build_managers`, `configure_kv_cache_capacity` flow).
+
+- `executor.recreate_py_executor_instance` (second-pass warmup)
+  - **What it does:** when KV cache capacity is first estimated using a temporary/minimal setup, the executor is rebuilt with final KV cache sizing, then warmup runs again on the final runtime state.
+  - **Why it is needed:** first pass establishes sizing/profiling context; second pass ensures compile/capture/warmup artifacts match the final KV cache and executor resource layout used in serving.
+  - **Code reference:** `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py` (`estimating_kv_cache`, first `create_py_executor_instance`, `configure_kv_cache_capacity`, manager teardown/rebuild, second `create_py_executor_instance`).
+
 ### Data Flow
 
 ```
