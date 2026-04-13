@@ -2,8 +2,10 @@
 
 | | |
 |---|---|
-| **PR** | [#12416](https://github.com/NVIDIA/TensorRT-LLM/pull/12416) |
-| **Status** | In review |
+| **PR** | [#12816](https://github.com/NVIDIA/TensorRT-LLM/pull/12816) (merged), [#12416](https://github.com/NVIDIA/TensorRT-LLM/pull/12416) (closed — superseded) |
+| **Status** | ✅ Complete |
+
+> **Note:** The original PR #12416 explored a broader refactoring of `_handle_responses` (extracting helpers, collapsing termination branches, making `_do_terminate_request` idempotent). Based on reviewer feedback, the approach was simplified in PR #12816 to a minimal fix: guarding the redundant `_terminate_request` call in `_end_transfer_and_maybe_terminate` with `if not should_store_blocks`. The analysis and root cause sections below remain accurate — only the fix approach changed.
 
 ## Problem
 
