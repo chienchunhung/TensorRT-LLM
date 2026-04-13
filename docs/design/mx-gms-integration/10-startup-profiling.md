@@ -234,282 +234,69 @@ The **JSON artifact** contains:
 
 ---
 
-## Benchmark Results
+## Benchmark Plan (v2)
 
-**Environment:** NVIDIA B300 SXM6 AC (275 GB), 8x GPUs available, PyTorch backend
-**Contract:** `first_request_ready` — profile finalized after first successful end-to-end request
-**Date:** 2026-04-10
+See [startup-benchmark-plan-v2.md](startup-benchmark-plan-v2.md) for the full revised test matrix, including model selection, storage tiers, statistical protocol, and impact projection.
 
-### Model Size Scaling (Group B)
+**Previous results** from the initial profiling runs (2026-04-10) are preserved below for reference. They will be superseded by v2 results once the 70-run matrix completes.
 
-Same configuration (`TP=1, max_batch_size=4, max_num_tokens=1024, max_seq_len=4096`), three different model sizes. This shows how the dominant bottleneck shifts from warmup to weight loading as model size grows.
+<details>
+<summary>Previous Results (2026-04-10, initial profiling)</summary>
 
-| Phase | B1: DeepSeek 1.5B (3GB) | B2: Llama 8B (16GB) | B3: DeepSeek-V3-Lite (53GB) |
+### Model Size Scaling (old Group B)
+
+| Phase | DeepSeek 1.5B (3GB) | Llama 8B (16GB) | DeepSeek-V3-Lite (53GB) |
 |:------|:----------------------|:-------------------|:---------------------------|
 | **Total executor startup** | **49.1s** | **47.1s** | **114.2s** |
 | Weight loading total | 19.6s (40%) | 38.3s (81%) | 79.3s (69%) |
-| -- checkpoint prefetch | 18.2s (37%) | 35.2s (75%) | 68.6s (60%) |
-| -- parallel load | 0.0s | 0.0s | 0.4s |
-| -- apply weights | 0.7s (2%) | 2.6s (5%) | 9.8s (9%) |
-| -- model init (meta) | 0.6s (1%) | 0.5s (1%) | 0.4s |
 | Warmup total (1st pass) | 25.0s (51%) | 6.1s (13%) | 31.1s (27%) |
-| -- autotuner forward | 24.3s (50%) | 5.8s (12%) | 29.5s (26%) |
-| -- CUDA graphs | 0.2s | 0.2s | 1.2s (1%) |
-| -- memory pool | 0.0s | 0.0s | 0.3s |
-| Warmup (2nd pass) | 2.2s (5%) | 1.4s (3%) | 2.4s (2%) |
 
-**Key insights:**
-1. **Checkpoint prefetch dominates weight loading.** For all three models, prefetch (reading safetensor files into OS page cache) is >95% of the weight loading time.
-2. **Weight loading scales with checkpoint size** — roughly linearly: 18s for 3GB, 35s for 16GB, 69s for 53GB.
-3. **Autotuner cost is model-architecture-dependent, not size-dependent.** The 1.5B DeepSeek has a 24s autotuner warmup (50%), while the 8B Llama is only 5.8s (12%). This is because DeepSeek uses a different architecture with more expensive autotuner-profiled kernels.
-4. **The dominant bottleneck shifts with model size:** small models are warmup-dominated (51%), medium/large models are weight-loading-dominated (69-81%).
+### Remote-Cold Download (old Group G)
 
-### Replica Scaling Problem (Group A)
+| Phase | G1: 1.5B Remote-Cold | G3: 72B Remote-Cold |
+|:------|:---------------------|:--------------------|
+| **Total startup** | **38.4s** | **96.4s** |
+| `llm.hf.remote_download` | 3.4s | 44.0s |
+| Weight loading (worker) | 2.9s | 8.7s |
+| Warmup (1st pass) | 7.4s | 14.7s |
 
-Same model (DeepSeek-V3-Lite BF16, 53GB), first vs second cold start from the same local NFS checkpoint.
-
-| Phase | A1: 1st Replica | A2: 2nd Replica |
-|:------|:---------------|:---------------|
-| **Total executor startup** | **114.2s** | **47.6s** |
-| checkpoint prefetch | 68.6s (60%) | 5.6s (12%) |
-| apply weights | 9.8s (9%) | 8.3s (17%) |
-| autotuner forward (1st pass) | 29.5s (26%) | 27.7s (58%) |
-
-**Key insights:**
-5. **The 2nd replica starts 2.4x faster because checkpoint files are already in OS page cache** — prefetch drops from 68.6s to 5.6s (12x faster). This is a filesystem-level cache effect, not an application optimization.
-6. **Without MX/GMS, every cold start on a fresh node pays the full 69s prefetch.** In production autoscaling, new nodes don't have warm page caches.
-7. **Weight application time is stable** (~8-10s) regardless of cache state — it's GPU-memory-bound.
-8. **Autotuner cost is stable** (~28-30s) — it's compute-bound and doesn't benefit from page cache.
-
-### Autotuner Impact (Group C)
-
-Same model (DeepSeek-V3-Lite BF16, 53GB), autotuner enabled vs disabled.
-
-| Phase | C1: Autotuner ON | C2: Autotuner OFF |
-|:------|:----------------|:-----------------|
-| **Total executor startup** | **114.2s** | **88.6s** |
-| Weight loading total | 79.3s (69%) | 77.2s (87%) |
-| Warmup total (1st pass) | 31.1s (27%) | 7.5s (8%) |
-| -- autotuner forward | 29.5s | 0.0s (skipped) |
-| -- CUDA graphs | 1.2s | 7.1s |
-| -- memory pool | 0.3s | 0.2s |
-
-**Key insights:**
-9. **Disabling autotuner saves ~25.6s** (114.2s -> 88.6s), but CUDA graph capture becomes 6x more expensive (1.2s -> 7.1s) without optimized kernel selections.
-10. **The autotuner is almost entirely a forward pass cost** — `autotuner.forward` is 29.5s out of 29.5s total. Setup and sync are negligible.
-11. **Even without autotuner, weight loading still dominates** (87%). MX/GMS targets the right bottleneck for large models.
-
-### Serving Config Sensitivity (Group D)
-
-Same model (Llama 3.1 8B), small vs large serving configuration.
-
-| Phase | D1: Small (bs=4, nt=1024) | D2: Large (bs=64, nt=8192) |
-|:------|:-------------------------|:--------------------------|
-| **Total executor startup** | **47.1s** | **42.1s** |
-| checkpoint prefetch | 35.2s (75%) | 27.2s (65%) |
-| apply weights | 2.6s (5%) | 2.9s (7%) |
-| autotuner forward (1st pass) | 5.8s (12%) | 5.8s (14%) |
-| CUDA graphs (1st pass) | 0.2s (0.4%) | 1.4s (3.4%) |
-| CUDA graphs (2nd pass) | 0.1s | 1.2s (2.8%) |
-
-**Key insights:**
-12. **Autotuner forward cost is stable across configs** — 5.8s in both cases.
-13. **CUDA graph capture scales with `max_batch_size`** — 0.2s for 4 batch sizes to 1.4s for 34 batch sizes. Production configs would be even larger.
-14. **Weight loading is config-independent** — checkpoint I/O is the same regardless of serving parameters.
-
-### Multi-GPU Scaling (Group E)
-
-Same model (DeepSeek-V3-Lite BF16, 53GB), TP=1 vs TP=8 across 8 B300 GPUs.
-
-| Phase | B3: TP=1 (1 GPU) | E1: TP=8 (8 GPUs) |
-|:------|:----------------|:-----------------|
-| **Total executor startup (rank 0)** | **114.2s** | **108.6s** |
-| Weight loading total | 79.3s (69%) | 54.4s (50%) |
-| -- checkpoint prefetch | 68.6s (60%) | 32.1s (30%) |
-| -- checkpoint parallel load | 0.4s | 0.4s |
-| -- apply weights | 9.8s (9%) | 2.9s (3%) |
-| -- model init (meta) | 0.4s | 1.3s (1%) |
-| Warmup total (1st pass) | 31.1s (27%) | 46.0s (42%) |
-| -- autotuner forward | 29.5s (26%) | 42.2s (39%) |
-| -- CUDA graphs | 1.2s (1%) | 2.7s (3%) |
-| Warmup (2nd pass) | 2.4s (2%) | 3.0s (3%) |
-| Other (sampler, config, kv) | 1.4s | 5.2s (5%) |
-
-**Key insights:**
-15. **Weight loading is faster per-rank with TP=8** — each rank loads/applies only its shard of the weights. Prefetch drops from 68.6s to 32.1s because each rank only needs a subset of the safetensor data.
-16. **But autotuner is significantly more expensive with TP=8** — 42.2s vs 29.5s (43% longer). Multi-GPU NCCL collective ops (allreduce, allgather) during the synthetic forward pass add substantial overhead.
-17. **Overall startup is only marginally faster** (108.6s vs 114.2s) because the weight loading savings are offset by the increased warmup cost. TP does not meaningfully reduce total startup time.
-18. **MX/GMS benefit is amplified for multi-GPU** — eliminating weight loading for 8 ranks simultaneously would save 8x the per-rank I/O cost. GMS zero-copy import would reduce the 54.4s weight loading block to ~0.1s across all ranks.
-
-### HuggingFace Remote Download (Group F)
-
-Same model (DeepSeek-R1-Distill-Qwen-1.5B), local checkpoint vs fresh HF download.
-
-| Phase | B1: Local Checkpoint | F1: HF Download (fresh cache) |
-|:------|:--------------------|:-----------------------------|
-| **Total executor startup** | **49.1s** | **40.5s** |
-| `llm.cached_model_loader` (server) | 6.9s (HF cached) | 3.5s (HF fresh download) |
-| `llm.load_tokenizer` (server) | 0.9s | 0.8s |
-| Weight loading (worker) | 19.6s (40%) | 3.1s (8%) |
-| -- checkpoint prefetch | 18.2s (37%) | 1.6s (4%) |
-| -- apply weights | 0.7s (2%) | 0.6s (2%) |
-| Warmup total (1st pass) | 25.0s (51%) | 31.1s (77%) |
-| -- autotuner forward | 24.3s (50%) | 30.8s (76%) |
-
-**Key insights:**
-19. **HF download adds ~3.5s** for a 1.8 GB model (`llm.cached_model_loader` captures the download time). For larger models (70B+), this would be minutes — exactly what MX eliminates by P2P transfer from an existing replica.
-20. **Checkpoint prefetch is much faster after download** (1.6s vs 18.2s) because HF writes to local disk and the data is already warm in page cache.
-21. **The autotuner takes longer in the F1 run** (30.8s vs 24.3s) — this is likely due to different system load conditions rather than a fundamental difference. Autotuner cost varies by ~20% between runs.
-22. **For the HF download case, warmup completely dominates** (77% of executor time) because the weight loading is already fast from warm cache.
-
-### True Remote-Cold Download Protocol (Group G)
-
-To fairly compare local checkpoints vs remote HuggingFace fetch, the HF cache must be isolated and empty before the run. Otherwise `llm.cached_model_loader` can silently reuse a previous local cache hit.
-
-**Objective:** measure startup from a truly remote-cold model source.
-
-**Run controls:**
-- Use a unique, empty HF cache directory per run (`HF_HOME` + `HUGGINGFACE_HUB_CACHE`).
-- Use a fresh result directory per run.
-- Keep model/config fixed (`TP=1, max_batch_size=4, max_num_tokens=1024, max_seq_len=4096`).
-- If allowed by host policy, drop Linux page cache before run to avoid file-cache carryover.
-
-**Protocol (single-run G1):**
-```bash
-# 1) Isolated cache roots (guarantees no HF cache hit)
-export TEST_ROOT=/tmp/trtllm-startup-g1
-export HF_HOME=$TEST_ROOT/hf-home
-export HUGGINGFACE_HUB_CACHE=$TEST_ROOT/hf-hub
-export TRANSFORMERS_CACHE=$TEST_ROOT/transformers
-rm -rf "$TEST_ROOT"
-mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$TRANSFORMERS_CACHE" "$TEST_ROOT/results"
-
-# 2) Optional but recommended for strict cold filesystem state
-#    (requires sudo/admin privileges on most systems)
-# sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
-
-# 3) Start server with startup profiling enabled
-TRTLLM_PROFILE_STARTUP=1 \
-TRTLLM_STARTUP_PROFILE_OUTPUT=$TEST_ROOT/results/startup_profile_g1.json \
-trtllm-serve deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
-    --backend pytorch \
-    --host 127.0.0.1 \
-    --port 8000 \
-    --tensor_parallel_size 1 \
-    --max_batch_size 4 \
-    --max_num_tokens 1024 \
-    --max_seq_len 4096
-
-# 4) Run startup benchmark collection
-python tensorrt_llm/serve/scripts/benchmark_serving.py \
-    --backend openai \
-    --base-url http://127.0.0.1:8000 \
-    --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
-    --tokenizer deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
-    --dataset-name random --random-ids \
-    --num-prompts 1 \
-    --random-input-len 16 --random-output-len 8 \
-    --request-rate inf \
-    --save-result \
-    --save-startup-metrics \
-    --startup-timeout 600 \
-    --result-dir $TEST_ROOT/results
-```
-
-**What to report for G1:**
-- `llm.hf.cache_probe` (local cache lookup cost)
-- `llm.hf.remote_download` (true remote HF transfer cost)
-- `llm.cached_model_loader` (aggregate loader block that includes cache probe + remote download + local resolution)
-- `llm.load_tokenizer`, `llm.load_hf_model_config`, `llm.load_generation_config` (auxiliary metadata fetch costs)
-- Worker `executor.checkpoint_prefetch` (local file-read warmup after download)
-- Worker `executor.checkpoint_parallel_load` and `executor.apply_model_weights`
-- Worker warmup blocks (`executor.warmup.*`) for end-to-end startup attribution
-
-**G1 measured results (2026-04-10, true remote-cold cache):**
-
-| Phase | G1: HF Remote-Cold (isolated empty cache) |
-|:------|:------------------------------------------|
-| **Total startup (server, first-request-ready)** | **38.4s** |
-| `llm.cached_model_loader` (server) | 3.4s (8.8%) |
-| `llm.load_tokenizer` (server) | 0.9s (2.2%) |
-| `llm.create_executor` (server) | 33.6s (87.4%) |
-| **Total executor startup (worker rank 0)** | **14.1s** |
-| Weight loading total (worker) | 2.9s (20.9%) |
-| -- checkpoint prefetch | 1.7s (12.1%) |
-| -- checkpoint parallel load | 0.006s (0.04%) |
-| -- apply weights | 0.8s (5.5%) |
-| Warmup total (1st pass) | 7.4s (52.7%) |
-| -- autotuner forward | 7.1s (50.4%) |
-| -- CUDA graphs | 0.17s (1.2%) |
-| Warmup (2nd pass) | 2.1s (15.1%) |
-
-**Key insights:**
-23. **For small models, remote-cold download is short** (1.5B model), and most startup still sits in executor warmup.
-24. **`checkpoint_prefetch` remains low (1.7s)** because files are immediately local after download and warm in page cache.
-25. **Worker startup is warmup-dominated** even in remote-cold mode (7.4s first-pass warmup vs 2.9s weight loading).
-26. **For small models, remote download does not dominate startup**; for larger models, this block is expected to grow substantially and become the main MX target.
-
-**G3 measured results (2026-04-10, large-model remote-cold):**
-
-Model: `Qwen/Qwen2.5-72B-Instruct` (`TP=8, max_batch_size=4, max_num_tokens=1024, max_seq_len=4096`)
-
-| Phase | G3: 72B HF Remote-Cold (isolated empty cache) |
-|:------|:-----------------------------------------------|
-| **Total startup (server, first-request-ready)** | **96.4s** |
-| `llm.hf.cache_probe` | 0.00035s |
-| `llm.hf.remote_download` (rank 0) | 44.0s |
-| `llm.cached_model_loader` (server aggregate) | 64.0s (66.4%) |
-| `llm.create_executor` (server) | 31.2s (32.4%) |
-| **Total executor startup (worker rank 0)** | **75.7s** |
-| Weight loading total (worker rank 0) | 8.7s (11.5%) |
-| -- checkpoint prefetch | 3.4s (4.5%) |
-| -- checkpoint parallel load | 0.15s (0.2%) |
-| -- apply weights | 3.8s (5.0%) |
-| Warmup total (1st pass, rank 0) | 14.7s (19.4%) |
-| -- autotuner forward | 13.9s (18.3%) |
-| -- CUDA graphs | 0.56s (0.7%) |
-
-**G3 key insights:**
-27. **The explicit split timer makes remote transfer unambiguous:** `llm.hf.remote_download = 44.0s` for the 72B model.
-28. **`llm.cached_model_loader` now cleanly acts as an aggregate stage** (`cache_probe + remote_download + local resolution`) rather than the only download proxy.
-29. **Large-model remote download dominates server startup** (44.0s out of 96.4s total), which aligns with MX motivation.
-30. **Even for large models, rank-0 worker warmup remains non-trivial** (~14.7s), making compile/warmup caching a separate optimization target.
-
----
-
-## Summary Table
+### Old Summary Table
 
 | ID | Model | Config | Executor Total | Weight Load | Warmup (1st) | Dominant Bottleneck |
 |:---|:------|:-------|:--------------|:-----------|:------------|:-------------------|
 | B1 | DeepSeek 1.5B | TP=1,bs=4,nt=1024 | 49.1s | 19.6s (40%) | 25.0s (51%) | Warmup/autotuner |
 | B2 | Llama 8B | TP=1,bs=4,nt=1024 | 47.1s | 38.3s (81%) | 6.1s (13%) | Weight loading |
 | B3 | DeepSeek-V3-Lite 53GB | TP=1,bs=4,nt=1024 | 114.2s | 79.3s (69%) | 31.1s (27%) | Weight loading |
-| A2 | DeepSeek-V3-Lite (replica 2) | TP=1,bs=4,nt=1024 | 47.6s | 14.8s (31%) | 28.9s (61%) | Warmup (cached IO) |
-| C2 | DeepSeek-V3-Lite (no autotuner) | TP=1,bs=4,nt=1024 | 88.6s | 77.2s (87%) | 7.5s (8%) | Weight loading |
-| D2 | Llama 8B (large config) | TP=1,bs=64,nt=8192 | 42.1s | 30.7s (73%) | 7.5s (18%) | Weight loading |
-| **E1** | **DeepSeek-V3-Lite 53GB** | **TP=8,bs=4,nt=1024** | **108.6s** | **54.4s (50%)** | **46.0s (42%)** | **Both (balanced)** |
-| **F1** | **DeepSeek 1.5B (HF download)** | **TP=1,bs=4,nt=1024** | **40.5s** | **3.1s (8%)** | **31.1s (77%)** | **Warmup/autotuner** |
-| **G1** | **DeepSeek 1.5B (HF remote-cold)** | **TP=1,bs=4,nt=1024** | **14.1s** | **2.9s (21%)** | **7.4s (53%)** | **Warmup/autotuner** |
-| **G3** | **Qwen2.5-72B (HF remote-cold)** | **TP=8,bs=4,nt=1024** | **75.7s** | **8.7s (11%)** | **14.7s (19%)** | **HF remote download (server)** |
+| G1 | DeepSeek 1.5B (HF remote-cold) | TP=1,bs=4,nt=1024 | 14.1s | 2.9s (21%) | 7.4s (53%) | Warmup/autotuner |
+| G3 | Qwen2.5-72B (HF remote-cold) | TP=8,bs=4,nt=1024 | 75.7s | 8.7s (11%) | 14.7s (19%) | HF remote download |
+
+</details>
+
+---
+
+## Benchmark Results (v2)
+
+**Environment:** NVIDIA B300 SXM6 AC (275 GB), 8x GPUs available, PyTorch backend
+**Contract:** `first_request_ready` — profile finalized after first successful end-to-end request
+**Statistical protocol:** 5 runs per configuration; report median (min-max)
+
+*Results pending — will be populated after executing the 70-run benchmark matrix.*
 
 ---
 
 ## MX+GMS Impact Projection
 
-Based on the measured breakdowns, here is what MX+GMS would change for the DeepSeek-V3-Lite 53GB case:
+Scenario-based projection showing both first-instance and second-instance costs. The "first pays upfront, rest benefit" property of MX and GMS is reflected explicitly.
 
-| Scenario | Weight Load | Warmup | Other | Total |
-|:---------|:-----------|:-------|:------|:------|
-| **Baseline (current)** | 79.3s | 33.5s | 1.4s | **114.2s** |
-| **With MX (P2P from replica 1)** | ~15s | 33.5s | 1.4s | **~50s** |
-| **With MX+GMS (zero-copy import)** | ~0.1s | 33.5s | 1.4s | **~35s** |
-| **With MX+GMS+compile cache (future)** | ~0.1s | ~2s | 1.4s | **~3.5s** |
+Baseline uses **B2-S1 (Qwen 72B remote cold) median** once measured.
 
-**Observations:**
-1. MX alone reduces startup from **114s to ~50s** (56% reduction) by eliminating disk I/O for replicas.
-2. Adding GMS reduces it further to **~35s** (69% reduction) by zero-copy weight import.
-3. The warmup/autotuner floor (~33s) is the next frontier. Compile cache sharing would address this.
-4. The full stack (MX+GMS+compile cache) could bring replica startup from **minutes to single-digit seconds**.
+| Scenario | 1st Instance Weight Load | 2nd+ Instance Weight Load | Warmup (each) | Notes |
+|----------|--------------------------|---------------------------|---------------|-------|
+| 1. Baseline (no MX, no GMS) | Full storage I/O (measured) | Full storage I/O (measured) | Full (measured) | Every instance pays full cost |
+| 2. MX only (no GMS) | ~15s (P2P from donor node) | ~15s (P2P again) | Full (measured) | Each instance fetches independently via MX |
+| 3. GMS only (no MX) | Full storage I/O (measured) | ~0.1s (zero-copy) | Full (measured) | 1st pays storage cost; 2nd+ near-free on same node |
+| 4. MX + GMS | ~15s (P2P from donor node) | ~0.1s (zero-copy) | Full (measured) | 1st cheaper via MX; 2nd+ near-free via GMS |
+| 5. MX + GMS + compile cache | ~15s (P2P) | ~0.1s (zero-copy) | ~2s (cached) | Best case for all replicas |
 
 ---
 
