@@ -6,8 +6,8 @@
 | **PR** | [#12208](https://github.com/NVIDIA/TensorRT-LLM/pull/12208) |
 | **Author** | Chien-Chun Hung |
 | **Created** | 2026-03-13 |
-| **Last Updated** | 2026-04-03 |
-| **Status** | In review |
+| **Last Updated** | 2026-04-13 |
+| **Status** | Merged |
 
 ## Problem
 
@@ -38,7 +38,7 @@ This PR is justified on three grounds:
 
 2. **Robustness beyond the deadlock.** Even when RDMA avoids the deadlock, the fill loop prevents the GEN executor from doing any other work while it waits: no timeout handling, no error detection, no hang detector progress, no control request handling.
 
-3. **Code quality.** Consolidates duplicated gating logic, adds a missing `can_forward` gate to `_executor_loop`, fixes the ADP dummy counting bug, and provides 44 unit tests for a code path that previously had zero test coverage.
+3. **Code quality.** Consolidates duplicated gating logic, adds a missing `can_forward` gate to `_executor_loop`, fixes the ADP dummy counting bug, and provides 40 unit tests for a code path that previously had zero test coverage.
 
 ## Detailed Design Documents
 

@@ -32,7 +32,8 @@ Consolidates the gate logic shared by both `_executor_loop` and `_executor_loop_
 
 - When `is_warmup` is True: bypasses the gate (warmup must proceed normally).
 - When `can_forward` is already True: no-op (gate is latching).
-- When fill is incomplete: sleeps 1 second, returns `should_retry=True`.
+- When fill is incomplete: sleeps 0.1 seconds (aligned with PR #12640), returns `should_retry=True`.
+- When fill completes: sets `_benchmark_fill_phase_active = False` (enabling normal dummy lifecycle for taper-down), returns `can_forward=True`.
 
 The `tuple[bool, bool]` return exists because `can_forward` and `should_retry` are independent during warmup: `can_forward` stays False (so the gate activates after warmup ends) while `should_retry` is False (so the warmup forward pass proceeds). Collapsing to a single return would require either moving the warmup check to both callers (duplicating logic) or setting `can_forward=True` during warmup (permanently disabling the gate).
 

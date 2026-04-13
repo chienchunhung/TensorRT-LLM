@@ -10,6 +10,29 @@ The dummy request is a single-token placeholder that lets idle ranks participate
 
 Dummies follow an add-forward-terminate lifecycle: added before the forward pass, used during collectives, terminated after the forward pass in `_update_request_states_tp`. However, during the benchmark disagg fill phase, the `can_forward` gate prevents forward passes from running. A dummy added during the fill phase is never terminated — it permanently occupies a KV cache slot for the rest of the fill phase.
 
+## Two Phases: Fill vs Taper-Down
+
+The benchmark disagg mode has two distinct phases with different dummy requirements:
+
+### Fill Phase (`_benchmark_fill_phase_active = True`)
+
+The period between starting the GEN executor and the first forward pass. KV transfers are in progress, the `can_forward` gate is closed, and no forward-pass collectives run.
+
+- **Dummies should be skipped.** The gate prevents collectives, so empty ranks are safe. Adding a dummy would permanently waste a KV cache slot (no forward pass to terminate it).
+
+### Taper-Down Phase (`_benchmark_fill_phase_active = False`)
+
+The period after the gate opens and the benchmark is running. Requests generate tokens and finish at different rates (e.g., due to varied speculative decoding acceptance rates). Some ranks may temporarily become empty while others still have work.
+
+- **Dummies should be allowed.** Forward passes are running normally, so dummies follow the normal add-forward-terminate lifecycle. Ranks that temporarily empty out need dummies to participate in collectives.
+
+## The `_benchmark_fill_phase_active` Flag
+
+A runtime flag that starts `True` (when `is_benchmark_disagg` is True) and is cleared to `False` when the `can_forward` gate opens in `_check_benchmark_disagg_gate`. This cleanly separates the two phases:
+
+- `is_benchmark_disagg`: configuration fact — "we are in benchmark disagg mode" (never changes)
+- `_benchmark_fill_phase_active`: runtime state — "we are in the fill phase" (transitions once: True → False)
+
 ## Refactored Helper Methods
 
 ### `_count_schedulable_active_requests() -> int`
@@ -27,35 +50,14 @@ return sum(1 for req in self.active_requests
 
 ### `_should_skip_dummy_for_benchmark_disagg(num_schedulable_requests) -> bool`
 
-Encapsulates the skip decision with clear early returns:
+Simple check gated by the fill phase flag:
 
 ```python
-if not self.is_benchmark_disagg or self.is_warmup:
-    return False           # not in benchmark disagg mode
-if num_schedulable_requests > 0:
-    return False           # some requests are ready — don't skip
+if not self._benchmark_fill_phase_active or self.is_warmup:
+    return False    # not in fill phase — use normal dummy lifecycle
 
-fill_phase_complete = (self.num_fetch_requests
-                       >= self.benchmark_req_queues_size)
-some_ranks_permanently_empty = (self.enable_attention_dp
-                                and self.benchmark_req_queues_size
-                                < self.dist.tp_size)
-
-if fill_phase_complete and some_ranks_permanently_empty:
-    return False           # allow dummy — rank will never get a real request
-
-return True                # skip dummy in all other benchmark disagg cases
+return True         # fill phase active — skip dummies
 ```
-
-## The Skip Logic Explained
-
-Dummies are skipped throughout the benchmark disagg fill phase because:
-
-1. **The `can_forward` gate prevents forward-pass collectives during fill.** Temporarily-empty ranks are safe because no collectives run.
-2. **Dummies added during fill are never cleaned up.** The termination logic only runs after a forward pass. A stuck dummy permanently wastes a KV cache slot.
-3. **More requests will arrive.** During fill, temporarily-empty ranks will eventually receive real requests from the ADP router.
-
-The **one exception** is the terminal case: all benchmark requests have been fetched (`fill_phase_complete`) AND there are fewer total requests than TP ranks (`some_ranks_permanently_empty`). In that case, some ranks will **never** receive a real request and need a permanent dummy for forward-pass collectives once the gate opens.
 
 ## Why Not Add Dummies Early?
 
