@@ -184,8 +184,14 @@ def load_weights_vanilla_helper(module: Linear,
             assert "bias" in weights[0]
     device = torch.device('cuda')
 
-    weight = load_weight_shard(weights[0]['weight'], module.tp_size,
-                               module.tp_rank, module.tp_mode,
+    # Skip TP slicing when weights are already sharded (e.g. MX P2P transfer).
+    tp_size = 1 if getattr(module, '_weights_presharded',
+                           False) else module.tp_size
+    tp_rank = 0 if getattr(module, '_weights_presharded',
+                           False) else module.tp_rank
+
+    weight = load_weight_shard(weights[0]['weight'], tp_size,
+                               tp_rank, module.tp_mode,
                                device) if "weight" in weights[0] else None
 
     if weight is not None:
@@ -201,8 +207,8 @@ def load_weights_vanilla_helper(module: Linear,
         copy_weight(module.weight, weight_transform(weight))
 
     if module.bias is not None:
-        bias = load_weight_shard(weights[0]['bias'], module.tp_size,
-                                 module.tp_rank, module.tp_mode,
+        bias = load_weight_shard(weights[0]['bias'], tp_size,
+                                 tp_rank, module.tp_mode,
                                  device) if "bias" in weights[0] else None
         if bias is not None:
             copy_weight(module.bias, bias_transform(bias))
@@ -225,25 +231,31 @@ def load_weights_fused_qkv_helper(
         ) is not None, "Fused weight shard indices mapping is required in partial loading"
     device = torch.device('cuda')
 
-    q_weight = load_weight_shard(weights[0]['weight'], module.tp_size,
-                                 module.tp_rank, module.tp_mode,
+    # Skip TP slicing when weights are already sharded (e.g. MX P2P transfer).
+    tp_size = 1 if getattr(module, '_weights_presharded',
+                           False) else module.tp_size
+    tp_rank = 0 if getattr(module, '_weights_presharded',
+                           False) else module.tp_rank
+
+    q_weight = load_weight_shard(weights[0]['weight'], tp_size,
+                                 tp_rank, module.tp_mode,
                                  device) if "weight" in weights[0] else None
-    k_weight = load_weight_shard(weights[1]['weight'], module.tp_size,
-                                 module.tp_rank, module.tp_mode,
+    k_weight = load_weight_shard(weights[1]['weight'], tp_size,
+                                 tp_rank, module.tp_mode,
                                  device) if "weight" in weights[1] else None
-    v_weight = load_weight_shard(weights[2]['weight'], module.tp_size,
-                                 module.tp_rank, module.tp_mode,
+    v_weight = load_weight_shard(weights[2]['weight'], tp_size,
+                                 tp_rank, module.tp_mode,
                                  device) if "weight" in weights[2] else None
 
     if module.bias is not None:
-        q_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
-                                   module.tp_rank, module.tp_mode,
+        q_bias = load_weight_shard(weights[0]['bias'], tp_size,
+                                   tp_rank, module.tp_mode,
                                    device) if "bias" in weights[0] else None
-        k_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
-                                   module.tp_rank, module.tp_mode,
+        k_bias = load_weight_shard(weights[1]['bias'], tp_size,
+                                   tp_rank, module.tp_mode,
                                    device) if "bias" in weights[1] else None
-        v_bias = load_weight_shard(weights[2]['bias'], module.tp_size,
-                                   module.tp_rank, module.tp_mode,
+        v_bias = load_weight_shard(weights[2]['bias'], tp_size,
+                                   tp_rank, module.tp_mode,
                                    device) if "bias" in weights[2] else None
         if not allow_partial_loading:
             copy_weight(module.bias,
@@ -278,18 +290,24 @@ def load_weights_fused_gate_up_helper(
         ) is not None, "Fused weight shard indices mapping is required in partial loading"
     device = torch.device('cuda')
 
-    gate_weight = load_weight_shard(weights[0]['weight'], module.tp_size,
-                                    module.tp_rank, module.tp_mode,
+    # Skip TP slicing when weights are already sharded (e.g. MX P2P transfer).
+    tp_size = 1 if getattr(module, '_weights_presharded',
+                           False) else module.tp_size
+    tp_rank = 0 if getattr(module, '_weights_presharded',
+                           False) else module.tp_rank
+
+    gate_weight = load_weight_shard(weights[0]['weight'], tp_size,
+                                    tp_rank, module.tp_mode,
                                     device) if "weight" in weights[0] else None
-    up_weight = load_weight_shard(weights[1]['weight'], module.tp_size,
-                                  module.tp_rank, module.tp_mode,
+    up_weight = load_weight_shard(weights[1]['weight'], tp_size,
+                                  tp_rank, module.tp_mode,
                                   device) if "weight" in weights[1] else None
     if module.bias is not None:
-        gate_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
-                                      module.tp_rank, module.tp_mode,
+        gate_bias = load_weight_shard(weights[0]['bias'], tp_size,
+                                      tp_rank, module.tp_mode,
                                       device) if "bias" in weights[0] else None
-        up_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
-                                    module.tp_rank, module.tp_mode,
+        up_bias = load_weight_shard(weights[1]['bias'], tp_size,
+                                    tp_rank, module.tp_mode,
                                     device) if "bias" in weights[1] else None
         if not allow_partial_loading:
             copy_weight(module.bias,
@@ -2502,6 +2520,7 @@ class Linear(nn.Module):
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
         self.disable_deep_gemm = disable_deep_gemm
         self.fused_weight_shard_indices_mapping = fused_weight_shard_indices_mapping
+        self._weights_presharded = False
 
         # Store NVFP4 GEMM allowed backends configuration
         # Read from model_extra_attrs if not explicitly provided (allows config via llm_api_options)

@@ -3452,6 +3452,8 @@ class LoadFormat(Enum):
     DUMMY = 1
     # Only load the multimodal(vision) encoder weights
     VISION_ONLY = 2
+    # Load weights from GPU Memory Service (read-only GPU memory pool).
+    GMS = 3
 
 
 class SamplerType(StrEnum):
@@ -3683,6 +3685,48 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    mx_server_url: Optional[str] = Field(
+        default=None,
+        description=
+        "URL of the MX (Model eXchange) server for P2P weight transfer. "
+        "When set together with checkpoint_format='MX', enables GPU-to-GPU "
+        "weight transfer from a running source instance, bypassing disk I/O. "
+        "When the server is unreachable, loading falls back to the standard "
+        "HuggingFace checkpoint path.",
+        status="prototype",
+    )
+
+    gms_socket_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Unix domain socket path of the GPU Memory Service (GMS). "
+        "When set together with load_format='GMS', model weights are mapped "
+        "from a shared GPU memory pool managed by GMS, enabling near-zero "
+        "startup latency. Defaults to /tmp/gms-{device_id}.sock when not set. "
+        "The checkpoint_format axis (e.g. 'HF', 'MX') is independent and "
+        "controls which config/weight format is used.",
+        status="prototype",
+    )
+
+    gms_mode: Optional[str] = Field(
+        default="auto",
+        description=
+        "GMS operating mode: 'auto' (detect RW/RO automatically), "
+        "'rw' (first writer, loads weights into GMS pool), or "
+        "'ro' (read-only, maps existing weights from GMS pool). "
+        "Only used when load_format='GMS'.",
+        status="prototype",
+    )
+
+    gms_tag: str = Field(
+        default="model_weights",
+        description=
+        "Tag identifying the weight set in the GMS memory pool. "
+        "Used to distinguish multiple models or versions in the same "
+        "GMS instance. Only used when load_format='GMS'.",
+        status="prototype",
+    )
+
     kv_connector_config: Optional[KvCacheConnectorConfig] = Field(
         default=None,
         description="The config for KV cache connector.",
@@ -3786,6 +3830,8 @@ class TorchLlmArgs(BaseLlmArgs):
     def convert_load_format(cls, v):
         if isinstance(v, LoadFormat):
             return v
+        if isinstance(v, int):
+            return LoadFormat(v)
         load_format = v.upper()
         if load_format not in LoadFormat.__members__:
             raise ValueError(f"Invalid LoadFormat: {v}")
@@ -3893,6 +3939,32 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = "HF"
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_mx_config(self) -> 'TorchLlmArgs':
+        if self.mx_server_url is not None and self.checkpoint_format != "MX":
+            logger.warning(
+                "mx_server_url is set but checkpoint_format is '%s', not "
+                "'MX'. The mx_server_url will be ignored. Set "
+                "checkpoint_format='MX' to enable MX P2P weight transfer.",
+                self.checkpoint_format)
+        return self
+
+    @model_validator(mode="after")
+    def validate_gms_config(self) -> 'TorchLlmArgs':
+        if self.load_format == LoadFormat.GMS:
+            if self.gms_mode not in ("auto", "rw", "ro"):
+                raise ValueError(
+                    f"gms_mode must be 'auto', 'rw', or 'ro', "
+                    f"got '{self.gms_mode}'.")
+        if (self.gms_socket_path is not None
+                and self.load_format != LoadFormat.GMS):
+            logger.warning(
+                "gms_socket_path is set but load_format is '%s', not 'GMS'. "
+                "The gms_socket_path will be ignored. Set load_format='GMS' "
+                "to enable GPU Memory Service.",
+                self.load_format.name)
         return self
 
     @model_validator(mode="after")
