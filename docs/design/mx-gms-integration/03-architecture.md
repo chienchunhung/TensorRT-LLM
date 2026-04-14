@@ -35,8 +35,8 @@ graph TB
     MXServer <-->|gRPC| W_A1
     MXServer <-->|gRPC| W_B1
     MXServer <-->|gRPC| W_C1
-    GMS_A -->|"P2P via MX<br/>NIXL/RDMA"| GMS_B
-    GMS_A -->|"P2P via MX<br/>NIXL/RDMA"| GMS_C
+    W_A1 -->|"P2P via MX<br/>NIXL/RDMA"| W_B1
+    W_A1 -->|"P2P via MX<br/>NIXL/RDMA"| W_C1
 ```
 
 ## Component Responsibilities
