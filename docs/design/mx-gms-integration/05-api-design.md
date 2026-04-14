@@ -20,9 +20,11 @@ These compose independently. The checkpoint loader is selected by `checkpoint_fo
 | **Pure TRT-LLM** | `"HF"` (default) | `AUTO` (default) | Current behavior, unchanged |
 | **MX only** | `"MX"` | `AUTO` | MX P2P source, standard CUDA allocator |
 | **GMS only** | `"HF"` (default) | `GMS` | Disk source, GMS memory management |
-| **MX + GMS** | `"MX"` | `GMS` | MX P2P source, GMS memory management |
+| **MX + GMS** | `"MX"` | `GMS` | MX P2P source, GMS memory management **(see note below)** |
 
 **Why this matters:** MX is a weight *source* (it replaces where weights come from — P2P instead of disk). GMS is a memory *management mode* (it replaces how GPU memory is allocated and shared). Conflating them into a single enum (e.g., a combined `LoadFormat.MX_GMS`) creates combinatorial explosion and doesn't compose. The two-axis approach avoids this.
+
+> **Important: current prototype limitation.** In the current prototype, the "MX + GMS" combined mode behaves **identically** to "GMS only." The GMS RW path (first writer on a node) always loads from disk — it cannot leverage MX P2P because the MX SDK allocates received buffers outside the GMS memory pool (`torch.cuda.use_mem_pool` context). Weights received via MX P2P would land in regular CUDA memory that GMS cannot manage or share. See [Section 3 — architecture](03-architecture.md) for the full explanation and future optimization path. The two-axis model is architecturally correct and future-proof, but the composed "MX + GMS" benefit requires a future optimization (pre-allocating GMS pool buffers as MX P2P receive targets).
 
 ### Relationship to PR #12898
 
@@ -164,7 +166,7 @@ Key design decisions in the prototype:
 - **`GMSBackend` class instead of bare `get_gms_client()`.** The prototype wraps the GMS client SDK in a `GMSBackend` class that encapsulates connection, mode resolution, and lifecycle. This is the concrete implementation of the `GPUMemoryBackend` protocol (see [Section 6](#6-gms-api-stability-abstraction-new-trt-llm-code)).
 - **Mode resolved at connect time.** `GMSBackend.connect()` resolves `gms_mode="auto"` to RW or RO by checking `has_committed_weights(tag)`. The `is_rw` property is then used to branch in `ModelLoader.load()`.
 - **Meta-init preserved for GMS.** The prototype skips both the `meta→CUDA` tensor init and `model.to("cuda")` for `LoadFormat.GMS`. The RW path allocates under the GMS mem pool during weight loading; the RO path replaces meta tensors via `materialize_module()`.
-- **MX P2P not used in GMS RW mode.** When `checkpoint_format="MX"` + `load_format=GMS`, the GMS RW path does NOT attempt MX P2P because model parameters are still meta tensors (no CUDA buffers for P2P to write into). It loads from disk under the GMS pool instead. The MX+GMS priority cascade relies on GMS RO being the fast path (checking for committed weights first).
+- **MX P2P not used in GMS RW mode — MX+GMS combined = GMS-only in current prototype.** When `checkpoint_format="MX"` + `load_format=GMS`, the GMS RW path does NOT attempt MX P2P. The root cause is CUDA memory pool isolation: GMS requires all weight memory to be allocated under `torch.cuda.use_mem_pool(gms_pool)` so RO readers can zero-copy import it. MX P2P receives allocate buffers inside the MX/NIXL SDK, outside the GMS pool context — those weights cannot be managed or shared by GMS. Consequently, the GMS RW path loads from disk under the GMS pool, making `checkpoint_format="MX"` + `load_format=GMS` functionally identical to `checkpoint_format="HF"` + `load_format=GMS`. The future optimization (pre-allocate GMS pool buffers, then MX P2P into them) would make the combined mode genuinely faster than either alone.
 - **`post_load_weights()` ordering differs by path.** For GMS RO, `post_load_weights()` runs *before* `materialize_module()` so module aliases are set up correctly. For GMS RW and all other modes, `post_load_weights()` runs after weight loading as normal. A guard prevents double-execution.
 
 ```python

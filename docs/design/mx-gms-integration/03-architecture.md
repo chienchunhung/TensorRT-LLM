@@ -66,7 +66,23 @@ flowchart TD
     PostLoad2 --> Ready2["Ready to serve<br/>(minutes path, first writer)"]
 ```
 
-> **Prototype note (MX+GMS combined):** In the current prototype, the GMS RW path always loads from disk — MX P2P is **not** used in GMS RW mode because model parameters are meta tensors at that point (no CUDA buffers for P2P to write into). The priority cascade works through GMS RO: the first worker loads from disk into GMS (RW), subsequent workers import from GMS (RO, ~100ms). Cross-node replication happens via MX in `LoadFormat.AUTO` mode (without GMS). A future optimization could allocate CUDA buffers under the GMS pool first, then attempt MX P2P into those buffers.
+> **Critical design constraint — MX+GMS combined mode:**
+>
+> In the current prototype, `checkpoint_format="MX"` + `load_format=GMS` behaves **identically** to `checkpoint_format="HF"` + `load_format=GMS` (GMS-only). The MX checkpoint format provides no additional benefit when GMS is active. Here is why:
+>
+> **The root cause: CUDA memory pool isolation.** In GMS RW mode, all weight memory must live in the GMS-managed memory pool so that RO readers can later zero-copy import it. The loading path wraps weight loading in `torch.cuda.use_mem_pool(gms_pool)`, ensuring all CUDA allocations land in GMS memory. However, when MX receives weights via P2P RDMA, the MX/NIXL layer allocates CUDA buffers **inside the MX SDK** — outside the `use_mem_pool` context. Those received weights land in regular CUDA memory, not the GMS pool. This means GMS cannot track, manage, or share them with RO readers — defeating the entire purpose of GMS RW mode.
+>
+> **What this means in practice:**
+>
+> | Mode | Node B, Worker 1 (first on node) | Node B, Worker 2+ |
+> |:-----|:---------------------------------|:-------------------|
+> | **MX only** (`LoadFormat.AUTO`) | P2P from Node A (~15-30s), regular CUDA memory | Must load independently (no sharing) |
+> | **GMS only** (`LoadFormat.GMS`) | Load from disk (minutes), commits to GMS | Zero-copy RO (~100ms) |
+> | **MX + GMS** (`checkpoint_format="MX"`, `LoadFormat.GMS`) | Load from disk (minutes), commits to GMS — **same as GMS-only** | Zero-copy RO (~100ms) |
+>
+> MX and GMS currently operate as **separate modes**, not a truly composed solution. MX provides fast cross-node startup (in `LoadFormat.AUTO`); GMS provides within-node sharing + crash resilience (in `LoadFormat.GMS`). They do not compose because the GMS RW path cannot leverage MX P2P.
+>
+> **Future optimization path:** Pre-allocate empty CUDA buffers under the GMS pool, then pass those buffer pointers to the MX SDK as P2P receive targets. This would allow MX to write directly into GMS-managed memory, giving the best of both: P2P speed (~15-30s) + GMS sharing (~100ms for subsequent workers). This requires MX SDK support for receiving into pre-allocated buffers rather than SDK-managed allocations.
 
 For **MX-only mode** (`--checkpoint-format mx`, no GMS):
 
