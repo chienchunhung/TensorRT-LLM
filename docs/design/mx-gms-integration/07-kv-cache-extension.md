@@ -133,7 +133,7 @@ To ensure KV cache extension is possible later, Phases 1-3 must:
 
 1. **Use tag-based memory management consistently.** All GMS allocations should use tags (`model_weights`, `kv_cache`) so they can be managed independently.
 
-2. **Keep the GMS client API general.** Don't hardcode model-weight-specific assumptions. The `GMSAllocator` should work for any GPU memory, not just weight tensors.
+2. **Keep the GMS client API general.** Don't hardcode model-weight-specific assumptions. The `GPUMemoryBackend` protocol (see [API Design](05-api-design.md) Section 5.6) should work for any GPU memory, not just weight tensors.
 
 3. **Don't assume all GMS memory is static.** KV cache is dynamic (allocated/freed per request). The GMS allocator must support frequent alloc/free, not just bulk commit.
 

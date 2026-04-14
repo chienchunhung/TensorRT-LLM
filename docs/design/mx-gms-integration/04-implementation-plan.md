@@ -100,7 +100,7 @@ gantt
 ## Phase 1: MX + TRT-LLM (Cross-Node P2P) — 3-4 Weeks
 
 **Priority:** P1 (Tier 1) — competitive catch-up with vLLM
-**Objective:** Enable P2P weight transfer across nodes via `--load-format mx`
+**Objective:** Enable P2P weight transfer across nodes via `--checkpoint-format mx`
 
 ### Deliverables
 
@@ -153,7 +153,7 @@ TRT-LLM only needs to:
 
 - Unit tests: identity matching, fallback logic
 - Integration test: 2-node cluster, cold-start with MX vs baseline
-- Benchmark comparison against vLLM's `--load-format mx`
+- Benchmark comparison against vLLM's `--load-format mx` (vLLM uses `--load-format`; TRT-LLM uses `--checkpoint-format`)
 - **Gate:** Cold-start within 20% of vLLM MX for same model
 
 ### Phase 1 Success Criteria

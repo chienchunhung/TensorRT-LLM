@@ -135,14 +135,16 @@ graph LR
 ```yaml
 # Context instance config
 context:
-  load_format: mx-gms
+  checkpoint_format: mx         # Weight source axis: MX P2P
+  load_format: gms              # Memory mgmt axis: GMS shared memory
   mx_server_url: http://mx-server:8001
   gms_socket_path: /tmp/gms-ctx-0.sock
   gms_tag: model_weights:context
 
 # Generation instance config
 generation:
-  load_format: mx-gms
+  checkpoint_format: mx         # Weight source axis: MX P2P
+  load_format: gms              # Memory mgmt axis: GMS shared memory
   mx_server_url: http://mx-server:8001
   gms_socket_path: /tmp/gms-gen-0.sock
   gms_tag: model_weights:gen

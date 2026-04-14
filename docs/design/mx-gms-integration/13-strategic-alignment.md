@@ -42,7 +42,7 @@ graph LR
     subgraph "After Phase 1"
         VLLM_P1["vLLM: --load-format mx ✅"]
         SGLANG_P1["SGLang: elastic EP ✅"]
-        TRTLLM_P1["TRT-LLM: --load-format mx ✅"]
+        TRTLLM_P1["TRT-LLM: --checkpoint-format mx ✅"]
     end
 
     subgraph "After Phase 3"

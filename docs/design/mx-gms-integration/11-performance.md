@@ -22,12 +22,12 @@
 **What:** Time from process start to first successful inference.
 
 **Configurations:**
-| Config | load_format | Expected |
-|:-------|:-----------|:---------|
-| Baseline | `hf` | Minutes |
-| MX (2nd replica) | `mx` | 15-30s |
-| GMS (2nd worker) | `gms` | < 5s |
-| MX+GMS (2nd replica+worker) | `mx-gms` | < 30s |
+| Config | `checkpoint_format` | `load_format` | Expected |
+|:-------|:-------------------|:-------------|:---------|
+| Baseline | `HF` (default) | `AUTO` (default) | Minutes |
+| MX (2nd replica) | `MX` | `AUTO` | 15-30s |
+| GMS (2nd worker) | `HF` | `GMS` | < 5s |
+| MX+GMS (2nd replica+worker) | `MX` | `GMS` | < 30s |
 
 **Models:** TinyLlama-1.1B (sanity), Llama-3.1-8B (medium), Llama-3.1-70B (large), DeepSeek-V3 (MoE).
 
@@ -70,7 +70,7 @@ N=4: memory_4 ≈ model_size + 4*(kv_cache + overhead)
 
 ### Test 6: vLLM Comparison (Phase 1)
 
-**What:** Compare TRT-LLM `--load-format mx` against vLLM `--load-format mx`.
+**What:** Compare TRT-LLM `--checkpoint-format mx` against vLLM `--load-format mx`.
 
 **Metrics:**
 - Cold-start latency (2nd replica)

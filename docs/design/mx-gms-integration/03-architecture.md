@@ -53,7 +53,7 @@ graph TB
 
 ```mermaid
 flowchart TD
-    Start["TRT-LLM Worker starts<br/>--load-format mx-gms"] --> CheckGMS{"Local GMS has<br/>committed weights?"}
+    Start["TRT-LLM Worker starts<br/>--checkpoint-format mx --load-format gms"] --> CheckGMS{"Local GMS has<br/>committed weights?"}
 
     CheckGMS -->|Yes| ImportGMS["Import from GMS<br/>(RO mode, zero-copy)"]
     ImportGMS --> PostLoad["Run post_load_weights()<br/>Validate tensor shapes"]
@@ -64,15 +64,15 @@ flowchart TD
     QueryMX -->|Yes| FilterRank["Filter by matching<br/>TP/PP/EP rank"]
     FilterRank --> P2PReceive["P2P receive via NIXL<br/>(GPU-to-GPU RDMA)"]
     P2PReceive --> CommitGMS["Commit to local GMS<br/>(for future sharing)"]
-    CommitGMS --> PostLoad2["Run post_load_weights()"]
-    PostLoad2 --> PublishMX["Publish as MX source"]
-    PublishMX --> Ready2["Ready to serve<br/>(~15-30s path)"]
+    CommitGMS --> PublishMX["Publish as MX source<br/>(BEFORE post_load_weights)"]
+    PublishMX --> PostLoad2["Run post_load_weights()"]
+    PostLoad2 --> Ready2["Ready to serve<br/>(~15-30s path)"]
 
     QueryMX -->|No| LoadDisk["Load from disk/HuggingFace<br/>(standard path)"]
     LoadDisk --> CommitGMS2["Commit to local GMS"]
-    CommitGMS2 --> PostLoad3["Run post_load_weights()"]
-    PostLoad3 --> PublishMX2["Publish as MX source<br/>(seed the cluster)"]
-    PublishMX2 --> Ready3["Ready to serve<br/>(minutes path)"]
+    CommitGMS2 --> PublishMX2["Publish as MX source<br/>(BEFORE post_load_weights)"]
+    PublishMX2 --> PostLoad3["Run post_load_weights()"]
+    PostLoad3 --> Ready3["Ready to serve<br/>(minutes path)"]
 ```
 
 ## Data Flow: Shadow Failover
