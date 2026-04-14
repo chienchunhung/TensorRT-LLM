@@ -33,7 +33,7 @@ Efficient prefill/decode separation where context and generation workers may nee
 
 1. **Native MX support**: `--checkpoint-format mx` for P2P weight loading (parity with vLLM)
 2. **Native GMS support**: `--load-format gms` for shared memory loading
-3. **Combined MX+GMS**: `--checkpoint-format mx --load-format gms` for cross-node P2P with within-node sharing (the two axes compose independently — see [API Design](05-api-design.md) Section 5.1)
+3. **Combined MX+GMS**: `--checkpoint-format mx --load-format gms` for cross-node P2P with within-node sharing (the two axes compose independently — see [Implementation & API Design](04-implementation-plan.md#design-principle-two-orthogonal-axes))
 4. **Executor-level failover**: Shadow failover integrated with PyExecutor sleep/wake
 5. **KV cache extension path**: Design that enables future KV cache persistence via GMS/KVBM
 6. **Backward compatibility**: Existing workflows unchanged; MX/GMS are opt-in

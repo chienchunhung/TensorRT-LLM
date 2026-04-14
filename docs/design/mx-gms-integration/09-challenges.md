@@ -88,7 +88,7 @@ candidates = [s for s in sources if s.worker_rank == my_rank]
 
 **Mitigation:**
 - Use `torch.cuda.memory.CUDAPluggableAllocator` API (provided by the GMS client library)
-- The GMS library already implements the allocator (`CUDAPluggableAllocator` + `MemPool`), the CUDA VMM FD import/export (`cuda_utils.py`), and zero-copy tensor construction (`materialize_module_from_gms`). **TRT-LLM does not reimplement any of this** — it only wraps model loading inside `torch.cuda.use_mem_pool(gms_pool)` for the RW path, or calls `materialize_module_from_gms()` for the RO path. See [API Design](05-api-design.md) Section 5.5 for a full inventory.
+- The GMS library already implements the allocator (`CUDAPluggableAllocator` + `MemPool`), the CUDA VMM FD import/export (`cuda_utils.py`), and zero-copy tensor construction (`materialize_module_from_gms`). **TRT-LLM does not reimplement any of this** — it only wraps model loading inside `torch.cuda.use_mem_pool(gms_pool)` for the RW path, or calls `materialize_module_from_gms()` for the RO path. See [Implementation & API Design](04-implementation-plan.md#library-inventory) for a full inventory.
 - Handle allocation/deallocation lifecycle at TRT-LLM orchestration level:
   - RW mode: wrap model loading in GMS memory pool context manager
   - RO mode: call `materialize_module_from_gms()` after `post_load_weights()`
@@ -116,7 +116,7 @@ candidates = [s for s in sources if s.worker_rank == my_rank]
 **Challenge:** The GPU Memory Service (GMS) API used in the [prototype PR #7053](https://github.com/ai-dynamo/dynamo/pull/7053) may evolve before GA. The prototype demonstrates a working integration including `materialize_module_from_gms`, RW/RO lock semantics, and tagged memory operations, but the public API surface has not been formally stabilized.
 
 **Mitigation:**
-- Define a thin `GPUMemoryBackend` protocol in TRT-LLM (see [API Design](05-api-design.md) Section 5.4) to insulate TRT-LLM from GMS API changes:
+- Define a thin `GPUMemoryBackend` protocol in TRT-LLM (see [Implementation & API Design](04-implementation-plan.md#gms-api-stability-abstraction)) to insulate TRT-LLM from GMS API changes:
   ```python
   class GPUMemoryBackend(Protocol):
       def has_committed_weights(self, tag: str) -> bool: ...
@@ -150,7 +150,7 @@ candidates = [s for s in sources if s.worker_rank == my_rank]
 - Source publish logic is split between `model_loader.py` and `worker.py` with a fragile `getattr` chain
 
 **Mitigation:**
-- Coordinate with MX team to refactor toward the two-axis model: MX as `checkpoint_format="MX"` (weight source), not a `LoadFormat` (see [API Design](05-api-design.md) Section 5.1)
+- Coordinate with MX team to refactor toward the two-axis model: MX as `checkpoint_format="MX"` (weight source), not a `LoadFormat` (see [Implementation & API Design](04-implementation-plan.md#design-principle-two-orthogonal-axes))
 - Adopt PR #12898's validated insights: pre-`post_load_weights()` publish timing, `_weights_presharded` TP-skip on Linear modules
 - If PR #12898 lands first: build on top of it incrementally — extract the `PRESHARDED` logic into an `MXCheckpointLoader`, migrate env var to `TorchLlmArgs` field, and add `LoadFormat.GMS` at the next available enum slot
 

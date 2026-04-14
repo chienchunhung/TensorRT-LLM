@@ -87,7 +87,7 @@ graph TB
 
 ## TensorRT-LLM Current Architecture (Relevant Extension Points)
 
-TRT-LLM's `ModelLoader.load()` has two independent axes that MX and GMS map onto naturally (see [API Design](05-api-design.md) Section 5.1 for full rationale):
+TRT-LLM's `ModelLoader.load()` has two independent axes that MX and GMS map onto naturally (see [Implementation & API Design](04-implementation-plan.md#design-principle-two-orthogonal-axes) for full rationale):
 
 | Axis | Controlled by | Current values | MX/GMS maps to |
 |:-----|:-------------|:---------------|:----------------|

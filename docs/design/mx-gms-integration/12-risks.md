@@ -59,7 +59,7 @@
 
 **Mitigation:**
 - MX and GMS are optional — defaults (`checkpoint_format="HF"`, `LoadFormat.AUTO`) preserve current behavior
-- The two-axis design (see [API Design](05-api-design.md) Section 5.1) keeps MX and GMS decoupled — each can be used independently or removed without affecting the other
+- The two-axis design (see [Implementation & API Design](04-implementation-plan.md#design-principle-two-orthogonal-axes)) keeps MX and GMS decoupled — each can be used independently or removed without affecting the other
 - `GPUMemoryBackend` protocol allows alternative GMS implementations
 - Both MX and GMS are open-source
 
