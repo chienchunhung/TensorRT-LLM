@@ -53,26 +53,38 @@ graph TB
 
 ```mermaid
 flowchart TD
-    Start["TRT-LLM Worker starts<br/>--checkpoint-format mx --load-format gms"] --> CheckGMS{"Local GMS has<br/>committed weights?"}
+    Start["TRT-LLM Worker starts<br/>--checkpoint-format mx --load-format gms"] --> CheckGMS{"Local GMS has<br/>committed weights?<br/>(GMSBackend.connect resolves mode)"}
 
-    CheckGMS -->|Yes| ImportGMS["Import from GMS<br/>(RO mode, zero-copy)"]
-    ImportGMS --> PostLoad["Run post_load_weights()<br/>Validate tensor shapes"]
-    PostLoad --> Ready["Ready to serve<br/>(~100ms path)"]
+    CheckGMS -->|"Yes (RO mode)"| PostLoadRO["Run post_load_weights()<br/>(set up module aliases FIRST)"]
+    PostLoadRO --> ImportGMS["materialize_module()<br/>(GMS RO, zero-copy import)"]
+    ImportGMS --> Ready["Ready to serve<br/>(~100ms path)"]
 
-    CheckGMS -->|No| QueryMX{"MX server has<br/>READY sources?"}
+    CheckGMS -->|"No (RW mode)"| LoadUnderPool["Load from disk under<br/>torch.cuda.use_mem_pool(gms_pool)"]
+    LoadUnderPool --> CommitGMS["finalize_write() →<br/>commit to local GMS"]
+    CommitGMS --> PublishMX["Publish as MX source<br/>(BEFORE post_load_weights)"]
+    PublishMX --> PostLoad2["Run post_load_weights()"]
+    PostLoad2 --> Ready2["Ready to serve<br/>(minutes path, first writer)"]
+```
+
+> **Prototype note (MX+GMS combined):** In the current prototype, the GMS RW path always loads from disk — MX P2P is **not** used in GMS RW mode because model parameters are meta tensors at that point (no CUDA buffers for P2P to write into). The priority cascade works through GMS RO: the first worker loads from disk into GMS (RW), subsequent workers import from GMS (RO, ~100ms). Cross-node replication happens via MX in `LoadFormat.AUTO` mode (without GMS). A future optimization could allocate CUDA buffers under the GMS pool first, then attempt MX P2P into those buffers.
+
+For **MX-only mode** (`--checkpoint-format mx`, no GMS):
+
+```mermaid
+flowchart TD
+    Start2["TRT-LLM Worker starts<br/>--checkpoint-format mx"] --> QueryMX{"MX server has<br/>compatible sources?"}
 
     QueryMX -->|Yes| FilterRank["Filter by matching<br/>TP/PP/EP rank"]
     FilterRank --> P2PReceive["P2P receive via NIXL<br/>(GPU-to-GPU RDMA)"]
-    P2PReceive --> CommitGMS["Commit to local GMS<br/>(for future sharing)"]
-    CommitGMS --> PublishMX["Publish as MX source<br/>(BEFORE post_load_weights)"]
-    PublishMX --> PostLoad2["Run post_load_weights()"]
-    PostLoad2 --> Ready2["Ready to serve<br/>(~15-30s path)"]
+    P2PReceive --> MarkPresharded["Mark Linear modules<br/>_weights_presharded = True"]
+    MarkPresharded --> PublishMX3["Publish as MX source<br/>(BEFORE post_load_weights)"]
+    PublishMX3 --> PostLoad4["Run post_load_weights()"]
+    PostLoad4 --> Ready3["Ready to serve<br/>(~15-30s path)"]
 
-    QueryMX -->|No| LoadDisk["Load from disk/HuggingFace<br/>(standard path)"]
-    LoadDisk --> CommitGMS2["Commit to local GMS"]
-    CommitGMS2 --> PublishMX2["Publish as MX source<br/>(BEFORE post_load_weights)"]
-    PublishMX2 --> PostLoad3["Run post_load_weights()"]
-    PostLoad3 --> Ready3["Ready to serve<br/>(minutes path)"]
+    QueryMX -->|No| LoadDisk2["Load from disk/HuggingFace<br/>(inherited HF fallback)"]
+    LoadDisk2 --> PublishMX4["Publish as MX source"]
+    PublishMX4 --> PostLoad5["Run post_load_weights()"]
+    PostLoad5 --> Ready4["Ready to serve<br/>(minutes path)"]
 ```
 
 ## Data Flow: Shadow Failover
@@ -121,16 +133,16 @@ flowchart LR
     end
 
     subgraph "Weight Source Axis (checkpoint_format)"
-        D1["MX: @register_checkpoint_loader('MX')<br/>(TRT-LLM code, calls MX SDK)<br/>Sets _weights_presharded when P2P"]
+        D1["MX: HfCheckpointLoader subclass<br/>lazy connect, P2P via modelexpress SDK<br/>p2p_succeeded → _weights_presharded"]
     end
 
     subgraph "Memory Mgmt Axis (LoadFormat)"
-        D3["GMS RW: wrap with<br/>torch.cuda.use_mem_pool(gms_pool)<br/>(GMS library provides allocator)"]
-        D4["GMS RO: materialize_module_from_gms<br/>(GMS library function, bypasses<br/>checkpoint_loader entirely)"]
+        D3["GMS RW: load under<br/>torch.cuda.use_mem_pool(gms_pool)<br/>then finalize_write() + commit"]
+        D4["GMS RO: post_load_weights() first<br/>then materialize_module()<br/>(zero-copy from GMS pool)"]
     end
 
     subgraph "Post-Load Hooks (TRT-LLM orchestration)"
-        D2["MX: publish_as_source() BEFORE post_load_weights<br/>GMS: finalize_write() after loading"]
+        D2["MX: publish_as_source(model, mapping, checkpoint_dir)<br/>BEFORE post_load_weights<br/>Fires for AUTO and GMS-RW modes"]
     end
 
     D -.->|"checkpoint_format=MX"| D1
@@ -138,3 +150,5 @@ flowchart LR
     C -.->|"LoadFormat.GMS (RO)"| D4
     E -.->|"Add hooks"| D2
 ```
+
+> **Prototype reference:** See the [`dynamo-integration-prototype`](https://github.com/chienchunhung/TensorRT-LLM/tree/dynamo-integration-prototype) branch for the full working implementation.

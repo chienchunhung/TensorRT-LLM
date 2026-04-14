@@ -1,8 +1,8 @@
 # TensorRT-LLM Integration with ModelExpress and GPU Memory Service
 
-**Status:** Draft (Revised)
+**Status:** Draft (Revised) — [Prototype available](https://github.com/chienchunhung/TensorRT-LLM/tree/dynamo-integration-prototype)
 **Created:** 2026-04-01
-**Last Updated:** 2026-04-08
+**Last Updated:** 2026-04-13
 
 ---
 

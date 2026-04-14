@@ -2,7 +2,7 @@
 
 [< Back to Overview](README.md)
 
-**Last Updated:** 2026-04-08
+**Last Updated:** 2026-04-13
 
 ---
 
@@ -14,6 +14,7 @@ This plan treats MX and GMS as **library dependencies**, not things to reimpleme
 
 - **MX (ModelExpress)**: The [`modelexpress`](https://github.com/ai-dynamo/modelexpress) library provides a gRPC server, Python client SDK, and NIXL-based GPU-to-GPU transfer. vLLM's `--load-format mx` integration is a thin loader (~500 lines) that calls the MX client API. [PR #12898](https://github.com/NVIDIA/TensorRT-LLM/pull/12898) demonstrates a working MX prototype with TRT-LLM using `LoadFormat.PRESHARDED`.
 - **GMS (GPU Memory Service)**: The [`gpu_memory_service`](https://github.com/ai-dynamo/dynamo/pull/7053) library provides the CUDA VMM allocator, RW/RO client, and socket-based locking. PR #7053 shows a working TRT-LLM integration (~300 lines of TRT-LLM-specific model loading code) that calls the GMS client.
+- **Two-axis prototype**: The [`dynamo-integration-prototype`](https://github.com/chienchunhung/TensorRT-LLM/tree/dynamo-integration-prototype) branch implements the two-axis integration model described in this design doc (~830 lines changed across 15 files). It covers both the MX checkpoint loader and GMS loading mode with RW/RO dual paths, ready for benchmarking.
 
 ### Two-Axis Integration Model
 
@@ -116,38 +117,37 @@ gantt
 
 **Weeks 1-2: MX Checkpoint Loader + Configuration**
 
-The MX loader follows the same `BaseCheckpointLoader` pattern as the existing HF loader. The key difference is the weight source. MX integrates as a `checkpoint_format` (weight source axis), not a `LoadFormat` (memory management axis) — see [API Design](05-api-design.md) Section 5.1 for rationale.
+The MX loader **subclasses `HfCheckpointLoader`** so disk fallback is inherited automatically. MX integrates as a `checkpoint_format` (weight source axis), not a `LoadFormat` (memory management axis) — see [API Design](05-api-design.md) Section 5.2 for rationale and full code.
 
 ```python
 @register_checkpoint_loader("MX")
-class MXCheckpointLoader(BaseCheckpointLoader):
-    def load_weights(self, checkpoint_dir, mapping, **kwargs):
-        # 1. Query MX server for existing sources with matching identity
-        sources = self._mx_client.list_sources(self._build_identity(mapping))
-        compatible = [s for s in sources if self._rank_matches(s, mapping)]
+class MXCheckpointLoader(HfCheckpointLoader):
+    """P2P via modelexpress SDK, with inherited HF disk fallback."""
 
-        if compatible:
-            # 2a. P2P receive from existing source (fast path)
-            self._weights_presharded = True  # Signal to skip TP slicing
-            return self._mx_client.receive(compatible[0])
-        else:
-            # 2b. Load from disk normally, then register as MX source
-            self._weights_presharded = False
-            weights = self._fallback_loader.load_weights(checkpoint_dir, mapping)
-            return weights
+    def load_weights(self, checkpoint_dir, mapping, **kwargs):
+        model = kwargs.pop("model", None)
+        self._p2p_succeeded = False
+
+        if self._mx_server_url is not None and model is not None:
+            if self._try_p2p_transfer(model, mapping, checkpoint_dir):
+                self._p2p_succeeded = True
+                return {}  # Weights already in model params
+
+        # Fallback: disk loading via inherited HF pipeline
+        return super().load_weights(checkpoint_dir, mapping=mapping, **kwargs)
 ```
 
 The MX client SDK (`modelexpress.client`) handles:
-- gRPC connection to MX server
-- Source registration and discovery
-- NIXL-based P2P transfer
+- gRPC connection to MX server (lazy — called inside `_try_p2p_transfer`, not in `__init__`)
+- Source registration and discovery (`list_sources`, `register_source`)
+- NIXL-based P2P transfer (`receive`)
 - Heartbeat and lifecycle
 
 TRT-LLM only needs to:
-- Call the client at the right time (inside `load_weights`)
-- Build the `SourceIdentity` with TRT-LLM's parallelism config (TP/PP/EP ranks)
+- Call the client at the right time (inside `_try_p2p_transfer`, called from `load_weights`)
+- Build the `SourceIdentity` with TRT-LLM's parallelism config (TP/PP/EP ranks) via `_build_identity()`
 - Handle the config plumbing (`TorchLlmArgs.checkpoint_format`, `TorchLlmArgs.mx_server_url`)
-- Publish as MX source BEFORE `post_load_weights()` (learned from [PR #12898](https://github.com/NVIDIA/TensorRT-LLM/pull/12898) — targets run their own transforms)
+- Publish as MX source BEFORE `post_load_weights()` via `publish_as_source(model, mapping, checkpoint_dir)`
 
 **Weeks 3-4: Testing + Comparison**
 
@@ -177,36 +177,50 @@ TRT-LLM only needs to:
 | # | Deliverable | Description | TRT-LLM Files |
 |:--|:-----------|:-----------|:------|
 | 2.1 | GMS loading mode | `LoadFormat.GMS` branch in `ModelLoader.load()` with RW/RO paths | `_torch/pyexecutor/model_loader.py` |
-| 2.2 | Sleep/wake GMS tag mapping | Map `release_with_tag("kv_cache")` to GMS-safe operations | `_torch/pyexecutor/py_executor_creator.py` |
-| 2.3 | Shadow failover integration | PyExecutor shadow mode with GMS-backed activation | `_torch/pyexecutor/py_executor.py` |
-| 2.4 | Configuration schema | `LoadFormat.GMS`, `gms_socket_path`, `gms_mode` in `TorchLlmArgs` | `llmapi/llm_args.py` |
-| 2.5 | Tests and documentation | Failover tests, memory sharing verification | `tests/`, `docs/` |
+| 2.2 | `GMSBackend` class | Protocol-based abstraction + concrete implementation | `_torch/memory/gpu_memory_backend.py` |
+| 2.3 | Sleep/wake GMS tag mapping | Map `release_with_tag("kv_cache")` to GMS-safe operations | `_torch/pyexecutor/py_executor_creator.py` |
+| 2.4 | Shadow failover integration | PyExecutor shadow mode with GMS-backed activation | `_torch/pyexecutor/py_executor.py` |
+| 2.5 | Configuration schema | `LoadFormat.GMS`, `gms_socket_path`, `gms_mode`, `gms_tag` in `TorchLlmArgs` | `llmapi/llm_args.py` |
+| 2.6 | Tests and documentation | Failover tests, memory sharing verification | `tests/`, `docs/` |
 
 ### Implementation Details
 
 **Weeks 1-2: GMS Weight Loader + Sleep/Wake**
 
-GMS integrates as a `LoadFormat` (memory management axis), not a `checkpoint_format` — it changes *how GPU memory is managed*, not *where weights come from*. The `LoadFormat.GMS` branch composes with **any** checkpoint loader (HF for disk, MX for P2P). Pattern validated in [PR #7053](https://github.com/ai-dynamo/dynamo/pull/7053):
+GMS integrates as a `LoadFormat` (memory management axis), not a `checkpoint_format` — it changes *how GPU memory is managed*, not *where weights come from*. The `LoadFormat.GMS` branch uses a `GMSBackend` class that wraps the `gpu_memory_service.client` SDK. Pattern validated in [PR #7053](https://github.com/ai-dynamo/dynamo/pull/7053):
 
 ```python
 # Inside ModelLoader.load() — new LoadFormat.GMS branch
-if load_format == LoadFormat.GMS:
-    gms_client = get_gms_client(self.llm_args)
+elif load_format == LoadFormat.GMS:
+    from tensorrt_llm._torch.memory import GMSBackend
 
-    if gms_client.has_committed_weights(tag="model_weights"):
-        # RO mode: zero-copy import from existing GMS pool (~100ms)
-        model = AutoModelForCausalLM.from_config(config)  # meta init
-        model.post_load_weights()  # Fix module aliases (PR #7053 fix)
-        materialize_module_from_gms(gms_client, model)     # GMS library call
-    else:
-        # RW mode: load via checkpoint_loader (HF or MX) under GMS pool
-        gms_pool = gms_client.get_mem_pool()               # GMS library call
+    gms_backend = GMSBackend(
+        socket_path=self.llm_args.gms_socket_path,
+        mapping=self.mapping,
+        mode=self.llm_args.gms_mode or "auto",
+        tag=self.llm_args.gms_tag or "model_weights",
+    )
+    if not gms_backend.connect():
+        raise RuntimeError("Failed to connect to GMS")
+
+    if gms_backend.is_rw:
+        # RW mode: load via checkpoint_loader under GMS memory pool
+        gms_pool = gms_backend.get_mem_pool()
         with torch.cuda.use_mem_pool(gms_pool, device=device):
-            # checkpoint_loader could be HF or MX — GMS doesn't care
-            weights = checkpoint_loader.load_weights(checkpoint_dir, mapping)
-            model.load_weights(weights, weight_mapper)
-        gms_client.finalize_write(model)                   # GMS library call
+            weights = checkpoint_loader.load_weights(checkpoint_dir, ...)
+            if weights:
+                # ... weight mapper setup, model.load_weights() ...
+        gms_backend.finalize_write(model)
+    else:
+        # RO mode: post_load_weights() FIRST, then zero-copy materialize
+        for module in model.modules():
+            if hasattr(module, 'post_load_weights'): module.post_load_weights()
+        gms_backend.materialize_module(model)  # also sets _weights_presharded
+
+    self._gms_backend = gms_backend
 ```
+
+> **Note:** The prototype skips `meta→CUDA` tensor init and `model.to("cuda")` for `LoadFormat.GMS` — the RW path allocates under the GMS pool, and the RO path replaces meta tensors via `materialize_module()`. MX P2P is not used in GMS RW mode (meta tensors have no CUDA buffers for P2P to write into).
 
 The GMS client library (`gpu_memory_service.client`) handles:
 - CUDA VMM allocation and FD-based sharing
@@ -214,9 +228,9 @@ The GMS client library (`gpu_memory_service.client`) handles:
 - `materialize_module_from_gms()` for zero-copy tensor import
 
 TRT-LLM only needs to:
-- Call `materialize_module_from_gms` at the right lifecycle point (after `post_load_weights()`)
+- Call `materialize_module` at the right lifecycle point (after `post_load_weights()` for RO)
 - Map sleep/wake tags to GMS operations: `release_with_tag("kv_cache")` frees KV cache via virtual-memory tagged operations while keeping GMS-managed weights untouched
-- Handle configuration (`TorchLlmArgs.load_format`, `TorchLlmArgs.gms_socket_path`, `TorchLlmArgs.gms_mode`)
+- Handle configuration (`TorchLlmArgs.load_format`, `TorchLlmArgs.gms_socket_path`, `TorchLlmArgs.gms_mode`, `TorchLlmArgs.gms_tag`)
 
 **Weeks 3-4: Shadow Failover + Testing**
 
