@@ -13,18 +13,35 @@ Default serving config: `max_batch_size=4, max_num_tokens=1024, max_seq_len=4096
 
 ## Storage Tier Matrix (Group S)
 
-| Tier | ID | Description | Setup |
-|------|----|-------------|-------|
-| Remote cold | S1 | Fresh download from HF, no local cache | Isolated empty `HF_HOME` + `HUGGINGFACE_HUB_CACHE` |
-| NFS cache | S2 | Model files on NFS, cold page cache | Existing NFS path; drop page cache before run |
-| Local node cache | S3 | Model files hot in OS page cache | Run after a prior load (2nd replica scenario) |
+Three tiers measuring different weight-loading scenarios:
+
+| Tier | ID | What it measures | Setup |
+|------|----|-----------------|-------|
+| Remote cold | S1 | Full HF download over network + model load | Isolated empty HF cache on `/tmp` (tmpfs); every run downloads from scratch |
+| NFS cold | S2 | NFS file read (no page cache) + model load | Model files pre-copied to a **fresh NFS directory per run** (new inodes), guaranteeing cold page cache without needing `drop_caches` privileges |
+| Local warm | S3 | Page-cache-warm file read + model load | Model files on NFS, page cache hot from a prior run; simulates 2nd replica on the same node |
 
 **Default tier: S1 (remote cold).**
 
+### S2 Methodology: Ensuring True NFS-Cold Reads
+
+The Linux page cache is keyed on `(device, inode)`. Once a file is read, subsequent reads of the same inode are served from RAM regardless of the file path. This means:
+- Simply pointing at the same NFS directory for multiple runs would make runs 2+ effectively warm (S3).
+- Dropping page cache (`echo 3 > /proc/sys/vm/drop_caches`) requires root/sysctl privileges that may not be available on shared nodes.
+
+To guarantee cold NFS reads without special privileges, each S2 run:
+1. Copies the model to a **new directory** (`_s2_nfs_cold/<model>_runN/`) using `cp -rL`, creating fresh inodes.
+2. Serves from the new directory.
+3. Cleans up the previous run's copy to keep disk usage at ~1x model size.
+
+The copy time is **not** included in the benchmark measurement.
+
 ## Statistical Protocol
 
-- Each configuration runs **5 times**.
+- Each configuration runs **3 times**.
 - Report: **median**, **min**, **max** for each profiled phase.
+- Automate via `run_startup_bench.sh` (single config) and `run_startup_bench_all.sh` (full matrix).
+- Post-process with `aggregate_startup_results.py` for median/min/max extraction.
 
 ## Test Matrix
 
@@ -32,26 +49,26 @@ Default serving config: `max_batch_size=4, max_num_tokens=1024, max_seq_len=4096
 
 | Test ID | Model | Tier | TP | Runs | Purpose |
 |---------|-------|------|----|------|---------|
-| B1-S1 | Qwen 7B | S1 | 1 | 5 | Small baseline (Qwen) |
-| B2-S1 | Qwen 72B | S1 | 8 | 5 | Large baseline (Qwen) |
-| B3-S1 | DeepSeek 7B | S1 | 1 | 5 | Small baseline (DeepSeek) |
-| B4-S1 | DeepSeek 70B | S1 | 8 | 5 | Large baseline (DeepSeek) |
+| B1-S1 | Qwen 7B | S1 | 1 | 3 | Small baseline (Qwen) |
+| B2-S1 | Qwen 72B | S1 | 8 | 3 | Large baseline (Qwen) |
+| B3-S1 | DeepSeek 7B | S1 | 1 | 3 | Small baseline (DeepSeek) |
+| B4-S1 | DeepSeek 70B | S1 | 8 | 3 | Large baseline (DeepSeek) |
 
 ### Part 2: Storage Tier Comparison (large models only)
 
 | Test ID | Model | Tier | TP | Runs | Purpose |
 |---------|-------|------|----|------|---------|
-| B2-S2 | Qwen 72B | S2 | 8 | 5 | NFS cold page cache |
-| B2-S3 | Qwen 72B | S3 | 8 | 5 | Warm page cache (2nd replica) |
-| B4-S2 | DeepSeek 70B | S2 | 8 | 5 | NFS cold page cache |
-| B4-S3 | DeepSeek 70B | S3 | 8 | 5 | Warm page cache (2nd replica) |
+| B2-S2 | Qwen 72B | S2 | 8 | 3 | NFS cold (fresh inode copy per run) |
+| B2-S3 | Qwen 72B | S3 | 8 | 3 | Warm page cache (2nd replica) |
+| B4-S2 | DeepSeek 70B | S2 | 8 | 3 | NFS cold (fresh inode copy per run) |
+| B4-S3 | DeepSeek 70B | S3 | 8 | 3 | Warm page cache (2nd replica) |
 
 ### Part 3: Autotuner Impact (Group C, large models, S1)
 
 | Test ID | Model | Tier | TP | Autotuner | Runs | Purpose |
 |---------|-------|------|----|-----------|------|---------|
-| B2-S1-C | Qwen 72B | S1 | 8 | OFF | 5 | Isolate autotuner cost (Qwen) |
-| B4-S1-C | DeepSeek 70B | S1 | 8 | OFF | 5 | Isolate autotuner cost (DeepSeek) |
+| B2-S1-C | Qwen 72B | S1 | 8 | OFF | 3 | Isolate autotuner cost (Qwen) |
+| B4-S1-C | DeepSeek 70B | S1 | 8 | OFF | 3 | Isolate autotuner cost (DeepSeek) |
 
 Compare against B2-S1 and B4-S1 (autotuner ON by default).
 
@@ -59,10 +76,10 @@ Compare against B2-S1 and B4-S1 (autotuner ON by default).
 
 | Test ID | Model | Tier | TP | Config | Runs | Purpose |
 |---------|-------|------|----|--------|------|---------|
-| B2-S1-D1 | Qwen 72B | S1 | 8 | bs=64, nt=8192 | 5 | Large batch + token budget |
-| B4-S1-D1 | DeepSeek 70B | S1 | 8 | bs=64, nt=8192 | 5 | Large batch + token budget |
-| B2-S1-D2 | Qwen 72B | S1 | 8 | max_seq_len=16384 | 5 | Long-sequence KV cache impact |
-| B4-S1-D2 | DeepSeek 70B | S1 | 8 | max_seq_len=16384 | 5 | Long-sequence KV cache impact |
+| B2-S1-D1 | Qwen 72B | S1 | 8 | bs=64, nt=8192 | 3 | Large batch + token budget |
+| B4-S1-D1 | DeepSeek 70B | S1 | 8 | bs=64, nt=8192 | 3 | Large batch + token budget |
+| B2-S1-D2 | Qwen 72B | S1 | 8 | max_seq_len=16384 | 3 | Long-sequence KV cache impact |
+| B4-S1-D2 | DeepSeek 70B | S1 | 8 | max_seq_len=16384 | 3 | Long-sequence KV cache impact |
 
 Compare against B2-S1 and B4-S1 (default bs=4, nt=1024, max_seq_len=4096).
 
@@ -70,11 +87,11 @@ Compare against B2-S1 and B4-S1 (default bs=4, nt=1024, max_seq_len=4096).
 
 ### Summary
 
-Total: **14 configurations x 5 runs = 70 benchmark runs**.
+Total: **14 configurations x 3 runs = 42 benchmark runs**.
 
 ## Impact Projection Matrix
 
-Scenario-based projection using **B2-S1 median** as measured baseline. Shows both 1st and 2nd+ instance costs.
+Scenario-based projection using **B2-S1 median** as measured baseline. Shows both 1st and 2nd+ instance costs to reflect the "first pays upfront, rest benefit" property of MX and GMS.
 
 | Scenario | 1st Instance Weight Load | 2nd+ Instance Weight Load | Warmup (each) | Notes |
 |----------|--------------------------|---------------------------|---------------|-------|
