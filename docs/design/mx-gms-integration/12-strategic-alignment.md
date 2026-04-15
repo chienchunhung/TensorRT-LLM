@@ -1,4 +1,4 @@
-# 13. Strategic Alignment
+# 12. Strategic Alignment
 
 [< Back to Overview](README.md)
 
@@ -25,7 +25,7 @@ The [TRT-LLM Architecture Overview](../../overview/README.md) identifies three c
 
 | Feature | How MX/GMS Helps | Impact |
 |:--------|:-----------------|:-------|
-| **KVaaS / distributed KV fabric** (Section 5.3, Item 3.4) | GMS's out-of-process memory and MX's P2P transfer are the building blocks for cluster-wide KV cache sharing. The KV Cache Extension Path (Section 7) designs this trajectory. | **Foundation** |
+| **KVaaS / distributed KV fabric** (Section 5.3, Item 3.4) | GMS's out-of-process memory and MX's P2P transfer are the building blocks for cluster-wide KV cache sharing. The KV Cache Extension Path (Section 8) designs this trajectory. | **Foundation** |
 | **Agentic workflow optimization** (Section 5.3, Item 3.2) | Persistent agent sessions benefit from crash-resilient KV cache (future GMS+KV extension). Shadow failover preserves agent state across crashes. | **Enabler** |
 | **Hardware co-design** (Section 5.3, Item 3.3) | GMS's CUDA VMM integration and MX's RDMA leverage NVIDIA-specific hardware advantages that competitors cannot match. | **Deepens moat** |
 

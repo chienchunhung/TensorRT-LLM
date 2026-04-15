@@ -1,4 +1,4 @@
-# 7. KV Cache Extension Path
+# 8. KV Cache Extension Path
 
 [< Back to Overview](README.md)
 

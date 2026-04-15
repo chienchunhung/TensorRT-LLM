@@ -315,7 +315,7 @@ elif load_format == LoadFormat.GMS:
 
 `post_load_weights()` creates **module aliases** (e.g., `layer.next_attn = self.model.layers[idx+1].self_attn`). Because `self_attn` is an `nn.Module`, PyTorch's `__setattr__` registers it in `layer._modules['next_attn']`. GMS's `materialize_module_from_gms()` walks the module tree to resolve stored tensor paths — if `next_attn` doesn't exist yet, resolution fails with `AttributeError`.
 
-This is safe because at GMS RO time the model is still on meta device — `post_load_weights()` only performs Python pointer assignments, no tensor operations. See [Challenges — Module Path Resolution](09-challenges.md#7-module-path-resolution-gms-specific) for details.
+This is safe because at GMS RO time the model is still on meta device — `post_load_weights()` only performs Python pointer assignments, no tensor operations. See [Challenges — Module Path Resolution](05-challenges.md#7-module-path-resolution-gms-specific) for details.
 
 ### GMS API Stability Abstraction
 

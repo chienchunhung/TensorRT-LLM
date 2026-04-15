@@ -1,4 +1,4 @@
-# 10. Startup Performance Profiling
+# 9. Startup Performance Profiling
 
 [< Back to Overview](README.md)
 

@@ -1,4 +1,4 @@
-# 8. Disaggregated Serving Interaction
+# 7. Disaggregated Serving Interaction
 
 [< Back to Overview](README.md)
 

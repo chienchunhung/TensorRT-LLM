@@ -172,7 +172,7 @@ Shadow Activation:
   - Client sees minimal interruption
 ```
 
-This connects to the [KV Cache Extension Path](07-kv-cache-extension.md) and would be Phase 4+ work.
+This connects to the [KV Cache Extension Path](08-kv-cache-extension.md) and would be Phase 4+ work.
 
 ## Health Check Protocol
 

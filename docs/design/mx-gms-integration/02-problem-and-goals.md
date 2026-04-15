@@ -27,7 +27,7 @@ Instant switchover when primary worker fails. A shadow worker maintains VA-stabl
 Zero-downtime model version updates. New version loads via MX while old version continues serving. GMS enables atomic switchover.
 
 ### UC5: Disaggregated Serving
-Efficient prefill/decode separation where context and generation workers may need different startup patterns and memory sharing strategies (see [Disaggregated Serving Interaction](08-disagg-interaction.md)).
+Efficient prefill/decode separation where context and generation workers may need different startup patterns and memory sharing strategies (see [Disaggregated Serving Interaction](07-disagg-interaction.md)).
 
 ## Goals
 
@@ -44,5 +44,5 @@ Efficient prefill/decode separation where context and generation workers may nee
 1. Modifying MX or GMS core implementations
 2. Supporting legacy TensorRT engine backend (PyTorch backend only)
 3. Automatic MX server deployment (separate concern)
-4. Full KV cache sharing via GMS in this proposal (designed for, not implemented — see [KV Cache Extension](07-kv-cache-extension.md))
-5. Compile cache sharing via MX (future work, noted in [Startup Profiling](10-startup-profiling.md))
+4. Full KV cache sharing via GMS in this proposal (designed for, not implemented — see [KV Cache Extension](08-kv-cache-extension.md))
+5. Compile cache sharing via MX (future work, noted in [Startup Profiling](09-startup-profiling.md))
