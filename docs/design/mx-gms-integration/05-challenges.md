@@ -145,8 +145,8 @@ candidates = [s for s in sources if s.worker_rank == my_rank]
 
 **Challenge:** [PR #12898](https://github.com/NVIDIA/TensorRT-LLM/pull/12898) from the MX team adds `LoadFormat.PRESHARDED = 3` as a prototype MX integration. This conflates weight source and memory management into a single `LoadFormat` value, which prevents clean composition with GMS. Specific conflicts:
 - `LoadFormat.PRESHARDED = 3` occupies the enum slot we need for `LoadFormat.GMS`
-- The `MODEL_EXPRESS_SOURCE` env var bypasses `TorchLlmArgs` configuration
-- Source publish logic is split between `model_loader.py` and `worker.py` with a fragile `getattr` chain
+- The `MODEL_EXPRESS_URL` / `MODEL_EXPRESS_TARGET` env vars bypass `TorchLlmArgs` configuration
+- Source publish logic is split between `model_loader.py` and `worker.py` (duplicated `publish_from_worker` calls) with env-var-gated control flow
 
 **Mitigation:**
 - Coordinate with MX team to refactor toward the two-axis model: MX as `checkpoint_format="MX"` (weight source), not a `LoadFormat` (see [Implementation & API Design](04-implementation-plan.md#design-principle-two-orthogonal-axes))
