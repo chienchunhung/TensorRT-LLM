@@ -90,8 +90,9 @@ candidates = [s for s in sources if s.worker_rank == my_rank]
 - Use `torch.cuda.memory.CUDAPluggableAllocator` API (provided by the GMS client library)
 - The GMS library already implements the allocator (`CUDAPluggableAllocator` + `MemPool`), the CUDA VMM FD import/export (`cuda_utils.py`), and zero-copy tensor construction (`materialize_module_from_gms`). **TRT-LLM does not reimplement any of this** — it only wraps model loading inside `torch.cuda.use_mem_pool(gms_pool)` for the RW path, or calls `materialize_module_from_gms()` for the RO path. See [Implementation & API Design](04-implementation-plan.md#library-inventory) for a full inventory.
 - Handle allocation/deallocation lifecycle at TRT-LLM orchestration level:
-  - RW mode: wrap model loading in GMS memory pool context manager
+  - RW mode: wrap model loading in GMS memory pool context manager; move stray params into pool via `move_untracked_params()`; finalize via `finalize_write()` which commits, disconnects RW, reconnects as RO, and remaps VAs
   - RO mode: call `materialize_module_from_gms()` after `post_load_weights()`
+  - VMM safety: apply `patch_empty_cache()` on connect to prevent segfaults from `torch.cuda.empty_cache()` on VMM-backed allocations
   - Shutdown: release GMS client connection (GMS handles cleanup)
 - **Risk mitigation:** Start with simple contiguous allocations; handle edge cases (views, in-place ops) incrementally
 
@@ -123,9 +124,13 @@ candidates = [s for s in sources if s.worker_rank == my_rank]
       def get_mem_pool(self) -> torch.cuda.MemPool: ...
       def materialize_module(self, model: torch.nn.Module) -> None: ...
       def finalize_write(self, model: torch.nn.Module, tag: str) -> None: ...
+      def move_untracked_params(self, model: torch.nn.Module) -> None: ...
       def release(self, tag: str) -> None: ...
       def cleanup(self) -> None: ...
   ```
+- `finalize_write()` mirrors the GMS library's `finalize_gms_write()` — after `register_module_tensors + commit`, it disconnects the RW client, reconnects as RO, and remaps virtual addresses so tensors remain valid under the new RO client
+- `move_untracked_params()` moves any parameters allocated outside the `use_mem_pool` context (stray buffers from `post_load_weights()` or transforms) into the GMS pool before `finalize_write()`, ensuring all model state is committed to shared memory
+- `connect()` applies `patch_empty_cache()` from `gpu_memory_service.integrations.common.patches` to prevent `torch.cuda.empty_cache()` from segfaulting on VMM-backed GMS allocations — this is critical for MoE models whose load balancer calls `empty_cache()` during `make_tensor_host_accessible()`
 - GMS client implements this protocol; if the API changes, only the adapter changes
 - Verify API stability with Dynamo team before Phase 2 starts
 - Have a fallback plan: if GMS API is unstable, a `CudaIpcBackend` could implement the same protocol (less featured — no crash resilience or zero-copy, but uses stable CUDA IPC APIs)
