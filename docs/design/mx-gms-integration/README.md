@@ -38,8 +38,8 @@ The integration targets three critical production pain points simultaneously: sl
 
 ### Part IV: Performance & Benchmarks
 
-9. [Startup Performance Profiling](09-startup-profiling.md) — **Implemented.** Hierarchical profiler, benchmark workflow, real DeepSeek results
-10. [Performance Expectations and Benchmark Plan](10-performance.md) — Target metrics, detailed test matrix, impact projections
+9. [Startup Profiling Framework](09-startup-profiling.md) — **Implemented.** Hierarchical profiler, instrumentation, how to run, schema reference
+10. [Performance Expectations and Benchmark Plan](10-performance.md) — Target metrics, detailed test matrix, impact projections, baseline results
 
 ### Part V: Strategy & Risk
 

@@ -1,4 +1,4 @@
-# 9. Startup Performance Profiling
+# 9. Startup Profiling Framework
 
 [< Back to Overview](README.md)
 
@@ -231,72 +231,6 @@ The **JSON artifact** contains:
 - `records[]`: hierarchical tree of `{name, start_offset_s, duration_s, metadata, children[]}`
 - `metadata`: server-level info (model, host, port, startup_contract, first_request_id)
 - `attached_profiles.executor.ranks[]`: per-rank executor worker profiles (same tree schema)
-
----
-
-## Benchmark Plan (v2)
-
-See [startup-benchmark-plan-v2.md](startup-benchmark-plan-v2.md) for the full revised test matrix, including model selection, storage tiers, statistical protocol, and impact projection.
-
-**Previous results** from the initial profiling runs (2026-04-10) are preserved below for reference. They will be superseded by v2 results once the 70-run matrix completes.
-
-<details>
-<summary>Previous Results (2026-04-10, initial profiling)</summary>
-
-### Model Size Scaling (old Group B)
-
-| Phase | DeepSeek 1.5B (3GB) | Llama 8B (16GB) | DeepSeek-V3-Lite (53GB) |
-|:------|:----------------------|:-------------------|:---------------------------|
-| **Total executor startup** | **49.1s** | **47.1s** | **114.2s** |
-| Weight loading total | 19.6s (40%) | 38.3s (81%) | 79.3s (69%) |
-| Warmup total (1st pass) | 25.0s (51%) | 6.1s (13%) | 31.1s (27%) |
-
-### Remote-Cold Download (old Group G)
-
-| Phase | G1: 1.5B Remote-Cold | G3: 72B Remote-Cold |
-|:------|:---------------------|:--------------------|
-| **Total startup** | **38.4s** | **96.4s** |
-| `llm.hf.remote_download` | 3.4s | 44.0s |
-| Weight loading (worker) | 2.9s | 8.7s |
-| Warmup (1st pass) | 7.4s | 14.7s |
-
-### Old Summary Table
-
-| ID | Model | Config | Executor Total | Weight Load | Warmup (1st) | Dominant Bottleneck |
-|:---|:------|:-------|:--------------|:-----------|:------------|:-------------------|
-| B1 | DeepSeek 1.5B | TP=1,bs=4,nt=1024 | 49.1s | 19.6s (40%) | 25.0s (51%) | Warmup/autotuner |
-| B2 | Llama 8B | TP=1,bs=4,nt=1024 | 47.1s | 38.3s (81%) | 6.1s (13%) | Weight loading |
-| B3 | DeepSeek-V3-Lite 53GB | TP=1,bs=4,nt=1024 | 114.2s | 79.3s (69%) | 31.1s (27%) | Weight loading |
-| G1 | DeepSeek 1.5B (HF remote-cold) | TP=1,bs=4,nt=1024 | 14.1s | 2.9s (21%) | 7.4s (53%) | Warmup/autotuner |
-| G3 | Qwen2.5-72B (HF remote-cold) | TP=8,bs=4,nt=1024 | 75.7s | 8.7s (11%) | 14.7s (19%) | HF remote download |
-
-</details>
-
----
-
-## Benchmark Results (v2)
-
-**Environment:** NVIDIA B300 SXM6 AC (275 GB), 8x GPUs available, PyTorch backend
-**Contract:** `first_request_ready` — profile finalized after first successful end-to-end request
-**Statistical protocol:** 5 runs per configuration; report median (min-max)
-
-*Results pending — will be populated after executing the 70-run benchmark matrix.*
-
----
-
-## MX+GMS Impact Projection
-
-Scenario-based projection showing both first-instance and second-instance costs. The "first pays upfront, rest benefit" property of MX and GMS is reflected explicitly.
-
-Baseline uses **B2-S1 (Qwen 72B remote cold) median** once measured.
-
-| Scenario | 1st Instance Weight Load | 2nd+ Instance Weight Load | Warmup (each) | Notes |
-|----------|--------------------------|---------------------------|---------------|-------|
-| 1. Baseline (no MX, no GMS) | Full storage I/O (measured) | Full storage I/O (measured) | Full (measured) | Every instance pays full cost |
-| 2. MX only (no GMS) | ~15s (P2P from donor node) | ~15s (P2P again) | Full (measured) | Each instance fetches independently via MX |
-| 3. GMS only (no MX) | Full storage I/O (measured) | ~0.1s (zero-copy) | Full (measured) | 1st pays storage cost; 2nd+ near-free on same node |
-| 4. MX + GMS | ~15s (P2P from donor node) | ~0.1s (zero-copy) | Full (measured) | 1st cheaper via MX; 2nd+ near-free via GMS |
-| 5. MX + GMS + compile cache | ~15s (P2P) | ~0.1s (zero-copy) | ~2s (cached) | Best case for all replicas |
 
 ---
 

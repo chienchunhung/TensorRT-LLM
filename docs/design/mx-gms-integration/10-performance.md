@@ -174,6 +174,46 @@ Scenario-based projection using **B2-S1 median** as measured baseline. Shows bot
 | 4. MX + GMS | ~15s (P2P from donor node) | ~0.1s (zero-copy) | Full (measured) | 1st cheaper via MX; 2nd+ near-free via GMS |
 | 5. MX + GMS + compile cache | ~15s (P2P) | ~0.1s (zero-copy) | ~2s (cached) | Best case for all replicas |
 
+## Benchmark Results
+
+**Environment:** NVIDIA B300 SXM6 AC (275 GB), 8x GPUs available, PyTorch backend
+**Contract:** `first_request_ready` — profile finalized after first successful end-to-end request
+**Statistical protocol:** 3 runs per configuration; report median (min-max)
+
+*v2 results pending — will be populated after executing the 42-run benchmark matrix.*
+
+<details>
+<summary>Previous Results (2026-04-10, initial profiling)</summary>
+
+### Model Size Scaling
+
+| Phase | DeepSeek 1.5B (3GB) | Llama 8B (16GB) | DeepSeek-V3-Lite (53GB) |
+|:------|:----------------------|:-------------------|:---------------------------|
+| **Total executor startup** | **49.1s** | **47.1s** | **114.2s** |
+| Weight loading total | 19.6s (40%) | 38.3s (81%) | 79.3s (69%) |
+| Warmup total (1st pass) | 25.0s (51%) | 6.1s (13%) | 31.1s (27%) |
+
+### Remote-Cold Download
+
+| Phase | 1.5B Remote-Cold | 72B Remote-Cold |
+|:------|:---------------------|:--------------------|
+| **Total startup** | **38.4s** | **96.4s** |
+| `llm.hf.remote_download` | 3.4s | 44.0s |
+| Weight loading (worker) | 2.9s | 8.7s |
+| Warmup (1st pass) | 7.4s | 14.7s |
+
+### Summary
+
+| ID | Model | Config | Executor Total | Weight Load | Warmup (1st) | Dominant Bottleneck |
+|:---|:------|:-------|:--------------|:-----------|:------------|:-------------------|
+| B1 | DeepSeek 1.5B | TP=1,bs=4,nt=1024 | 49.1s | 19.6s (40%) | 25.0s (51%) | Warmup/autotuner |
+| B2 | Llama 8B | TP=1,bs=4,nt=1024 | 47.1s | 38.3s (81%) | 6.1s (13%) | Weight loading |
+| B3 | DeepSeek-V3-Lite 53GB | TP=1,bs=4,nt=1024 | 114.2s | 79.3s (69%) | 31.1s (27%) | Weight loading |
+| G1 | DeepSeek 1.5B (HF remote-cold) | TP=1,bs=4,nt=1024 | 14.1s | 2.9s (21%) | 7.4s (53%) | Warmup/autotuner |
+| G3 | Qwen2.5-72B (HF remote-cold) | TP=8,bs=4,nt=1024 | 75.7s | 8.7s (11%) | 14.7s (19%) | HF remote download |
+
+</details>
+
 ## Performance Regression Detection
 
 ```python
