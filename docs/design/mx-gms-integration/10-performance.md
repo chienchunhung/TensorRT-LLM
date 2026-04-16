@@ -185,6 +185,27 @@ Serving config sensitivity on S1 (B2-S1-D1/D2, B4-S1-D1/D2) not yet run — low 
 **Total profiles collected:** 62 across 21 configurations
 **Note:** S1 (remote cold) downloads used an internal HF CDN/mirror achieving ~2 GB/s. Public cloud download times will be significantly longer.
 
+### Reading the Results Tables
+
+The startup profiler spans **two processes** that run sequentially:
+
+1. **Server process** — downloads/resolves the model, then spawns the executor worker.
+2. **Executor worker process** — loads weights from disk, runs warmup, signals ready.
+
+The tables below show a hierarchical timer tree. Indented rows (prefixed with `└─` or `├─`) are **children** of the row above — their time is already included in the parent. Only top-level (non-indented) rows are additive. For example, "HF remote download" is *inside* "Cached model loader", not separate from it.
+
+**How total startup adds up** (using Qwen 72B S1 as example):
+
+```
+Total startup = 93.4s
+│
+├─ [Server]  Cached model loader         63.5s  ← includes HF download (43.9s)
+├─ [Worker]  Weight loading total          8.7s  ← includes prefetch (3.5s) + apply (3.8s) + other
+├─ [Worker]  Warmup (1st pass)            12.1s  ← includes autotuner (11.3s) + CUDA graphs (0.6s)
+├─ [Worker]  Warmup (2nd pass)             4.1s
+└─ [Both]    Other overhead               ~5.0s  ← config, sampler, KV cache setup, IPC, etc.
+```
+
 ### Part 1 — Model Size Scaling (S1, Remote Cold Download)
 
 Fresh HF download to `/tmp` (tmpfs) each run. All times in seconds (median).
@@ -192,15 +213,17 @@ Fresh HF download to `/tmp` (tmpfs) each run. All times in seconds (median).
 | Metric | B1: Qwen 7B (TP=1) | B3: DS 7B (TP=1) | B2: Qwen 72B (TP=8) | B4: DS 70B (TP=8) |
 |:-------|----:|----:|----:|----:|
 | **Total startup** | **36.1** | **38.2** | **93.4** | **95.5** |
-| HF remote download | 6.4 | 6.6 | 43.9 | 42.9 |
-| Cached model loader | 6.4 | 6.6 | 63.5 | 62.5 |
-| Weight loading total | 5.5 | 7.5 | 8.7 | 10.5 |
-| — Checkpoint prefetch | 2.3 | 4.2 | 3.5 | 5.3 |
-| — Apply weights | 2.8 | 2.8 | 3.8 | 3.6 |
-| Warmup (1st pass) | 4.9 | 4.8 | 12.1 | 12.8 |
-| — Autotuner forward | 4.6 | 4.5 | 11.3 | 12.1 |
-| — CUDA graphs | 0.1 | 0.1 | 0.6 | 0.5 |
-| Warmup (2nd pass) | 1.6 | 1.6 | 4.1 | 4.0 |
+| Cached model loader (server) | 6.4 | 6.6 | 63.5 | 62.5 |
+| └─ HF remote download | 6.4 | 6.6 | 43.9 | 42.9 |
+| Weight loading total (worker) | 5.5 | 7.5 | 8.7 | 10.5 |
+| ├─ Checkpoint prefetch | 2.3 | 4.2 | 3.5 | 5.3 |
+| └─ Apply weights | 2.8 | 2.8 | 3.8 | 3.6 |
+| Warmup — 1st pass (worker) | 4.9 | 4.8 | 12.1 | 12.8 |
+| ├─ Autotuner forward | 4.6 | 4.5 | 11.3 | 12.1 |
+| └─ CUDA graphs | 0.1 | 0.1 | 0.6 | 0.5 |
+| Warmup — 2nd pass (worker) | 1.6 | 1.6 | 4.1 | 4.0 |
+
+The four top-level phases (cached model loader + weight loading + warmup 1st + warmup 2nd) sum to ~88s for Qwen 72B; the remaining ~5s is executor overhead (config loading, sampler creation, KV cache setup, IPC signaling).
 
 ### Part 2 — Storage Tier Comparison (72B/70B Models, TP=8)
 
@@ -209,11 +232,13 @@ S1 = remote cold download, S2 = NFS cold (fresh inode copy per run), S3 = NFS wa
 | Metric | Qwen 72B S1 | Qwen 72B S2 | Qwen 72B S3 | DS 70B S1 | DS 70B S2 | DS 70B S3 |
 |:-------|----:|----:|----:|----:|----:|----:|
 | **Total startup** | **93.4** | **114.4** | **50.2** | **95.5** | **146.1** | **52.9** |
-| Model loader (server) | 63.5 | 0.003 | 0.002 | 62.5 | 0.003 | 0.001 |
-| Checkpoint prefetch | 3.5 | 67.7 | 3.3 | 5.3 | 99.2 | 6.0 |
-| Apply weights | 3.8 | 3.8 | 3.7 | 3.6 | 3.6 | 3.6 |
-| Warmup (1st pass) | 12.1 | 12.4 | 12.1 | 12.8 | 12.8 | 12.5 |
-| Warmup (2nd pass) | 4.1 | 4.1 | 4.1 | 4.0 | 4.0 | 4.0 |
+| Cached model loader (server) | 63.5 | 0.003 | 0.002 | 62.5 | 0.003 | 0.001 |
+| Checkpoint prefetch (worker) | 3.5 | 67.7 | 3.3 | 5.3 | 99.2 | 6.0 |
+| Apply weights (worker) | 3.8 | 3.8 | 3.7 | 3.6 | 3.6 | 3.6 |
+| Warmup — 1st pass (worker) | 12.1 | 12.4 | 12.1 | 12.8 | 12.8 | 12.5 |
+| Warmup — 2nd pass (worker) | 4.1 | 4.1 | 4.1 | 4.0 | 4.0 | 4.0 |
+
+**Why S2 (NFS cold) is slower than S1 (remote download):** The I/O cost shifts between processes. In S1, the server downloads from an internal CDN at ~2 GB/s and writes to tmpfs — the worker's prefetch then reads from fast local tmpfs (3.5s). In S2, there is no download (0.003s), but the worker's checkpoint prefetch reads from cold NFS with no page cache (67.7–99.2s), which is slower than the CDN. The net result: S1 pays ~63s in the server + ~4s in the worker = ~67s of I/O, while S2 pays ~0s in the server + ~68–99s in the worker = ~68–99s of I/O. S3 (warm cache) eliminates this entirely since page cache serves the reads (~3–6s).
 
 ### Part 3 — Autotuner Impact
 
@@ -257,24 +282,25 @@ Comparing autotuner ON vs OFF on S2 and S3 tiers. Warmup component shift when au
 
 #### 1. Storage I/O Dominates Cold Start
 
-For large models (70–72B), the dominant bottleneck shifts based on storage tier:
+For large models (70–72B), total I/O cost = server-side download/resolution + worker-side checkpoint prefetch. The dominant bottleneck shifts by tier:
 
-- **S1 (remote cold):** HF download is 43–44s (46% of total). The internal CDN makes this faster than expected; public cloud would be significantly worse.
-- **S2 (NFS cold):** Checkpoint prefetch from cold NFS is the slowest path at 68–99s (59–68% of total). Cold NFS reads without page cache are slower than the CDN download.
-- **S3 (warm cache):** Page cache eliminates I/O bottleneck entirely. Prefetch drops to 3–6s, yielding **50–53s total** — a 2–3x improvement over S2.
+- **S1 (remote cold):** Server downloads from CDN (43–44s) to tmpfs; worker prefetches from fast tmpfs (3–5s). Total I/O: ~47–49s. Note: the internal CDN achieves ~2 GB/s; public cloud would be significantly slower.
+- **S2 (NFS cold):** No download needed (0.003s), but worker prefetches from cold NFS (68–99s) — cold inode reads are slower than the CDN. Total I/O: ~68–99s. **S2 is slower than S1** because cold NFS throughput < CDN throughput.
+- **S3 (warm cache):** No download (0.002s), worker prefetches from page cache (3–6s). Total I/O: ~3–6s — **2–3x faster** than S1.
 
 The weight *application* phase (`apply_weights`) is constant at 3.6–3.8s regardless of storage tier, confirming it's GPU-bound, not I/O-bound.
 
 #### 2. Warmup Is the Irreducible Floor
 
-With warm cache (S3), warmup dominates the remaining startup time:
+With warm cache (S3), I/O is negligible and warmup dominates the remaining startup time:
 
 | Component | Qwen 72B S3 | % of Total |
 |:----------|------------:|-----------:|
-| Weight loading | 8.8s | 17.5% |
-| Warmup (1st pass) | 12.1s | 24.1% |
-| Warmup (2nd pass) | 4.1s | 8.2% |
-| Executor overhead | ~21s | ~42% |
+| Cached model loader (server) | ~0s | ~0% |
+| Weight loading (worker) | 8.8s | 17.5% |
+| Warmup — 1st pass (worker) | 12.1s | 24.1% |
+| Warmup — 2nd pass (worker) | 4.1s | 8.2% |
+| Executor overhead | ~25s | ~50% |
 | **Total** | **50.2s** | 100% |
 
 The autotuner forward pass alone is 11.3s (22.5% of total). This is the irreducible floor that MX and GMS cannot improve — only compilation caching can address it.
