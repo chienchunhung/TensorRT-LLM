@@ -100,11 +100,28 @@ Default serving config: `max_batch_size=4, max_num_tokens=1024, max_seq_len=4096
 
 | Tier | ID | What it measures | Production analog | Setup |
 |------|----|-----------------|-------------------|-------|
-| Remote cold | S1 | Full HF download over network + model load | Model not pre-staged; downloads on first use | `HF_HOME=/tmp` (tmpfs); every run downloads from scratch. In production, `snapshot_download()` writes to `~/.cache/huggingface/hub/` (local disk), but worker prefetch is still page-cache-speed because the download itself warms the cache |
-| NFS cold | S2 | NFS file read (no page cache) + model load | **First cold start** on a node with model pre-staged on NFS | Model files pre-copied to a **fresh NFS directory per run** (new inodes), guaranteeing cold page cache without needing `drop_caches` privileges |
-| Local warm | S3 | Page-cache-warm file read + model load | Second instance on same node (page cache hot from prior load) | Model files on NFS, page cache hot from a prior run |
+| Remote cold | S1 | Full HF download over network + model load | Dev/experimentation, or first-time use without pre-staged model. Valid code path (`snapshot_download()` → `CachedModelLoader`); uncommon in production where models are pre-staged | `HF_HOME=/tmp` (tmpfs); every run downloads from scratch. Worker prefetch is page-cache-speed because the download itself warms the cache (same on local disk) |
+| NFS cold | S2 | NFS file read (no page cache) + model load | **First cold start** on a node with model pre-staged on NFS (fresh node, reboot, or page cache evicted after prolonged idle) | Model files pre-copied to a **fresh NFS directory per run** (new inodes), guaranteeing cold page cache without needing `drop_caches` privileges |
+| Local warm | S3 | Page-cache-warm file read + model load | Second instance on same node, rapid restart, or scale-up (page cache hot from prior load) | Model files on NFS, page cache hot from a prior run |
 
-**Default tier: S1 (remote cold).** However, **S2 is the most realistic production cold-start scenario** — models are typically pre-staged on shared storage, not downloaded from HF Hub at serve time. S1 is useful mainly as a comparison point and for environments without pre-staged models.
+**Default tier: S1 (remote cold).** However, **S2 is the most realistic production cold-start scenario** — models are typically pre-staged on shared storage, not downloaded from HF Hub at serve time.
+
+### Scenario Coverage and Gaps
+
+All three tiers exercise valid code paths and represent real operational contexts:
+
+| Tier | When it happens | Frequency in production |
+|------|----------------|------------------------|
+| S1 | Model not pre-staged; `trtllm-serve` downloads from HF Hub | Rare (dev/experimentation) |
+| S2 | Model on NFS, first access on node (cold page cache) | Common (fresh node, reboot, idle eviction) |
+| S3 | Model on NFS, page cache warm from prior load | Common (2nd instance, restart, scale-up) |
+
+**Not yet covered:**
+
+| Scenario | Expected behavior | Priority |
+|----------|------------------|----------|
+| **Model on local NVMe SSD (cold)** | Prefetch at NVMe sequential read speed (~3–7 GB/s); ~20–40s for 145GB. Falls between S2 (65–99s cold NFS) and S3 (3–5s warm cache). Common in production where models are pre-copied to node-local storage. | Medium — would provide a useful data point between S2 and S3 |
+| **Multi-node TP** (workers on different nodes) | Each node's workers prefetch independently from NFS; no shared page cache across nodes. Per-node I/O = S2 or S3 depending on local cache state. | Low — current benchmarks are single-node TP=8 |
 
 ### Statistical Protocol
 
