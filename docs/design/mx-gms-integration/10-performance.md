@@ -191,17 +191,16 @@ Scenario-based projection using measured S2/S3 baselines for Qwen 72B (TP=8). Th
 |:---------|:------------|:------------|:-------|:--------------|:------|
 | **1. Baseline S2 (NFS cold)** | 21s (measured) | 71.8s (measured) | 16.6s (measured) | **114.4s** | Full cold start |
 | **2. Baseline S3 (warm cache)** | 21s (measured) | 8.9s (measured) | 16.0s (measured) | **50.2s** | Page cache hot |
-| **3. Early worker warm-up (S3)** | ~0s (hidden) | 8.9s | 16.0s | **~29s** | Dispatch no-op to workers at `init_mpi_session` |
-| **4. MX (1st on new node)** | 21s | ~10–15s (GPU P2P) | 16.6s | **~50–55s** | MX streams weights from donor node |
-| **5. MX + early warm-up** | ~0s (hidden) | ~10–15s | 16.6s | **~29–34s** | Worker init overlaps with MX setup |
-| **6. GMS (2nd+ on same node)** | 21s | ~0.1s (zero-copy) | 16.6s | **~41s** | 2nd+ instance via shared GPU memory |
-| **7. GMS + early warm-up** | ~0s (hidden) | ~0.1s | 16.6s | **~20s** | Worker init hidden; weights near-free |
-| **8. MX+GMS+compile+early warm-up** | ~0s (hidden) | ~0.1s | ~2s (cached) | **~6s** | Best case for all replicas |
+| **3. MX (1st on new node)** | 21s | ~10–15s (GPU P2P) | 16.6s | **~50–55s** | MX streams weights from donor; worker init overlaps with MX P2P transfer |
+| **4. GMS (2nd+ on same node)** | 21s | ~0.1s (zero-copy) | 16.6s | **~41s** | 2nd+ instance via shared GPU memory |
+| **5. MX+GMS (2nd+ on new node)** | 21s | ~0.1s (zero-copy) | 16.6s | **~41s** | 1st fetches via MX; 2nd+ near-free via GMS |
+| **6. MX+GMS+compile cache** | 21s | ~0.1s (zero-copy) | ~2s (cached) | **~27s** | Warmup artifacts pre-cached |
+| **7. MX+GMS+compile+reduced worker init** | ~2s (optimized) | ~0.1s | ~2s | **~8s** | Requires MPI process pool optimization (see below) |
 
 Key takeaways:
-- **Early worker warm-up** (row 3) is a standalone optimization worth ~21s — it overlaps MPI worker cold start (Python imports, CUDA context, NCCL) with server-side work. Orthogonal to MX/GMS and stacks with every scenario.
-- **MX** eliminates the 65–99s NFS cold-read penalty by streaming only the relevant TP shard directly to each rank's GPU (~10–15s), also eliminating the 8x redundant CPU memory consumption of the current load-all-then-shard pattern.
+- **MX** eliminates the 65–99s NFS cold-read penalty by streaming only the relevant TP shard directly to each rank's GPU (~10–15s). For S1, MX P2P transfer provides enough concurrent server work to hide the 21s worker init naturally (similar to how HF download hides it today).
 - **GMS** eliminates the 8.9s weight loading cost entirely for 2nd+ instances via zero-copy GPU memory sharing.
+- **Worker init (~21s) is on the critical path** for all scenarios without substantial concurrent server work. See [investigation results](#worker-init-investigation-results) for why early warm-up alone cannot hide this cost.
 - **Neither MX nor GMS can reduce the ~16s warmup floor** — only compilation/autotuner caching can address this.
 - **The very first cluster-wide instance always pays full cost** (114–146s with NFS cold). MX requires a donor node; GMS requires a prior instance on the same node.
 
@@ -504,7 +503,26 @@ Workers:       │..cold start (~21s)..│                           │
 
 The ~21s is constant across all tiers. It is hidden in S1 because workers warm up during the download phase, and visible in S2/S3 because there is no server-side work to overlap with.
 
-**Optimization opportunity:** For local-model deployments (S2/S3), dispatching a lightweight warm-up task to workers immediately after `init_mpi_session` — before `cached_model_loader` — would overlap the ~21s worker cold start with tokenizer loading and config parsing. This would reduce S3 total startup from ~50s to ~29s. This optimization is **orthogonal to MX/GMS** — the worker cold-start cost persists regardless of how weights are delivered, so the fix stacks with every MX/GMS scenario.
+#### Worker Init Investigation Results
+
+Experimental verification (branch `dynamo/worker-warmup-investigation`) tested three approaches to hiding the ~21s worker cold start:
+
+| Approach | What happens | Total S3 startup | Savings |
+|----------|-------------|-----------------|---------|
+| **Baseline** (no warm-up) | Workers cold-start during `worker_main` | **~47s** | — |
+| **Blocking warm-up** (noop + wait before worker_main) | Cold start in `ensure_workers_ready()`, then fast `worker_main` dispatch (0.05s entry vs 0.37s) | **~47s** | 0s |
+| **Non-blocking warm-up** (noop queued before worker_main) | Both tasks queue on each worker; cold start during noop, then `worker_main` | **~47s** | 0s |
+
+**Why early warm-up doesn't help for S2/S3:** There is only ~0.2s of server work between `init_mpi_session` and `create_executor` (for local models). The warm-up noop triggers worker cold start, but `worker_main` is dispatched just 0.2s later — workers are still cold-starting. Whether cold start happens during the noop or during `worker_main`, the total is the same because there's no concurrent server work to overlap with.
+
+**Why it works for S1:** The first dispatch (`_node_download_hf_model`) provides 63.7s of server-side work. Workers complete their cold start during this time. The second dispatch (`worker_main`) finds workers warm and enters in 0.003s.
+
+**Reducing the 21s itself** requires addressing the `mpi4py.futures.MPIPoolExecutor` lazy-spawn behavior: processes are spawned on first `submit()`, and the combined process creation + Python `sys.path` setup + `import_main` takes ~20s. Potential approaches:
+- Eager process spawning at pool creation time (mpi4py configuration or custom pool)
+- Pre-warmed persistent worker processes across server restarts
+- Reducing Python import overhead in worker processes (lazy imports, import caching)
+
+This is orthogonal to MX/GMS integration. MX P2P transfers (~10–15s) would naturally provide enough concurrent server work to hide most of the worker cold start, similar to how S1's HF download does today.
 
 #### 2. Warmup Is the Irreducible Floor
 
@@ -512,18 +530,18 @@ With warm cache (S3), I/O is negligible. The remaining startup time breaks down 
 
 | Component | Qwen 72B S3 | % of Total | Reducible by |
 |:----------|------------:|-----------:|:-------------|
-| MPI worker cold start | ~21s | ~42% | Early warm-up dispatch (see above) |
+| MPI worker cold start | ~21s | ~42% | MPI pool optimization or concurrent server work (see [investigation](#worker-init-investigation-results)) |
 | Weight loading (prefetch + apply) | 7.0s | 14% | GMS zero-copy (~0.1s) |
 | Warmup — 1st pass | 11.9s | 24% | Compilation caching (~2s) |
 | Warmup — 2nd pass | 4.1s | 8% | Compilation caching |
 | Other overhead (model init, sampler, KV cache, IPC) | ~6s | ~12% | Minor |
 | **Total** | **50.2s** | 100% | |
 
-The largest single component is the MPI worker cold start (~21s), which is addressable independently via early warm-up dispatch. After that fix, the floor would be ~29s, dominated by warmup (~16s) and weight loading (~7s).
+The largest single component is the MPI worker cold start (~21s). Experimental verification showed that simply dispatching a warm-up noop does NOT reduce total startup because there's only ~0.2s of server work to overlap with for local models. The cold start is on the critical path regardless of when it's triggered. Reducing it requires either (a) providing concurrent server work (as MX P2P transfer would), or (b) optimizing the MPI process pool itself.
 
 MX and GMS address weight loading but cannot reduce warmup:
 - **Warmup (~16s):** Autotuner forward (11.0s) + CUDA graph capture (0.6s) + 2nd-pass warmup (4.1s). Only compilation/autotuner caching can reduce this.
-- **MPI worker cold start (~21s):** Python imports, CUDA context, NCCL setup. Orthogonal to MX/GMS — addressable by pre-warming workers at `init_mpi_session` time.
+- **MPI worker cold start (~21s):** Lazy process spawning + Python imports in `mpi4py.futures.MPIPoolExecutor`. Not addressable by simple warm-up dispatch; requires MPI pool or import optimization.
 
 #### 3. Disabling Autotuner Has No Net Benefit
 
