@@ -100,7 +100,7 @@ Default serving config: `max_batch_size=4, max_num_tokens=1024, max_seq_len=4096
 
 | Tier | ID | What it measures | Production analog | Setup |
 |------|----|-----------------|-------------------|-------|
-| Remote cold | S1 | Full HF download over network + model load | Model not pre-staged; downloads on first use | Isolated empty HF cache on `/tmp` (tmpfs); every run downloads from scratch |
+| Remote cold | S1 | Full HF download over network + model load | Model not pre-staged; downloads on first use | `HF_HOME=/tmp` (tmpfs); every run downloads from scratch. **Caveat:** in production, `snapshot_download()` writes to local disk (`~/.cache/huggingface/hub/`), not RAM — worker prefetch would be disk-speed-dependent, not the 3–5s shown here |
 | NFS cold | S2 | NFS file read (no page cache) + model load | **First cold start** on a node with model pre-staged on NFS | Model files pre-copied to a **fresh NFS directory per run** (new inodes), guaranteeing cold page cache without needing `drop_caches` privileges |
 | Local warm | S3 | Page-cache-warm file read + model load | Second instance on same node (page cache hot from prior load) | Model files on NFS, page cache hot from a prior run |
 
