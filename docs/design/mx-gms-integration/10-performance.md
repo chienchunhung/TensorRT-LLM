@@ -100,11 +100,12 @@ Default serving config: `max_batch_size=4, max_num_tokens=1024, max_seq_len=4096
 
 | Tier | ID | What it measures | Production analog | Setup |
 |------|----|-----------------|-------------------|-------|
-| Remote cold | S1 | Full HF download over network + model load | Dev/experimentation, or first-time use without pre-staged model. Valid code path (`snapshot_download()` → `CachedModelLoader`); uncommon in production where models are pre-staged | `HF_HOME=/tmp` (tmpfs); every run downloads from scratch. Worker prefetch is page-cache-speed because the download itself warms the cache (same on local disk) |
-| NFS cold | S2 | NFS file read (no page cache) + model load | **First cold start** on a node with model pre-staged on NFS (fresh node, reboot, or page cache evicted after prolonged idle) | Model files pre-copied to a **fresh NFS directory per run** (new inodes), guaranteeing cold page cache without needing `drop_caches` privileges |
-| Local warm | S3 | Page-cache-warm file read + model load | Second instance on same node, rapid restart, or scale-up (page cache hot from prior load) | Model files on NFS, page cache hot from a prior run |
+| Remote cold | S1 | Full HF download over network + model load | Dev/experimentation, or first-time use without pre-staged model | `HF_HOME=/tmp` (tmpfs); every run downloads from scratch |
+| **NFS cold** | **S2** | **NFS file read (no page cache) + model load** | **First cold start on a node with model pre-staged on NFS** | Model files pre-copied to a **fresh NFS directory per run** (new inodes) |
+| Local warm | S3 | Page-cache-warm file read + model load | Second instance on same node, rapid restart, or scale-up | Model files on NFS, page cache hot from a prior run |
+| Local NVMe cold | S4 | Local SSD read (no page cache, no network) + model load | Model pre-staged to node-local NVMe (e.g., by DaemonSet or init container) | Fresh NVMe directory per run. *Planned — not yet executed* |
 
-**Default tier: S1 (remote cold).** However, **S2 is the most realistic production cold-start scenario** — models are typically pre-staged on shared storage, not downloaded from HF Hub at serve time.
+**Default tier: S2 (NFS cold)** — the most realistic production cold-start scenario. Models are typically pre-staged on shared storage, not downloaded from HF Hub at serve time.
 
 ### Scenario Coverage and Gaps
 
@@ -293,11 +294,32 @@ Each worker rank (independently, in parallel):
 
 **Existing optimization path (side observation):** The `safetensors` library supports selective tensor loading via `safe_open().get_slice()`, which reads only the requested byte range without materializing the full tensor. TRT-LLM's `load_weight_shard` (`_torch/modules/linear.py:129-136`) already has a code path for `PySafeSlice` objects — but it is never reached because `load_file()` materializes everything first. Switching from `load_file()` to `safe_open()` + `get_slice()` would let each rank read only its TP shard, reducing peak CPU memory from ~9x to ~2x model size. This is a potential quick-win optimization for the existing HF loading path, but becomes moot once MX integration is complete (MX streams only the relevant shard directly to each rank's GPU, bypassing storage entirely).
 
-### Part 1 — Model Size Scaling (S1, Remote Cold Download)
+### Part 1 — Model Size Scaling (S2, NFS Cold — Production Baseline)
 
-Fresh HF download each run with `HF_HOME` set to `/tmp` (tmpfs). The benchmark used tmpfs for isolation, but the worker prefetch times (3–5s) are representative of real S1 behavior regardless of storage backend: the download itself populates the OS page cache (Linux retains written pages in cache via write-back), so workers always read from warm page cache after a download — whether the underlying storage is tmpfs, local SSD, or even NFS. This is the same reason S3 (page cache hot) shows similar prefetch times.
+S2 (NFS cold) is the primary baseline because it represents the realistic production cold-start scenario: model files pre-staged on shared storage, no prior page cache warming, no HF download. This is the cost that MX integration aims to eliminate.
 
-All times in seconds (representative run). Percentages are of total startup.
+All times in seconds (representative run). Percentages are of total startup. The ~21s MPI worker cold-start overhead is included in the total but not shown as a separate row (see [root cause analysis](#executor-overhead-gap-s1-5s-vs-s2s3-25s--root-cause) for details).
+
+| Metric | Qwen 72B S2 (TP=8) | DS 70B S2 (TP=8) |
+|:-------|----:|----:|
+| **Total startup** | **114.4 (100%)** | **146.1 (100%)** |
+| MPI worker cold start (hidden) | ~21 (18%) | ~21 (14%) |
+| Checkpoint prefetch (worker) | 65.0 (57%) | 99.2 (68%) |
+| Apply weights (worker) | 4.3 (4%) | 3.6 (2%) |
+| Warmup — 1st pass (worker) | 12.4 (11%) | 13.0 (9%) |
+| ├─ Autotuner forward | 11.5 (10%) | 12.3 (8%) |
+| └─ CUDA graphs | 0.7 (<1%) | 0.5 (<1%) |
+| Warmup — 2nd pass (worker) | 4.2 (4%) | 4.0 (3%) |
+| Other overhead | ~7 (6%) | ~5 (4%) |
+
+**Key observations:**
+- Cold NFS checkpoint prefetch dominates: **57–68% of total startup**. This is the primary target for MX (GPU P2P streaming eliminates NFS reads entirely).
+- MPI worker cold start is **~21s in all tiers** but only visible in S2/S3 (see [root cause analysis](#executor-overhead-gap-s1-5s-vs-s2s3-25s--root-cause)).
+- Warmup is constant at ~16s regardless of storage tier — this is the irreducible floor without compilation caching.
+
+### Part 1b — Model Size Scaling (S1, Remote Cold Download — Complementary)
+
+S1 measures the full HF download path. It is complementary to S2 because (a) S1's download inherently warms the page cache, making worker prefetch fast (~3s), and (b) S1 hides the ~21s MPI worker cold start behind the 63s download. These two effects make S1 appear faster than S2 despite involving a network download.
 
 | Metric | B1: Qwen 7B (TP=1) | B3: DS 7B (TP=1) | B2: Qwen 72B (TP=8) | B4: DS 70B (TP=8) |
 |:-------|----:|----:|----:|----:|
@@ -312,43 +334,27 @@ All times in seconds (representative run). Percentages are of total startup.
 | └─ CUDA graphs | 0.1 (<1%) | 0.1 (<1%) | 0.6 (<1%) | 0.5 (<1%) |
 | Warmup — 2nd pass (worker) | 1.7 (5%) | 1.7 (4%) | 4.1 (4%) | 4.0 (4%) |
 
-For S1, the four highlighted phases (cached model loader + weight loading + warmup 1st + warmup 2nd) sum to ~88s for Qwen 72B; the remaining ~5s is executor overhead (model construction, sampler, KV cache, IPC).
+**Why S1 appears faster than S2:** Two effects combine: (1) the HF download warms the page cache, so workers prefetch in ~3.5s instead of ~65s; (2) the ~21s MPI worker cold start is hidden behind the 63s download (workers are dispatched early for the download, and are already warm by the time `create_executor` runs). Note: the internal HF CDN achieves ~2 GB/s; with a slower public CDN, S1 would be significantly slower.
 
 ### Part 2 — Storage Tier Comparison (72B/70B Models, TP=8)
 
-S1 = remote cold download, S2 = NFS cold (fresh inode copy per run), S3 = NFS warm (page cache hot).
-
 | Metric | Qwen 72B S1 | Qwen 72B S2 | Qwen 72B S3 | DS 70B S1 | DS 70B S2 | DS 70B S3 |
 |:-------|----:|----:|----:|----:|----:|----:|
-| **Total startup** | **93.4 (100%)** | **114.4 (100%)** | **50.2 (100%)** | **95.5 (100%)** | **146.1 (100%)** | **52.9 (100%)** |
-| Cached model loader (server) | 63.5 (68%) | 0.003 (<1%) | 0.002 (<1%) | 62.5 (65%) | 0.003 (<1%) | 0.001 (<1%) |
-| Checkpoint prefetch (worker) | 3.5 (4%) | 65.0 (57%) | 3.4 (7%) | 5.0 (5%) | 99.2 (68%) | 6.0 (11%) |
-| Apply weights (worker) | 3.8 (4%) | 4.3 (4%) | 3.6 (7%) | 3.7 (4%) | 3.6 (2%) | 3.6 (7%) |
-| Warmup — 1st pass (worker) | 12.1 (13%) | 12.4 (11%) | 11.9 (24%) | 13.0 (14%) | 13.0 (9%) | 12.5 (24%) |
-| Warmup — 2nd pass (worker) | 4.1 (4%) | 4.2 (4%) | 4.1 (8%) | 4.0 (4%) | 4.0 (3%) | 4.0 (8%) |
+| **Total startup** | **93.4** | **114.4** | **50.2** | **95.5** | **146.1** | **52.9** |
+| MPI worker cold start (hidden) | hidden in download | ~21s visible | ~21s visible | hidden in download | ~21s visible | ~21s visible |
+| Cached model loader (server) | 63.5 | 0.003 | 0.002 | 62.5 | 0.003 | 0.001 |
+| Checkpoint prefetch (worker) | 3.5 | 65.0 | 3.4 | 5.0 | 99.2 | 6.0 |
+| Apply weights (worker) | 3.8 | 4.3 | 3.6 | 3.7 | 3.6 | 3.6 |
+| Warmup — 1st pass (worker) | 12.1 | 12.4 | 11.9 | 13.0 | 13.0 | 12.5 |
+| Warmup — 2nd pass (worker) | 4.1 | 4.2 | 4.1 | 4.0 | 4.0 | 4.0 |
 
-**Why S1 worker prefetch ≈ S3 worker prefetch (both ~3–5s):**
+| Tier | Page cache state | Worker prefetch (Qwen 72B) | MPI worker cold start | Why |
+|------|-----------------|---------------------------|----------------------|-----|
+| S1 | Warm (download populates cache) | 3.5s | Hidden (behind 63s download) | Download dispatches to workers early |
+| S2 | Cold (fresh inodes) | 65.0s | Visible (~21s) | No prior dispatch to workers |
+| S3 | Warm (prior run's reads) | 3.4s | Visible (~21s) | No prior dispatch to workers |
 
-The download in S1 inherently **warms the OS page cache**. When `snapshot_download()` writes model files (whether to tmpfs or local disk), Linux retains the written pages in the page cache via write-back caching. When workers subsequently prefetch the same files, they hit warm page cache — exactly like S3, where a prior run's reads warmed the cache. This explains why S1 prefetch (3.5s) ≈ S3 prefetch (3.4s) for Qwen 72B.
-
-**Why S2 is slower than both S1 and S3:**
-
-In S2, no prior operation has warmed the page cache (fresh inodes ensure cold cache). Workers must read directly from NFS — 65–99s of cold storage I/O that S1 and S3 avoid entirely.
-
-| Tier | What warms page cache | Worker prefetch (Qwen 72B) |
-|------|----------------------|---------------------------|
-| S1 | Download writes populate cache | 3.5s (page cache hit) |
-| S2 | Nothing — cold cache by design | 65.0s (cold NFS) |
-| S3 | Prior run's reads populate cache | 3.4s (page cache hit) |
-
-**S1 vs S2 total cost comparison:**
-- **S1:** pays 63.5s server-side (download + HF cache mgmt), then workers get free page-cache I/O (~3.5s). Total I/O cost = ~67s, mostly in the server process.
-- **S2:** pays 0s server-side, but workers pay 65–99s cold NFS I/O. Total I/O cost = 65–99s, entirely in the worker process.
-- **S1 < S2** because the fast internal HF mirror (~2 GB/s) delivers the full model faster than cold NFS reads with 8 ranks contending. With a slower CDN (public HF Hub), S1 would likely be slower than S2.
-
-**Executor overhead gap:** S2/S3 show ~25–28s of additional executor overhead compared to ~5s in S1. The source of this ~20s discrepancy is not yet fully characterized — the full hierarchical JSON profiles contain additional phase detail that may explain it.
-
-**For MX/GMS projections, S2 is the correct baseline** — it represents the production cold-start cost (model pre-staged on shared storage, no prior cache warming). S3 shows the floor after I/O is removed.
+**Planned: S4 (Local NVMe SSD, cold):** A fourth tier measuring cold reads from node-local NVMe (no network hop) is planned. This represents the model-pre-staged-to-local-disk scenario and provides the storage-speed ceiling against which MX P2P throughput should be compared. The node has 8x 3.5TB NVMe SSDs available. S4 uses the same fresh-inode-copy methodology as S2 to ensure cold page cache. Results pending.
 
 ### Part 3 — Autotuner Impact
 
