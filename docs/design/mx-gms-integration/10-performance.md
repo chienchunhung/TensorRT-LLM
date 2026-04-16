@@ -218,20 +218,20 @@ Total startup = 93.4s
 
 ### Part 1 — Model Size Scaling (S1, Remote Cold Download)
 
-Fresh HF download to `/tmp` (tmpfs) each run. All times in seconds (representative run).
+Fresh HF download to `/tmp` (tmpfs) each run. All times in seconds (representative run). Percentages are of total startup.
 
 | Metric | B1: Qwen 7B (TP=1) | B3: DS 7B (TP=1) | B2: Qwen 72B (TP=8) | B4: DS 70B (TP=8) |
 |:-------|----:|----:|----:|----:|
-| **Total startup** | **36.1** | **38.2** | **93.4** | **95.5** |
-| Cached model loader (server) | 6.4 | 6.3 | 63.5 | 62.5 |
-| └─ HF remote download | 6.4 | 6.3 | 43.9 | 43.0 |
-| Weight loading total (worker) | 5.5 | 7.5 | 8.7 | 10.5 |
-| ├─ Checkpoint prefetch | 2.2 | 4.2 | 3.5 | 5.0 |
-| └─ Apply weights | 2.8 | 2.8 | 3.8 | 3.7 |
-| Warmup — 1st pass (worker) | 4.9 | 4.9 | 12.1 | 13.0 |
-| ├─ Autotuner forward | 4.6 | 4.6 | 11.3 | 12.3 |
-| └─ CUDA graphs | 0.1 | 0.1 | 0.6 | 0.5 |
-| Warmup — 2nd pass (worker) | 1.7 | 1.7 | 4.1 | 4.0 |
+| **Total startup** | **36.1 (100%)** | **38.2 (100%)** | **93.4 (100%)** | **95.5 (100%)** |
+| Cached model loader (server) | 6.4 (18%) | 6.3 (16%) | 63.5 (68%) | 62.5 (65%) |
+| └─ HF remote download | 6.4 (18%) | 6.3 (16%) | 43.9 (47%) | 43.0 (45%) |
+| Weight loading total (worker) | 5.5 (15%) | 7.5 (20%) | 8.7 (9%) | 10.5 (11%) |
+| ├─ Checkpoint prefetch | 2.2 (6%) | 4.2 (11%) | 3.5 (4%) | 5.0 (5%) |
+| └─ Apply weights | 2.8 (8%) | 2.8 (7%) | 3.8 (4%) | 3.7 (4%) |
+| Warmup — 1st pass (worker) | 4.9 (14%) | 4.9 (13%) | 12.1 (13%) | 13.0 (14%) |
+| ├─ Autotuner forward | 4.6 (13%) | 4.6 (12%) | 11.3 (12%) | 12.3 (13%) |
+| └─ CUDA graphs | 0.1 (<1%) | 0.1 (<1%) | 0.6 (<1%) | 0.5 (<1%) |
+| Warmup — 2nd pass (worker) | 1.7 (5%) | 1.7 (4%) | 4.1 (4%) | 4.0 (4%) |
 
 The four top-level phases (cached model loader + weight loading + warmup 1st + warmup 2nd) sum to ~88s for Qwen 72B; the remaining ~5s is executor overhead (config loading, sampler creation, KV cache setup, IPC signaling).
 
@@ -241,12 +241,12 @@ S1 = remote cold download, S2 = NFS cold (fresh inode copy per run), S3 = NFS wa
 
 | Metric | Qwen 72B S1 | Qwen 72B S2 | Qwen 72B S3 | DS 70B S1 | DS 70B S2 | DS 70B S3 |
 |:-------|----:|----:|----:|----:|----:|----:|
-| **Total startup** | **93.4** | **114.4** | **50.2** | **95.5** | **146.1** | **52.9** |
-| Cached model loader (server) | 63.5 | 0.003 | 0.002 | 62.5 | 0.003 | 0.001 |
-| Checkpoint prefetch (worker) | 3.5 | 65.0 | 3.4 | 5.0 | 99.2 | 6.0 |
-| Apply weights (worker) | 3.8 | 4.3 | 3.6 | 3.7 | 3.6 | 3.6 |
-| Warmup — 1st pass (worker) | 12.1 | 12.4 | 11.9 | 13.0 | 13.0 | 12.5 |
-| Warmup — 2nd pass (worker) | 4.1 | 4.2 | 4.1 | 4.0 | 4.0 | 4.0 |
+| **Total startup** | **93.4 (100%)** | **114.4 (100%)** | **50.2 (100%)** | **95.5 (100%)** | **146.1 (100%)** | **52.9 (100%)** |
+| Cached model loader (server) | 63.5 (68%) | 0.003 (<1%) | 0.002 (<1%) | 62.5 (65%) | 0.003 (<1%) | 0.001 (<1%) |
+| Checkpoint prefetch (worker) | 3.5 (4%) | 65.0 (57%) | 3.4 (7%) | 5.0 (5%) | 99.2 (68%) | 6.0 (11%) |
+| Apply weights (worker) | 3.8 (4%) | 4.3 (4%) | 3.6 (7%) | 3.7 (4%) | 3.6 (2%) | 3.6 (7%) |
+| Warmup — 1st pass (worker) | 12.1 (13%) | 12.4 (11%) | 11.9 (24%) | 13.0 (14%) | 13.0 (9%) | 12.5 (24%) |
+| Warmup — 2nd pass (worker) | 4.1 (4%) | 4.2 (4%) | 4.1 (8%) | 4.0 (4%) | 4.0 (3%) | 4.0 (8%) |
 
 **Why S2 (NFS cold) is slower than S1 (remote download):** The I/O cost shifts between processes. In S1, the server downloads from an internal CDN at ~2 GB/s and writes to tmpfs — the worker's prefetch then reads from fast local tmpfs (3.5s). In S2, there is no download (0.003s), but the worker's checkpoint prefetch reads from cold NFS with no page cache (65–99s), which is slower than the CDN. The net result: S1 pays ~63s in the server + ~4s in the worker = ~67s of I/O, while S2 pays ~0s in the server + ~65–99s in the worker = ~65–99s of I/O. S3 (warm cache) eliminates this entirely since page cache serves the reads (~3–6s).
 
@@ -256,19 +256,19 @@ Comparing autotuner ON vs OFF on S2 and S3 tiers. Warmup component shift when au
 
 | Metric | Qwen 72B S2 ON | Qwen 72B S2 OFF | Qwen 72B S3 ON | Qwen 72B S3 OFF |
 |:-------|----:|----:|----:|----:|
-| **Total startup** | **114.4** | **104.9** | **50.2** | **49.8** |
-| Warmup (1st pass) | 12.4 | 11.9 | 11.9 | 11.8 |
-| — Autotuner | 11.5 | 0.0 | 11.0 | 0.0 |
-| — CUDA graphs | 0.7 | 11.1 | 0.6 | 11.0 |
-| — Memory pool | 0.1 | 0.6 | 0.1 | 0.6 |
+| **Total startup** | **114.4 (100%)** | **104.9 (100%)** | **50.2 (100%)** | **49.8 (100%)** |
+| Warmup (1st pass) | 12.4 (11%) | 11.9 (11%) | 11.9 (24%) | 11.8 (24%) |
+| — Autotuner | 11.5 (10%) | 0.0 (0%) | 11.0 (22%) | 0.0 (0%) |
+| — CUDA graphs | 0.7 (<1%) | 11.1 (11%) | 0.6 (1%) | 11.0 (22%) |
+| — Memory pool | 0.1 (<1%) | 0.6 (<1%) | 0.1 (<1%) | 0.6 (1%) |
 
 | Metric | DS 70B S2 ON | DS 70B S2 OFF | DS 70B S3 ON | DS 70B S3 OFF |
 |:-------|----:|----:|----:|----:|
-| **Total startup** | **146.1** | **155.2** | **52.9** | **52.1** |
-| Warmup (1st pass) | 13.0 | 12.1 | 12.5 | 11.9 |
-| — Autotuner | 12.3 | 0.0 | 11.8 | 0.0 |
-| — CUDA graphs | 0.5 | 11.4 | 0.5 | 11.1 |
-| — Memory pool | 0.1 | 0.6 | 0.1 | 0.6 |
+| **Total startup** | **146.1 (100%)** | **155.2 (100%)** | **52.9 (100%)** | **52.1 (100%)** |
+| Warmup (1st pass) | 13.0 (9%) | 12.1 (8%) | 12.5 (24%) | 11.9 (23%) |
+| — Autotuner | 12.3 (8%) | 0.0 (0%) | 11.8 (22%) | 0.0 (0%) |
+| — CUDA graphs | 0.5 (<1%) | 11.4 (7%) | 0.5 (1%) | 11.1 (21%) |
+| — Memory pool | 0.1 (<1%) | 0.6 (<1%) | 0.1 (<1%) | 0.6 (1%) |
 
 ### Part 4 — Serving Config Sensitivity
 
@@ -276,17 +276,17 @@ Comparing autotuner ON vs OFF on S2 and S3 tiers. Warmup component shift when au
 
 | Metric | Qwen 72B S3 default | Qwen 72B S3 large | DS 70B S3 default | DS 70B S3 large |
 |:-------|----:|----:|----:|----:|
-| **Total startup** | **50.2** | **58.8** | **52.9** | **61.6** |
-| Warmup (1st pass) | 11.9 | 16.7 | 12.5 | 17.3 |
-| — CUDA graphs | 0.6 | 4.9 | 0.5 | 4.1 |
-| Warmup (2nd pass) | 4.1 | 8.2 | 4.0 | 7.6 |
+| **Total startup** | **50.2 (100%)** | **58.8 (100%)** | **52.9 (100%)** | **61.6 (100%)** |
+| Warmup (1st pass) | 11.9 (24%) | 16.7 (28%) | 12.5 (24%) | 17.3 (28%) |
+| — CUDA graphs | 0.6 (1%) | 4.9 (8%) | 0.5 (1%) | 4.1 (7%) |
+| Warmup (2nd pass) | 4.1 (8%) | 8.2 (14%) | 4.0 (8%) | 7.6 (12%) |
 
 **D2: Long sequence** (seq_len=16384 vs default 4096):
 
 | Metric | Qwen 72B S3 default | Qwen 72B S3 seq16k | DS 70B S3 default | DS 70B S3 seq16k |
 |:-------|----:|----:|----:|----:|
-| **Total startup** | **50.2** | **50.8** | **52.9** | **52.9** |
-| Warmup (1st pass) | 11.9 | 12.4 | 12.5 | 12.6 |
+| **Total startup** | **50.2 (100%)** | **50.8 (100%)** | **52.9 (100%)** | **52.9 (100%)** |
+| Warmup (1st pass) | 11.9 (24%) | 12.4 (24%) | 12.5 (24%) | 12.6 (24%) |
 
 ### Analysis and Key Insights
 
