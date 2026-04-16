@@ -267,7 +267,7 @@ S1 = remote cold download, S2 = NFS cold (fresh inode copy per run), S3 = NFS wa
 
 **Why S2 (NFS cold) is slower than S1 (remote download):**
 
-1. **I/O speed:** Cold NFS reads (65–99s for checkpoint prefetch) are genuinely slower than the CDN download path (~44s download to tmpfs + ~4s worker prefetch = ~48s total I/O in S1 vs 65–99s in S2).
+1. **I/O speed in this environment:** Cold NFS reads (65–99s for checkpoint prefetch across 8 concurrent worker ranks) were slower than the internal CDN mirror path (~44s download to tmpfs + ~4s worker prefetch = ~48s). Note: S1 uses a fast internal HF mirror (~2 GB/s); public HF Hub downloads would be much slower and likely reverse this ordering. The S2 cold NFS performance also reflects worst-case conditions (fresh inodes, no page cache, 8 ranks contending on the same NFS server).
 
 2. **Executor overhead gap:** S2/S3 show ~25–28s of executor initialization overhead (model construction, tensor materialization, CUDA context, NCCL, sampler, KV cache setup) not broken out in the summary table, compared to only ~5s in S1. The source of this ~20s discrepancy is not yet fully characterized — the full hierarchical JSON profiles contain additional phase detail that may explain it.
 
@@ -317,8 +317,8 @@ Comparing autotuner ON vs OFF on S2 and S3 tiers. Warmup component shift when au
 
 For large models (70–72B), I/O is the dominant bottleneck:
 
-- **S1 (remote cold):** CDN download (43–44s) to tmpfs dominates, with the full model loader phase taking 62–64s (includes HF cache management overhead beyond raw download). Worker prefetch from tmpfs is fast (3–5s).
-- **S2 (NFS cold):** No download needed, but worker prefetch from cold NFS is 65–99s — genuinely slower than the CDN path. This is the primary reason S2 total exceeds S1.
+- **S1 (remote cold):** Internal CDN mirror download (43–44s) to tmpfs dominates, with the full model loader phase taking 62–64s (includes HF cache management overhead beyond raw download). Worker prefetch from tmpfs is fast (3–5s). Note: the fast internal mirror (~2 GB/s) makes S1 unusually favorable — public HF Hub downloads would be significantly slower.
+- **S2 (NFS cold):** No download needed, but worker prefetch from cold NFS is 65–99s with 8 ranks contending on the same NFS server. In this environment, S2 I/O was slower than S1's CDN path, though this is environment-specific — NFS performance varies widely by deployment.
 - **S3 (warm cache):** No download, page-cache-warm prefetch (3–6s). Provides the clearest view of the non-I/O startup floor.
 
 The weight *application* phase (`apply_weights`) is constant at 3.6–4.3s regardless of storage tier, confirming it's GPU-bound, not I/O-bound.
