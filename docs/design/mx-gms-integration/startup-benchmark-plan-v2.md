@@ -1,6 +1,6 @@
 # Revised Startup Benchmark Test Plan (v2)
 
-**Status:** Completed (2026-04-16). 62 profiles across 21 configurations. Results in [10-startup-profiling.md](10-startup-profiling.md#benchmark-results-v2).
+**Status:** Completed (2026-04-16). 62 profiles across 21 configurations. Results in [10-performance.md](10-performance.md#benchmark-results-v2).
 
 ## Model Matrix (Group B)
 
