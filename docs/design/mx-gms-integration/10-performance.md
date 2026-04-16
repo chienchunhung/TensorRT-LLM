@@ -197,43 +197,41 @@ Key takeaways for MX/GMS integration:
 
 ### Reading the Results Tables
 
-The startup profiler spans **two processes** with partial concurrency:
+The startup path is **strictly serial** across two processes:
 
-1. **Server process** — MPI session setup spawns executor worker processes early, then downloads/resolves the model, then calls `create_executor` to coordinate with the worker.
-2. **Executor worker process** — once spawned, initializes independently (Python imports, CUDA context, NCCL communicator setup — ~21s), then loads weights, runs warmup, signals ready.
+1. **Server process** — parses CLI args, creates MPI pool (for TP>1), runs `CachedModelLoader` (downloads/resolves the model), then calls `create_executor` which dispatches `worker_main` to the MPI pool.
+2. **Executor worker process** — receives `worker_main` dispatch (only AFTER the server's model loader completes), then runs the full initialization: config loading, model construction (meta tensors), tensor materialization, checkpoint reading, weight application, warmup. Signals ready when done.
 
-**Key concurrency effect:** Worker spawn/initialization (~21s) runs *concurrently* with whatever the server is doing. In S1, the 63.5s model download fully hides this 21s. In S2/S3, the model loader finishes instantly (0.003s), so the 21s worker spawn becomes visible overhead.
+**Key: download and worker initialization are sequential.** The `create_executor` call happens AFTER `CachedModelLoader` completes — there is no concurrent worker initialization during download. (Verified via code: `llm.py:1284` runs `_build_model()` → download, then `llm.py:1309` calls `create_executor` → dispatches `worker_main`.)
 
 The tables below show a hierarchical timer tree. Indented rows (prefixed with `└─` or `├─`) are **children** of the row above — their time is already included in the parent. Only top-level (non-indented) rows are additive. For example, "HF remote download" is *inside* "Cached model loader", not separate from it.
 
 **How total startup adds up** (using Qwen 72B as example across tiers):
 
 ```
-S1 (remote cold) — worker spawn hidden behind download:
+S1 (remote cold):
 Total = 93.4s
-├─ [Server]  Cached model loader         63.5s  ← includes HF download (43.9s)
-│            [Worker spawn ~21s runs concurrently — fully hidden]
+├─ [Server]  Cached model loader         63.5s  ← includes HF download (43.9s) + cache mgmt
 ├─ [Worker]  Weight loading total          8.7s  ← prefetch from tmpfs (3.5s) + apply (3.8s)
 ├─ [Worker]  Warmup (1st pass)            12.1s  ← autotuner (11.3s) + CUDA graphs (0.6s)
 ├─ [Worker]  Warmup (2nd pass)             4.1s
-└─ [Both]    Other overhead               ~5.0s  ← config, sampler, KV cache, IPC
+└─ [Both]    Executor overhead            ~5.0s  ← model construction, sampler, KV cache, IPC
                                           -----
-             Visible sum                  ~88.4s + ~5s overhead = ~93.4s
+             Sum                          ~93.4s
 
-S2 (NFS cold) — worker spawn exposed:
+S2 (NFS cold):
 Total = 114.4s
 ├─ [Server]  Cached model loader          0.003s ← no download needed
-├─ [Worker]  Worker spawn overhead        ~21s   ← Python imports, CUDA ctx, NCCL (now visible)
 ├─ [Worker]  Checkpoint prefetch          65.0s  ← cold NFS reads
 ├─ [Worker]  Apply weights                 4.3s
 ├─ [Worker]  Warmup (1st pass)            12.4s
 ├─ [Worker]  Warmup (2nd pass)             4.2s
-└─ [Both]    Other overhead               ~4.0s  ← config, sampler, KV cache, IPC
+└─ [Both]    Executor overhead           ~28.5s  ← see note below
                                           -----
-             Visible sum                 ~111s + ~4s overhead ≈ 114.4s
+             Sum                         ~114.4s
 ```
 
-The ~21s worker spawn is constant across all tiers — it just shifts between "hidden" (S1) and "visible" (S2/S3).
+**Note on executor overhead:** The summary tables highlight the largest phases. The remaining time ("executor overhead") covers model construction on meta tensors, tensor materialization, CUDA context setup, NCCL communicator initialization, sampler creation, KV cache allocation/configuration, and IPC coordination. This overhead is ~5s for S1 but ~25–28s for S2/S3 — the difference is not yet fully characterized and warrants further investigation using the full hierarchical JSON profiles.
 
 ### Part 1 — Model Size Scaling (S1, Remote Cold Download)
 
@@ -252,7 +250,7 @@ Fresh HF download to `/tmp` (tmpfs) each run. All times in seconds (representati
 | └─ CUDA graphs | 0.1 (<1%) | 0.1 (<1%) | 0.6 (<1%) | 0.5 (<1%) |
 | Warmup — 2nd pass (worker) | 1.7 (5%) | 1.7 (4%) | 4.1 (4%) | 4.0 (4%) |
 
-For S1, the four visible phases (cached model loader + weight loading + warmup 1st + warmup 2nd) sum to ~88s for Qwen 72B; the remaining ~5s is executor overhead. The ~21s worker spawn is hidden inside the 63.5s download — see "Reading the Results Tables" above for the full concurrency explanation.
+For S1, the four highlighted phases (cached model loader + weight loading + warmup 1st + warmup 2nd) sum to ~88s for Qwen 72B; the remaining ~5s is executor overhead (model construction, sampler, KV cache, IPC).
 
 ### Part 2 — Storage Tier Comparison (72B/70B Models, TP=8)
 
@@ -262,19 +260,18 @@ S1 = remote cold download, S2 = NFS cold (fresh inode copy per run), S3 = NFS wa
 |:-------|----:|----:|----:|----:|----:|----:|
 | **Total startup** | **93.4 (100%)** | **114.4 (100%)** | **50.2 (100%)** | **95.5 (100%)** | **146.1 (100%)** | **52.9 (100%)** |
 | Cached model loader (server) | 63.5 (68%) | 0.003 (<1%) | 0.002 (<1%) | 62.5 (65%) | 0.003 (<1%) | 0.001 (<1%) |
-| Worker spawn overhead | *hidden* | ~21s (18%) | ~21s (42%) | *hidden* | ~21s (14%) | ~21s (40%) |
 | Checkpoint prefetch (worker) | 3.5 (4%) | 65.0 (57%) | 3.4 (7%) | 5.0 (5%) | 99.2 (68%) | 6.0 (11%) |
 | Apply weights (worker) | 3.8 (4%) | 4.3 (4%) | 3.6 (7%) | 3.7 (4%) | 3.6 (2%) | 3.6 (7%) |
 | Warmup — 1st pass (worker) | 12.1 (13%) | 12.4 (11%) | 11.9 (24%) | 13.0 (14%) | 13.0 (9%) | 12.5 (24%) |
 | Warmup — 2nd pass (worker) | 4.1 (4%) | 4.2 (4%) | 4.1 (8%) | 4.0 (4%) | 4.0 (3%) | 4.0 (8%) |
 
-**Why S2 (NFS cold) is slower than S1 (remote download):** Two factors combine:
+**Why S2 (NFS cold) is slower than S1 (remote download):**
 
-1. **Real I/O speed difference:** Cold NFS reads (65–99s) are genuinely slower than the internal CDN (~2 GB/s, 43–44s to tmpfs). S1's total I/O (server download + worker prefetch) is ~48s; S2's is ~65–99s.
+1. **I/O speed:** Cold NFS reads (65–99s for checkpoint prefetch) are genuinely slower than the CDN download path (~44s download to tmpfs + ~4s worker prefetch = ~48s total I/O in S1 vs 65–99s in S2).
 
-2. **Hidden parallelism in S1:** The ~21s worker spawn overhead (Python imports, CUDA context, NCCL setup) runs concurrently with the 63.5s server download — fully hidden. In S2/S3, the model loader takes 0.003s, so there's nothing to hide behind. This makes the gap between S1 and S2 appear ~21s larger than the pure I/O difference would suggest.
+2. **Executor overhead gap:** S2/S3 show ~25–28s of executor initialization overhead (model construction, tensor materialization, CUDA context, NCCL, sampler, KV cache setup) not broken out in the summary table, compared to only ~5s in S1. The source of this ~20s discrepancy is not yet fully characterized — the full hierarchical JSON profiles contain additional phase detail that may explain it.
 
-The combined effect: S2 is ~21–51s slower than S1 (Qwen 72B: +21s, DeepSeek 70B: +51s). S3 (warm cache) eliminates both the I/O penalty and exposes that the ~21s worker spawn + ~4s other overhead is the true irreducible infrastructure cost.
+S3 (warm cache) eliminates the I/O penalty entirely (page cache serves reads in 3–6s) and shows the clearest picture of the executor overhead floor (~27s), making it the most useful baseline for projecting MX/GMS improvements.
 
 ### Part 3 — Autotuner Impact
 
@@ -316,15 +313,17 @@ Comparing autotuner ON vs OFF on S2 and S3 tiers. Warmup component shift when au
 
 ### Analysis and Key Insights
 
-#### 1. Storage I/O Dominates Cold Start — But Hidden Parallelism Distorts the Comparison
+#### 1. Storage I/O Dominates Cold Start
 
-For large models (70–72B), I/O is the dominant bottleneck, but comparing S1 vs S2 requires accounting for server/worker concurrency:
+For large models (70–72B), I/O is the dominant bottleneck:
 
-- **S1 (remote cold):** CDN download (43–44s) to tmpfs is the bottleneck, but the 63.5s server-side model loader also hides ~21s of worker spawn overhead that runs concurrently. Worker prefetch from tmpfs is fast (3–5s). Effective I/O: ~47–49s, but total appears lower than expected because worker initialization is "free."
-- **S2 (NFS cold):** No download (0.003s), but worker prefetch from cold NFS is 65–99s. The ~21s worker spawn is no longer hidden behind a download, adding visible overhead. **S2 is slower than S1** for two reasons: (1) cold NFS throughput < CDN throughput, and (2) the 21s worker spawn is exposed.
-- **S3 (warm cache):** No download (0.002s), worker prefetch from page cache (3–6s). Total I/O: ~3–6s — **2–3x faster** than S1. The ~21s worker spawn dominates the non-warmup overhead.
+- **S1 (remote cold):** CDN download (43–44s) to tmpfs dominates, with the full model loader phase taking 62–64s (includes HF cache management overhead beyond raw download). Worker prefetch from tmpfs is fast (3–5s).
+- **S2 (NFS cold):** No download needed, but worker prefetch from cold NFS is 65–99s — genuinely slower than the CDN path. This is the primary reason S2 total exceeds S1.
+- **S3 (warm cache):** No download, page-cache-warm prefetch (3–6s). Provides the clearest view of the non-I/O startup floor.
 
 The weight *application* phase (`apply_weights`) is constant at 3.6–4.3s regardless of storage tier, confirming it's GPU-bound, not I/O-bound.
+
+**Open question:** S2/S3 show ~25–28s of executor overhead not broken out in the summary tables, compared to ~5s in S1. This gap warrants further investigation with the full hierarchical profiles to determine whether it reflects unmeasured initialization phases, profiler coverage differences, or other factors.
 
 #### 2. Warmup Is the Irreducible Floor
 
@@ -332,16 +331,15 @@ With warm cache (S3), I/O is negligible. The remaining startup time breaks down 
 
 | Component | Qwen 72B S3 | % of Total |
 |:----------|------------:|-----------:|
-| Worker spawn (Python, CUDA ctx, NCCL) | ~21s | ~42% |
-| Weight loading (worker) | 8.9s | 17.7% |
-| Warmup — 1st pass (worker) | 11.9s | 23.7% |
-| Warmup — 2nd pass (worker) | 4.1s | 8.2% |
-| Other overhead (config, sampler, KV cache, IPC) | ~4s | ~8% |
+| Weight loading (prefetch + apply) | 7.0s | 14% |
+| Warmup — 1st pass | 11.9s | 24% |
+| Warmup — 2nd pass | 4.1s | 8% |
+| Executor overhead (model construction, CUDA ctx, NCCL, sampler, KV cache, IPC) | ~27s | ~54% |
 | **Total** | **50.2s** | 100% |
 
-The two irreducible floors that MX and GMS cannot improve:
-- **Worker spawn (~21s):** Python interpreter startup, CUDA context initialization, NCCL communicator setup. Only process-level optimizations (persistent workers, pre-warmed containers) can reduce this.
+MX and GMS can reduce the 7.0s weight loading cost (GMS: ~0.1s zero-copy) but cannot address:
 - **Warmup (~16s):** Autotuner forward (11.0s) + CUDA graph capture (0.6s) + 2nd-pass warmup (4.1s). Only compilation/autotuner caching can reduce this.
+- **Executor overhead (~27s):** Model construction, tensor materialization, CUDA context, NCCL communicators, sampler/KV cache creation. Only process-level optimizations (persistent workers, pre-warmed containers) can reduce this. The exact breakdown of this overhead requires further profiling.
 
 #### 3. Disabling Autotuner Has No Net Benefit
 
