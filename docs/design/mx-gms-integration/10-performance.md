@@ -257,11 +257,15 @@ Each worker rank (independently, in parallel):
 
 **Why cooperative prefetch then full load:** Without prefetch, 8 ranks would simultaneously issue cold NFS reads for all files — an I/O contention storm. The prefetch ensures each file is read from NFS exactly once (total I/O = 1x model size), then all subsequent `load_file()` calls hit warm OS page cache.
 
-**Key inefficiency:** Each rank briefly holds the *full* checkpoint (~145GB for Qwen 72B) in CPU memory before slicing to keep only its ~18GB shard. This 8x redundant CPU memory consumption is one of the inefficiencies that MX addresses — by streaming only the relevant shard directly to each rank's GPU.
+**Memory behavior:** While `safetensors.torch.load_file()` uses mmap internally (shared physical pages across ranks via `MAP_PRIVATE` + `PROT_READ`), its `get_tensor()` implementation **copies** each tensor's bytes from the mmap region into a new CPU-allocated `torch.Tensor`. So each rank creates a private CPU copy of every tensor before slicing its 1/8 shard. Peak CPU memory: ~1x model (shared page cache) + 8x model (private tensor copies) ≈ **~9x model size** (~1.3TB for Qwen 72B). The copies are freed incrementally via `mark_consumed()`, but the transient spike is real.
+
+**Existing optimization path (side observation):** The `safetensors` library supports selective tensor loading via `safe_open().get_slice()`, which reads only the requested byte range without materializing the full tensor. TRT-LLM's `load_weight_shard` (`_torch/modules/linear.py:129-136`) already has a code path for `PySafeSlice` objects — but it is never reached because `load_file()` materializes everything first. Switching from `load_file()` to `safe_open()` + `get_slice()` would let each rank read only its TP shard, reducing peak CPU memory from ~9x to ~2x model size. This is a potential quick-win optimization for the existing HF loading path, but becomes moot once MX integration is complete (MX streams only the relevant shard directly to each rank's GPU, bypassing storage entirely).
 
 ### Part 1 — Model Size Scaling (S1, Remote Cold Download)
 
-Fresh HF download to `/tmp` (tmpfs) each run. All times in seconds (representative run). Percentages are of total startup.
+Fresh HF download each run with `HF_HOME` set to `/tmp` (tmpfs). Workers prefetch from the same tmpfs-backed HF cache — the 3–5s prefetch times reflect RAM-to-RAM throughput. In production without tmpfs override, `snapshot_download()` writes to `~/.cache/huggingface/hub/` (local disk); worker prefetch would then depend on that disk's speed (NVMe SSD: ~30–45s for 145GB, NFS-mounted home: similar to S2).
+
+All times in seconds (representative run). Percentages are of total startup.
 
 | Metric | B1: Qwen 7B (TP=1) | B3: DS 7B (TP=1) | B2: Qwen 72B (TP=8) | B4: DS 70B (TP=8) |
 |:-------|----:|----:|----:|----:|
@@ -346,7 +350,7 @@ Comparing autotuner ON vs OFF on S2 and S3 tiers. Warmup component shift when au
 For large models (70–72B), cooperative NFS prefetch (65–99s) is the dominant bottleneck in the realistic production scenario (S2). Each worker rank reads 1/8 of the safetensors files from cold NFS to warm the OS page cache; the total NFS read volume is 1x model size, but 8 ranks share NFS bandwidth.
 
 - **S2 (NFS cold, production baseline):** 65–99s checkpoint prefetch dominates. This is the cost MX aims to eliminate.
-- **S1 (remote cold):** Appeared faster than S2 in this benchmark due to a fast internal HF mirror (~2 GB/s to tmpfs). Public HF Hub downloads would be significantly slower and make S1 the worst tier. S1 is not representative of production cold-start.
+- **S1 (remote cold):** Appeared faster than S2 in this benchmark for two reasons: (1) fast internal HF mirror (~2 GB/s), and (2) download destination was tmpfs (RAM-backed), so worker prefetch was 3–5s (RAM-to-RAM, not disk I/O). In production, `snapshot_download()` writes to local disk (`~/.cache/huggingface/hub/`); worker prefetch would then be disk-speed-dependent (~30–45s on NVMe for 145GB, much longer on HDD/NFS). S1 is not representative of production cold-start.
 - **S3 (warm cache):** Prefetch from page cache (3–6s). Represents the second instance on the same node.
 
 The weight *application* phase (`apply_weights`) is constant at 3.6–4.3s regardless of storage tier, confirming it's GPU-bound, not I/O-bound.
