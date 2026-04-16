@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any, Optional
 
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import \
@@ -59,7 +60,8 @@ class MXCheckpointLoader(HfCheckpointLoader):
         # that reads self._checkpoint_format directly (instead of the
         # property) also sees "MX".
         self._checkpoint_format = "MX"
-        self._mx_server_url = mx_server_url
+        self._mx_server_url = mx_server_url or os.environ.get(
+            "MODEL_EXPRESS_URL")
         self._p2p_succeeded = False
         self._identity = None
 
