@@ -405,18 +405,99 @@ The weight *application* phase (`apply_weights`) is constant at 3.6–4.3s regar
 
 Investigation of the full hierarchical JSON profiles identified the source of the ~20s discrepancy. It is the **MPI worker first-dispatch latency** — the time for worker processes to receive their first task and begin executing.
 
-The MPI worker pool is created in `llm.init_mpi_session`, but workers remain idle until they receive a dispatched function call. The first dispatch triggers worker-side cold start: Python module imports, CUDA context creation, and NCCL communicator setup (~21s on this hardware).
+The MPI worker pool is created in `llm.init_mpi_session` (`MpiPoolSession.__init__` → `MPIPoolExecutor`, `mpi_session.py:138`), but workers remain idle until they receive a dispatched function call via `mpi_session.submit()`. The first dispatch triggers worker-side cold start: Python module imports, CUDA context creation, and NCCL communicator setup (~21s on this hardware).
 
-The key code path difference (`llm_utils.py`, `CachedModelLoader._download_hf_model_if_needed`):
+**The branching point** is `CachedModelLoader._download_hf_model_if_needed` (`llm_utils.py:719`):
 
-- **S1** (`is_hub_model = True`): The first dispatch occurs inside `cached_model_loader`, which calls `_submit_to_all_workers(_node_download_hf_model)` to coordinate the HF download across MPI ranks. Workers wake up and pay their ~21s cold-start cost while the server is orchestrating the 63.5s download. By the time `create_executor` dispatches `worker_main`, workers are already warm — gap is only 0.6s.
-- **S2/S3** (`is_hub_model = False`): `_download_hf_model_if_needed` returns the local `Path` immediately — no MPI dispatch. Workers remain idle until `create_executor` dispatches `worker_main`, which is the **first dispatch**. Workers pay their ~21s cold-start cost inside `create_executor`, making it fully visible.
+```python
+def _download_hf_model_if_needed(self, model_obj, revision=None):
+    if model_obj.is_hub_model:          # ← S1: True (model is HF ID string)
+        model_dirs = self._submit_to_all_workers(   # ← FIRST MPI DISPATCH
+            CachedModelLoader._node_download_hf_model, ...)
+        ...
+    return model_obj.model_dir          # ← S2/S3: returns immediately (model is local Path)
+```
 
-Evidence from server/worker clock correlation (Qwen 72B):
+Where `is_hub_model` (`llm_args.py:2467`) simply checks if the model is a string (HF ID) vs a `Path` (local directory):
+
+```python
+@property
+def is_hub_model(self) -> bool:
+    return not self.is_local_model      # True for "Qwen/Qwen2.5-72B-Instruct"
+
+@property
+def is_local_model(self) -> bool:
+    return isinstance(self.model, Path) # True for Path("/home/.../Qwen2.5-72B-Instruct")
+```
+
+**Time-sequence comparison** (Qwen 72B, measured from profiler data):
+
+```
+S1 (remote cold) — worker cold start HIDDEN in download
+═══════════════════════════════════════════════════════════════════════════════
+Server clock:  0s        20s              64s                    93s
+               │          │                │                      │
+Server:        ├─ init_mpi_session (0s)    │                      │
+               │  └─ MPIPoolExecutor       │                      │
+               │     spawns 8 workers      │                      │
+               │                           │                      │
+               ├─ cached_model_loader ─────┤ (63.5s)              │
+               │  └─ _submit_to_all_workers(_node_download_hf_model)
+               │     ← FIRST MPI DISPATCH (server time 0.001s)   │
+               │                           │                      │
+               │                           ├─ create_executor ────┤ (28.7s)
+               │                           │  └─ submit(worker_main)
+               │                           │     ← workers already warm, gap=0.6s
+               │                           │                      │
+Workers:       │..cold start (~21s)........│                      │
+               ├──────────────────────────>│                      │
+               │  Python imports, CUDA ctx,│                      │
+               │  NCCL init                │                      │
+               │          │                │                      │
+               │          ├─ _node_download_hf_model (43.9s) ────>│
+               │          │                │                      │
+               │          │                ├─ executor_worker.initialize (28.1s)──>│
+               │          │                │                      │
+═══════════════════════════════════════════════════════════════════════════════
+                          ▲                ▲
+                          │                └─ Workers warm; create_executor starts
+                          └─ Workers finally ready after cold start
+
+
+S2/S3 (local model) — worker cold start VISIBLE in create_executor
+═══════════════════════════════════════════════════════════════════════════════
+Server clock:  0s        21s                                    50/114s
+               │          │                                      │
+Server:        ├─ init_mpi_session (0s)                          │
+               │  └─ MPIPoolExecutor spawns 8 workers            │
+               │                                                 │
+               ├─ cached_model_loader (0.003s)                   │
+               │  └─ is_hub_model = False → return immediately   │
+               │     ← NO MPI DISPATCH                          │
+               │                                                 │
+               ├─ create_executor ───────────────────────────────┤ (49/113s)
+               │  └─ submit(worker_main)                         │
+               │     ← FIRST MPI DISPATCH (server time 0.2s)    │
+               │                                                 │
+Workers:       │..cold start (~21s)..│                           │
+               ├────────────────────>│                           │
+               │  Python imports,    │                           │
+               │  CUDA ctx, NCCL     │                           │
+               │                     │                           │
+               │                     ├─ executor_worker.initialize ──>│
+               │                     │   (28s for S3, 92s for S2)│
+               │                     │                           │
+═══════════════════════════════════════════════════════════════════════════════
+                                     ▲
+                                     └─ Workers finally ready; all 21s is INSIDE
+                                        create_executor, making it visible
+```
+
+**Evidence from server/worker clock correlation** (Qwen 72B):
 
 | | S1 | S2 | S3 |
 |---|---|---|---|
-| First MPI dispatch (server clock) | 0.001s (in `cached_model_loader`) | 0.213s (in `create_executor`) | 0.229s (in `create_executor`) |
+| First MPI dispatch (server clock) | 0.001s (`cached_model_loader`) | 0.213s (`create_executor`) | 0.229s (`create_executor`) |
 | Worker profiler starts (server clock) | ~20s | ~22s | ~21s |
 | Worker cold-start latency | **~20s** (hidden in download) | **~22s** (visible) | **~21s** (visible) |
 | `create_executor` − `executor_worker.initialize` gap | 0.6s | 21.5s | 21.0s |
