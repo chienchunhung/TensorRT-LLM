@@ -98,13 +98,13 @@ Default serving config: `max_batch_size=4, max_num_tokens=1024, max_seq_len=4096
 
 ### Storage Tier Matrix
 
-| Tier | ID | What it measures | Setup |
-|------|----|-----------------|-------|
-| Remote cold | S1 | Full HF download over network + model load | Isolated empty HF cache on `/tmp` (tmpfs); every run downloads from scratch |
-| NFS cold | S2 | NFS file read (no page cache) + model load | Model files pre-copied to a **fresh NFS directory per run** (new inodes), guaranteeing cold page cache without needing `drop_caches` privileges |
-| Local warm | S3 | Page-cache-warm file read + model load | Model files on NFS, page cache hot from a prior run; simulates 2nd replica on the same node |
+| Tier | ID | What it measures | Production analog | Setup |
+|------|----|-----------------|-------------------|-------|
+| Remote cold | S1 | Full HF download over network + model load | Model not pre-staged; downloads on first use | Isolated empty HF cache on `/tmp` (tmpfs); every run downloads from scratch |
+| NFS cold | S2 | NFS file read (no page cache) + model load | **First cold start** on a node with model pre-staged on NFS | Model files pre-copied to a **fresh NFS directory per run** (new inodes), guaranteeing cold page cache without needing `drop_caches` privileges |
+| Local warm | S3 | Page-cache-warm file read + model load | Second instance on same node (page cache hot from prior load) | Model files on NFS, page cache hot from a prior run |
 
-**Default tier: S1 (remote cold).**
+**Default tier: S1 (remote cold).** However, **S2 is the most realistic production cold-start scenario** — models are typically pre-staged on shared storage, not downloaded from HF Hub at serve time. S1 is useful mainly as a comparison point and for environments without pre-staged models.
 
 ### Statistical Protocol
 
@@ -180,8 +180,8 @@ Scenario-based projection using measured S2/S3 baselines for Qwen 72B (TP=8). Th
 | **6. MX+GMS+compile cache** | ~0.1s (zero-copy) | ~2s (cached) | **~12–15s** | Best case: all warmup artifacts pre-cached |
 
 Key takeaways for MX/GMS integration:
-- **MX** eliminates the 65–99s NFS cold-read penalty by streaming weights GPU-to-GPU (~10–15s).
-- **GMS** eliminates the 8.9s weight loading cost entirely for 2nd+ instances via zero-copy sharing.
+- **MX** eliminates the 65–99s NFS cold-read penalty by streaming only the relevant TP shard directly to each rank's GPU (~10–15s), also eliminating the 8x redundant CPU memory consumption of the current load-all-then-shard pattern.
+- **GMS** eliminates the 8.9s weight loading cost entirely for 2nd+ instances via zero-copy GPU memory sharing.
 - **Neither MX nor GMS can reduce the ~16s warmup floor** — only compilation/autotuner caching can address this.
 - **The very first cluster-wide instance always pays full cost** (114–146s with NFS cold). MX requires a donor node; GMS requires a prior instance on the same node.
 
@@ -233,6 +233,32 @@ Total = 114.4s
 
 **Note on executor overhead:** The summary tables highlight the largest phases. The remaining time ("executor overhead") covers model construction on meta tensors, tensor materialization, CUDA context setup, NCCL communicator initialization, sampler creation, KV cache allocation/configuration, and IPC coordination. This overhead is ~5s for S1 but ~25–28s for S2/S3 — the difference is not yet fully characterized and warrants further investigation using the full hierarchical JSON profiles.
 
+### Weight Loading Data Flow (TP=8)
+
+Understanding the weight loading pattern is important for interpreting results and for MX/GMS design:
+
+```
+Server process:
+  CachedModelLoader — resolves model path only (0.003s for local models)
+                      does NOT read weight files for PyTorch backend
+  create_executor   — dispatches worker_main to 8 MPI pool workers
+
+Each worker rank (independently, in parallel):
+  1. Cooperative prefetch: each rank reads 1/8 of .safetensors files
+     via raw f.read() (bytes discarded) → warms OS page cache
+  2. MPI barrier — ensures all files are in page cache
+  3. Full load: each rank loads ALL safetensors files into CPU memory
+     (safetensors.torch.load_file, backed by mmap hitting warm cache)
+  4. Shard: each rank slices its TP=1/8 partition from every tensor
+  5. Copy shard to GPU, free CPU memory for consumed tensors
+```
+
+**Why every rank loads all files:** HF safetensors files are sharded by layer groups (file 1 = layers 0-15, file 2 = layers 16-31, etc.), but TP shards by *tensor slicing* — each rank needs a column/row slice of every layer's weights. Under pure TP, no file can be skipped.
+
+**Why cooperative prefetch then full load:** Without prefetch, 8 ranks would simultaneously issue cold NFS reads for all files — an I/O contention storm. The prefetch ensures each file is read from NFS exactly once (total I/O = 1x model size), then all subsequent `load_file()` calls hit warm OS page cache.
+
+**Key inefficiency:** Each rank briefly holds the *full* checkpoint (~145GB for Qwen 72B) in CPU memory before slicing to keep only its ~18GB shard. This 8x redundant CPU memory consumption is one of the inefficiencies that MX addresses — by streaming only the relevant shard directly to each rank's GPU.
+
 ### Part 1 — Model Size Scaling (S1, Remote Cold Download)
 
 Fresh HF download to `/tmp` (tmpfs) each run. All times in seconds (representative run). Percentages are of total startup.
@@ -265,13 +291,15 @@ S1 = remote cold download, S2 = NFS cold (fresh inode copy per run), S3 = NFS wa
 | Warmup — 1st pass (worker) | 12.1 (13%) | 12.4 (11%) | 11.9 (24%) | 13.0 (14%) | 13.0 (9%) | 12.5 (24%) |
 | Warmup — 2nd pass (worker) | 4.1 (4%) | 4.2 (4%) | 4.1 (8%) | 4.0 (4%) | 4.0 (3%) | 4.0 (8%) |
 
-**Why S2 (NFS cold) is slower than S1 (remote download):**
+**Why S2 (NFS cold) is slower than S1 (remote download) in this benchmark:**
 
-1. **I/O speed in this environment:** Cold NFS reads (65–99s for checkpoint prefetch across 8 concurrent worker ranks) were slower than the internal CDN mirror path (~44s download to tmpfs + ~4s worker prefetch = ~48s). Note: S1 uses a fast internal HF mirror (~2 GB/s); public HF Hub downloads would be much slower and likely reverse this ordering. The S2 cold NFS performance also reflects worst-case conditions (fresh inodes, no page cache, 8 ranks contending on the same NFS server).
+S2 is the realistic production cold-start scenario (model pre-staged on NFS), yet it shows higher total startup than S1 (HF download). This is an artifact of the test environment:
+
+1. **I/O path difference:** In S1, the server downloads the full model to tmpfs (RAM-backed) at ~2 GB/s from a fast internal HF mirror, then workers prefetch from RAM (3–5s). In S2, workers cooperatively prefetch all files directly from cold NFS — 8 ranks sharing NFS bandwidth with no page cache. The CDN mirror is unusually fast; public HF Hub downloads would make S1 significantly slower than S2.
 
 2. **Executor overhead gap:** S2/S3 show ~25–28s of executor initialization overhead (model construction, tensor materialization, CUDA context, NCCL, sampler, KV cache setup) not broken out in the summary table, compared to only ~5s in S1. The source of this ~20s discrepancy is not yet fully characterized — the full hierarchical JSON profiles contain additional phase detail that may explain it.
 
-S3 (warm cache) eliminates the I/O penalty entirely (page cache serves reads in 3–6s) and shows the clearest picture of the executor overhead floor (~27s), making it the most useful baseline for projecting MX/GMS improvements.
+**For MX/GMS projections, S2 is the correct baseline** — it represents the cold-start cost that MX aims to eliminate. S3 (page cache hot from a prior load on the same node, 3–6s prefetch) shows the floor after I/O is removed.
 
 ### Part 3 — Autotuner Impact
 
@@ -313,13 +341,13 @@ Comparing autotuner ON vs OFF on S2 and S3 tiers. Warmup component shift when au
 
 ### Analysis and Key Insights
 
-#### 1. Storage I/O Dominates Cold Start
+#### 1. Storage I/O Dominates Production Cold Start
 
-For large models (70–72B), I/O is the dominant bottleneck:
+For large models (70–72B), cooperative NFS prefetch (65–99s) is the dominant bottleneck in the realistic production scenario (S2). Each worker rank reads 1/8 of the safetensors files from cold NFS to warm the OS page cache; the total NFS read volume is 1x model size, but 8 ranks share NFS bandwidth.
 
-- **S1 (remote cold):** Internal CDN mirror download (43–44s) to tmpfs dominates, with the full model loader phase taking 62–64s (includes HF cache management overhead beyond raw download). Worker prefetch from tmpfs is fast (3–5s). Note: the fast internal mirror (~2 GB/s) makes S1 unusually favorable — public HF Hub downloads would be significantly slower.
-- **S2 (NFS cold):** No download needed, but worker prefetch from cold NFS is 65–99s with 8 ranks contending on the same NFS server. In this environment, S2 I/O was slower than S1's CDN path, though this is environment-specific — NFS performance varies widely by deployment.
-- **S3 (warm cache):** No download, page-cache-warm prefetch (3–6s). Provides the clearest view of the non-I/O startup floor.
+- **S2 (NFS cold, production baseline):** 65–99s checkpoint prefetch dominates. This is the cost MX aims to eliminate.
+- **S1 (remote cold):** Appeared faster than S2 in this benchmark due to a fast internal HF mirror (~2 GB/s to tmpfs). Public HF Hub downloads would be significantly slower and make S1 the worst tier. S1 is not representative of production cold-start.
+- **S3 (warm cache):** Prefetch from page cache (3–6s). Represents the second instance on the same node.
 
 The weight *application* phase (`apply_weights`) is constant at 3.6–4.3s regardless of storage tier, confirming it's GPU-bound, not I/O-bound.
 
