@@ -187,16 +187,19 @@ Compare against B2-S3 and B4-S3 (default bs=4, nt=1024, max_seq_len=4096). `nt` 
 
 Scenario-based projection using measured S2/S3 baselines for Qwen 72B (TP=8). The "first pays upfront, rest benefit" property of MX and GMS is reflected explicitly.
 
-| Scenario | Weight Load Cost | Warmup Cost | Total Startup | Notes |
-|:---------|:-----------------|:------------|:--------------|:------|
-| **1. Baseline S2 (NFS cold)** | 71.8s (measured) | 16.6s (measured) | **114.4s** | Every instance pays full NFS cold read |
-| **2. Baseline S3 (warm cache)** | 8.9s (measured) | 16.0s (measured) | **50.2s** | 2nd instance on same node, page cache hot |
-| **3. MX (1st on new node)** | ~10–15s (GPU P2P) | 16.6s | **~50–55s** | MX streams weights from donor node, converts S2→S3 equivalent |
-| **4. GMS (2nd+ on same node)** | ~0.1s (zero-copy) | 16.6s | **~25–30s** | 1st instance loads normally; 2nd+ near-free via shared GPU memory |
-| **5. MX+GMS (2nd+ on new node)** | ~0.1s (zero-copy) | 16.6s | **~25–30s** | 1st fetches via MX; 2nd+ near-free via GMS |
-| **6. MX+GMS+compile cache** | ~0.1s (zero-copy) | ~2s (cached) | **~12–15s** | Best case: all warmup artifacts pre-cached |
+| Scenario | Worker Init | Weight Load | Warmup | Total Startup | Notes |
+|:---------|:------------|:------------|:-------|:--------------|:------|
+| **1. Baseline S2 (NFS cold)** | 21s (measured) | 71.8s (measured) | 16.6s (measured) | **114.4s** | Full cold start |
+| **2. Baseline S3 (warm cache)** | 21s (measured) | 8.9s (measured) | 16.0s (measured) | **50.2s** | Page cache hot |
+| **3. Early worker warm-up (S3)** | ~0s (hidden) | 8.9s | 16.0s | **~29s** | Dispatch no-op to workers at `init_mpi_session` |
+| **4. MX (1st on new node)** | 21s | ~10–15s (GPU P2P) | 16.6s | **~50–55s** | MX streams weights from donor node |
+| **5. MX + early warm-up** | ~0s (hidden) | ~10–15s | 16.6s | **~29–34s** | Worker init overlaps with MX setup |
+| **6. GMS (2nd+ on same node)** | 21s | ~0.1s (zero-copy) | 16.6s | **~41s** | 2nd+ instance via shared GPU memory |
+| **7. GMS + early warm-up** | ~0s (hidden) | ~0.1s | 16.6s | **~20s** | Worker init hidden; weights near-free |
+| **8. MX+GMS+compile+early warm-up** | ~0s (hidden) | ~0.1s | ~2s (cached) | **~6s** | Best case for all replicas |
 
-Key takeaways for MX/GMS integration:
+Key takeaways:
+- **Early worker warm-up** (row 3) is a standalone optimization worth ~21s — it overlaps MPI worker cold start (Python imports, CUDA context, NCCL) with server-side work. Orthogonal to MX/GMS and stacks with every scenario.
 - **MX** eliminates the 65–99s NFS cold-read penalty by streaming only the relevant TP shard directly to each rank's GPU (~10–15s), also eliminating the 8x redundant CPU memory consumption of the current load-all-then-shard pattern.
 - **GMS** eliminates the 8.9s weight loading cost entirely for 2nd+ instances via zero-copy GPU memory sharing.
 - **Neither MX nor GMS can reduce the ~16s warmup floor** — only compilation/autotuner caching can address this.
@@ -238,17 +241,30 @@ Total = 93.4s
 
 S2 (NFS cold):
 Total = 114.4s
-├─ [Server]  Cached model loader          0.003s ← no download needed
+├─ [Worker]  MPI worker cold start       ~21.5s  ← Python imports, CUDA ctx, NCCL (see note)
 ├─ [Worker]  Checkpoint prefetch          65.0s  ← cold NFS reads
 ├─ [Worker]  Apply weights                 4.3s
 ├─ [Worker]  Warmup (1st pass)            12.4s
 ├─ [Worker]  Warmup (2nd pass)             4.2s
-└─ [Both]    Executor overhead           ~28.5s  ← see note below
+├─ [Server]  Cached model loader          0.003s ← no download needed
+└─ [Both]    Other overhead               ~6.9s  ← model construction, sampler, KV cache, IPC
                                           -----
-             Sum                         ~114.4s
+             Sum                         ~114.3s
+
+S3 (NFS warm):
+Total = 50.2s
+├─ [Worker]  MPI worker cold start       ~21.0s  ← Python imports, CUDA ctx, NCCL (see note)
+├─ [Worker]  Checkpoint prefetch           3.4s  ← page cache hit
+├─ [Worker]  Apply weights                 3.6s
+├─ [Worker]  Warmup (1st pass)            11.9s
+├─ [Worker]  Warmup (2nd pass)             4.1s
+├─ [Server]  Cached model loader          0.002s
+└─ [Both]    Other overhead               ~6.2s  ← model construction, sampler, KV cache, IPC
+                                          -----
+             Sum                          ~50.2s
 ```
 
-**Note on executor overhead:** The summary tables highlight the largest phases. The remaining time ("executor overhead") covers model construction on meta tensors, tensor materialization, CUDA context setup, NCCL communicator initialization, sampler creation, KV cache allocation/configuration, and IPC coordination. This overhead is ~5s for S1 but ~25–28s for S2/S3 — the difference is not yet fully characterized and warrants further investigation using the full hierarchical JSON profiles.
+**Note on MPI worker cold start:** The executor overhead gap between S1 (~5s) and S2/S3 (~25–28s) is fully explained by when MPI workers first receive dispatched work. In S1, `cached_model_loader` dispatches the HF download to workers (`_submit_to_all_workers`), triggering their ~21s cold start (Python imports, CUDA context, NCCL) early — hidden behind the 63.5s download. In S2/S3, the model is local (`is_hub_model = False`), so no dispatch occurs until `create_executor` calls `worker_main` — the ~21s cold start is fully visible. See [Analysis §1](#executor-overhead-gap-s1-5s-vs-s2s3-25s--root-cause) for the detailed investigation.
 
 ### Weight Loading Data Flow (TP=8)
 
@@ -385,23 +401,48 @@ For large models (70–72B), the dominant bottleneck depends on whether the OS p
 
 The weight *application* phase (`apply_weights`) is constant at 3.6–4.3s regardless of storage tier, confirming it's GPU-bound, not I/O-bound.
 
-**Open question:** S2/S3 show ~25–28s of executor overhead not broken out in the summary tables, compared to ~5s in S1. This gap warrants further investigation with the full hierarchical profiles to determine whether it reflects unmeasured initialization phases, profiler coverage differences, or other factors.
+#### Executor Overhead Gap: S1 (~5s) vs S2/S3 (~25s) — Root Cause
+
+Investigation of the full hierarchical JSON profiles identified the source of the ~20s discrepancy. It is the **MPI worker first-dispatch latency** — the time for worker processes to receive their first task and begin executing.
+
+The MPI worker pool is created in `llm.init_mpi_session`, but workers remain idle until they receive a dispatched function call. The first dispatch triggers worker-side cold start: Python module imports, CUDA context creation, and NCCL communicator setup (~21s on this hardware).
+
+The key code path difference (`llm_utils.py`, `CachedModelLoader._download_hf_model_if_needed`):
+
+- **S1** (`is_hub_model = True`): The first dispatch occurs inside `cached_model_loader`, which calls `_submit_to_all_workers(_node_download_hf_model)` to coordinate the HF download across MPI ranks. Workers wake up and pay their ~21s cold-start cost while the server is orchestrating the 63.5s download. By the time `create_executor` dispatches `worker_main`, workers are already warm — gap is only 0.6s.
+- **S2/S3** (`is_hub_model = False`): `_download_hf_model_if_needed` returns the local `Path` immediately — no MPI dispatch. Workers remain idle until `create_executor` dispatches `worker_main`, which is the **first dispatch**. Workers pay their ~21s cold-start cost inside `create_executor`, making it fully visible.
+
+Evidence from server/worker clock correlation (Qwen 72B):
+
+| | S1 | S2 | S3 |
+|---|---|---|---|
+| First MPI dispatch (server clock) | 0.001s (in `cached_model_loader`) | 0.213s (in `create_executor`) | 0.229s (in `create_executor`) |
+| Worker profiler starts (server clock) | ~20s | ~22s | ~21s |
+| Worker cold-start latency | **~20s** (hidden in download) | **~22s** (visible) | **~21s** (visible) |
+| `create_executor` − `executor_worker.initialize` gap | 0.6s | 21.5s | 21.0s |
+
+The ~21s is constant across all tiers. It is hidden in S1 because workers warm up during the download phase, and visible in S2/S3 because there is no server-side work to overlap with.
+
+**Optimization opportunity:** For local-model deployments (S2/S3), dispatching a lightweight warm-up task to workers immediately after `init_mpi_session` — before `cached_model_loader` — would overlap the ~21s worker cold start with tokenizer loading and config parsing. This would reduce S3 total startup from ~50s to ~29s. This optimization is **orthogonal to MX/GMS** — the worker cold-start cost persists regardless of how weights are delivered, so the fix stacks with every MX/GMS scenario.
 
 #### 2. Warmup Is the Irreducible Floor
 
 With warm cache (S3), I/O is negligible. The remaining startup time breaks down as:
 
-| Component | Qwen 72B S3 | % of Total |
-|:----------|------------:|-----------:|
-| Weight loading (prefetch + apply) | 7.0s | 14% |
-| Warmup — 1st pass | 11.9s | 24% |
-| Warmup — 2nd pass | 4.1s | 8% |
-| Executor overhead (model construction, CUDA ctx, NCCL, sampler, KV cache, IPC) | ~27s | ~54% |
-| **Total** | **50.2s** | 100% |
+| Component | Qwen 72B S3 | % of Total | Reducible by |
+|:----------|------------:|-----------:|:-------------|
+| MPI worker cold start | ~21s | ~42% | Early warm-up dispatch (see above) |
+| Weight loading (prefetch + apply) | 7.0s | 14% | GMS zero-copy (~0.1s) |
+| Warmup — 1st pass | 11.9s | 24% | Compilation caching (~2s) |
+| Warmup — 2nd pass | 4.1s | 8% | Compilation caching |
+| Other overhead (model init, sampler, KV cache, IPC) | ~6s | ~12% | Minor |
+| **Total** | **50.2s** | 100% | |
 
-MX and GMS can reduce the 7.0s weight loading cost (GMS: ~0.1s zero-copy) but cannot address:
+The largest single component is the MPI worker cold start (~21s), which is addressable independently via early warm-up dispatch. After that fix, the floor would be ~29s, dominated by warmup (~16s) and weight loading (~7s).
+
+MX and GMS address weight loading but cannot reduce warmup:
 - **Warmup (~16s):** Autotuner forward (11.0s) + CUDA graph capture (0.6s) + 2nd-pass warmup (4.1s). Only compilation/autotuner caching can reduce this.
-- **Executor overhead (~27s):** Model construction, tensor materialization, CUDA context, NCCL communicators, sampler/KV cache creation. Only process-level optimizations (persistent workers, pre-warmed containers) can reduce this. The exact breakdown of this overhead requires further profiling.
+- **MPI worker cold start (~21s):** Python imports, CUDA context, NCCL setup. Orthogonal to MX/GMS — addressable by pre-warming workers at `init_mpi_session` time.
 
 #### 3. Disabling Autotuner Has No Net Benefit
 
