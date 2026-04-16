@@ -60,6 +60,10 @@ class GPUMemoryBackend(Protocol):
         """Register model tensors and commit them for RO readers (RW path)."""
         ...
 
+    def move_untracked_params(self, model: nn.Module) -> None:
+        """Move stray params not in the GMS pool into shared memory."""
+        ...
+
     def release(self, tag: str) -> None:
         """Release committed memory for a given tag."""
         ...
@@ -129,6 +133,16 @@ class GMSBackend:
                 self._client = gms_client.connect(self._socket_path)
                 self._is_rw = not self._client.has_committed_weights(
                     self._tag)
+
+            # Patch torch.cuda.empty_cache() to skip VMM-backed allocations.
+            # Without this, empty_cache() can segfault when it encounters
+            # memory regions managed by GMS's CUDAPluggableAllocator.
+            try:
+                from gpu_memory_service.integrations.common.patches import patch_empty_cache  # type: ignore[import-not-found]
+                patch_empty_cache()
+            except ImportError:
+                logger.debug(
+                    "GMS patch_empty_cache not available; skipping VMM safety patch")
 
             logger.info(
                 "Connected to GMS at %s (mode=%s, resolved=%s)",
@@ -202,11 +216,18 @@ class GMSBackend:
             self._mapping.tp_rank, self._mapping.tp_size)
 
     def finalize_write(self, model: nn.Module, tag: str = None) -> None:
-        """Register model tensors and commit for RO readers (RW path).
+        """Register model tensors, commit, and transition to RO mode.
 
         After the standard weight loading pipeline completes (under the
-        GMS mem pool), this method tells GMS which tensors belong to the
-        model and commits them for read-only access.
+        GMS mem pool), this method:
+        1. Registers model tensors with GMS.
+        2. Commits them for read-only access.
+        3. Disconnects the RW client.
+        4. Reconnects as RO so subsequent access is read-only.
+        5. Remaps virtual addresses so the RO client can serve the data.
+
+        This mirrors the GMS library's ``finalize_gms_write()`` behavior
+        (see ``gpu_memory_service.integrations.common.utils``).
         """
         if self._client is None:
             raise RuntimeError("GMS client not connected. Call connect() first.")
@@ -214,10 +235,61 @@ class GMSBackend:
             tag = self._tag
 
         from gpu_memory_service import client as gms_client  # type: ignore[import-not-found]
+
+        # Step 1-2: Register tensors and commit.
         gms_client.register_module_tensors(self._client, model)
         gms_client.commit(self._client, tag)
         logger.info(
             "GMS RW: committed weights at %s (tag=%s)", self._socket_path, tag)
+
+        # Step 3: Unmap VAs before disconnecting RW client.
+        manager = self._client.get_manager()
+        manager.unmap_all_vas()
+
+        # Step 4: Disconnect RW client and reconnect as RO.
+        gms_client.disconnect(self._client)
+        self._client = gms_client.connect(self._socket_path, mode="ro")
+        self._is_rw = False
+
+        # Step 5: Remap VAs under the new RO client so tensors remain valid.
+        manager = self._client.get_manager()
+        manager.remap_all_vas()
+        logger.info(
+            "GMS RW→RO: reconnected as RO at %s (tag=%s)",
+            self._socket_path, tag)
+
+    def move_untracked_params(self, model: nn.Module) -> None:
+        """Move parameters not tracked by GMS into the GMS memory pool.
+
+        During the RW loading pipeline, some parameters may be allocated
+        outside the ``use_mem_pool`` context (e.g., buffers created during
+        ``post_load_weights()`` or ``model.to("cuda")``).  These "stray"
+        tensors must be moved into the GMS pool before ``finalize_write()``
+        so that all model state is committed to shared memory.
+
+        This mirrors the GMS library's ``_move_untracked_params()`` behavior
+        (see ``gpu_memory_service.integrations.trtllm.model_loader``).
+        """
+        if self._client is None:
+            raise RuntimeError("GMS client not connected. Call connect() first.")
+
+        from gpu_memory_service import client as gms_client  # type: ignore[import-not-found]
+        pool = gms_client.get_mem_pool(self._client)
+        device = torch.device('cuda')
+
+        for name, param in model.named_parameters():
+            if param.is_cuda and not pool.is_from_pool(param.data):
+                with torch.cuda.use_mem_pool(pool, device=device):
+                    new_param = param.data.clone()
+                param.data = new_param
+                logger.debug("GMS: moved untracked param %s into pool", name)
+
+        for name, buf in model.named_buffers():
+            if buf.is_cuda and not pool.is_from_pool(buf.data):
+                with torch.cuda.use_mem_pool(pool, device=device):
+                    new_buf = buf.data.clone()
+                buf.data = new_buf
+                logger.debug("GMS: moved untracked buffer %s into pool", name)
 
     def release(self, tag: str = None) -> None:
         if self._client is None:

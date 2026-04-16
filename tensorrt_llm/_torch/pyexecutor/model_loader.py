@@ -516,7 +516,11 @@ class ModelLoader:
                                 model.load_weights, weights,
                                 self.weight_mapper)
 
-                    # Commit weights for RO readers.
+                    # Move any parameters that landed outside the GMS pool
+                    # (e.g., buffers created during weight loading transforms).
+                    gms_backend.move_untracked_params(model)
+
+                    # Commit weights for RO readers and transition to RO mode.
                     gms_backend.finalize_write(model)
                     logger.info("LoadFormat.GMS (RW): loaded and committed "
                                 "weights via %s",
@@ -531,6 +535,13 @@ class ModelLoader:
                             module.post_load_weights()
 
                     gms_backend.materialize_module(model)
+                    # Note: MoE load balancer finalization (lines below) works
+                    # because register functions access module attributes at
+                    # call time, resolving to materialized CUDA tensors.
+                    # The patch_empty_cache() applied during connect() is
+                    # critical here — MoE's make_tensor_host_accessible()
+                    # calls torch.cuda.empty_cache() which would segfault
+                    # on VMM-backed GMS tensors without the patch.
                     logger.info("LoadFormat.GMS (RO): zero-copy materialized "
                                 "weights")
 
