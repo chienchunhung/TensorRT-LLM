@@ -642,6 +642,28 @@ Increasing `max_seq_len` (4096→16384) has minimal impact on startup (~0.6s dif
 
 Qwen 72B and DeepSeek 70B show nearly identical startup patterns at the same tier and TP configuration in both v2 and v3. v3 Qwen 72B S2 is 306s vs DS 70B S2 at 390s — the difference (~85s) is almost entirely from checkpoint prefetch (DS is ~15% more file data to read and the difference scales with NFS read time). Warmup times are within a few seconds of each other (Qwen 38s, DS 36s).
 
+#### 6. Warmup Overhead Regression from PR #12407 (new in v3)
+
+PR #12407 ("Refactor warmup orchestration in MTP", merged 2026-04-13) **increased total warmup time by ~27s** on B300 (TP=8) across all models we measured. This is an unintended regression effect of the refactor, not an environment/build artifact — same node, same GPU, same model checkpoint would show similar numbers if the code were checked out at the pre-#12407 commit.
+
+**What the PR added:** A new general warmup pass in `PyTorchModelEngine.warmup()` that runs a shape-specialization forward pass over `_get_full_general_warmup_requests(resource_manager)` inside a `no_cuda_graph()` context, followed by MoE workspace cleanup and GC. The timer label `executor.warmup.torch_compile` is misleading — the pass runs regardless of whether `torch.compile` is enabled (`torch_compile_config` default remains `None`). See `tensorrt_llm/_torch/pyexecutor/model_engine.py:729-775`.
+
+**Measured warmup deltas (v2 → v3, Qwen 72B TP=8):**
+
+| Phase | v2 (pre-#12407) | v3 (post-#12407) | Δ |
+|:------|----------------:|-----------------:|---:|
+| torch_compile / general warmup | 0.0s | +25.0s | +25s |
+| Autotuner forward | 11.5s | 1.5s | -10s |
+| CUDA graphs | 0.7s | 11.4s | +10.7s |
+| Memory pool | 0.1s | 0.1s | 0 |
+| Warmup 2nd pass | 4.2s | 4.7s | +0.5s |
+| **Total warmup** | **~16.6s** | **~42.7s** | **+26.1s** |
+
+**Why it matters:**
+- Every cold-start path on rebased code — S1, S2, S3, with or without MX/GMS — now pays this ~27s penalty. It's additive to all scenarios in the impact projection.
+- The new general warmup pass is a candidate for the same compilation-caching optimization that applies to autotuner and CUDA graphs. If those artifacts can be persisted and restored across starts (the "MX+GMS+compile cache" scenario in our projection), this 27s becomes recoverable.
+- **Recommendation**: raise this finding with the TRT-LLM team. Even if the refactor has a correctness benefit we're unaware of, it would be worth checking whether the new general warmup is strictly required for all serving configs, or whether it can be gated/skipped (e.g., only when torch.compile is actually enabled, or only for MTP models).
+
 <details>
 <summary>Previous Results (2026-04-10, initial profiling)</summary>
 
