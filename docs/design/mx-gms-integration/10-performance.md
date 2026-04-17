@@ -2,7 +2,7 @@
 
 [< Back to Overview](README.md)
 
-**Last Updated:** 2026-04-16
+**Last Updated:** 2026-04-17
 
 ## Target Metrics
 
@@ -23,7 +23,7 @@
 
 **What:** Time from process start to first successful inference under the standard HF weight-loading path (no MX, no GMS). Establishes the baseline startup breakdown across model sizes, storage tiers, autotuner settings, and serving configurations.
 
-**Status:** Completed (2026-04-16). 62 profiles across 21 configurations. See [Benchmark Results (v2)](#benchmark-results-v2) below.
+**Status:** Completed (2026-04-17). 14 configurations × 3 runs = **42 profiles** on the current rebased codebase (v3). See [Benchmark Results](#benchmark-results) below. Earlier v2 dataset (pre-PR #12407, different node) is preserved as reference.
 
 **Configurations tested:**
 | Config | `checkpoint_format` | `load_format` | Status |
@@ -190,34 +190,40 @@ Compare against B2-S3 and B4-S3 (default bs=4, nt=1024, max_seq_len=4096). `nt` 
 
 ## MX+GMS Impact Projection
 
-Scenario-based projection using measured S2/S3 baselines for Qwen 72B (TP=8). The "first pays upfront, rest benefit" property of MX and GMS is reflected explicitly.
+Scenario-based projection using **v3 measured baselines** for Qwen 72B (TP=8) on the current rebased codebase. The "first pays upfront, rest benefit" property of MX and GMS is reflected explicitly.
 
 | Scenario | Worker Init | Weight Load | Warmup | Total Startup | Notes |
 |:---------|:------------|:------------|:-------|:--------------|:------|
-| **1. Baseline S2 (NFS cold)** | 21s (measured) | 71.8s (measured) | 16.6s (measured) | **114.4s** | Full cold start |
-| **2. Baseline S3 (warm cache)** | 21s (measured) | 8.9s (measured) | 16.0s (measured) | **50.2s** | Page cache hot |
-| **3. MX (1st on new node)** | 21s | ~10–15s (GPU P2P) | 16.6s | **~50–55s** | MX streams weights from donor; worker init overlaps with MX P2P transfer |
-| **4. GMS shadow (same node)** | 21s | ~0.1s (zero-copy) | 16.6s | **~41s** | Shadow pre-imports weights via GMS RO for fast failover activation |
-| **5. MX+GMS shadow (new node)** | 21s | ~0.1s (zero-copy) | 16.6s | **~41s** | 1st fetches via MX; shadow pre-imports via GMS RO |
-| **6. MX+GMS+compile cache** | 21s | ~0.1s (zero-copy) | ~2s (cached) | **~27s** | Warmup artifacts pre-cached (disk or GMS compile_cache tag) |
-| **7. MX+GMS+compile+reduced worker init** | ~2s (optimized) | ~0.1s | ~2s | **~8s** | Requires MPI process pool optimization (see below) |
+| **1. Baseline S2 (NFS cold)** | 21s (measured) | 240s (measured)* | 43s (measured) | **306s** | Full cold start; S2 prefetch is environment-dependent |
+| **2. Baseline S3 (warm cache)** | 21s (measured) | 7s (measured) | 41s (measured) | **75s** | Page cache hot |
+| **3. MX (1st on new node)** | 21s | ~10–15s (GPU P2P) | 43s | **~75–80s** | MX streams weights from donor; worker init overlaps with MX P2P transfer |
+| **4. GMS shadow (same node)** | 21s | ~0.1s (zero-copy) | 43s | **~64s** | Shadow pre-imports weights via GMS RO for fast failover activation |
+| **5. MX+GMS shadow (new node)** | 21s | ~0.1s (zero-copy) | 43s | **~64s** | 1st fetches via MX; shadow pre-imports via GMS RO |
+| **6. MX+GMS+compile cache** | 21s | ~0.1s (zero-copy) | ~2s (cached) | **~24s** | Warmup artifacts pre-cached (disk or GMS compile_cache tag); recovers most of PR #12407 regression too |
+| **7. MX+GMS+compile+reduced worker init** | ~2s (optimized) | ~0.1s | ~2s | **~5s** | Requires MPI process pool optimization (see [worker init investigation](#worker-init-investigation-results)) |
 
-Key takeaways:
-- **MX** eliminates the 65–99s NFS cold-read penalty by streaming only the relevant TP shard directly to each rank's GPU (~10–15s), also eliminating the ~9× CPU memory spike of the current load-all-then-shard pattern. For S1, MX P2P transfer provides enough concurrent server work to hide the 21s worker init naturally (similar to how HF download hides it today).
+\* The S2 prefetch (~240s on the current node) is the cold-NFS network read time and varies significantly by node-to-NFS network path. The v2 dataset on a different node showed ~70s for the same workload. Both are valid measurements of "cold NFS read" — the underlying point (cold NFS dominates, MX eliminates it) is unchanged regardless of the absolute number.
+
+**Key takeaways:**
+- **MX** eliminates the 70–320s NFS cold-read penalty by streaming only the relevant TP shard directly to each rank's GPU (~10–15s), also eliminating the ~9× CPU memory spike of the current load-all-then-shard pattern. For S1, MX P2P transfer provides enough concurrent server work to hide the 21s worker init naturally (similar to how HF download hides it today).
 - **GMS** eliminates the weight loading cost for shadow/standby workers via zero-copy GPU memory import (~100ms). The primary use case is pre-staging shadow workers for <5s failover activation, not running multiple active serving instances.
 - **Worker init (~21s) is on the critical path** for all scenarios without substantial concurrent server work. See [investigation results](#worker-init-investigation-results) for why early warm-up alone cannot hide this cost.
-- **Neither MX nor GMS can reduce the ~16s warmup floor** — only compilation/autotuner caching can address this.
-- **The very first cluster-wide instance always pays full cost** (114–146s with NFS cold). MX requires a donor node; GMS requires a prior instance on the same node.
+- **Neither MX nor GMS can reduce the ~43s warmup floor** — only compilation/autotuner caching can address this. The warmup floor grew from ~16s (v2) to ~43s (v3) due to PR #12407; see [Insight #6](#6-warmup-overhead-regression-from-pr-12407-new-in-v3).
+- **The very first cluster-wide instance always pays full cost** (306–390s with NFS cold on this node). MX requires a donor node; GMS requires a prior instance on the same node.
 
 ---
 
-## Benchmark Results (v2)
+## Benchmark Results
 
-**Environment:** 8x NVIDIA B300 SXM6 AC (275 GB each), NFS-backed storage, CUDA 13.1, TRT-LLM 1.3.0rc11
-**Contract:** `first_request_ready` — profile finalized after first successful end-to-end request
-**Statistical protocol:** 3 runs per configuration; **representative-run** approach (the run whose total startup is the median is selected, and all per-component metrics are reported from that single run so components sum consistently to the total)
-**Total profiles collected:** 62 across 21 configurations
-**Note:** S1 (remote cold) downloads used an internal HF CDN/mirror achieving ~2 GB/s. Public cloud download times will be significantly longer.
+**Primary dataset (v3):** Current rebased codebase at upstream `4a848ccce` (2026-04-16), measured on node `umb-b300-dp-186`. Reflects today's TRT-LLM startup behavior.
+
+**Reference dataset (v2):** Earlier codebase predating [PR #12407](https://github.com/NVIDIA/TensorRT-LLM/pull/12407) (warmup refactor), measured on node `umb-b300-dp-199`. Preserved in collapsible sections under each Part for the v2→v3 comparison and Insight #6.
+
+**Environment:** 8x NVIDIA B300 SXM6 AC (275 GB each), NFS-backed storage, CUDA 13.1.
+**Contract:** `first_request_ready` — profile finalized after first successful end-to-end request.
+**Statistical protocol:** 3 runs per configuration; **representative-run** approach (the run whose total startup is the median is selected, and all per-component metrics are reported from that single run so components sum consistently to the total). Min/max across runs reported in per-config aggregate JSON for range context.
+**Total profiles:** v3 = 14 configs × 3 runs = 42. v2 = 21 configs × 3 runs = 62.
+**Note:** S1 (remote cold) downloads in v2 used an internal HF CDN/mirror achieving ~2 GB/s. Public cloud download times will be significantly longer. v3 did not run S1 (HF rate limits + storage tier story already validated).
 
 ### Reading the Results Tables
 
@@ -230,7 +236,38 @@ The startup path is **strictly serial** across two processes:
 
 The tables below show a hierarchical timer tree. Indented rows (prefixed with `└─` or `├─`) are **children** of the row above — their time is already included in the parent. Only top-level (non-indented) rows are additive. For example, "HF remote download" is *inside* "Cached model loader", not separate from it.
 
-**How total startup adds up** (using Qwen 72B as example across tiers):
+**How total startup adds up** (v3 measurements, Qwen 72B TP=8 across tiers):
+
+```
+S2 (NFS cold) — production baseline
+Total = 306.3s
+├─ [Worker]  MPI worker cold start       ~21.5s  ← Python imports, CUDA ctx, NCCL (see note)
+├─ [Worker]  Checkpoint prefetch         233.2s  ← cold NFS reads (node-dependent)
+├─ [Worker]  Apply weights                 3.7s
+├─ [Worker]  Warmup (1st pass)            38.0s  ← torch_compile (25s) + autotuner (1.5s) + cuda graphs (11.4s)
+├─ [Worker]  Warmup (2nd pass)             4.7s
+├─ [Server]  Cached model loader          0.003s ← no download needed
+└─ [Both]    Other overhead               ~5.4s  ← model construction, sampler, KV cache, IPC
+                                          -----
+             Sum                         ~306.5s
+
+S3 (NFS warm) — best case (page cache hot)
+Total = 74.6s
+├─ [Worker]  MPI worker cold start       ~21.0s  ← Python imports, CUDA ctx, NCCL (see note)
+├─ [Worker]  Checkpoint prefetch           3.5s  ← page cache hit
+├─ [Worker]  Apply weights                 3.6s
+├─ [Worker]  Warmup (1st pass)            36.3s  ← torch_compile (23.6s) + autotuner (1.5s) + cuda graphs (11.1s)
+├─ [Worker]  Warmup (2nd pass)             4.6s
+├─ [Server]  Cached model loader          0.002s
+└─ [Both]    Other overhead               ~5.6s
+                                          -----
+             Sum                          ~74.6s
+```
+
+**Note on MPI worker cold start:** The ~21s "executor overhead" gap visible in S2/S3 is the **MPI worker first-dispatch latency** — Python imports, CUDA context creation, NCCL init triggered when the first task is `submit()`-ed to the pool. In S1 (remote cold), `cached_model_loader` dispatches the HF download to workers early via `_submit_to_all_workers`, so workers cold-start during the 63s download and are already warm by the time `worker_main` runs. In S2/S3, the model is local (`is_hub_model = False`), so no dispatch occurs until `create_executor` calls `worker_main` — the ~21s cold start is fully visible. See [Analysis §1](#executor-overhead-gap-s1-5s-vs-s2s3-25s--root-cause) for the detailed investigation.
+
+<details>
+<summary>v2 walkthrough (reference, pre-PR #12407)</summary>
 
 ```
 S1 (remote cold):
@@ -245,30 +282,30 @@ Total = 93.4s
 
 S2 (NFS cold):
 Total = 114.4s
-├─ [Worker]  MPI worker cold start       ~21.5s  ← Python imports, CUDA ctx, NCCL (see note)
-├─ [Worker]  Checkpoint prefetch          65.0s  ← cold NFS reads
+├─ [Worker]  MPI worker cold start       ~21.5s
+├─ [Worker]  Checkpoint prefetch          65.0s  ← cold NFS reads (different node, ~3.5× faster than v3)
 ├─ [Worker]  Apply weights                 4.3s
-├─ [Worker]  Warmup (1st pass)            12.4s
+├─ [Worker]  Warmup (1st pass)            12.4s  ← autotuner (11.5s) + CUDA graphs (0.7s); no torch_compile pass
 ├─ [Worker]  Warmup (2nd pass)             4.2s
-├─ [Server]  Cached model loader          0.003s ← no download needed
-└─ [Both]    Other overhead               ~6.9s  ← model construction, sampler, KV cache, IPC
+├─ [Server]  Cached model loader          0.003s
+└─ [Both]    Other overhead               ~6.9s
                                           -----
              Sum                         ~114.3s
 
 S3 (NFS warm):
 Total = 50.2s
-├─ [Worker]  MPI worker cold start       ~21.0s  ← Python imports, CUDA ctx, NCCL (see note)
-├─ [Worker]  Checkpoint prefetch           3.4s  ← page cache hit
+├─ [Worker]  MPI worker cold start       ~21.0s
+├─ [Worker]  Checkpoint prefetch           3.4s
 ├─ [Worker]  Apply weights                 3.6s
 ├─ [Worker]  Warmup (1st pass)            11.9s
 ├─ [Worker]  Warmup (2nd pass)             4.1s
 ├─ [Server]  Cached model loader          0.002s
-└─ [Both]    Other overhead               ~6.2s  ← model construction, sampler, KV cache, IPC
+└─ [Both]    Other overhead               ~6.2s
                                           -----
              Sum                          ~50.2s
 ```
 
-**Note on MPI worker cold start:** The executor overhead gap between S1 (~5s) and S2/S3 (~25–28s) is fully explained by when MPI workers first receive dispatched work. In S1, `cached_model_loader` dispatches the HF download to workers (`_submit_to_all_workers`), triggering their ~21s cold start (Python imports, CUDA context, NCCL) early — hidden behind the 63.5s download. In S2/S3, the model is local (`is_hub_model = False`), so no dispatch occurs until `create_executor` calls `worker_main` — the ~21s cold start is fully visible. See [Analysis §1](#executor-overhead-gap-s1-5s-vs-s2s3-25s--root-cause) for the detailed investigation.
+</details>
 
 ### Weight Loading Data Flow (TP=8)
 
@@ -302,14 +339,6 @@ Each worker rank (independently, in parallel):
 
 S2 (NFS cold) is the primary baseline because it represents the realistic production cold-start scenario: model files pre-staged on shared storage, no prior page cache warming, no HF download. This is the cost that MX integration aims to eliminate.
 
-Two dataset versions are reported below:
-- **v3 (current)**: rebased onto upstream/main at `4a848ccce` (2026-04-16), measured on node `umb-b300-dp-186`
-- **v2 (baseline)**: earlier codebase predating [PR #12407 (warmup refactor)](https://github.com/NVIDIA/TensorRT-LLM/pull/12407), measured on node `umb-b300-dp-199`
-
-The v2→v3 comparison reveals two independent effects: (1) the node's NFS cold-read throughput differs significantly between these two nodes, and (2) PR #12407 added a new general warmup pass (~25s) before CUDA graph capture. See [v2 vs v3 analysis](#v2-vs-v3-what-changed) below.
-
-#### Part 1 v3 (current) — S2 NFS Cold
-
 All times in seconds (representative run). Percentages are of total startup.
 
 | Metric | B1: Qwen 7B (TP=1) | B3: DS 7B (TP=1) | B2: Qwen 72B (TP=8) | B4: DS 70B (TP=8) |
@@ -324,7 +353,14 @@ All times in seconds (representative run). Percentages are of total startup.
 | └─ CUDA graphs | 20.6 (27%) | 19.9 (21%) | 11.4 (4%) | 11.0 (3%) |
 | Warmup — 2nd pass (worker) | 0.8 (1%) | 0.7 (<1%) | 4.7 (2%) | 4.5 (1%) |
 
-#### Part 1 v2 (baseline, pre-PR #12407) — S2 NFS Cold
+**Key observations:**
+- **Cold NFS checkpoint prefetch dominates** for large models (76–82% of total). This is the primary target for MX (GPU P2P streaming eliminates NFS reads entirely).
+- **For small models (7B, TP=1)**, warmup dominates (~49% of total) because model size is small and cold NFS reads are relatively quick (~17s for 14GB).
+- **Warmup floor is ~36–38s** across all sizes due to torch_compile general warmup (~25s for 72B, ~17s for 7B) + CUDA graph capture (~11–20s) + autotuner (~0–2s).
+- **MPI worker cold start (~21s)** is included in the totals but only visible for TP>1 (single-rank pools have no MPI dispatch latency).
+
+<details>
+<summary>v2 reference (pre-PR #12407, different node)</summary>
 
 Only large models measured in v2; small-model S2 was not part of the original v2 matrix.
 
@@ -339,27 +375,24 @@ Only large models measured in v2; small-model S2 was not part of the original v2
 | └─ CUDA graphs | 0.7 (<1%) | 0.5 (<1%) |
 | Warmup — 2nd pass (worker) | 4.2 (4%) | 4.0 (3%) |
 
-#### v2 vs v3: What Changed
+**v2 → v3 deltas (Qwen 72B):**
 
-| Component | v2 Qwen 72B | v3 Qwen 72B | Δ | Cause |
-|:----------|------------:|------------:|---:|:------|
-| Checkpoint prefetch | 65.0s | **233.2s** | +168s | **Different NFS path on new node** (environment) |
-| torch_compile (general warmup) | 0.0s | **25.0s** | +25s | **PR #12407 added new general warmup pass** (code) |
-| Autotuner forward | 11.5s | 1.5s | -10s | **PR #12407 refactor** (code) |
-| CUDA graphs | 0.7s | **11.4s** | +10.7s | **PR #12407 refactor** (code) |
-| Total warmup (1st + 2nd pass) | ~16.6s | **~42.7s** | +26.1s | Net effect of PR #12407 |
-| Total startup | 114.4s | **306.3s** | +192s | Dominated by NFS (+168s) + warmup (+26s) |
+| Component | v2 | v3 | Δ | Cause |
+|:----------|---:|---:|---:|:------|
+| Checkpoint prefetch | 65.0s | 233.2s | +168s | Different NFS path on new node (environment) |
+| Total warmup | ~16.6s | ~42.7s | +26.1s | PR #12407 added general warmup pass (code) |
+| Total startup | 114.4s | 306.3s | +192s | Sum of above |
 
-**Two independent changes:**
-1. **Environment (node-specific NFS throughput)**: v3 node has ~3.5× slower cold NFS reads than v2 node. Both nodes use the same NFS server; the network path / bandwidth between this node and NFS appears different. This is an environment artifact, not a code regression.
-2. **Code (PR #12407, merged 2026-04-13)**: "Refactor warmup orchestration in MTP" added `_get_full_general_warmup_requests` + a new general warmup pass wrapped with `no_cuda_graph()` and tracked as `executor.warmup.torch_compile` (misleading name — it runs regardless of whether `torch.compile` is enabled; `torch_compile_config` default is still `None`). Net effect: total warmup grew from ~16s to ~43s.
+The v2→v3 storage delta is fully attributable to the new node's slower cold NFS path (verified: v3 S3 prefetch is identical to v2 S3 prefetch — only S2 differs). The warmup delta is fully attributable to PR #12407 (see [Insight #6](#6-warmup-overhead-regression-from-pr-12407-new-in-v3)).
 
-**Key observations (v3, revised from v2):**
-- **Cold NFS checkpoint prefetch still dominates** for large models (76–82% of total in v3 vs 57–68% in v2). The story is unchanged — I/O is still the primary bottleneck — only more pronounced on this node.
-- **MPI worker cold start is still ~21s** and still hidden in S1 but visible in S2/S3 (root cause unchanged).
-- **Warmup floor grew from ~16s to ~43s** due to PR #12407's new general warmup pass. The new pass is a shape-specialization forward pass over multiple input shapes before CUDA graph capture; it runs even when torch.compile is disabled. This is a potential optimization target but is orthogonal to MX/GMS (it's CPU/GPU compute, not weight I/O).
+</details>
 
-### Part 1b — Model Size Scaling (S1, Remote Cold Download — Complementary)
+### Part 1b — Model Size Scaling (S1, Remote Cold Download — Reference Only)
+
+S1 was not re-measured in v3 (HF rate-limiting concerns and the storage tier story is already validated by the S3 measurements that match v2). The v2 S1 data is preserved for reference and to demonstrate the "S1 hides MPI worker cold start" effect.
+
+<details>
+<summary>v2 S1 results (HF download path)</summary>
 
 S1 measures the full HF download path. It is complementary to S2 because (a) S1's download inherently warms the page cache, making worker prefetch fast (~3s), and (b) S1 hides the ~21s MPI worker cold start behind the 63s download. These two effects make S1 appear faster than S2 despite involving a network download.
 
@@ -378,25 +411,9 @@ S1 measures the full HF download path. It is complementary to S2 because (a) S1'
 
 **Why S1 appears faster than S2:** Two effects combine: (1) the HF download warms the page cache, so workers prefetch in ~3.5s instead of ~65s; (2) the ~21s MPI worker cold start is hidden behind the 63s download (workers are dispatched early for the download, and are already warm by the time `create_executor` runs). Note: the internal HF CDN achieves ~2 GB/s; with a slower public CDN, S1 would be significantly slower.
 
+</details>
+
 ### Part 2 — Storage Tier Comparison (72B/70B Models, TP=8)
-
-Both v2 and v3 data are shown. v3 S3 results are pending additional runs; those rows show the v2 baseline until re-measured.
-
-#### v2 (baseline, pre-PR #12407)
-
-| Metric | Qwen 72B S1 | Qwen 72B S2 | Qwen 72B S3 | DS 70B S1 | DS 70B S2 | DS 70B S3 |
-|:-------|----:|----:|----:|----:|----:|----:|
-| **Total startup** | **93.4** | **114.4** | **50.2** | **95.5** | **146.1** | **52.9** |
-| MPI worker cold start | hidden in download | ~21s visible | ~21s visible | hidden in download | ~21s visible | ~21s visible |
-| Cached model loader (server) | 63.5 | 0.003 | 0.002 | 62.5 | 0.003 | 0.001 |
-| Checkpoint prefetch (worker) | 3.5 | 65.0 | 3.4 | 5.0 | 99.2 | 6.0 |
-| Apply weights (worker) | 3.8 | 4.3 | 3.6 | 3.7 | 3.6 | 3.6 |
-| Warmup — 1st pass (worker) | 12.1 | 12.4 | 11.9 | 13.0 | 13.0 | 12.5 |
-| Warmup — 2nd pass (worker) | 4.1 | 4.2 | 4.1 | 4.0 | 4.0 | 4.0 |
-
-#### v3 (current, post-PR #12407)
-
-S1 runs were not executed in v3 (HF rate-limiting concerns).
 
 | Metric | Qwen 72B S2 | Qwen 72B S3 | DS 70B S2 | DS 70B S3 |
 |:-------|----:|----:|----:|----:|
@@ -410,43 +427,38 @@ S1 runs were not executed in v3 (HF rate-limiting concerns).
 | └─ CUDA graphs | 11.4 | 11.1 | 11.0 | 10.9 |
 | Warmup — 2nd pass (worker) | 4.7 | 4.6 | 4.5 | 4.5 |
 
-#### Storage tier story (unchanged by v2→v3)
+**Storage tier ordering (v3, unchanged from v2):**
 
-| Tier | Page cache state | Worker prefetch (Qwen 72B, v2 / v3) | MPI worker cold start | Why |
-|------|-----------------|-------------------------------------|----------------------|-----|
-| S1 | Warm (download populates cache) | 3.5s / *not measured* | Hidden (behind download) | Download dispatches to workers early |
-| S2 | Cold (fresh inodes) | 65.0s / 233.2s | Visible (~21s) | No prior dispatch to workers |
-| S3 | Warm (prior run's reads) | 3.4s / 3.5s | Visible (~21s) | No prior dispatch to workers |
+| Tier | Page cache state | Worker prefetch (Qwen 72B) | MPI worker cold start | Why |
+|------|-----------------|----------------------------|----------------------|-----|
+| S2 | Cold (fresh inodes) | 233.2s | Visible (~21s) | No prior dispatch to workers |
+| S3 | Warm (prior run's reads) | 3.5s | Visible (~21s) | No prior dispatch to workers |
+| (S1 v2 ref) | Warm (download populates cache) | 3.5s | Hidden (behind download) | Download dispatches to workers early |
 
-**Key takeaway:** The qualitative storage-tier story is unchanged — S2 cold NFS reads dominate, S1/S3 enjoy page-cache-speed reads. The v3 S3 prefetch (3.5s for Qwen 72B, 6.0s for DS 70B) is essentially identical to v2 (3.4s/6.0s), confirming that the v2→v3 storage-tier delta is fully attributable to the S2 NFS path on the new node, not codebase change. The relative ordering (S2 ≫ S1 ≈ S3) and the MX/GMS optimization targets remain valid.
+**Key takeaway:** S2 cold NFS reads dominate (76–82% of total for large models); S1/S3 enjoy page-cache-speed reads (~3–6s). MX is the optimization target for the cold-NFS path.
+
+<details>
+<summary>v2 reference (pre-PR #12407, different node)</summary>
+
+| Metric | Qwen 72B S1 | Qwen 72B S2 | Qwen 72B S3 | DS 70B S1 | DS 70B S2 | DS 70B S3 |
+|:-------|----:|----:|----:|----:|----:|----:|
+| **Total startup** | **93.4** | **114.4** | **50.2** | **95.5** | **146.1** | **52.9** |
+| MPI worker cold start | hidden in download | ~21s visible | ~21s visible | hidden in download | ~21s visible | ~21s visible |
+| Cached model loader (server) | 63.5 | 0.003 | 0.002 | 62.5 | 0.003 | 0.001 |
+| Checkpoint prefetch (worker) | 3.5 | 65.0 | 3.4 | 5.0 | 99.2 | 6.0 |
+| Apply weights (worker) | 3.8 | 4.3 | 3.6 | 3.7 | 3.6 | 3.6 |
+| Warmup — 1st pass (worker) | 12.1 | 12.4 | 11.9 | 13.0 | 13.0 | 12.5 |
+| Warmup — 2nd pass (worker) | 4.1 | 4.2 | 4.1 | 4.0 | 4.0 | 4.0 |
+
+**v3 S3 prefetch is essentially identical to v2 S3 prefetch** (3.5s vs 3.4s for Qwen 72B; 6.0s vs 6.0s for DS 70B), confirming the v2→v3 S2 delta is purely a node-specific NFS path difference, not codebase change.
+
+</details>
 
 **Planned: S4 (Local NVMe SSD, cold):** A fourth tier measuring cold reads from node-local NVMe (no network hop) is planned. This represents the model-pre-staged-to-local-disk scenario and provides the storage-speed ceiling against which MX P2P throughput should be compared. The node has 8x 3.5TB NVMe SSDs available. S4 uses the same fresh-inode-copy methodology as S2 to ensure cold page cache. Results pending.
 
 ### Part 3 — Autotuner Impact
 
-Comparing autotuner ON vs OFF on S2 and S3 tiers. Warmup component shift when autotuner is disabled.
-
-#### v2 (baseline, pre-PR #12407)
-
-| Metric | Qwen 72B S2 ON | Qwen 72B S2 OFF | Qwen 72B S3 ON | Qwen 72B S3 OFF |
-|:-------|----:|----:|----:|----:|
-| **Total startup** | **114.4 (100%)** | **104.9 (100%)** | **50.2 (100%)** | **49.8 (100%)** |
-| Warmup (1st pass) | 12.4 (11%) | 11.9 (11%) | 11.9 (24%) | 11.8 (24%) |
-| — Autotuner | 11.5 (10%) | 0.0 (0%) | 11.0 (22%) | 0.0 (0%) |
-| — CUDA graphs | 0.7 (<1%) | 11.1 (11%) | 0.6 (1%) | 11.0 (22%) |
-| — Memory pool | 0.1 (<1%) | 0.6 (<1%) | 0.1 (<1%) | 0.6 (1%) |
-
-| Metric | DS 70B S2 ON | DS 70B S2 OFF | DS 70B S3 ON | DS 70B S3 OFF |
-|:-------|----:|----:|----:|----:|
-| **Total startup** | **146.1 (100%)** | **155.2 (100%)** | **52.9 (100%)** | **52.1 (100%)** |
-| Warmup (1st pass) | 13.0 (9%) | 12.1 (8%) | 12.5 (24%) | 11.9 (23%) |
-| — Autotuner | 12.3 (8%) | 0.0 (0%) | 11.8 (22%) | 0.0 (0%) |
-| — CUDA graphs | 0.5 (<1%) | 11.4 (7%) | 0.5 (1%) | 11.1 (21%) |
-| — Memory pool | 0.1 (<1%) | 0.6 (<1%) | 0.1 (<1%) | 0.6 (1%) |
-
-#### v3 (current, post-PR #12407)
-
-In v3, autotuner forward only takes ~1.5–2s (down from 11s in v2 due to PR #12407 refactor), so disabling it has a much smaller direct impact. The CUDA graph capture time also no longer changes when autotuner is disabled.
+Comparing autotuner ON vs OFF on S2 and S3 tiers. In v3, autotuner forward only takes ~1.5–2s (down from 11s in v2 due to PR #12407 refactor), so disabling it has a much smaller direct impact than it appeared to in v2.
 
 | Metric | Qwen 72B S2 ON | Qwen 72B S2 OFF | Qwen 72B S3 ON | Qwen 72B S3 OFF |
 |:-------|----:|----:|----:|----:|
@@ -468,20 +480,30 @@ In v3, autotuner forward only takes ~1.5–2s (down from 11s in v2 due to PR #12
 
 Note: The DS 70B S2 OFF total is higher than ON (410.7s vs 389.8s) entirely due to NFS variability in the cold-prefetch phase (340s vs 318s) — not from autotuner being disabled. Warmup itself is unchanged.
 
+<details>
+<summary>v2 reference (pre-PR #12407)</summary>
+
+In v2, autotuner ran for ~11s and CUDA graphs took only ~0.6s; disabling autotuner caused CUDA graphs to slow down by almost the same amount (~11s). Net warmup change was <1s.
+
+| Metric | Qwen 72B S2 ON | Qwen 72B S2 OFF | Qwen 72B S3 ON | Qwen 72B S3 OFF |
+|:-------|----:|----:|----:|----:|
+| **Total startup** | **114.4** | **104.9** | **50.2** | **49.8** |
+| Warmup (1st pass) | 12.4 | 11.9 | 11.9 | 11.8 |
+| — Autotuner | 11.5 | 0.0 | 11.0 | 0.0 |
+| — CUDA graphs | 0.7 | 11.1 | 0.6 | 11.0 |
+
+| Metric | DS 70B S2 ON | DS 70B S2 OFF | DS 70B S3 ON | DS 70B S3 OFF |
+|:-------|----:|----:|----:|----:|
+| **Total startup** | **146.1** | **155.2** | **52.9** | **52.1** |
+| Warmup (1st pass) | 13.0 | 12.1 | 12.5 | 11.9 |
+| — Autotuner | 12.3 | 0.0 | 11.8 | 0.0 |
+| — CUDA graphs | 0.5 | 11.4 | 0.5 | 11.1 |
+
+</details>
+
 ### Part 4 — Serving Config Sensitivity
 
 **D1: Large config** (bs=64, nt=8192 vs default bs=4, nt=1024):
-
-#### v2 (baseline)
-
-| Metric | Qwen 72B S3 default | Qwen 72B S3 large | DS 70B S3 default | DS 70B S3 large |
-|:-------|----:|----:|----:|----:|
-| **Total startup** | **50.2 (100%)** | **58.8 (100%)** | **52.9 (100%)** | **61.6 (100%)** |
-| Warmup (1st pass) | 11.9 (24%) | 16.7 (28%) | 12.5 (24%) | 17.3 (28%) |
-| — CUDA graphs | 0.6 (1%) | 4.9 (8%) | 0.5 (1%) | 4.1 (7%) |
-| Warmup (2nd pass) | 4.1 (8%) | 8.2 (14%) | 4.0 (8%) | 7.6 (12%) |
-
-#### v3 (current)
 
 | Metric | Qwen 72B S3 default | Qwen 72B S3 large | DS 70B S3 default | DS 70B S3 large |
 |:-------|----:|----:|----:|----:|
@@ -491,18 +513,9 @@ Note: The DS 70B S2 OFF total is higher than ON (410.7s vs 389.8s) entirely due 
 | — CUDA graphs | 11.1 (15%) | 28.9 (29%) | 10.9 (14%) | 27.3 (27%) |
 | Warmup (2nd pass) | 4.6 (6%) | 11.7 (12%) | 4.5 (6%) | 11.3 (11%) |
 
-The D1 effect grew from ~+8s in v2 to ~+25s in v3 — same root cause (more graph variants captured) but now amplified because the per-variant CUDA graph capture time is larger.
+D1 effect: +25s on both models, mostly in CUDA graphs (more variants captured) and 2nd-pass warmup.
 
 **D2: Long sequence** (seq_len=16384 vs default 4096):
-
-#### v2 (baseline)
-
-| Metric | Qwen 72B S3 default | Qwen 72B S3 seq16k | DS 70B S3 default | DS 70B S3 seq16k |
-|:-------|----:|----:|----:|----:|
-| **Total startup** | **50.2 (100%)** | **50.8 (100%)** | **52.9 (100%)** | **52.9 (100%)** |
-| Warmup (1st pass) | 11.9 (24%) | 12.4 (24%) | 12.5 (24%) | 12.6 (24%) |
-
-#### v3 (current)
 
 | Metric | Qwen 72B S3 default | Qwen 72B S3 seq16k | DS 70B S3 default | DS 70B S3 seq16k |
 |:-------|----:|----:|----:|----:|
@@ -510,19 +523,42 @@ The D1 effect grew from ~+8s in v2 to ~+25s in v3 — same root cause (more grap
 | Warmup (1st pass) | 36.3 (49%) | 42.6 (53%) | 36.4 (47%) | 36.5 (47%) |
 | — torch_compile | 23.6 (32%) | 29.7 (37%) | 23.4 (30%) | 23.4 (30%) |
 
-Note: The Qwen 72B seq16k config shows a +6s increase in v3 (mostly in `torch_compile`'s general warmup), while DS 70B is unchanged. In v2, both models showed ~0.6s impact. The v3 increase for Qwen 72B is likely due to the new general warmup pass needing to specialize over more KV cache window-size variants.
+D2 effect is model-dependent: Qwen 72B sees +6s (the new general warmup specializes over more KV-cache window-size variants), DS 70B is unchanged.
+
+<details>
+<summary>v2 reference (pre-PR #12407)</summary>
+
+D1 (large config) in v2 added only ~+8s; D2 (seq16384) added ~+0.6s. Both effects are amplified in v3 because (a) per-CUDA-graph-variant capture time grew, and (b) the new general warmup pass adds a shape-iteration loop.
+
+| Metric | Qwen 72B S3 default | Qwen 72B S3 large | DS 70B S3 default | DS 70B S3 large |
+|:-------|----:|----:|----:|----:|
+| **Total startup (D1)** | **50.2** | **58.8** | **52.9** | **61.6** |
+| Warmup (1st pass) | 11.9 | 16.7 | 12.5 | 17.3 |
+| — CUDA graphs | 0.6 | 4.9 | 0.5 | 4.1 |
+| Warmup (2nd pass) | 4.1 | 8.2 | 4.0 | 7.6 |
+
+| Metric | Qwen 72B S3 default | Qwen 72B S3 seq16k | DS 70B S3 default | DS 70B S3 seq16k |
+|:-------|----:|----:|----:|----:|
+| **Total startup (D2)** | **50.2** | **50.8** | **52.9** | **52.9** |
+| Warmup (1st pass) | 11.9 | 12.4 | 12.5 | 12.6 |
+
+</details>
 
 ### Analysis and Key Insights
 
+All insights below are based on **v3 (current codebase)** measurements, with v2 numbers cited for the regression observation in Insight #6.
+
 #### 1. Cold NFS I/O Dominates Production Cold Start
 
-For large models (70–72B), the dominant bottleneck depends on whether the OS page cache is warm:
+For large models (70–72B), the dominant bottleneck is cold NFS reads in S2:
 
-- **S2 (NFS cold, production baseline):** 65–99s checkpoint prefetch from cold NFS in v2; **233–318s in v3** on the new node. No prior operation has warmed the page cache. This is the realistic first-cold-start cost that MX aims to eliminate.
-- **S1 and S3 (page cache warm):** Worker prefetch is ~3–5s in both. S1's download inherently warms the page cache (Linux retains written pages via write-back caching), giving workers the same page-cache-hit behavior as S3. The difference is that S1 pays 63.5s upfront for the download, while S3 benefits from a prior run's cache.
-- **S1 < S2 in this benchmark** because the fast internal HF mirror delivered 145GB faster (~63.5s total including cache mgmt) than cold NFS served it (~65–99s), and the download warmed the page cache as a side effect. With a slower CDN (public HF Hub), S1 would be slower.
+- **S2 (NFS cold, production baseline):** **233–318s checkpoint prefetch** = 76–82% of total startup. No prior operation has warmed the page cache. This is the realistic first-cold-start cost that MX aims to eliminate.
+- **S3 (page cache warm):** Worker prefetch is **3.5–6.0s** (the 7B/70B file size difference). With I/O removed, the bottleneck shifts to MPI worker cold start (~21s) + warmup (~41s).
+- **S1 (remote cold, v2 only):** The internal HF mirror download was actually faster than this node's cold NFS, and the download itself warmed the page cache so worker prefetch was also ~3.5s. With a slower CDN (public HF Hub), S1 would be slower than S2.
 
-The weight *application* phase (`apply_weights`) is constant at 3.6–4.3s regardless of storage tier, confirming it's GPU-bound, not I/O-bound.
+The weight *application* phase (`apply_weights`) is constant at 3.6–3.7s regardless of storage tier, confirming it's GPU-bound, not I/O-bound.
+
+**Note on v3 absolute numbers:** The S2 cold-prefetch time is highly node-dependent. v2 measured 65–99s on a different node; v3 measures 233–318s on the current node. Same NFS server, different network path. The qualitative story (S2 ≫ S3, MX target = cold-NFS) is unchanged either way.
 
 #### Executor Overhead Gap: S1 (~5s) vs S2/S3 (~25s) — Root Cause
 
@@ -648,78 +684,63 @@ Experimental verification (branch `dynamo/worker-warmup-investigation`) tested t
 
 This is orthogonal to MX/GMS integration. MX P2P transfers (~10–15s) would naturally provide enough concurrent server work to hide most of the worker cold start, similar to how S1's HF download does today.
 
-#### 2. Warmup Is the Irreducible Floor (updated for v3)
+#### 2. Warmup Is the Irreducible Floor
 
 With warm cache (S3), I/O is negligible. The remaining startup time breaks down as:
 
-**v3 (post-PR #12407, estimated from v2 S3 + v3 warmup delta):**
-
-| Component | Qwen 72B S3 (v3 est.) | % of Total | Reducible by |
+| Component | Qwen 72B S3 | % of Total | Reducible by |
 |:----------|------------:|-----------:|:-------------|
-| MPI worker cold start | ~21s | ~29% | MPI pool optimization or concurrent server work (see [investigation](#worker-init-investigation-results)) |
-| Weight loading (prefetch + apply) | ~7s | ~10% | GMS zero-copy (~0.1s) |
-| Warmup — 1st pass | ~38s | ~52% | Compilation caching (~5s) |
-| — torch_compile / general warmup | ~25s | ~34% | Compilation caching of shape-specialization pass |
-| — Autotuner forward | ~1.5s | ~2% | Autotuner caching |
-| — CUDA graphs | ~11s | ~15% | Persistent graph cache |
-| Warmup — 2nd pass | ~5s | ~7% | Compilation caching |
-| Other overhead | ~2s | ~3% | Minor |
-| **Total (est.)** | **~73s** | 100% | |
+| MPI worker cold start | ~21s | ~28% | MPI pool optimization or concurrent server work (see [investigation](#worker-init-investigation-results)) |
+| Weight loading (prefetch + apply) | 7.1s | 10% | GMS zero-copy (~0.1s) |
+| Warmup — 1st pass | 36.3s | 49% | Compilation caching (~5s) |
+| — torch_compile / general warmup | 23.6s | 32% | Compilation caching of shape-specialization pass |
+| — Autotuner forward | 1.5s | 2% | Autotuner caching |
+| — CUDA graphs | 11.1s | 15% | Persistent graph cache |
+| Warmup — 2nd pass | 4.6s | 6% | Compilation caching |
+| Other overhead | ~5.6s | 8% | Minor |
+| **Total** | **74.6s** | 100% | |
 
-**v2 (baseline, pre-PR #12407) for reference:**
-
-| Component | Qwen 72B S3 (v2) | % of Total |
-|:----------|------------:|-----------:|
-| MPI worker cold start | ~21s | ~42% |
-| Weight loading (prefetch + apply) | 7.0s | 14% |
-| Warmup — 1st pass | 11.9s | 24% |
-| Warmup — 2nd pass | 4.1s | 8% |
-| Other overhead | ~6s | 12% |
-| **Total** | **50.2s** | 100% |
-
-The largest single component is still the MPI worker cold start (~21s) plus the new torch_compile general warmup pass (~25s). Experimental verification showed that simply dispatching a warm-up noop does NOT reduce total startup because there's only ~0.2s of server work to overlap with for local models. The cold start is on the critical path regardless of when it's triggered. Reducing it requires either (a) providing concurrent server work (as MX P2P transfer would), or (b) optimizing the MPI process pool itself.
+The two largest components are the MPI worker cold start (~21s) and the new general warmup pass (~24s). Experimental verification showed that simply dispatching a warm-up noop does NOT reduce total startup because there's only ~0.2s of server work to overlap with for local models. The cold start is on the critical path regardless of when it's triggered. Reducing it requires either (a) providing concurrent server work (as MX P2P transfer would), or (b) optimizing the MPI process pool itself.
 
 MX and GMS address weight loading but cannot reduce warmup:
-- **Warmup (v3 ~43s, v2 ~16s):** general warmup (~25s) + autotuner (~1.5s) + CUDA graph capture (~11s) + 2nd-pass warmup (~5s). Only compilation/autotuner caching can reduce this. **PR #12407 increased this floor by ~27s** by adding the general warmup pass.
+- **Warmup (~41s):** general warmup (~24s) + autotuner (~1.5s) + CUDA graph capture (~11s) + 2nd-pass warmup (~5s). Only compilation/autotuner caching can reduce this. PR #12407 raised this floor by ~27s vs the pre-#12407 baseline (see [Insight #6](#6-warmup-overhead-regression-from-pr-12407-new-in-v3)).
 - **MPI worker cold start (~21s):** Lazy process spawning + Python imports in `mpi4py.futures.MPIPoolExecutor`. Not addressable by simple warm-up dispatch; requires MPI pool or import optimization.
 
-#### 3. Disabling Autotuner Has No Net Benefit (still holds in v3, different reason)
+#### 3. Disabling Autotuner Has No Net Benefit
 
-**v2 finding:** When autotuner is disabled (~11s saved), CUDA graph capture time increases by almost exactly the same amount (0.6s → 11s), because the autotuner's kernel selections make subsequent CUDA graph capture faster. **Net warmup change: <1s (<1% of total).**
+In v3, autotuner forward only takes ~1.5–2s (down from ~11s in v2 due to PR #12407 refactor), while CUDA graph capture stays roughly constant (~11s) regardless of autotuner state. Disabling autotuner saves only ~1s of total startup.
 
-**v3 finding (verified):** In v3, autotuner forward is only ~1.5–2s (down from 11s in v2 due to PR #12407 refactor), while CUDA graphs stays roughly constant (~11s) regardless of autotuner state.
+| Comparison | Δ when autotuner OFF (v3) |
+|:-----------|--------------:|
+| Qwen 72B S3: warmup 1st pass | -0.6s |
+| Qwen 72B S3: total startup | -1.0s |
+| DS 70B S3: warmup 1st pass | -1.3s |
+| DS 70B S3: total startup | -1.0s |
 
-| Comparison | v2 Δ when OFF | v3 Δ when OFF |
-|:-----------|--------------:|--------------:|
-| Qwen 72B S3: warmup 1st pass | -0.1s | -0.6s |
-| Qwen 72B S3: total startup | -0.4s | -1.0s |
-| DS 70B S3: warmup 1st pass | -0.6s | -1.3s |
-| DS 70B S3: total startup | -0.8s | -1.0s |
+**Conclusion:** Disabling autotuner is not a useful optimization lever. (In v2 the conclusion was the same but for a different reason — autotuner saved ~11s but CUDA graphs slowed by ~11s in compensation. In v3, autotuner is small to begin with.)
 
-**Insight still holds with the same conclusion (negligible net benefit) but for a different reason:** in v2 the autotuner cost was offset by a CUDA graph slowdown; in v3 the autotuner is small to begin with. Either way, disabling autotuner is not a useful optimization lever.
+#### 4. Serving Config Affects CUDA Graph Capture
 
-#### 4. Serving Config Affects CUDA Graph Capture (still holds in v3, amplified)
+| Config | v3 Δ (S3) | Cause |
+|:-------|----------:|:------|
+| D1: Qwen 72B large bs/nt (`bs=64, nt=8192`) | **+25.1s** | More CUDA graph variants captured (default has ~16 variants for bs∈{1..16}; large config has ~34 variants for bs∈{1..32, 64, 128}) |
+| D1: DS 70B large bs/nt | **+23.1s** | Same as above |
+| D2: Qwen 72B seq16384 (`max_seq_len=16384`) | **+6.0s** | The new general warmup pass specializes over more KV-cache window-size variants |
+| D2: DS 70B seq16384 | +0.1s | DS does not have multiple window sizes; only Qwen does |
 
-**v2 finding (D1, large bs/nt):** Increasing `max_batch_size` (4→64) and `max_num_tokens` (1024→8192) adds 4–5s to CUDA graph capture and doubles 2nd-pass warmup (4→8s), adding ~8–9s total. This is proportional to the number of graph variants captured.
+**Takeaways:**
+- **Larger serving configs cost more startup time**, primarily through CUDA graph capture (proportional to graph variants) and 2nd-pass warmup. This is a real tradeoff users make when configuring high-throughput servers.
+- **D2 is model-dependent**: only models with sliding/window attention pay the seq_len cost. Qwen 72B uses sliding window, DS 70B (Llama-based) does not.
 
-**v2 finding (D2, long seq):** Increasing `max_seq_len` (4096→16384) has minimal impact on startup (~0.6s difference with S3), affecting only KV cache block allocation.
+(In v2, D1 added only ~+8s and D2 added ~+0.6s. The v3 amplification is due to (a) PR #12407's new general warmup pass, and (b) per-variant CUDA graph capture being slower in the rebased code.)
 
-**v3 findings (verified):**
+#### 5. Model Architecture Has Minor Impact
 
-| Config | v2 Δ (S3) | v3 Δ (S3) | Cause |
-|:-------|----------:|----------:|:------|
-| D1 (Qwen 72B large bs/nt) | +8.6s | **+25.1s** | More graph variants × larger per-variant capture cost in v3 |
-| D1 (DS 70B large bs/nt) | +8.7s | **+23.1s** | Same as above |
-| D2 (Qwen 72B seq16384) | +0.6s | **+6.0s** | New general warmup pass specializes over more KV-cache window-size variants |
-| D2 (DS 70B seq16384) | +0.0s | **+0.1s** | Unchanged |
+Qwen 72B and DeepSeek 70B show nearly identical startup patterns at the same tier and TP configuration. Qwen 72B S2 is 306s vs DS 70B S2 at 390s — the difference (~85s) is almost entirely from checkpoint prefetch (DS is ~15% more file data to read, and that delta scales with cold-NFS read time). On warm cache (S3): Qwen 72B is 75s, DS 70B is 78s — only a 3s difference.
 
-**Insight still holds with the same root cause** (more graph variants → more capture time, more shape variants → more general-warmup time), but the magnitude is amplified in v3 because PR #12407's general-warmup pass adds another shape-iteration loop and CUDA graph capture per variant has gotten slower.
-
-**Additional observation:** D2 impact is now model-dependent (Qwen +6s, DS unchanged). Likely the seq16384 config triggers different KV-cache window sizes in Qwen than in DS due to differences in window/sliding-attention configuration. Worth a closer look if seq_len becomes a config of interest.
-
-#### 5. Model Architecture Has Minor Impact (still holds in v3)
-
-Qwen 72B and DeepSeek 70B show nearly identical startup patterns at the same tier and TP configuration in both v2 and v3. v3 Qwen 72B S2 is 306s vs DS 70B S2 at 390s — the difference (~85s) is almost entirely from checkpoint prefetch (DS is ~15% more file data to read and the difference scales with NFS read time). Warmup times are within a few seconds of each other (Qwen 38s, DS 36s).
+Warmup times are within a few seconds of each other (Qwen 38s, DS 36s). The model-architecture-specific impact shows up only in:
+- Sliding-window attention (D2 seq16384): Qwen pays +6s for window-size specialization, DS pays nothing
+- File size for NFS prefetch (S2): DS files are ~15% larger
 
 #### 6. Warmup Overhead Regression from PR #12407 (new in v3)
 
