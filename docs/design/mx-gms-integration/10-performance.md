@@ -10,8 +10,8 @@
 |:---------|:---------|:-------|:-----------|
 | Cold-start (DeepSeek-V3, 681GB) | 5-10 min | 15-30s | **10-20x** |
 | Replica scale-up (Llama-70B) | 2-3 min | 5-10s | **12-36x** |
-| Memory per worker (same GPU) | N x weights | 1 x weights | **Nx reduction** |
-| Failover time (shadow takeover) | Cold-start | < 5s | **60-120x** |
+| Shadow failover time | Cold-start (50-114s) | < 5s | **10-23x** |
+| Shadow GPU memory overhead | N/A (no shadow today) | Weights only (no KV cache) | Zero-copy import |
 | Multi-node scale-out (N replicas) | N x load time | ~constant | **Near-constant** |
 | P2P transfer throughput | N/A | > 20 GB/s (NVLink) | — |
 | GMS import latency | N/A | < 500ms | — |
@@ -42,16 +42,18 @@
 - Cross-node (InfiniBand HDR): expect > 20 GB/s
 - Cross-node (RoCE 100G): expect > 10 GB/s
 
-### Test 3: Memory Efficiency — Not Yet Executed
+### Test 3: Shadow Failover Memory Overhead — Not Yet Executed
 
-**What:** Peak GPU memory with N workers sharing via GMS. Requires GMS integration to be implemented.
+**What:** Verify that a GMS shadow worker (RO import, no KV cache) adds minimal GPU memory overhead alongside an active primary. Requires GMS integration to be implemented.
 
 **Validation:**
 ```
-N=1: memory_1 = model_size + kv_cache + overhead
-N=2: memory_2 ≈ model_size + 2*(kv_cache + overhead)  # NOT 2*model_size
-N=4: memory_4 ≈ model_size + 4*(kv_cache + overhead)
+Primary alone: memory_primary = weights (1/TP) + kv_cache + overhead
+Primary + shadow: memory_total ≈ weights (1/TP, shared via GMS) + kv_cache + overhead
+                                  # Shadow imports same physical memory — near-zero additional cost
 ```
+
+> **Note:** For large models (70B+ with TP=8), a single active instance already consumes most GPU HBM. The shadow worker holds only weight references (zero-copy RO import) without KV cache, so the additional memory is negligible. Testing with N=4 active workers sharing weights is unrealistic for large models — the realistic scenario is 1 active + 1 shadow. Multi-instance sharing (N>2) applies only to small models or multi-LoRA deployments where multiple instances with independent KV caches fit on a single GPU.
 
 ### Test 4: Shadow Failover Latency — Not Yet Executed
 
@@ -59,10 +61,12 @@ N=4: memory_4 ≈ model_size + 4*(kv_cache + overhead)
 
 **Steps:**
 1. Start primary + shadow with GMS
-2. Send warmup requests to primary
+2. Send warmup requests to primary (this also populates compile cache)
 3. Kill primary (`kill -9`)
 4. Measure time until shadow returns first response
 5. **Target:** < 5s
+
+**Critical dependency:** The <5s target assumes compile cache (disk or GMS-backed) is warm. Without compile cache, warmup adds ~16s (autotuner ~12s + CUDA graphs ~4s), making failover ~17-19s. Since primary and shadow are co-located on the same node and share the filesystem, disk-based compile cache is sufficient for Phase 2. See [Compile Cache: Closing the Warmup Gap](06-executor-failover.md#compile-cache-closing-the-warmup-gap) for the tiered cache design.
 
 ### Test 5: Throughput Regression — Not Yet Executed
 
@@ -193,14 +197,14 @@ Scenario-based projection using measured S2/S3 baselines for Qwen 72B (TP=8). Th
 | **1. Baseline S2 (NFS cold)** | 21s (measured) | 71.8s (measured) | 16.6s (measured) | **114.4s** | Full cold start |
 | **2. Baseline S3 (warm cache)** | 21s (measured) | 8.9s (measured) | 16.0s (measured) | **50.2s** | Page cache hot |
 | **3. MX (1st on new node)** | 21s | ~10–15s (GPU P2P) | 16.6s | **~50–55s** | MX streams weights from donor; worker init overlaps with MX P2P transfer |
-| **4. GMS (2nd+ on same node)** | 21s | ~0.1s (zero-copy) | 16.6s | **~41s** | 2nd+ instance via shared GPU memory |
-| **5. MX+GMS (2nd+ on new node)** | 21s | ~0.1s (zero-copy) | 16.6s | **~41s** | 1st fetches via MX; 2nd+ near-free via GMS |
-| **6. MX+GMS+compile cache** | 21s | ~0.1s (zero-copy) | ~2s (cached) | **~27s** | Warmup artifacts pre-cached |
+| **4. GMS shadow (same node)** | 21s | ~0.1s (zero-copy) | 16.6s | **~41s** | Shadow pre-imports weights via GMS RO for fast failover activation |
+| **5. MX+GMS shadow (new node)** | 21s | ~0.1s (zero-copy) | 16.6s | **~41s** | 1st fetches via MX; shadow pre-imports via GMS RO |
+| **6. MX+GMS+compile cache** | 21s | ~0.1s (zero-copy) | ~2s (cached) | **~27s** | Warmup artifacts pre-cached (disk or GMS compile_cache tag) |
 | **7. MX+GMS+compile+reduced worker init** | ~2s (optimized) | ~0.1s | ~2s | **~8s** | Requires MPI process pool optimization (see below) |
 
 Key takeaways:
-- **MX** eliminates the 65–99s NFS cold-read penalty by streaming only the relevant TP shard directly to each rank's GPU (~10–15s). For S1, MX P2P transfer provides enough concurrent server work to hide the 21s worker init naturally (similar to how HF download hides it today).
-- **GMS** eliminates the 8.9s weight loading cost entirely for 2nd+ instances via zero-copy GPU memory sharing.
+- **MX** eliminates the 65–99s NFS cold-read penalty by streaming only the relevant TP shard directly to each rank's GPU (~10–15s), also eliminating the ~9× CPU memory spike of the current load-all-then-shard pattern. For S1, MX P2P transfer provides enough concurrent server work to hide the 21s worker init naturally (similar to how HF download hides it today).
+- **GMS** eliminates the weight loading cost for shadow/standby workers via zero-copy GPU memory import (~100ms). The primary use case is pre-staging shadow workers for <5s failover activation, not running multiple active serving instances.
 - **Worker init (~21s) is on the critical path** for all scenarios without substantial concurrent server work. See [investigation results](#worker-init-investigation-results) for why early warm-up alone cannot hide this cost.
 - **Neither MX nor GMS can reduce the ~16s warmup floor** — only compilation/autotuner caching can address this.
 - **The very first cluster-wide instance always pays full cost** (114–146s with NFS cold). MX requires a donor node; GMS requires a prior instance on the same node.

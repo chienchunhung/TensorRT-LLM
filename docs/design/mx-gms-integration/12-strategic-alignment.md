@@ -12,14 +12,14 @@ The [TRT-LLM Architecture Overview](../../overview/README.md) identifies three c
 |:----|:-----------------|:-------|
 | **Elastic fault tolerance** (Section 5.1, Item 1.3) | GMS shadow failover enables <5s recovery without full reload. This is a prerequisite for elastic fault tolerance — you can't redistribute work if recovery takes minutes. | **Direct enabler** |
 | **TTFT competitiveness** (Section 5.1, Item 1.4) | MX eliminates cold-start latency for new replicas. In autoscaling scenarios, TTFT = cold-start + first-request latency. MX removes the dominant term. | **Indirect improvement** |
-| **Multi-model serving** (Section 5.1, Item 1.7) | GMS zero-copy sharing enables multiple model variants on the same GPU with shared base weights. Different LoRA adapters can share the base model via GMS. | **Architectural enabler** |
+| **Multi-model serving** (Section 5.1, Item 1.7) | For smaller models or multi-LoRA deployments, GMS zero-copy sharing enables multiple model variants on the same GPU with shared base weights. This is a niche but valid use case — the primary GMS value for large models remains crash resilience and shadow failover. | **Niche enabler** |
 
 ### Category 2: Critical Bugs and Architectural Issues
 
 | Issue | How MX/GMS Helps | Impact |
 |:------|:-----------------|:-------|
 | **Disaggregated serving reliability** (Section 5.2, Item 2.1) | GMS-backed failover reduces blast radius of disagg worker crashes. Shadow gen workers can take over in <5s vs. full cold-start. | **Mitigates impact** |
-| **Weights loading OOM** (Section 5.2, Item 2.6) | GMS RO mode imports existing memory — no weight loading OOM risk for subsequent workers. MX P2P avoids disk I/O entirely. | **Eliminates for N>1** |
+| **Weights loading OOM** (Section 5.2, Item 2.6) | GMS RO mode imports existing memory — no weight loading OOM risk for shadow/standby workers. MX P2P avoids disk I/O entirely, eliminating the ~9× CPU memory spike. | **Eliminates for shadow + MX paths** |
 
 ### Category 3: Innovative and Futuristic Features
 
@@ -109,7 +109,7 @@ graph TD
     end
 
     subgraph "Phase 2-3: GMS (Next)"
-        GMS["Crash-Resilient Memory<br/>Shadow Failover"]
+        GMS["Crash-Resilient Memory<br/>Shadow Failover (<5s)<br/>Zero-Downtime Updates"]
     end
 
     subgraph "Phase 4: KV Cache (Future)"

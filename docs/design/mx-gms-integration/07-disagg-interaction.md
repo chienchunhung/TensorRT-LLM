@@ -138,7 +138,8 @@ context:
   checkpoint_format: mx         # Weight source axis: MX P2P
   load_format: gms              # Memory mgmt axis: GMS shared memory
   mx_server_url: http://mx-server:8001
-  gms_socket_path: /tmp/gms-ctx-0.sock
+  # Socket path auto-resolved from GPU UUID; can override via gms_socket_path
+  # Actual format: {GMS_SOCKET_DIR}/gms_{GPU_UUID}_{tag}.sock
   gms_tag: model_weights:context
 
 # Generation instance config
@@ -146,7 +147,7 @@ generation:
   checkpoint_format: mx         # Weight source axis: MX P2P
   load_format: gms              # Memory mgmt axis: GMS shared memory
   mx_server_url: http://mx-server:8001
-  gms_socket_path: /tmp/gms-gen-0.sock
+  # Socket path auto-resolved from GPU UUID
   gms_tag: model_weights:gen
   gms_mode: auto  # auto-detect RW vs shadow
 ```

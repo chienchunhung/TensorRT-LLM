@@ -13,7 +13,7 @@ This proposal integrates TensorRT-LLM with two complementary systems from the Dy
 - **ModelExpress (MX)**: GPU-to-GPU model weight streaming via NIXL/RDMA for fast cold-start across nodes
 - **GPU Memory Service (GMS)**: Out-of-process GPU memory management for zero-copy sharing and crash-resilient failover within nodes
 
-The integration targets three critical production pain points simultaneously: slow cold-start (minutes to seconds), memory waste from weight duplication (Nx to 1x), and crash recovery (full reload to <5s failover). vLLM already ships `--load-format mx` — this is a competitive catch-up for the MX integration and a differentiation opportunity for GMS and combined modes.
+The integration targets three critical production pain points simultaneously: slow cold-start (minutes to seconds via MX P2P), crash recovery (full reload to <5s failover via GMS shadow workers), and zero-downtime operations (rolling updates, elastic scaling). vLLM already ships `--load-format mx` — this is a competitive catch-up for the MX integration and a differentiation opportunity for GMS and combined modes.
 
 ---
 
@@ -53,5 +53,5 @@ The integration targets three critical production pain points simultaneously: sl
 | Phase | Priority | Timeline | Rationale |
 |:------|:---------|:---------|:----------|
 | MX Integration (Part II) | **P1 (Tier 1)** | 0-2 months | vLLM already has `--load-format mx`; competitive catch-up |
-| GMS Integration (Part II) | **P2 (Tier 2)** | 2-4 months | Enables crash resilience and memory sharing; differentiation |
+| GMS Integration (Part II) | **P2 (Tier 2)** | 2-4 months | Enables crash resilience, <5s shadow failover, and zero-downtime operations; differentiation |
 | Extensions (Part III) | **P2 (Tier 2)** | 4-6 months | Shadow failover, disagg interaction, KV cache extension path |

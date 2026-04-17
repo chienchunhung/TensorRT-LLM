@@ -11,25 +11,35 @@ graph TB
     end
 
     subgraph "Node A (Seed)"
-        GMS_A["GMS<br/>(Local)"]
+        GMS_A["GMS Launcher<br/>(spawns per-GPU processes)"]
+        GMS_A0["GMS GPU0<br/>(weights + kv_cache)"]
+        GMS_A1["GMS GPU1<br/>(weights + kv_cache)"]
+        GMS_AN["GMS GPU2..7<br/>(weights + kv_cache)"]
+        GMS_A --> GMS_A0
+        GMS_A --> GMS_A1
+        GMS_A --> GMS_AN
         W_A1["TRT-LLM Worker 1<br/>(RW mode)"]
         W_A2["TRT-LLM Worker 2<br/>(RO mode, shadow)"]
-        W_A1 --> GMS_A
-        W_A2 --> GMS_A
+        W_A1 --> GMS_A0
+        W_A2 --> GMS_A0
     end
 
     subgraph "Node B (Replica)"
-        GMS_B["GMS<br/>(Local)"]
+        GMS_B["GMS Launcher"]
+        GMS_B0["GMS GPU0..7"]
+        GMS_B --> GMS_B0
         W_B1["TRT-LLM Worker 1"]
         W_B2["TRT-LLM Worker 2<br/>(shadow)"]
-        W_B1 --> GMS_B
-        W_B2 --> GMS_B
+        W_B1 --> GMS_B0
+        W_B2 --> GMS_B0
     end
 
     subgraph "Node C (Replica)"
-        GMS_C["GMS<br/>(Local)"]
+        GMS_C["GMS Launcher"]
+        GMS_C0["GMS GPU0..7"]
+        GMS_C --> GMS_C0
         W_C1["TRT-LLM Worker 1"]
-        W_C1 --> GMS_C
+        W_C1 --> GMS_C0
     end
 
     MXServer <-->|gRPC| W_A1
@@ -44,7 +54,7 @@ graph TB
 | Component | Responsibility | Owner |
 |:----------|:--------------|:------|
 | **MX Server** | Coordinate P2P transfers across nodes; track source availability | Dynamo/MX team |
-| **GMS (per node)** | Manage GPU memory; enable zero-copy sharing within node | Dynamo team |
+| **GMS (per GPU, per tag)** | Manage GPU memory; enable zero-copy sharing within node. Runs as one independent process per GPU per tag (e.g., 16 processes on an 8-GPU node: 8 for `weights` + 8 for `kv_cache`). A per-node launcher spawns all processes. Socket paths use GPU UUID for stability: `{GMS_SOCKET_DIR}/gms_{GPU_UUID}_{tag}.sock`. Sharing is strictly per-GPU (CUDA VMM constraint). | Dynamo team |
 | **TRT-LLM Weight Loaders** | Integrate with MX/GMS via clean APIs | TRT-LLM team (this proposal) |
 | **NIXL/UCX** | Execute actual GPU-to-GPU RDMA transfers | NVIDIA |
 | **TRT-LLM Executor** | Shadow failover, sleep/wake lifecycle | TRT-LLM team (this proposal) |
@@ -77,12 +87,12 @@ flowchart TD
 > | Mode | Node B, Worker 1 (first on node) | Node B, Worker 2+ |
 > |:-----|:---------------------------------|:-------------------|
 > | **MX only** (`LoadFormat.AUTO`) | P2P from Node A (~15-30s), regular CUDA memory | Must load independently (no sharing) |
-> | **GMS only** (`LoadFormat.GMS`) | Load from disk (minutes), commits to GMS | Zero-copy RO (~100ms) |
-> | **MX + GMS** (`checkpoint_format="MX"`, `LoadFormat.GMS`) | Load from disk (minutes), commits to GMS — **same as GMS-only** | Zero-copy RO (~100ms) |
+> | **GMS only** (`LoadFormat.GMS`) | Load from disk (minutes), commits to GMS | Shadow: zero-copy RO import (~100ms) |
+> | **MX + GMS** (`checkpoint_format="MX"`, `LoadFormat.GMS`) | Load from disk (minutes), commits to GMS — **same as GMS-only** | Shadow: zero-copy RO import (~100ms) |
 >
-> MX and GMS currently operate as **separate modes**, not a truly composed solution. MX provides fast cross-node startup (in `LoadFormat.AUTO`); GMS provides within-node sharing + crash resilience (in `LoadFormat.GMS`). They do not compose because the GMS RW path cannot leverage MX P2P.
+> MX and GMS currently operate as **separate modes**, not a truly composed solution. MX provides fast cross-node startup (in `LoadFormat.AUTO`); GMS provides within-node crash resilience + shadow failover (in `LoadFormat.GMS`). They do not compose because the GMS RW path cannot leverage MX P2P.
 >
-> **Future optimization path:** Pre-allocate empty CUDA buffers under the GMS pool, then pass those buffer pointers to the MX SDK as P2P receive targets. This would allow MX to write directly into GMS-managed memory, giving the best of both: P2P speed (~15-30s) + GMS sharing (~100ms for subsequent workers). This requires MX SDK support for receiving into pre-allocated buffers rather than SDK-managed allocations.
+> **Future optimization path:** Pre-allocate empty CUDA buffers under the GMS pool, then pass those buffer pointers to the MX SDK as P2P receive targets. This would allow MX to write directly into GMS-managed memory, giving the best of both: P2P speed (~15-30s) + GMS crash resilience (~100ms shadow import). This requires MX SDK support for receiving into pre-allocated buffers rather than SDK-managed allocations.
 
 For **MX-only mode** (`--checkpoint-format mx`, no GMS):
 

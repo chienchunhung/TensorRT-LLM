@@ -83,6 +83,6 @@
 |:-----------|:-----|:-----|:--------|
 | **External wrapper only** (like PR #7053) | No core changes; fast start | Fragile; breaks with updates; poor UX | Not for production |
 | **GMS-only (no MX)** | Simpler; within-node only | Doesn't solve cross-node cold-start | Insufficient |
-| **MX-only (no GMS)** | Solves cross-node cold-start | No memory sharing; no crash resilience | Partial solution |
+| **MX-only (no GMS)** | Solves cross-node cold-start | No crash resilience; no shadow failover; no zero-downtime updates | Partial solution |
 | **Custom implementation** | Full control | 6-12 months; duplicates existing systems | Not recommended |
 | **Phased MX + GMS** | Leverages existing systems; incremental value | Dynamo dependency | **Recommended** |

@@ -28,15 +28,20 @@ ModelExpress is a Rust-based service from the Dynamo ecosystem that coordinates 
 
 ## GPU Memory Service (GMS)
 
-GMS is an out-of-process GPU memory manager that decouples memory ownership from processes:
+GMS is an out-of-process GPU memory manager that decouples GPU memory lifecycle from process lifecycle:
 
-- **Zero-copy sharing**: Multiple workers share the same GPU memory for model weights
-- **Crash resilience**: Memory persists when worker crashes; new worker imports existing memory
-- **VA-stable failover**: Shadow engines can release/reclaim memory while keeping tensor pointers valid
+- **Crash resilience** (primary value): Memory persists when worker crashes; new worker imports existing memory in ~100ms instead of reloading from storage (minutes)
+- **Shadow failover**: Shadow workers pre-import weights via RO zero-copy; on primary failure, activate in <5s (lock upgrade + KV cache alloc + executor start)
+- **Zero-copy sharing**: Active and shadow workers share the same GPU memory for model weights on the same GPU (per-GPU, not cross-GPU — CUDA VMM constraint)
 - **Socket-based locking**: Connection IS the lock; automatic release on crash
 - **CUDA VMM integration**: Uses `cuMemExportToShareableHandle` / `cuMemImportFromShareableHandle` for FD-based memory sharing
+- **Per-GPU, per-tag deployment**: Each GMS server manages exactly one GPU. On an 8-GPU node, 16 independent GMS processes run (one `weights` + one `kv_cache` per GPU). Socket paths use GPU UUID for stability across `CUDA_VISIBLE_DEVICES` configs.
+
+> **Scope of sharing:** GMS sharing is between multiple **processes** on the **same GPU** (e.g., active worker + shadow standby), not between GPUs. For large models (70B+), the realistic multi-process scenario is active + shadow for failover, not multiple active serving instances (which wouldn't fit in GPU memory). For smaller models or multi-LoRA setups, multiple active instances sharing a base model is possible but niche.
 
 > **Terminology note:** "GPU Memory Service" (GMS) is the name used by the Dynamo team for the out-of-process GPU memory management component. The [prototype integration with TRT-LLM](https://github.com/ai-dynamo/dynamo/pull/7053) (PR #7053) demonstrates RW/RO weight loading, sleep/wake KV cache release, and shadow failover using the GMS client API. That PR also surfaced a concrete `post_load_weights()` / module-path-resolution bug when importing weights for models with aliased layers (e.g., `LlamaForCausalLM.next_attn`) — see [Challenges](05-challenges.md) section 7. This proposal uses "GMS" consistently to refer to this GPU Memory Service component. **API stability remains a key risk — see [Risk Assessment](11-risks.md).**
+
+**Repository:** GMS lives within the Dynamo monorepo at [`lib/gpu_memory_service/`](https://github.com/ai-dynamo/dynamo/tree/main/lib/gpu_memory_service)
 
 **Prototype:** https://github.com/ai-dynamo/dynamo/pull/7053 — demonstrates:
 - GMS-backed weight loading for TRT-LLM (`_load_read_mode` with `materialize_module_from_gms`)
@@ -46,7 +51,15 @@ GMS is an out-of-process GPU memory manager that decouples memory ownership from
 
 ## Dynamo Ecosystem Context
 
-MX and GMS are components of NVIDIA Dynamo, a datacenter-scale distributed inference framework:
+MX and GMS are components of NVIDIA Dynamo, a datacenter-scale distributed inference framework.
+
+**Repositories:**
+| Component | Repository |
+|:----------|:-----------|
+| **Dynamo** (orchestration, GMS, routing) | https://github.com/ai-dynamo/dynamo |
+| **ModelExpress** (weight streaming) | https://github.com/ai-dynamo/modelexpress |
+| **GMS** (GPU memory service) | [`lib/gpu_memory_service/`](https://github.com/ai-dynamo/dynamo/tree/main/lib/gpu_memory_service) within Dynamo monorepo |
+| **NIXL** (transfer API) | https://github.com/ai-dynamo/nixl |
 
 ```mermaid
 graph TB

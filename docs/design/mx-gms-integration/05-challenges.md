@@ -98,7 +98,7 @@ candidates = [s for s in sources if s.worker_rank == my_rank]
 
 **Known complexity from PR #7053:**
 - Module path resolution issues with aliased layers — `post_load_weights()` creates aliases that the GMS import path must resolve
-- Limited multi-rank support — multi-GPU GMS sharing requires per-device socket management
+- Multi-rank support — each GPU has its own GMS process (one per tag), so multi-GPU setups require connecting each rank to its corresponding per-GPU GMS socket (auto-resolved via GPU UUID)
 
 ## 7. Module Path Resolution (GMS-Specific)
 

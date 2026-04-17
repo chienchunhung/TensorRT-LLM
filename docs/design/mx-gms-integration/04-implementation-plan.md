@@ -37,7 +37,7 @@ MX is a weight *source* (it replaces where weights come from — P2P instead of 
 This plan treats MX and GMS as **library dependencies**, not things to reimplement:
 
 - **MX (ModelExpress)**: The [`modelexpress`](https://github.com/ai-dynamo/modelexpress) library provides a gRPC server, Python client SDK, and NIXL-based GPU-to-GPU transfer. vLLM's `--load-format mx` integration is a thin loader (~500 lines) that calls the MX client API. [PR #12898](https://github.com/NVIDIA/TensorRT-LLM/pull/12898) demonstrates a working MX prototype with TRT-LLM.
-- **GMS (GPU Memory Service)**: The [`gpu_memory_service`](https://github.com/ai-dynamo/dynamo/pull/7053) library provides the CUDA VMM allocator, RW/RO client, and socket-based locking. PR #7053 shows a working TRT-LLM integration (~300 lines).
+- **GMS (GPU Memory Service)**: The [`gpu_memory_service`](https://github.com/ai-dynamo/dynamo/pull/7053) library provides the CUDA VMM allocator, RW/RO client, and socket-based locking. Each GMS server manages memory for exactly one GPU — on an 8-GPU node, the GMS launcher spawns 16 independent processes (one per GPU per tag: `weights` and `kv_cache`). Socket paths use GPU hardware UUID for stability: `{GMS_SOCKET_DIR}/gms_{GPU_UUID}_{tag}.sock`. PR #7053 shows a working TRT-LLM integration (~300 lines).
 - **Two-axis prototype**: The [`dynamo-integration-prototype`](https://github.com/chienchunhung/TensorRT-LLM/tree/dynamo-integration-prototype) branch implements the full two-axis integration model (~830 lines changed across 15 files).
 
 ### Scope
@@ -255,6 +255,8 @@ class MXCheckpointLoader(HfCheckpointLoader):
 
 GMS integrates on the **loading mode axis** (`LoadFormat`) — it replaces *how* GPU memory is managed (out-of-process shared pool) without changing where weights come from. The `LoadFormat.GMS` branch composes with **any** checkpoint loader (HF, Mistral, or MX).
 
+> **GMS deployment model:** Each GMS server manages memory for exactly **one GPU**. On an 8-GPU node, the GMS launcher spawns **16 independent processes** — one `weights` service and one `kv_cache` service per GPU. The two-tag split is architecturally significant: the `kv_cache` GMS instance enables releasing KV cache memory independently of weights during shadow failover (sleep releases `kv_cache` tag; weights stay shared via `weights` tag). Each process listens on its own Unix socket: `{GMS_SOCKET_DIR}/gms_{GPU_UUID}_{tag}.sock`, where the GPU UUID is resolved via pynvml for stability across `CUDA_VISIBLE_DEVICES` configurations. Sharing is strictly per-GPU — this is a CUDA VMM hardware constraint, not a GMS design choice.
+
 ### GMS Loading Mode
 
 > **Prototype:** [`dynamo-integration-prototype`](https://github.com/chienchunhung/TensorRT-LLM/tree/dynamo-integration-prototype) branch. `GMSBackend` at `tensorrt_llm/_torch/memory/gpu_memory_backend.py`; `LoadFormat.GMS` branch in `tensorrt_llm/_torch/pyexecutor/model_loader.py`.
@@ -448,7 +450,9 @@ class TorchLlmArgs(BaseLlmArgs):
 
     # GMS-specific (only when load_format=GMS)
     gms_socket_path: Optional[str] = Field(
-        default=None, status="prototype")  # Default: /tmp/gms-{device_id}.sock
+        default=None, status="prototype")  # Default: {GMS_SOCKET_DIR}/gms_{GPU_UUID}_{tag}.sock
+        # GMS uses GPU hardware UUID (via pynvml), not device index, for stability
+        # across CUDA_VISIBLE_DEVICES configurations. Override dir via GMS_SOCKET_DIR env var.
     gms_mode: Optional[str] = Field(
         default="auto", status="prototype")  # "auto", "rw", or "ro"
     gms_tag: str = Field(
@@ -468,14 +472,15 @@ All four fields have `status="prototype"` and are registered in the API stabilit
 trtllm-serve meta-llama/Llama-3.1-70B \
     --checkpoint-format mx --mx-server-url http://mx:8001
 
-# GMS only (sharing within node)
+# GMS only (crash resilience + shadow failover within node)
+# Socket path auto-resolved from GPU UUID if omitted; override with --gms-socket-path
 trtllm-serve meta-llama/Llama-3.1-70B \
-    --load-format gms --gms-socket-path /tmp/gms-0.sock
+    --load-format gms
 
 # MX + GMS (combined)
 trtllm-serve meta-llama/Llama-3.1-70B \
     --checkpoint-format mx --mx-server-url http://mx:8001 \
-    --load-format gms --gms-socket-path /tmp/gms-0.sock
+    --load-format gms
 
 # Pure TRT-LLM (unchanged, default)
 trtllm-serve meta-llama/Llama-3.1-70B
@@ -506,7 +511,7 @@ gantt
 | Milestone | Duration | Cumulative | Key success criteria |
 |:----------|:---------|:-----------|:---------------------|
 | **MX** | 3-4 weeks | 3-4 weeks | Cold-start < 30s (Llama-70B); P2P > 20 GB/s; within 20% of vLLM MX |
-| **GMS** | 3-4 weeks | 6-8 weeks | 1x memory per worker; failover < 5s; GMS import < 500ms; bit-exact correctness |
+| **GMS** | 3-4 weeks | 6-8 weeks | Shadow failover < 5s; GMS RO import < 500ms; crash-resilient memory; bit-exact correctness |
 | **Combined** | 2-3 weeks | 8-11 weeks | DeepSeek-V3 cold-start < 30s; < 2% throughput regression; E2E disagg validation |
 
 Compressed from 18-22 weeks because TRT-LLM is integrating with existing libraries, not building them.
