@@ -396,16 +396,19 @@ Both v2 and v3 data are shown. v3 S3 results are pending additional runs; those 
 
 #### v3 (current, post-PR #12407)
 
-S1 runs were not executed in v3 (HF rate-limiting concerns). S3 runs are in progress — this table will be updated once complete.
+S1 runs were not executed in v3 (HF rate-limiting concerns).
 
-| Metric | Qwen 72B S2 | Qwen 72B S3 (pending) | DS 70B S2 | DS 70B S3 (pending) |
+| Metric | Qwen 72B S2 | Qwen 72B S3 | DS 70B S2 | DS 70B S3 |
 |:-------|----:|----:|----:|----:|
-| **Total startup** | **306.3** | *pending* | **389.8** | *pending* |
+| **Total startup** | **306.3** | **74.6** | **389.8** | **77.7** |
 | MPI worker cold start | ~21s visible | ~21s visible | ~21s visible | ~21s visible |
-| Checkpoint prefetch (worker) | 233.2 | *pending* | 318.4 | *pending* |
-| Apply weights (worker) | 3.7 | *pending* | 3.6 | *pending* |
-| Warmup — 1st pass (worker) | 38.0 | *pending* | 36.4 | *pending* |
-| Warmup — 2nd pass (worker) | 4.7 | *pending* | 4.5 | *pending* |
+| Checkpoint prefetch (worker) | 233.2 | 3.5 | 318.4 | 6.0 |
+| Apply weights (worker) | 3.7 | 3.6 | 3.6 | 3.7 |
+| Warmup — 1st pass (worker) | 38.0 | 36.3 | 36.4 | 36.4 |
+| ├─ torch_compile / general warmup | 25.0 | 23.6 | 23.3 | 23.4 |
+| ├─ Autotuner forward | 1.5 | 1.5 | 2.0 | 2.0 |
+| └─ CUDA graphs | 11.4 | 11.1 | 11.0 | 10.9 |
+| Warmup — 2nd pass (worker) | 4.7 | 4.6 | 4.5 | 4.5 |
 
 #### Storage tier story (unchanged by v2→v3)
 
@@ -413,15 +416,17 @@ S1 runs were not executed in v3 (HF rate-limiting concerns). S3 runs are in prog
 |------|-----------------|-------------------------------------|----------------------|-----|
 | S1 | Warm (download populates cache) | 3.5s / *not measured* | Hidden (behind download) | Download dispatches to workers early |
 | S2 | Cold (fresh inodes) | 65.0s / 233.2s | Visible (~21s) | No prior dispatch to workers |
-| S3 | Warm (prior run's reads) | 3.4s / *pending* | Visible (~21s) | No prior dispatch to workers |
+| S3 | Warm (prior run's reads) | 3.4s / 3.5s | Visible (~21s) | No prior dispatch to workers |
 
-**Key takeaway:** The qualitative storage-tier story is unchanged — S2 cold NFS reads dominate, S1/S3 enjoy page-cache-speed reads. The v2→v3 absolute numbers differ mainly because the v3 node has slower cold NFS throughput than the v2 node (same NFS server, different client-side network path). The relative ordering (S2 ≫ S1 ≈ S3) and the MX/GMS optimization targets remain valid.
+**Key takeaway:** The qualitative storage-tier story is unchanged — S2 cold NFS reads dominate, S1/S3 enjoy page-cache-speed reads. The v3 S3 prefetch (3.5s for Qwen 72B, 6.0s for DS 70B) is essentially identical to v2 (3.4s/6.0s), confirming that the v2→v3 storage-tier delta is fully attributable to the S2 NFS path on the new node, not codebase change. The relative ordering (S2 ≫ S1 ≈ S3) and the MX/GMS optimization targets remain valid.
 
 **Planned: S4 (Local NVMe SSD, cold):** A fourth tier measuring cold reads from node-local NVMe (no network hop) is planned. This represents the model-pre-staged-to-local-disk scenario and provides the storage-speed ceiling against which MX P2P throughput should be compared. The node has 8x 3.5TB NVMe SSDs available. S4 uses the same fresh-inode-copy methodology as S2 to ensure cold page cache. Results pending.
 
 ### Part 3 — Autotuner Impact
 
 Comparing autotuner ON vs OFF on S2 and S3 tiers. Warmup component shift when autotuner is disabled.
+
+#### v2 (baseline, pre-PR #12407)
 
 | Metric | Qwen 72B S2 ON | Qwen 72B S2 OFF | Qwen 72B S3 ON | Qwen 72B S3 OFF |
 |:-------|----:|----:|----:|----:|
@@ -439,9 +444,35 @@ Comparing autotuner ON vs OFF on S2 and S3 tiers. Warmup component shift when au
 | — CUDA graphs | 0.5 (<1%) | 11.4 (7%) | 0.5 (1%) | 11.1 (21%) |
 | — Memory pool | 0.1 (<1%) | 0.6 (<1%) | 0.1 (<1%) | 0.6 (1%) |
 
+#### v3 (current, post-PR #12407)
+
+In v3, autotuner forward only takes ~1.5–2s (down from 11s in v2 due to PR #12407 refactor), so disabling it has a much smaller direct impact. The CUDA graph capture time also no longer changes when autotuner is disabled.
+
+| Metric | Qwen 72B S2 ON | Qwen 72B S2 OFF | Qwen 72B S3 ON | Qwen 72B S3 OFF |
+|:-------|----:|----:|----:|----:|
+| **Total startup** | **306.3 (100%)** | **293.3 (100%)** | **74.6 (100%)** | **73.6 (100%)** |
+| Warmup (1st pass) | 38.0 (12%) | 35.3 (12%) | 36.3 (49%) | 35.7 (48%) |
+| — torch_compile | 25.0 (8%) | 23.6 (8%) | 23.6 (32%) | 23.9 (32%) |
+| — Autotuner | 1.5 (<1%) | 0.0 (0%) | 1.5 (2%) | 0.0 (0%) |
+| — CUDA graphs | 11.4 (4%) | 11.5 (4%) | 11.1 (15%) | 11.6 (16%) |
+| — Memory pool | 0.1 (<1%) | 0.1 (<1%) | 0.1 (<1%) | 0.1 (<1%) |
+
+| Metric | DS 70B S2 ON | DS 70B S2 OFF | DS 70B S3 ON | DS 70B S3 OFF |
+|:-------|----:|----:|----:|----:|
+| **Total startup** | **389.8 (100%)** | **410.7 (100%)** | **77.7 (100%)** | **76.7 (100%)** |
+| Warmup (1st pass) | 36.4 (9%) | 35.3 (9%) | 36.4 (47%) | 35.1 (46%) |
+| — torch_compile | 23.3 (6%) | 23.8 (6%) | 23.4 (30%) | 23.6 (31%) |
+| — Autotuner | 2.0 (<1%) | 0.0 (0%) | 2.0 (3%) | 0.0 (0%) |
+| — CUDA graphs | 11.0 (3%) | 11.4 (3%) | 10.9 (14%) | 11.4 (15%) |
+| — Memory pool | 0.1 (<1%) | 0.1 (<1%) | 0.1 (<1%) | 0.1 (<1%) |
+
+Note: The DS 70B S2 OFF total is higher than ON (410.7s vs 389.8s) entirely due to NFS variability in the cold-prefetch phase (340s vs 318s) — not from autotuner being disabled. Warmup itself is unchanged.
+
 ### Part 4 — Serving Config Sensitivity
 
 **D1: Large config** (bs=64, nt=8192 vs default bs=4, nt=1024):
+
+#### v2 (baseline)
 
 | Metric | Qwen 72B S3 default | Qwen 72B S3 large | DS 70B S3 default | DS 70B S3 large |
 |:-------|----:|----:|----:|----:|
@@ -450,12 +481,36 @@ Comparing autotuner ON vs OFF on S2 and S3 tiers. Warmup component shift when au
 | — CUDA graphs | 0.6 (1%) | 4.9 (8%) | 0.5 (1%) | 4.1 (7%) |
 | Warmup (2nd pass) | 4.1 (8%) | 8.2 (14%) | 4.0 (8%) | 7.6 (12%) |
 
+#### v3 (current)
+
+| Metric | Qwen 72B S3 default | Qwen 72B S3 large | DS 70B S3 default | DS 70B S3 large |
+|:-------|----:|----:|----:|----:|
+| **Total startup** | **74.6 (100%)** | **99.7 (100%)** | **77.7 (100%)** | **100.8 (100%)** |
+| Warmup (1st pass) | 36.3 (49%) | 54.0 (54%) | 36.4 (47%) | 52.6 (52%) |
+| — torch_compile | 23.6 (32%) | 23.7 (24%) | 23.4 (30%) | 23.4 (23%) |
+| — CUDA graphs | 11.1 (15%) | 28.9 (29%) | 10.9 (14%) | 27.3 (27%) |
+| Warmup (2nd pass) | 4.6 (6%) | 11.7 (12%) | 4.5 (6%) | 11.3 (11%) |
+
+The D1 effect grew from ~+8s in v2 to ~+25s in v3 — same root cause (more graph variants captured) but now amplified because the per-variant CUDA graph capture time is larger.
+
 **D2: Long sequence** (seq_len=16384 vs default 4096):
+
+#### v2 (baseline)
 
 | Metric | Qwen 72B S3 default | Qwen 72B S3 seq16k | DS 70B S3 default | DS 70B S3 seq16k |
 |:-------|----:|----:|----:|----:|
 | **Total startup** | **50.2 (100%)** | **50.8 (100%)** | **52.9 (100%)** | **52.9 (100%)** |
 | Warmup (1st pass) | 11.9 (24%) | 12.4 (24%) | 12.5 (24%) | 12.6 (24%) |
+
+#### v3 (current)
+
+| Metric | Qwen 72B S3 default | Qwen 72B S3 seq16k | DS 70B S3 default | DS 70B S3 seq16k |
+|:-------|----:|----:|----:|----:|
+| **Total startup** | **74.6 (100%)** | **80.6 (100%)** | **77.7 (100%)** | **77.8 (100%)** |
+| Warmup (1st pass) | 36.3 (49%) | 42.6 (53%) | 36.4 (47%) | 36.5 (47%) |
+| — torch_compile | 23.6 (32%) | 29.7 (37%) | 23.4 (30%) | 23.4 (30%) |
+
+Note: The Qwen 72B seq16k config shows a +6s increase in v3 (mostly in `torch_compile`'s general warmup), while DS 70B is unchanged. In v2, both models showed ~0.6s impact. The v3 increase for Qwen 72B is likely due to the new general warmup pass needing to specialize over more KV cache window-size variants.
 
 ### Analysis and Key Insights
 
@@ -463,7 +518,7 @@ Comparing autotuner ON vs OFF on S2 and S3 tiers. Warmup component shift when au
 
 For large models (70–72B), the dominant bottleneck depends on whether the OS page cache is warm:
 
-- **S2 (NFS cold, production baseline):** 65–99s checkpoint prefetch from cold NFS. No prior operation has warmed the page cache. This is the realistic first-cold-start cost that MX aims to eliminate.
+- **S2 (NFS cold, production baseline):** 65–99s checkpoint prefetch from cold NFS in v2; **233–318s in v3** on the new node. No prior operation has warmed the page cache. This is the realistic first-cold-start cost that MX aims to eliminate.
 - **S1 and S3 (page cache warm):** Worker prefetch is ~3–5s in both. S1's download inherently warms the page cache (Linux retains written pages via write-back caching), giving workers the same page-cache-hit behavior as S3. The difference is that S1 pays 63.5s upfront for the download, while S3 benefits from a prior run's cache.
 - **S1 < S2 in this benchmark** because the fast internal HF mirror delivered 145GB faster (~63.5s total including cache mgmt) than cold NFS served it (~65–99s), and the download warmed the page cache as a side effect. With a slower CDN (public HF Hub), S1 would be slower.
 
@@ -628,19 +683,39 @@ MX and GMS address weight loading but cannot reduce warmup:
 - **Warmup (v3 ~43s, v2 ~16s):** general warmup (~25s) + autotuner (~1.5s) + CUDA graph capture (~11s) + 2nd-pass warmup (~5s). Only compilation/autotuner caching can reduce this. **PR #12407 increased this floor by ~27s** by adding the general warmup pass.
 - **MPI worker cold start (~21s):** Lazy process spawning + Python imports in `mpi4py.futures.MPIPoolExecutor`. Not addressable by simple warm-up dispatch; requires MPI pool or import optimization.
 
-#### 3. Disabling Autotuner (v2: No Net Benefit) — v3 re-verification pending
+#### 3. Disabling Autotuner Has No Net Benefit (still holds in v3, different reason)
 
-**v2 finding:** When autotuner is disabled, CUDA graph capture time increases by almost exactly the same amount (0.6s → 11s), because the autotuner's kernel selections make subsequent CUDA graph capture faster. **Net warmup change: <1s (<1% of total).**
+**v2 finding:** When autotuner is disabled (~11s saved), CUDA graph capture time increases by almost exactly the same amount (0.6s → 11s), because the autotuner's kernel selections make subsequent CUDA graph capture faster. **Net warmup change: <1s (<1% of total).**
 
-**v3 status:** In v3, autotuner forward is only ~1.5s (down from 11s in v2), while CUDA graphs is already ~11s regardless. Disabling autotuner in v3 should have even less impact. Re-verification is in progress.
+**v3 finding (verified):** In v3, autotuner forward is only ~1.5–2s (down from 11s in v2 due to PR #12407 refactor), while CUDA graphs stays roughly constant (~11s) regardless of autotuner state.
 
-#### 4. Serving Config Affects CUDA Graph Capture (expected unchanged)
+| Comparison | v2 Δ when OFF | v3 Δ when OFF |
+|:-----------|--------------:|--------------:|
+| Qwen 72B S3: warmup 1st pass | -0.1s | -0.6s |
+| Qwen 72B S3: total startup | -0.4s | -1.0s |
+| DS 70B S3: warmup 1st pass | -0.6s | -1.3s |
+| DS 70B S3: total startup | -0.8s | -1.0s |
 
-**v2 finding:** Increasing `max_batch_size` (4→64) and `max_num_tokens` (1024→8192) adds 4–5s to CUDA graph capture and doubles 2nd-pass warmup (4→8s), adding ~8–9s total. This is proportional to the number of graph variants captured.
+**Insight still holds with the same conclusion (negligible net benefit) but for a different reason:** in v2 the autotuner cost was offset by a CUDA graph slowdown; in v3 the autotuner is small to begin with. Either way, disabling autotuner is not a useful optimization lever.
 
-Increasing `max_seq_len` (4096→16384) has minimal impact on startup (~0.6s difference with S3), affecting only KV cache block allocation.
+#### 4. Serving Config Affects CUDA Graph Capture (still holds in v3, amplified)
 
-**v3 status:** Re-verification pending. The logic (more graph variants → more capture time) should still hold.
+**v2 finding (D1, large bs/nt):** Increasing `max_batch_size` (4→64) and `max_num_tokens` (1024→8192) adds 4–5s to CUDA graph capture and doubles 2nd-pass warmup (4→8s), adding ~8–9s total. This is proportional to the number of graph variants captured.
+
+**v2 finding (D2, long seq):** Increasing `max_seq_len` (4096→16384) has minimal impact on startup (~0.6s difference with S3), affecting only KV cache block allocation.
+
+**v3 findings (verified):**
+
+| Config | v2 Δ (S3) | v3 Δ (S3) | Cause |
+|:-------|----------:|----------:|:------|
+| D1 (Qwen 72B large bs/nt) | +8.6s | **+25.1s** | More graph variants × larger per-variant capture cost in v3 |
+| D1 (DS 70B large bs/nt) | +8.7s | **+23.1s** | Same as above |
+| D2 (Qwen 72B seq16384) | +0.6s | **+6.0s** | New general warmup pass specializes over more KV-cache window-size variants |
+| D2 (DS 70B seq16384) | +0.0s | **+0.1s** | Unchanged |
+
+**Insight still holds with the same root cause** (more graph variants → more capture time, more shape variants → more general-warmup time), but the magnitude is amplified in v3 because PR #12407's general-warmup pass adds another shape-iteration loop and CUDA graph capture per variant has gotten slower.
+
+**Additional observation:** D2 impact is now model-dependent (Qwen +6s, DS unchanged). Likely the seq16384 config triggers different KV-cache window sizes in Qwen than in DS due to differences in window/sliding-attention configuration. Worth a closer look if seq_len becomes a config of interest.
 
 #### 5. Model Architecture Has Minor Impact (still holds in v3)
 
