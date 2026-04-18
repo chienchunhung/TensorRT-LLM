@@ -511,7 +511,7 @@ gantt
 | Milestone | Duration | Cumulative | Key success criteria |
 |:----------|:---------|:-----------|:---------------------|
 | **MX** | 3-4 weeks | 3-4 weeks | Cold-start < 30s (Llama-70B); P2P > 20 GB/s; within 20% of vLLM MX |
-| **GMS** | 3-4 weeks | 6-8 weeks | Shadow failover < 5s; GMS RO import < 500ms; crash-resilient memory; bit-exact correctness |
+| **GMS** | 3-4 weeks | 6-8 weeks | Shadow failover < 5s (requires warm compile cache on v3 code — see [§07 Tiered Compile Cache](07-compile-cache.md)); GMS RO import < 500ms; crash-resilient memory; bit-exact correctness |
 | **Combined** | 2-3 weeks | 8-11 weeks | DeepSeek-V3 cold-start < 30s; < 2% throughput regression; E2E disagg validation |
 
 Compressed from 18-22 weeks because TRT-LLM is integrating with existing libraries, not building them.

@@ -80,7 +80,7 @@ class PyExecutor:
         # Step 2: Allocate KV cache — ~1-3s (depends on cache size)
         self._resource_manager.allocate_kv_cache()
 
-        # Step 3: Cache-warm warmup — ~0.5-2s (see "Compile Cache" section below)
+        # Step 3: Cache-warm warmup — ~0.5-2s (see [§07 Tiered Compile Cache](07-compile-cache.md))
         # Loads compiled kernels from GMS compile_cache tag or disk cache,
         # then recaptures CUDA graphs with the new KV cache addresses.
         self._cache_warm_warmup()
@@ -132,94 +132,19 @@ def _init_shadow_with_gms(self):
 | `materialize_with_tag("compile_cache")` | `gms_client.import(tag="compile_cache")` | Deserialize artifacts | Shadow activation |
 | `release_with_tag("compile_cache")` | `gms_client.release_lock()` | Orchestration only | Demotion, shutdown |
 
-## Compile Cache: Closing the Warmup Gap
-
-### The Problem
-
-The shadow activation budget above targets <5s, but **warmup is not accounted for**. Benchmark data (Section 10) shows warmup takes ~16s for Qwen 72B:
-
-| Warmup Phase | Duration | What It Does |
-|:-------------|:---------|:-------------|
-| 1st pass (autotuner) | ~12s | `torch.compile` compilation + autotuner kernel selection |
-| 2nd pass (CUDA graphs) | ~4s | CUDA graph capture for the selected kernels |
-| **Total** | **~16s** | |
-
-Without a compile cache, shadow activation would take ~17-19s — far exceeding the <5s target.
-
-**Why the shadow can't pre-warm during shadow mode:** Warmup executes model forward passes, which require KV cache to be allocated. The shadow intentionally does NOT allocate KV cache (to minimize GPU memory footprint). No KV cache → no forward passes → no warmup.
-
-### Solution: Tiered Compile Cache
-
-A two-tier cache hierarchy, analogous to CPU cache (fast/volatile) backed by disk (slow/durable):
-
-```
-Shadow activation compile lookup:
-  Tier 1: GMS compile_cache tag (GPU memory, ~ms import)   → fast, volatile (survives process crash, not node reboot)
-  Tier 2: Disk compile cache (filesystem, ~0.5-2s load)    → slow, durable (survives node reboot)
-  Tier 3: Full recompile (~16s)                             → cold start, last resort
-```
-
-The primary writes to **both tiers** during its initial warmup. The shadow reads from whichever is available, in priority order.
-
-### GMS Tag Model (Extended)
-
-This adds a third GMS tag per GPU, fitting naturally into the existing per-GPU per-tag architecture:
-
-```
-Per-GPU GMS tags:
-  weights        → model parameters (RW/RO sharing, long-lived)
-  kv_cache       → KV cache blocks (released on sleep, allocated on activation)
-  compile_cache  → compiled kernels + autotuner results (written once by primary, imported by shadow)
-```
-
-On an 8-GPU node, this means 24 GMS processes (8 GPUs × 3 tags) instead of 16.
-
-| Tag | Written by | Read by | Lifecycle | Survives |
-|:----|:-----------|:--------|:----------|:---------|
-| `weights` | Primary (RW) | Shadow (RO import) | Long-lived; shared continuously | Process crash ✅, node reboot ❌ |
-| `kv_cache` | Active worker | Same worker only | Released on sleep/demotion; allocated on activation | Process crash ✅, node reboot ❌ |
-| `compile_cache` | Primary after warmup | Shadow on activation | Written once; imported on demand | Process crash ✅, node reboot ❌ |
-
-### What Goes in Each Tier
-
-| Artifact | GMS Tier (Tier 1) | Disk Tier (Tier 2) | Notes |
-|:---------|:-------------------|:-------------------|:------|
-| `torch.compile` compiled kernels | Serialized kernel objects | `~/.cache/torch/inductor/` (automatic) | Deterministic given same model + config |
-| Autotuner results (kernel configs) | Serialized config map | `TRTLLM_AUTOTUNER_CACHE_DIR` | Map from op signature → optimal kernel config |
-| CUDA graph templates | **Cannot share** | **Cannot share** | Tied to specific memory addresses; must recapture on activation |
-
-**Key insight:** CUDA graphs must always be recaptured after KV cache allocation because they encode specific GPU memory addresses. The compile cache eliminates the ~12s autotuner/compilation cost; CUDA graph recapture adds only ~0.5-1s with pre-compiled kernels.
-
-### Activation Warmup Budget (Cache-Warm)
-
-| Step | Without Cache | With Disk Cache (Tier 2) | With GMS Cache (Tier 1) |
-|:-----|:-------------|:------------------------|:------------------------|
-| Load compiled kernels | ~12s (recompile) | ~0.5-1s (disk read) | ~10ms (GMS import) |
-| CUDA graph recapture | ~4s | ~0.5-1s (compiled kernels ready) | ~0.5-1s (compiled kernels ready) |
-| **Warmup total** | **~16s** | **~1-2s** | **~0.5-1s** |
-
-Updated shadow activation budget with compile cache:
+## Shadow Activation Budget
 
 | Step | Time |
 |:-----|:-----|
 | GMS lock upgrade (RO → RW) | ~10ms |
 | KV cache allocation | ~1-3s |
-| Cache-warm warmup (Tier 1 or 2) | ~0.5-2s |
+| Cache-warm warmup (see [§07 Tiered Compile Cache](07-compile-cache.md)) | ~0.5-2s |
 | Scheduler reset | ~10ms |
 | Executor start | ~100ms |
 | Router registration | ~100ms |
 | **Total** | **~2-5.5s** |
 
-The <5s target is achievable with either tier of compile cache. Tier 1 (GMS) provides a tighter budget for large KV cache allocations.
-
-### Implementation Phasing
-
-| Phase | Scope | Compile Cache |
-|:------|:------|:-------------|
-| Phase 2 (GMS integration) | Shadow holds weights only | **Tier 2 (disk) only** — relies on shared filesystem between primary and shadow on same node |
-| Phase 3+ (extension) | Shadow imports compile artifacts from GMS | **Tier 1 (GMS) + Tier 2 (disk)** — full hierarchy |
-
-Tier 2 (disk cache) is sufficient for the initial implementation because primary and shadow are always co-located on the same node and share the filesystem. Tier 1 (GMS) is a performance optimization that tightens the failover budget and provides resilience against filesystem latency.
+The <5s target requires a warm compile cache. Without it, activation warmup adds ~16s (autotuner + CUDA graph capture) on v3 code — see [§07 Tiered Compile Cache](07-compile-cache.md) for the tiered cache design and [§11 Results & Analysis](11-results-analysis.md) for measured warmup numbers.
 
 ## In-Flight Request Handling During Failover
 
@@ -268,7 +193,7 @@ Shadow Activation:
   - Client sees minimal interruption
 ```
 
-This connects to the [KV Cache Extension Path](08-kv-cache-extension.md) and would be Phase 4+ work.
+This connects to the [KV Cache Extension Path](09-kv-cache-extension.md) and would be Phase 4+ work.
 
 ## Health Check Protocol
 
