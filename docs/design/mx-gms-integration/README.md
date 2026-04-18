@@ -49,9 +49,10 @@ The integration targets three critical production pain points simultaneously: sl
 12. [Risk Assessment](12-risks.md) — Technical risks, strategic concerns, GMS API stability, vLLM comparison
 13. [Strategic Alignment](13-strategic-alignment.md) — How this fits into the TRT-LLM opportunity roadmap
 
-### Part VI: Open Questions
+### Part VI: Open Questions & Working Plans
 
 14. [Open Questions & Discussion](14-open-questions.md) — Performance follow-ups, compile cache design, API stability, operational questions, deferred items
+15. [Prototype Validation Plan](15-prototype-validation-plan.md) — Strategy for validating PR #13045 against the §11 baseline (working plan; results will fold back into §11)
 
 ---
 
