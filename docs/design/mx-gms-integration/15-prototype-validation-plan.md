@@ -2,10 +2,12 @@
 
 [< Back to README](README.md)
 
-**Status:** Draft  •  **Last Updated:** 2026-04-17
+**Status:** Phase A complete; Phase B blocked on GMS API alignment  •  **Last Updated:** 2026-04-18
 **Scope:** Validation strategy for the [PR #13045 prototype](https://github.com/NVIDIA/TensorRT-LLM/pull/13045) (MX + GMS integration) using the §10/§11 benchmark infrastructure.
 
 > This file is a working plan. Once validation is executed, results will be folded into [§11 Results & Analysis](11-results-analysis.md) and this file can be retired or moved to a "completed plans" archive.
+
+> **Skip to current state:** [Execution Status](#execution-status) (what's done, what's blocked, what's next).
 
 ---
 
@@ -31,26 +33,176 @@ And establish go/no-go gates:
 
 PR #13045 lives on `chienchunhung:dynamo-integration-prototype`. The benchmark + profiler infrastructure lives on `dynamo/startup-profiling` (see [§10 Methodology](10-methodology.md)). They must be combined.
 
-**Approach:** create a temporary integration branch — keeps both upstream branches clean.
+**Approach:** rebase the prototype onto current `upstream/main` first (so the integration branch starts from the same base as the §11 v3 baseline), then create a fresh integration branch on top of the rebased prototype and cherry-pick the bench commits. This keeps the two original branches (`dynamo-integration-prototype` and `dynamo/startup-profiling`) untouched as canonical references.
 
-```bash
-git fetch fork dynamo-integration-prototype
-git fetch fork dynamo/startup-profiling
-git checkout -b dynamo/proto-bench-integration fork/dynamo-integration-prototype
+### Branches in fork (`github.com/chienchunhung/TensorRT-LLM`)
 
-# Cherry-pick the 6 profiler commits
-git cherry-pick fork/dynamo/startup-profiling~5..fork/dynamo/startup-profiling
+| Branch | Purpose | Base | Tip SHA |
+|--------|---------|------|---------|
+| `dynamo-integration-prototype` | **Original prototype** (PR #13045 source). Untouched. | upstream/main as of 2026-04-14 | `84dfb2aa7` |
+| `dynamo/startup-profiling` | **Bench + profiler infrastructure** (§10/§11 source). Untouched. | upstream/main as of 2026-04-17 | `f9771e571` |
+| `docs-and-plans` | This design doc. | — | (current) |
+| `dynamo/proto-rebased` | **NEW.** Prototype's 2 commits replayed on current `upstream/main`. Zero rebase conflicts. | upstream/main `4a848ccce` | `7bb11db6a` |
+| `dynamo/proto-bench-integration-v2` | **NEW.** Working integration branch — `dynamo/proto-rebased` + the 7 bench commits cherry-picked on top. | `dynamo/proto-rebased` | `5e9ee91c8` |
 
-# Resolve conflicts (likely in model_loader.py — both branches modify it)
-# Rebuild C++ if cherry-picks touched bindings
-cd cpp/build && cmake --build . --config Release -j$(nproc)
-cd ../.. && pip install -e .
-
-# Sanity check
-python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"
+```text
+upstream/main (4a848ccce)
+└── dynamo/proto-rebased (7bb11db6a)              ← prototype's 2 commits replayed
+    │   • [feat] Add MX and GMS integration prototype       (0dcb9f920)
+    │   • [feat] Align GMS backend with merged GMS API #7575 (7bb11db6a)
+    └── dynamo/proto-bench-integration-v2 (5e9ee91c8)   ← +7 bench cherry-picks
+        ├── [feat] Add hierarchical startup profiling and benchmark instrumentation
+        ├── [feat] Split HF cache probe and remote download timers
+        ├── [feat] Add startup benchmark automation scripts
+        ├── [feat] Fix S2 NFS cold benchmark with per-run fresh copy
+        ├── [fix]  Use offline mode and local tokenizer for S2/S3 benchmark tiers
+        ├── [fix]  Use representative-run approach for benchmark aggregation
+        └── [feat] Add failover floor benchmark script (Test 4a)
 ```
 
-This branch is throwaway — discard after validation.
+These two new branches are throwaway — discard after validation completes.
+
+### Setup commands (reproducible)
+
+```bash
+# 1. Rebase the prototype onto current upstream/main (clean — 0 conflicts)
+git fetch upstream main
+git fetch fork dynamo-integration-prototype dynamo/startup-profiling
+git checkout -b dynamo/proto-rebased fork/dynamo-integration-prototype
+git branch --unset-upstream            # Safety: avoid pushing to original prototype branch
+git rebase upstream/main
+
+# 2. Build the integration branch by cherry-picking the bench commits
+git checkout -b dynamo/proto-bench-integration-v2
+git cherry-pick 3c9aebfdd 800ba9751 642dcd05a 667a89be0 4bd024b5e bba6bb505 f9771e571
+# (5 conflicts on the foundational bench commit, all in
+#  py_executor_creator.py + model_loader.py — see "Conflict Resolutions" below)
+
+# 3. Push to fork for safekeeping (no force, new refs only)
+git push --no-verify fork dynamo/proto-rebased dynamo/proto-bench-integration-v2
+
+# 4. No C++ rebuild needed: both new branches share the same upstream/main HEAD
+#    as the existing in-container build artifacts (option 1 from the validation plan).
+```
+
+### Conflict Resolutions (one-time, captured for the record)
+
+All 5 conflicts landed on the foundational bench commit `3c9aebfdd` (hierarchical startup profiling). Resolution strategy: **keep prototype semantics, add bench timers without changing control flow.**
+
+| File | Region | Resolution |
+|------|--------|------------|
+| `py_executor_creator.py` | `_construct_checkpoint_loader` call | Kept prototype's new `mx_server_url=llm_args.mx_server_url` arg; wrapped `load_config_and_apply_defaults` in `executor.load_config_and_apply_defaults` timer. |
+| `model_loader.py` | Materialize tensors path | `executor.materialize_model_tensors` timer now wraps prototype's `virtual_memory_scope` block; `elif is_meta_init:` retains the `and load_format != LoadFormat.GMS` guard so GMS skips meta→CUDA init. |
+| `model_loader.py` | `model.to("cuda")` | Combined: `if load_format != LoadFormat.GMS: with startup_timer("executor.move_model_to_cuda"): model.to("cuda")`. GMS RO path stays a no-op. |
+| `model_loader.py` | `LoadFormat.AUTO` weight load | Kept MX-aware `load_weights_kwargs` with `model=` injection and the `mx_p2p_succeeded` short-circuit; weight-mapper init and `_call_load_weights` are now wrapped in `executor.weight_mapper_init.main_weights` and `executor.apply_model_weights.main_weights`, but only inside `if not mx_p2p_succeeded:` (so MX P2P still skips the mapping pipeline). |
+| `model_loader.py` | `post_load_weights` block | Added `executor.mx_publish_as_source` timer around prototype's new MX publish call; gated `executor.post_load_weights` on `not gms_ro_done` to preserve prototype's "skip post_load_weights for GMS RO" behavior. |
+
+Net effect: the integration branch produces an exact superset of the prototype's behavior (no semantic changes), with full §10 timer coverage on every code path.
+
+---
+
+## Execution Status
+
+Snapshot of progress as of **2026-04-18**. This section is updated as we work through the plan.
+
+### ✅ Phase A — Branch Integration (DONE)
+
+| Step | Outcome |
+|------|---------|
+| Rebase `dynamo-integration-prototype` onto current `upstream/main` | **Clean** — 0 conflicts |
+| Cherry-pick the 7 bench commits onto rebased prototype | 5 conflicts on foundational profiler commit, all resolved (see [Conflict Resolutions](#conflict-resolutions-one-time-captured-for-the-record)) |
+| Push both new branches to fork | Done — `dynamo/proto-rebased`, `dynamo/proto-bench-integration-v2` |
+| C++ rebuild | **Not needed** — both branches sit on the same `upstream/main @ 4a848ccce` HEAD as the existing in-container build (option 1 path; see "Smoke verification" below) |
+
+### ✅ Smoke Verification on Integrated Branch (DONE)
+
+Confirmed the integration is healthy and the M1 (baseline AUTO/HF) path is unaffected:
+
+| Check | Result |
+|-------|--------|
+| `import tensorrt_llm` | ✅ |
+| Prototype symbols (`tensorrt_llm._torch.memory.GMSBackend`) | ✅ importable |
+| Prototype Pydantic fields (`mx_server_url`, `gms_socket_path`, `gms_mode`, `gms_tag`) | ✅ present, render correct defaults |
+| Bench symbols (`tensorrt_llm.llmapi.startup_profiler.startup_timer`, `get_startup_profiler`) | ✅ |
+| `trtllm-serve --help` | ✅ |
+| `trtllm-serve` boots Qwen2.5-7B-Instruct TP=1, `LoadFormat.AUTO` (no MX, no GMS) | ✅ ready in ~45s on warm NFS |
+| Inference correctness (`The capital of France is` → ` Paris…`) | ✅ |
+| Bench profiler captures full hierarchy on integrated branch | ✅ 67.6s server / 36.3s worker, all expected timers populated (`executor.load_model_weights`, `executor.warmup.*`, `executor.recreate_py_executor_instance`, etc.) |
+
+The MX-aware `if not mx_p2p_succeeded:` guard in `model_loader.py` correctly takes the standard HF path when no MX server is configured, and `executor.apply_model_weights.main_weights: 2.288s` confirms `_call_load_weights` runs as expected.
+
+### ⚠️ Phase B — Blocked on GMS API Alignment
+
+The Phase B verification tests require either MX (`nvidia-modelexpress`) or GMS (`gpu-memory-service`) to be installed and runnable.
+
+#### GMS install: package OK, prototype API mismatch found
+
+| Step | Outcome |
+|------|---------|
+| Install GMS (`pip install -e dynamo/lib/gpu_memory_service`) | ✅ `gpu-memory-service 0.9.0` installed, daemon binary works, package importable |
+| Prototype's `GMSBackend.connect()` against installed GMS | ❌ **API mismatch — blocker** |
+
+Specifically, the prototype's `tensorrt_llm/_torch/memory/gpu_memory_backend.py` (commit `7bb11db6a`, message: *"Align GMS backend with merged GMS library API (PR #7575)"*) calls a high-level convenience API:
+
+```python
+# Prototype expects:
+from gpu_memory_service import client as gms_client
+self._client = gms_client.connect(self._socket_path, mode="rw")
+self._is_rw = not self._client.has_committed_weights(self._tag)
+gms_client.get_mem_pool(self._client)                                # RW path
+gms_client.materialize_module_from_gms(self._client, model)          # RO path
+```
+
+But the actual merged API in `ai-dynamo/dynamo` post-PR #7575 exposes a **class-based low-level API** plus a **monkey-patch integration**:
+
+```python
+# What's actually merged (verified Apr 18):
+from gpu_memory_service.client.memory_manager import GMSClientMemoryManager
+from gpu_memory_service.client.torch.allocator import gms_use_mem_pool   # context manager
+from gpu_memory_service.client.torch.module import materialize_module_from_gms
+
+mgr = GMSClientMemoryManager(socket_path, device=N)
+mgr.connect(lock_type=RequestedLockType.RW)  # explicit lock_type, no auto-mode wrapper
+# Allocate via context manager:
+with gms_use_mem_pool(tag, device):
+    ...
+materialize_module_from_gms(mgr, model, device_index=N)  # requires keyword arg
+```
+
+There is also an **official TRT-LLM integration shim** at `gpu_memory_service.integrations.trtllm.setup_gms()` (added by PR #7575 itself) that monkey-patches TRT-LLM's `ModelLoader` from outside — this is the supported way to enable GMS in TRT-LLM today. The prototype's `GMSBackend` is a parallel re-implementation of that integration that pre-dates the merge.
+
+Diagnostic facts:
+
+- PR #7575 ("feat: add TRT-LLM sleep/wake integration with GMS") merged into `ai-dynamo/dynamo` main on **2026-04-15** (commit `d96a2cf1`).
+- Zero commits to `lib/gpu_memory_service/client/` between #7575 and our checkout (verified 2026-04-18). The installed API is exactly the post-#7575 API.
+- Prototype's "Align GMS backend…" commit is dated **2026-04-16** (one day after #7575 merged) but was clearly written against an earlier, un-merged iteration of the API.
+
+Impact: any attempt to launch with `--load-format gms` will throw `AttributeError: module 'gpu_memory_service.client' has no attribute 'connect'`. M2 (GMS-only), M4 (MX+GMS), B2 (shadow memory), and B6 (failover E2E) are all blocked until this is resolved.
+
+Available paths forward (decision pending):
+
+1. **Patch the prototype's `GMSBackend`** to use the current `GMSClientMemoryManager` + `gms_use_mem_pool` context-manager API. Estimated: a few hours of focused refactor on the `dynamo/proto-bench-integration-v2` branch (or directly on the prototype). We own the code and it's an explicit prototype.
+2. **Adopt the official `setup_gms()` integration** from PR #7575 and remove the prototype's custom `GMSBackend`. Cleaner long-term, but the prototype's "two-axis MX+GMS" composition (e.g., GMS RW path that also publishes for MX P2P readers) would need to be reworked on top of the monkey-patch model.
+3. **File the API gap upstream** against PR #13045 / the prototype owner; pause GMS validation until the prototype catches up.
+
+#### MX install: not feasible on this node
+
+| Requirement | Status on current node |
+|-------------|------------------------|
+| Rust 1.90+ (cargo) | ❌ not installed |
+| `protoc` | ✅ 3.21.12 |
+| Docker (for Redis metadata backend) | ❌ not installed |
+| `redis-server` | ❌ not installed |
+
+`nvidia-modelexpress` lives at [github.com/ai-dynamo/modelexpress](https://github.com/ai-dynamo/modelexpress) — Rust server + Python client; build from source via `cargo build` then run with `MX_METADATA_BACKEND=redis cargo run --bin modelexpress-server`. Setting this up would require either provisioning Rust + Docker on the current node or migrating to a node that already has them. Estimated: 30–60 min of one-time setup before any MX test can start.
+
+Also relevant: per [modelexpress's known issues](https://github.com/ai-dynamo/modelexpress#known-issues), MLA-architecture models (DeepSeek-V2/V3, Kimi K2) are blocked from MX P2P transfer and silently fall back to disk. Our Qwen 72B (no MLA) and DeepSeek-R1-Distill-Llama-70B (Llama architecture, not MLA) are both safe.
+
+### 🔭 Recommended Next Step
+
+Resolve the GMS API mismatch first (path 1 or 2 above) before investing in MX node prep. GMS-only validation (B2 + B6) gives an independent, high-value go/no-go signal on the prototype's most novel claim (zero-copy shadow + sub-5s failover) and exercises ~half the prototype's new code with the lighter dependency footprint. MX validation (B1 + B3 + B4) can follow once a node with Rust + Docker is available.
+
+In parallel, M1 baseline regression on `dynamo/proto-bench-integration-v2` (i.e., re-run a single §11 v3 config — Qwen 7B TP=1 S2 — and confirm startup-time delta is within run-to-run noise) is a cheap (~15 min) sanity check that the prototype's edits to the AUTO/HF path don't subtly regress the baseline. The smoke test above is consistent with no regression but it ran on warm NFS, not the §11 cold protocol.
 
 ---
 
