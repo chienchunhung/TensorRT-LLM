@@ -348,11 +348,11 @@ Primary + shadow: memory_total ≈ weights (1/TP, shared via GMS) + kv_cache + o
 
 > **Note:** For large models (70B+ with TP=8), a single active instance already consumes most GPU HBM. The shadow worker holds only weight references (zero-copy RO import) without KV cache, so the additional memory is negligible. Testing with N=4 active workers sharing weights is unrealistic for large models — the realistic scenario is 1 active + 1 shadow. Multi-instance sharing (N>2) applies only to small models or multi-LoRA deployments where multiple instances with independent KV caches fit on a single GPU.
 
-### Test 4: Shadow Failover Latency — Not Yet Executed
+### Test 4: Shadow Failover Latency — Partially Executed
 
-**What:** Time from primary crash to shadow serving first request. Requires GMS + executor failover integration.
+**What:** Time from primary crash to shadow serving first request. Full end-to-end test requires GMS + executor failover integration. Measurable today: floor (Test 4a) and ceiling (cold-restart cost = Test 1 S2/S3).
 
-**Steps:**
+**End-to-end protocol (requires GMS, not yet runnable):**
 1. Start primary + shadow with GMS
 2. Send warmup requests to primary (this also populates compile cache)
 3. Kill primary (`kill -9`)
@@ -360,6 +360,27 @@ Primary + shadow: memory_total ≈ weights (1/TP, shared via GMS) + kv_cache + o
 5. **Target:** < 5s
 
 **Critical dependency:** The <5s target assumes compile cache (disk or GMS-backed) is warm. Without compile cache, warmup adds ~16s (v2) or ~43s (v3, post-PR #12407) to activation, making failover exceed the budget. Since primary and shadow are co-located on the same node and share the filesystem, disk-based compile cache is sufficient for Phase 2. See [§07 Tiered Compile Cache](07-compile-cache.md).
+
+#### Test 4a: Hot-Server First-Request Latency Floor — Completed
+
+**What:** Establishes the lower bound on activation latency by measuring how fast a fully warm server responds to a single request. This is the absolute floor that no failover scheme can beat — useful as the "target ceiling" for GMS+compile_cache.
+
+**Protocol:**
+1. Start `trtllm-serve`, wait until `Application startup complete`
+2. Send 1 warmup request (results discarded, populates lazy caches)
+3. Send 10 measurement requests (input=16, output=8 tokens)
+4. Capture per-request **TTFT** (Time-To-First-Token, via streaming API) and **E2E latency**
+5. Repeat 3× per config; take median-of-medians (matches Test 1 representative-run protocol)
+
+**Configs run:** Same 4 models as Test 1 Part 1 (Qwen 7B/72B, DS 7B/70B), all on S3 (storage tier doesn't affect steady-state response time).
+
+**Status:** Completed (2026-04-17). Results in [§11 Results & Analysis](11-results-analysis.md#test-4a-failover-latency-floor).
+
+#### Test 4b: Cold-Restart Failover Cost — Reuses Test 1 Data
+
+**What:** Today's failover cost = full cold restart of a new process. No special test needed — this is exactly what Test 1 measures (Part 1 S2 = "cold restart on a node with model on NFS"; Part 2 S3 = "cold restart with page cache warm from prior load"). The S3 number is the realistic upper bound on failover today (a fresh process on the same node, page cache warm from the dead primary).
+
+**Status:** Implicit in Test 1 results. Qwen 72B TP=8: ~75s S3 / ~306s S2.
 
 ### Test 5: Throughput Regression — Not Yet Executed
 
