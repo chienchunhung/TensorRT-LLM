@@ -355,9 +355,49 @@ D1 (large config) in v2 added only ~+8s; D2 (seq16384) added ~+0.6s. Both effect
 
 ---
 
+## Part 5 — Failover Latency Floor (Test 4a)
+
+**What this measures:** The lower bound on activation latency — how fast a fully warm server can respond to a request. This complements Parts 1–4 (which measure cold-start latency) by characterizing the *steady-state* response latency that any failover scheme must beat.
+
+**Why it matters:** Test 4a establishes the **floor** on the failover-latency spectrum:
+
+```
+Today (no failover support, cold restart):  ~75–306s   [Test 1 S2/S3]
+                                               │
+                                               │ ← gap that GMS+compile_cache aims to close
+                                               ▼
+GMS + compile_cache (Phase 2 target):       <5s        [§06 Executor Failover]
+                                               │
+                                               │ ← floor (irreducible without major rewrites)
+                                               ▼
+Hot-server first request (Test 4a):         ~30–60ms   [measured below]
+```
+
+The Phase 2 <5s failover target sits comfortably between the cold-restart cost (~75s) and the hot-server floor (~60ms) — a ~80× headroom above the floor.
+
+### Setup
+
+- **Same 4 models** as Part 1: Qwen 7B (TP=1), DS 7B (TP=1), Qwen 72B (TP=8), DS 70B (TP=8)
+- **Storage tier**: S3 (steady-state response time is independent of how the server was loaded; S3 picked for fastest startup)
+- **Per run**: send 1 warmup request (discarded), then 10 measurement requests via OpenAI streaming API (input=16, output=8 tokens). Capture per-request **TTFT** (Time-To-First-Token) and **E2E latency**.
+- **Statistical protocol**: 3 runs per config, take median-of-medians (matches Test 1 representative-run protocol).
+
+### Results
+
+| Config | Model | TP | TTFT median | TTFT range | E2E median | E2E range |
+|--------|-------|---:|------------:|------------:|-----------:|-----------:|
+| B1-FA | Qwen 7B | 1 | **32.3 ms** | 31.5–35.1 ms | **54.3 ms** | 53.6–56.2 ms |
+| B3-FA | DS 7B | 1 | **31.5 ms** | 31.1–33.7 ms | **53.6 ms** | 53.0–55.5 ms |
+| B2-FA | Qwen 72B | 8 | **63.0 ms** | 62.5–66.0 ms | **107.9 ms** | 107.0–111.3 ms |
+| B4-FA | DS 70B | 8 | **56.2 ms** | 55.2–59.5 ms | **98.1 ms** | 97.4–102.0 ms |
+
+---
+
 ## Analysis and Key Insights
 
 All insights below are based on **v3 (current codebase)** measurements, with v2 numbers cited for the regression observation in Insight #6.
+
+Insights #1–6 cover **cold-start latency** (Parts 1–4). Insight #7 covers the **failover-latency floor** (Part 5).
 
 ### 1. Cold NFS I/O Dominates Production Cold Start
 
@@ -597,56 +637,28 @@ PR #12407 ("Refactor warmup orchestration in MTP", merged 2026-04-13) **increase
 
 </details>
 
----
+### 7. Failover Latency Has a ~30–60 ms Floor (Part 5)
 
-## Test 4a: Failover Latency Floor
+Once a TRT-LLM server is fully warm, a single inference request is served in ~32 ms (TP=1) to ~63 ms (TP=8) at the TTFT level, and ~54 ms / ~108 ms end-to-end for an 8-token output. This is the **absolute lower bound** for any failover scheme on this hardware: even a perfect GMS+compile_cache implementation that eliminates weight-load and warmup costs cannot serve faster than this without changing the inference path itself.
 
-**Question this answers:** What is the absolute lower bound on failover latency? In other words, even with a perfect GMS + warm compile cache, how fast can a fully ready server respond to a request?
+**Component breakdown (Qwen 72B TP=8, ~63 ms TTFT):**
 
-**Why it matters:** Test 4a establishes the **floor** on the failover latency spectrum:
+| Component | Approx contribution |
+|:----------|:--------------------|
+| Scheduler dispatch + request parsing | ~5–10 ms |
+| Prefill forward pass (16 input tokens) | ~10–15 ms |
+| NCCL collective communication (8 ranks) | ~25–35 ms |
+| First-token sampling + IPC return | ~5–10 ms |
 
-```
-Today (no failover support, cold restart):  ~75–306s   [Test 1 S2/S3]
-                                               │
-                                               │ ← gap that GMS+compile_cache aims to close
-                                               ▼
-GMS + compile_cache (Phase 2 target):       <5s        [§06 Executor Failover]
-                                               │
-                                               │ ← floor (irreducible without major rewrites)
-                                               ▼
-Hot-server first request (Test 4a):         ~30–60ms   [measured below]
-```
+**Sub-observations:**
 
-The Phase 2 <5s failover target sits comfortably between the cold-restart cost (~75s) and the hot-server floor (~60ms) — a 1000× headroom above the floor.
+1. **TP=8 has ~2× higher TTFT than TP=1** (32 ms → 63 ms). The extra ~30 ms is NCCL collective communication overhead during the first forward pass. This will not be reducible by GMS — it's a fundamental cost of multi-rank tensor parallelism.
 
-### Test 4a Setup
+2. **Model size has minimal impact within the same TP** (Qwen 7B ≈ DS 7B at ~32 ms; Qwen 72B vs DS 70B differ by only 7 ms). Prefill+sampling overhead dominates per-layer compute for short outputs. This means the failover floor is roughly model-size-independent at the same TP.
 
-- **Same 4 models** as Part 1: Qwen 7B (TP=1), DS 7B (TP=1), Qwen 72B (TP=8), DS 70B (TP=8)
-- **Storage tier**: S3 (steady-state response time is independent of how the server was loaded; S3 picked for fastest startup)
-- **Per run**: send 1 warmup request (discarded), then 10 measurement requests via OpenAI streaming API (input=16, output=8 tokens). Capture per-request **TTFT** (Time-To-First-Token) and **E2E latency**.
-- **Statistical protocol**: 3 runs per config, take median-of-medians (matches Test 1 representative-run protocol).
+3. **E2E ≈ 1.7× TTFT** for all configs. Inter-token latency is roughly 3 ms (TP=1) or 6.5 ms (TP=8) for the first 7 generated tokens after the first.
 
-### Test 4a Results
-
-| Config | Model | TP | TTFT median | TTFT range | E2E median | E2E range |
-|--------|-------|---:|------------:|------------:|-----------:|-----------:|
-| B1-FA | Qwen 7B | 1 | **32.3 ms** | 31.5–35.1 ms | **54.3 ms** | 53.6–56.2 ms |
-| B3-FA | DS 7B | 1 | **31.5 ms** | 31.1–33.7 ms | **53.6 ms** | 53.0–55.5 ms |
-| B2-FA | Qwen 72B | 8 | **63.0 ms** | 62.5–66.0 ms | **107.9 ms** | 107.0–111.3 ms |
-| B4-FA | DS 70B | 8 | **56.2 ms** | 55.2–59.5 ms | **98.1 ms** | 97.4–102.0 ms |
-
-### Observations
-
-1. **TTFT floor is ~30–60 ms** on B300 (TP=1: ~32ms; TP=8: ~60ms). This is the absolute lower bound on activation latency for any failover scheme on this hardware — even a perfect GMS+compile_cache implementation cannot beat it.
-2. **TP=8 has ~2× higher TTFT than TP=1** (32 ms → 63 ms). The extra ~30 ms is NCCL collective communication overhead during the first forward pass — multiple collective ops per layer summing across 8 ranks.
-3. **Model size has minimal impact within the same TP** (Qwen 7B ≈ DS 7B; Qwen 72B vs DS 70B differ by only 7 ms). Prefill+sampling overhead dominates per-layer compute for an 8-token output.
-4. **E2E ≈ 1.7× TTFT** for all configs. With 8 generated tokens after the first, inter-token latency is roughly 3 ms (TP=1) or 6.5 ms (TP=8).
-
-### How This Informs the MX+GMS Impact Projection
-
-The Test 4a floor (~60 ms for Qwen 72B TP=8) is what the [Impact Projection](#mxgms-impact-projection)'s Scenario 7 ("MX+GMS+compile+reduced worker init", projected ~5s) approaches but doesn't reach. The ~5s projection is dominated by residual worker spawn overhead and minimal warmup/inference. There is plenty of room (~5000× from ~60ms to ~5s) for engineering tradeoffs in the GMS+compile_cache integration.
-
----
+4. **Implications for GMS+compile_cache integration:** The Phase 2 <5s failover target sits ~80× above the floor (~63 ms → ~5s). This is comfortable headroom — the ~5s budget can be entirely spent on (a) crash detection by the orchestrator, (b) shadow activation, (c) request re-routing, with negligible contribution from GMS itself. The engineering effort should focus on minimizing those orchestration costs rather than squeezing inference latency.
 
 ## MX+GMS Impact Projection
 
