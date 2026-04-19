@@ -31,6 +31,36 @@ For smaller models or multi-LoRA deployments, multiple instances can share base 
 ### UC5: Disaggregated Serving
 Efficient prefill/decode separation where context and generation workers may need different startup patterns and memory sharing strategies (see [Disaggregated Serving Interaction](08-disagg-interaction.md)).
 
+## Where MX and GMS Help — and Where They Don't
+
+MX and GMS cover **orthogonal axes**: MX handles **inter-node** weight distribution; GMS handles **intra-GPU** (same physical device) weight lifetime. Neither is a general "faster loading" knob — both have explicit scope boundaries that matter for deployment planning.
+
+**Scope constraints (verified against the Dynamo repo):**
+
+- **GMS is strictly per-GPU, not per-node.** From the [GMS README](https://github.com/ai-dynamo/dynamo/tree/main/lib/gpu_memory_service): *"Each GMS server is responsible for managing memory of only 1 GPU, and does not interact with GMS servers corresponding to other GPUs."* CUDA VMM handles cannot cross GPUs, so two workers on the same node using **disjoint** GPUs (e.g., 2× TP=4 on an 8-GPU box) **do not share weights via GMS** even though they're on the same node.
+- **MX requires a warm GPU source somewhere in the cluster** (or falls back to disk). The [ModelExpress README](https://github.com/ai-dynamo/modelexpress) describes coordinating downloads so *"no other node duplicates this download, reducing external ingress"* — the first node still pulls from HuggingFace (or equivalent), and subsequent nodes get P2P via RDMA/InfiniBand from that node's GPU memory. There is no dedicated "MX cache server" holding weights without serving.
+- **MX is focused on inter-node RDMA.** The README discusses InfiniBand/RDMA transport; intra-node NVLink P2P is not an explicit use case. Within a node, GMS zero-copy (same GPU) is the right tool.
+
+**Scenario matrix:**
+
+| Scenario | MX helps? | GMS helps? | Why |
+|:---------|:----------|:-----------|:----|
+| First-ever replica on a fresh cluster (nothing warm anywhere) | No — falls back to disk/HF download | No — no prior GPU state | Neither has a source |
+| Nth replica on a **different node**, seed already serving | **Yes** — RDMA pull from seed's GPU | No — cross-node, can't share VMM | This is MX's core win |
+| Many replicas launching simultaneously across nodes | **Yes, biggest win** — avoids storage contention | No | MX P2P distribution vs. each replica hammering storage |
+| Same-node second worker on **disjoint GPUs** (2× TP=4 on 8-GPU box) | Not the MX focus (NVLink P2P not explicit) | **No — different GPUs, VMM can't cross** | Each worker loads independently from disk |
+| Same-GPU shadow standby (active + shadow co-located) | Not applicable (same GPU) | **Yes** — RO import (~100ms) for fast failover | GMS's core win |
+| Process crash & restart on the same GPU | No | **Yes** — weights survive in GMS pool, ~100ms reattach | Out-of-process memory persists |
+| Rolling binary upgrade on the same GPU | No | **Yes** — new process re-imports from GMS pool | No reload cost |
+| Multi-LoRA or small-model co-location on the same GPU | No | **Yes** — deduplicated base weights (UC4) | Per-GPU zero-copy sharing |
+
+**One-line framing:**
+
+- **MX = inter-node weight distribution.** *"I have weights on node A; how do I get them to nodes B, C, D without each of them hammering shared storage?"* Benefit surfaces when a warm source exists somewhere in the cluster and we're distributing to a **different** node.
+- **GMS = intra-GPU weight lifetime.** *"Weights are already on this physical GPU; how do I avoid reloading them when the process restarts, gets upgraded, or when a shadow needs to pre-stage for failover?"* Benefit is strictly **per-GPU, same physical device** — never crosses GPUs, even on the same node.
+
+They compose naturally in MX+GMS: each node's first worker pulls weights via MX (fast cross-node), commits them into that GPU's GMS pool, and subsequent same-GPU processes (shadows, upgrades) import zero-copy from GMS.
+
 ## Goals
 
 1. **Native MX support**: `--checkpoint-format mx` for P2P weight loading (parity with vLLM)
