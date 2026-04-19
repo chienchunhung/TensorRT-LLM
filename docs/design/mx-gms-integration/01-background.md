@@ -112,8 +112,8 @@ Additional existing hooks:
 | Extension Point | Location | Used by |
 |:---------------|:---------|:--------|
 | `virtual_memory_scope(tag)` | Memory management | GMS sleep/wake tag mapping |
-| `release_with_tag()` / `materialize_with_tag()` | Memory management | GMS KV cache lifecycle |
-| KV Cache Connector API | `kv-cache-connector.md` | Future KV cache persistence |
+| `release_with_tag()` / `materialize_with_tag()` | Memory management | VMM-level KV cache release during sleep/wake (allocator lifecycle, not KV cache storage — see [§09](09-kv-cache-extension.md)) |
+| KV Cache Connector API | `kv-cache-connector.md` | Future KV cache persistence via KVBM (out of scope for this proposal — see [§09](09-kv-cache-extension.md)) |
 
 **Extension points to be added in TRT-LLM:**
 - `@register_checkpoint_loader("MX")` — new MX checkpoint loader (weight source axis)

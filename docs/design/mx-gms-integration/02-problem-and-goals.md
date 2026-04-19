@@ -37,7 +37,7 @@ Efficient prefill/decode separation where context and generation workers may nee
 2. **Native GMS support**: `--load-format gms` for shared memory loading
 3. **Combined MX+GMS**: `--checkpoint-format mx --load-format gms` for cross-node P2P with within-node crash resilience and shadow failover (the two axes compose independently — see [Implementation & API Design](04-implementation-plan.md#design-principle-two-orthogonal-axes))
 4. **Executor-level failover**: Shadow failover integrated with PyExecutor sleep/wake
-5. **KV cache extension path**: Design that enables future KV cache persistence via GMS/KVBM
+5. **KV cache extension path**: Ensure Phases 1–3 don't block a future KVBM-based KV cache integration via the KV Cache Connector API (KV cache is out of GMS's scope — see [§09](09-kv-cache-extension.md))
 6. **Backward compatibility**: Existing workflows unchanged; MX/GMS are opt-in
 7. **Clean extension points**: APIs usable by future backends beyond MX/GMS
 
@@ -46,5 +46,5 @@ Efficient prefill/decode separation where context and generation workers may nee
 1. Modifying MX or GMS core implementations
 2. Supporting legacy TensorRT engine backend (PyTorch backend only)
 3. Automatic MX server deployment (separate concern)
-4. Full KV cache sharing via GMS in this proposal (designed for, not implemented — see [KV Cache Extension](09-kv-cache-extension.md))
+4. KV cache persistence or sharing via GMS — KV cache is out of GMS's scope. Tiered KV cache is addressed by Dynamo's KVBM via the KV Cache Connector API, on a separate track (see [KV Cache Extension Path](09-kv-cache-extension.md))
 5. Compile cache sharing via MX (future work, noted in [§14 Open Questions](14-open-questions.md))

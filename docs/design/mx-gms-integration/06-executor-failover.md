@@ -178,22 +178,22 @@ sequenceDiagram
 2. **KV cache is reconstructed via prefix caching.** If the shadow has the same prefix cache (e.g., system prompts), re-queued requests hit the prefix cache and skip re-encoding the common prefix. This makes regeneration much faster than cold-start.
 3. **Clients see a brief interruption.** Streaming responses pause during the ~5s failover window. Non-streaming requests may time out and need client-side retry.
 
-## Future Enhancement: KV Cache Checkpoint
+## Future Enhancement: KV Cache Checkpoint via KVBM
 
-For workloads where in-flight request recovery matters (e.g., long-running agentic sessions), a future enhancement could checkpoint KV cache state:
+For workloads where in-flight request recovery matters (e.g., long-running agentic sessions), a future enhancement could checkpoint KV cache state — but via **KVBM, not GMS**. KV cache is out of GMS's scope (see [§09 KV Cache Extension Path](09-kv-cache-extension.md) for the division of labor):
 
 ```
 Primary Worker:
-  - Periodically snapshot KV cache blocks to GMS/host memory
-  - Tag snapshots with request_id + token_position
+  - KV Cache Manager V2 pushes blocks to KVBM via the KV Cache Connector API
+  - KVBM tiers them across HBM / DRAM / NVMe with per-request metadata
 
 Shadow Activation:
-  - Import KV cache snapshot from GMS
-  - Resume generation from last checkpoint position
+  - New primary pulls warm blocks from KVBM via the Connector API
+  - Resume generation from the last persisted block
   - Client sees minimal interruption
 ```
 
-This connects to the [KV Cache Extension Path](09-kv-cache-extension.md) and would be Phase 4+ work.
+This is Phase 4+ work and tracks the Dynamo KVBM roadmap, not the MX/GMS schedule. See [§09 KV Cache Extension Path](09-kv-cache-extension.md).
 
 ## Health Check Protocol
 

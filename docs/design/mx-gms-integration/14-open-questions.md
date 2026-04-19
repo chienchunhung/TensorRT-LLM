@@ -108,9 +108,9 @@ Configs measured on v2 but not yet re-verified on v3:
 
 ## E. Items Deferred from Earlier Drafts
 
-### E1. KV cache sharing via GMS
+### E1. KV cache sharing — deferred to KVBM, not GMS
 
-Designed for but not implemented in this proposal — see [§09 KV Cache Extension](09-kv-cache-extension.md). Deferred because Phase 2 targets shadow failover for weights-only workers; KV cache extension is a Phase 3+ concern that composes with KVBM.
+Earlier drafts proposed GMS-backed KV cache options; those are superseded. KV cache is out of GMS's scope — Dynamo's KVBM already covers tiered KV storage and cross-node sharing via the KV Cache Connector API. Phases 1–3 are scoped to ensure non-interference with a future KVBM connector; the KVBM integration itself is Phase 4+ and tracks the Dynamo roadmap. See [§09 KV Cache Extension Path](09-kv-cache-extension.md).
 
 ### E2. Compile cache sharing via MX
 

@@ -37,7 +37,7 @@ The integration targets three critical production pain points simultaneously: sl
 6. [Executor Integration and Failover](06-executor-failover.md) — Shadow failover mechanics, sleep/wake mapping, in-flight request handling
 7. [Tiered Compile Cache](07-compile-cache.md) — GMS + disk tiered compile/autotuner cache to close the shadow activation warmup gap
 8. [Disaggregated Serving Interaction](08-disagg-interaction.md) — How MX/GMS interact with P/D separation
-9. [KV Cache Extension Path](09-kv-cache-extension.md) — Future extension to KV cache persistence via GMS/KVBM
+9. [KV Cache Extension Path](09-kv-cache-extension.md) — Why KV cache is out of GMS's scope; deferred to KVBM via the KV Cache Connector API
 
 ### Part IV: Performance & Benchmarks
 

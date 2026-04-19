@@ -25,8 +25,8 @@ The [TRT-LLM Architecture Overview](../../overview/README.md) identifies three c
 
 | Feature | How MX/GMS Helps | Impact |
 |:--------|:-----------------|:-------|
-| **KVaaS / distributed KV fabric** (Section 5.3, Item 3.4) | GMS's out-of-process memory and MX's P2P transfer are the building blocks for cluster-wide KV cache sharing. The KV Cache Extension Path (Section 8) designs this trajectory. | **Foundation** |
-| **Agentic workflow optimization** (Section 5.3, Item 3.2) | Persistent agent sessions benefit from crash-resilient KV cache (future GMS+KV extension). Shadow failover preserves agent state across crashes. | **Enabler** |
+| **KVaaS / distributed KV fabric** (Section 5.3, Item 3.4) | GMS covers weight-like sharing; KVBM (Dynamo) covers tiered KV cache. This proposal scopes Phases 1–3 to keep the KVBM integration path clean via the KV Cache Connector API (see [§09](09-kv-cache-extension.md)). | **Foundation** |
+| **Agentic workflow optimization** (Section 5.3, Item 3.2) | Shadow failover preserves agent state across crashes via weight + compile-cache sharing; persistent KV cache for long sessions is addressed by future KVBM integration ([§09](09-kv-cache-extension.md)), not GMS. | **Enabler** |
 | **Hardware co-design** (Section 5.3, Item 3.3) | GMS's CUDA VMM integration and MX's RDMA leverage NVIDIA-specific hardware advantages that competitors cannot match. | **Deepens moat** |
 
 ## Competitive Context
@@ -48,7 +48,7 @@ graph LR
     subgraph "After Phase 3"
         VLLM_P3["vLLM: MX only"]
         SGLANG_P3["SGLang: elastic EP"]
-        TRTLLM_P3["TRT-LLM: MX + GMS + shadow failover ✅<br/>+ KV extension path"]
+        TRTLLM_P3["TRT-LLM: MX + GMS + shadow failover ✅<br/>+ clean path to KVBM"]
     end
 
     TRTLLM_NOW -->|"Phase 1<br/>6-8 weeks"| TRTLLM_P1
@@ -57,7 +57,7 @@ graph LR
 
 **Phase 1 is catch-up.** vLLM has MX; TRT-LLM doesn't. Every week of delay increases the risk that the Dynamo ecosystem optimizes primarily for vLLM.
 
-**Phases 2-3 are differentiation.** GMS shadow failover + KV cache extension path gives TRT-LLM capabilities that vLLM and SGLang don't have. Combined with TRT-LLM's existing disaggregated serving, this creates a unique production resilience story.
+**Phases 2-3 are differentiation.** GMS shadow failover gives TRT-LLM crash resilience + sub-5s failover that vLLM and SGLang don't have, and Phase 3 keeps the KV Cache Connector API clean for a future KVBM integration ([§09](09-kv-cache-extension.md)). Combined with TRT-LLM's existing disaggregated serving, this creates a unique production resilience story.
 
 ## Recommended Priority Adjustment
 
@@ -112,20 +112,15 @@ graph TD
         GMS["Crash-Resilient Memory<br/>Shadow Failover (<5s)<br/>Zero-Downtime Updates"]
     end
 
-    subgraph "Phase 4: KV Cache (Future)"
-        KV["GMS-Backed KV Cache<br/>Crash-resilient context"]
-    end
-
-    subgraph "Phase 5: Full Dynamo (Vision)"
-        KVBM["KVBM Integration<br/>Tiered KV: GPU→DRAM→NVMe→S3"]
+    subgraph "Phase 4+: KVBM Integration (Future, Separate Track)"
+        KVBM["KVBM via KV Cache Connector<br/>Tiered KV: GPU→DRAM→NVMe→S3<br/>(not GMS — see §09)"]
         Auto["Self-Healing Cluster<br/>Auto-recovery, auto-scaling"]
     end
 
     MX --> GMS
-    GMS --> KV
-    KV --> KVBM
-    KV --> Auto
+    GMS --> KVBM
     GMS --> Auto
+    KVBM --> Auto
 ```
 
 This trajectory transforms TRT-LLM from a high-performance inference engine into a **production-resilient inference platform** — the highest-leverage evolution for enterprise adoption.

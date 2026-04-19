@@ -1,34 +1,46 @@
-# 8. KV Cache Extension Path
+# 9. KV Cache Extension Path
 
 [< Back to Overview](README.md)
 
-> **This section is new** — the original proposal listed KV cache sharing as a non-goal. This section designs the extension path so Phases 1-3 don't create architectural barriers.
+> **Scope change (2026-04-19).** Earlier drafts explored routing KV cache through GMS directly (GMS-backed allocator, KV Cache Connector + GMS). We've since concluded that **KV cache is out of GMS's scope** — Dynamo's [KV Block Manager (KVBM)](https://github.com/ai-dynamo/dynamo) already covers tiered KV cache storage (HBM → DRAM → NVMe → object store) with NIXL-based transport and intra/inter-node coordination. GMS and KVBM have clean, non-overlapping mandates; the extension path for KV cache is **KVBM integration**, not GMS. This section documents that division of labor and the deferred integration plan.
 
-## Why KV Cache Matters More Than Model Weights
+## Division of Labor: GMS vs. KVBM
 
-Model weights are **static** — they're the same for every request and can be reloaded from disk. KV cache is **dynamic** and **expensive**:
+| Aspect | GMS | KVBM |
+|:-------|:----|:-----|
+| **What it holds** | Static weight-like artifacts (model weights, compile cache, LoRA adapters) | Dynamic per-request state (KV cache blocks) |
+| **Lifetime** | Long-lived; committed once, imported many times | Short-lived; allocated/freed per request |
+| **Storage tiers** | GPU HBM only (out-of-process via CUDA VMM) | HBM → DRAM → NVMe/GDS → S3/remote |
+| **Transport** | Intra-node, zero-copy via VMM | Intra- and inter-node via NIXL |
+| **Primary value** | Crash resilience + zero-copy sharing within a node | Tiered offload, prefix reuse, cross-node KV sharing |
+| **Phase** | 1–3 (this proposal) | Future — separate integration track |
+
+GMS's mandate is **weight-like, static, intra-node** memory that needs to survive process crashes. KVBM's mandate is **dynamic, tiered, cross-node** KV cache. Forcing KV cache through GMS would either (a) duplicate KVBM's function with a thinner feature set, or (b) create a second path that has to stay in sync with KVBM's. Neither is worthwhile.
+
+## Why KV Cache Persistence Matters
+
+Model weights are **static** — identical for every request, cheaply reloaded from disk or MX P2P. KV cache is **dynamic** and **expensive to recompute**:
 
 | Property | Model Weights | KV Cache |
 |:---------|:-------------|:---------|
-| **Cost to recreate** | Disk load (seconds with MX/GMS) | Full prefill recomputation (proportional to context length) |
+| **Cost to recreate** | Disk/MX load (seconds) | Full prefill recomputation (proportional to context length) |
 | **Per-request** | Shared across all requests | Unique per request |
 | **Size** | Fixed (model-dependent) | Variable (grows with context) |
-| **Loss impact** | Seconds of cold-start | Minutes of recomputation for long contexts |
-| **Persistence value** | Low (easily restored) | High (expensive to recreate) |
+| **Loss impact** | Seconds of cold-start | Tens of seconds for long contexts; session loss for agentic workloads |
 
-For a 100K-token context, losing the KV cache means re-encoding 100K tokens — potentially 10-30 seconds of GPU compute. For an agentic session with accumulated context, this destroys the session state entirely.
+For a 100K-token context, losing the KV cache can mean 10–30s of GPU compute to re-encode. KVBM addresses this through tiered persistence; this proposal's role is to ensure Phases 1–3 don't foreclose that integration.
 
 ## Design Principles
 
-1. **Model weight sharing (Phases 1-3) must not preclude KV cache sharing.** The APIs and memory management patterns should generalize.
-2. **KV cache persistence should integrate with the existing KV Cache Connector API** (`docs/source/features/kv-cache-connector.md`), not bypass it.
-3. **KV cache persistence is optional and gradual** — start with crash-resilient prefixes (system prompts, common prefixes), extend to per-request cache.
+1. **GMS stays scoped to weight-like artifacts.** Model weights (Phase 2), compile cache ([§07](07-compile-cache.md)), and future additions like LoRA adapters. KV cache is explicitly out of scope for GMS.
+2. **KV cache persistence integrates via KVBM**, using the existing [KV Cache Connector API](../../source/features/kv-cache-connector.md) as the entry point.
+3. **Phases 1–3 must not create architectural barriers** to a future KVBM connector — in particular, the GMS integration must not monopolize assumptions that only apply to weight-like memory.
 
-## Architecture: KV Cache Persistence via GMS
+## Architecture: KV Cache Persistence via KVBM
 
 ```mermaid
 graph TB
-    subgraph "Current KV Cache Flow"
+    subgraph "Current TRT-LLM KV Cache Flow"
         KVM["KV Cache Manager<br/>(V1 or V2)"]
         GPU["GPU HBM<br/>Hot cache"]
         Host["Host DRAM<br/>Offloaded cache"]
@@ -36,115 +48,81 @@ graph TB
         KVM --> Host
     end
 
-    subgraph "Extended Flow with GMS"
+    subgraph "Future Flow with KVBM (Phase 4+)"
         KVM2["KV Cache Manager V2"]
-        GPU2["GPU HBM<br/>Hot cache"]
-        GMS_KV["GMS Pool<br/>Crash-resilient cache"]
-        Host2["Host DRAM<br/>Offloaded cache"]
-        KVM2 --> GPU2
-        GPU2 <-->|"GMS-backed allocation"| GMS_KV
-        KVM2 --> Host2
-    end
-
-    subgraph "Extended Flow with GMS + KVBM"
-        KVM3["KV Cache Manager V2"]
-        GPU3["GPU HBM"]
-        GMS3["GMS Pool"]
-        KVBM["Dynamo KVBM<br/>Tiered storage"]
+        Connector["KV Cache Connector"]
+        KVBM["Dynamo KVBM"]
+        GPU2["GPU HBM"]
+        DRAM["Host DRAM"]
         NVMe["NVMe / GDS"]
-        S3["S3 / Remote"]
-        KVM3 --> GPU3
-        GPU3 <--> GMS3
-        GMS3 <--> KVBM
+        Remote["S3 / Remote"]
+        KVM2 --> Connector
+        Connector <-->|"NIXL"| KVBM
+        KVBM --> GPU2
+        KVBM --> DRAM
         KVBM --> NVMe
-        KVBM --> S3
+        KVBM --> Remote
+    end
+
+    subgraph "GMS Scope (This Proposal, Phases 1-3)"
+        Weights["Model Weights<br/>(weights tag)"]
+        Compile["Compile Cache<br/>(compile_cache tag)"]
+        GMSPool["GMS Pool<br/>(per-GPU, per-tag)"]
+        Weights --> GMSPool
+        Compile --> GMSPool
     end
 ```
 
-## Integration Points
+GMS and KVBM run **side by side** on the same node with no shared state. GMS manages VMM reservations for weight-like tags; KVBM manages KV cache blocks through the Connector API. A shadow worker imports weights from GMS and (when the KVBM connector is available) pulls relevant KV cache blocks from KVBM during activation — two independent transports, each serving the data it's designed for.
 
-### Option A: GMS-Backed KV Cache Allocator (Lightweight)
+## Integration Point: KV Cache Connector + KVBM
 
-Route KV cache GPU allocations through GMS, making them crash-resilient:
+TRT-LLM's KV Cache V2 exposes a [KV Cache Connector API](../../source/features/kv-cache-connector.md) for pluggable storage backends. The path is:
 
-```python
-# KV Cache Manager V2 with GMS allocator
-class KVCacheManagerV2:
-    def __init__(self, ..., gms_allocator=None):
-        if gms_allocator:
-            # KV cache blocks allocated via GMS = crash-resilient
-            self._block_allocator = GMSBlockAllocator(gms_allocator)
-        else:
-            self._block_allocator = StandardBlockAllocator()
-```
-
-**Pros:** Minimal changes — just swap the allocator. KV cache blocks survive worker crashes.
-**Cons:** All KV cache on GPU must go through GMS; may add allocation latency.
-**When:** Phase 3 or early Phase 4.
-
-### Option B: KV Cache Connector + GMS (Full Integration)
-
-Extend the existing KV Cache Connector API to use GMS as a storage backend:
-
-```python
-# New KV Cache Connector backend
-class GMSKVCacheConnector(KVCacheConnector):
-    """Stores KV cache blocks in GMS for crash-resilient sharing."""
-
-    def save_blocks(self, block_ids: List[int], block_data: List[torch.Tensor]):
-        """Commit KV cache blocks to GMS pool."""
-        for block_id, data in zip(block_ids, block_data):
-            self.gms_client.store(
-                tag=f"kv_cache_block_{block_id}",
-                data=data,
-            )
-
-    def load_blocks(self, block_ids: List[int]) -> List[torch.Tensor]:
-        """Import KV cache blocks from GMS pool."""
-        return [
-            self.gms_client.import_tensor(tag=f"kv_cache_block_{block_id}")
-            for block_id in block_ids
-        ]
-```
-
-**Pros:** Clean integration with existing KV Cache Connector API; works with disaggregated serving.
-**Cons:** More engineering effort; requires KV Cache Connector maturity in V2.
-**When:** Phase 4+, after KV Cache V2 becomes default.
-
-### Option C: KVBM Integration (Dynamo-Native)
-
-Connect TRT-LLM's KV cache to Dynamo's KV Block Manager (KVBM) for full tiered storage:
-
-```
+```text
 TRT-LLM KV Cache Manager V2
     ↕ (KV Cache Connector API)
 Dynamo KVBM
-    ↕ (NIXL)
+    ↕ (NIXL transport)
 GPU HBM → Host DRAM → NVMe/GDS → S3/Remote
 ```
 
-**Pros:** Full Dynamo ecosystem integration; tiered storage; cluster-wide KV sharing.
-**Cons:** Highest complexity; depends on KVBM API stability.
-**When:** Phase 4+, aligned with Dynamo roadmap.
+A KVBM connector implementation would live in TRT-LLM (or a thin Dynamo-side adapter) and plug into the Connector API — no new TRT-LLM-side KV cache machinery. Key properties:
 
-## What Phases 1-3 Must Not Block
+- **Prefix caching is preserved.** Common prefixes (system prompts, multi-turn history) hit KVBM's host/remote tiers and skip re-prefill.
+- **Shadow failover benefits without requiring GMS involvement.** On shadow activation, the new primary's KV Cache Manager pulls warm blocks from KVBM via the Connector API; GMS is not in the KV cache data path.
+- **Disaggregated serving composes naturally.** Prefill and decode workers both sit behind the Connector API; KVBM handles the P/D cache handoff. See [§08 Disaggregated Serving Interaction](08-disagg-interaction.md).
 
-To ensure KV cache extension is possible later, Phases 1-3 must:
+## What Phases 1–3 Must Not Block
 
-1. **Use tag-based memory management consistently.** All GMS allocations should use tags (`model_weights`, `kv_cache`) so they can be managed independently.
+To keep the KVBM integration unblocked, Phases 1–3 must:
 
-2. **Keep the GMS client API general.** Don't hardcode model-weight-specific assumptions. The `GPUMemoryBackend` protocol (see [Implementation & API Design](04-implementation-plan.md#gms-api-stability-abstraction)) should work for any GPU memory, not just weight tensors.
-
-3. **Don't assume all GMS memory is static.** KV cache is dynamic (allocated/freed per request). The GMS allocator must support frequent alloc/free, not just bulk commit.
-
-4. **Maintain KV Cache Connector API compatibility.** The weight loading changes must not break or constrain the KV Cache Connector API, which is the intended integration point for KV cache persistence.
+1. **Use tag-based GMS allocation consistently.** All GMS tags (`weights`, `compile_cache`) are independent of any KV cache machinery. KV cache never lives under a GMS tag.
+2. **Leave KV Cache Manager internals untouched.** The weight-loading changes (§04) and the shadow executor changes (§06) must not modify the KV Cache Manager's allocator or block layout in ways that would conflict with a future Connector-based backend.
+3. **Preserve the KV Cache Connector API surface.** The intended KVBM integration point is the existing Connector API — no changes in Phases 1–3 should constrain or break it.
+4. **Keep the `GPUMemoryBackend` protocol general** (see [§04 Implementation & API Design](04-implementation-plan.md)). Even though KV cache won't use it, the abstraction should stay generic enough for other weight-like artifacts (e.g., LoRA) to join the GMS pool later.
 
 ## Recommended Phasing
 
 | Phase | KV Cache Work | Scope |
 |:------|:-------------|:------|
 | Phase 1 (MX) | None | Model weights only |
-| Phase 2 (GMS) | Design GMS allocator to be tag-generic | Ensure allocator works for KV cache blocks |
-| Phase 3 (Combined) | Write KV cache extension design doc | No implementation, but validated design |
-| Phase 4 (Future) | Implement Option A (GMS-backed KV allocator) | Crash-resilient KV cache |
-| Phase 5 (Future) | Implement Option B or C (Connector/KVBM) | Full tiered KV cache with Dynamo |
+| Phase 2 (GMS) | None | Weights + compile cache via GMS; KV cache untouched |
+| Phase 3 (Combined) | None — validate non-interference | Ensure Connector API surface is unchanged |
+| Phase 4+ (KVBM) | Implement KV Cache Connector → KVBM backend | Tiered KV cache via KVBM; separate integration track |
+
+Phase 4 is **out of scope for this proposal** and is expected to align with the Dynamo KVBM roadmap rather than the MX/GMS schedule. See [§14 E1](14-open-questions.md) for the deferral status.
+
+## Why Not Route KV Cache Through GMS? (Rationale Kept for the Record)
+
+Earlier drafts of this section proposed two GMS-centered options:
+
+- **Option A: GMS-Backed KV Cache Allocator** — swap the KV block allocator for one that routes through GMS, making KV blocks crash-resilient.
+- **Option B: KV Cache Connector + GMS backend** — a Connector implementation that stores/loads blocks in a GMS pool.
+
+Both are **superseded by KVBM integration** for two reasons:
+
+1. **KVBM already solves the general problem.** Tiered offload, cross-node sharing, and NIXL transport are KVBM's design center. A GMS-backed KV path would re-implement a subset of that with no tiering beyond HBM.
+2. **Scope discipline.** GMS's strength is VMM-backed, long-lived, intra-node memory for static artifacts. Overloading it with short-lived per-request blocks muddies the mental model and adds allocator-churn pressure that GMS wasn't designed for.
+
+If KVBM's timeline slips materially or disagg-specific KV needs emerge that KVBM doesn't cover, the rationale can be revisited — GMS's VMM reservations don't preclude a future KV use — but the default path is KVBM.
