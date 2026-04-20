@@ -2,7 +2,7 @@
 
 [< Back to README](README.md)
 
-**Status:** Phase A complete; Phase B blocked on GMS API alignment  •  **Last Updated:** 2026-04-18
+**Status:** Phase A complete; prototype API aligned with merged GMS + MX (v0.9.0 / v0.3.0); Phase B ready once MX server + GMS daemon are reachable on a test node  •  **Last Updated:** 2026-04-20
 **Scope:** Validation strategy for the [PR #13045 prototype](https://github.com/NVIDIA/TensorRT-LLM/pull/13045) (MX + GMS integration) using the §10/§11 benchmark infrastructure.
 
 > This file is a working plan. Once validation is executed, results will be folded into [§11 Results & Analysis](11-results-analysis.md) and this file can be retired or moved to a "completed plans" archive.
@@ -39,18 +39,25 @@ PR #13045 lives on `chienchunhung:dynamo-integration-prototype`. The benchmark +
 
 | Branch | Purpose | Base | Tip SHA |
 |--------|---------|------|---------|
-| `dynamo-integration-prototype` | **Original prototype** (PR #13045 source). Untouched. | upstream/main as of 2026-04-14 | `84dfb2aa7` |
+| `dynamo-integration-prototype` | **Original prototype** (PR #13045 source) before the API alignment work. Will be force-pushed with the rebased + API-aligned commits once that work is reviewed. | upstream/main as of 2026-04-14 | `84dfb2aa7` (original) → `62ac40f6b` (planned, see `dynamo-integration-prototype-rebased`) |
 | `dynamo/startup-profiling` | **Bench + profiler infrastructure** (§10/§11 source). Untouched. | upstream/main as of 2026-04-17 | `f9771e571` |
 | `docs-and-plans` | This design doc. | — | (current) |
-| `dynamo/proto-rebased` | **NEW.** Prototype's 2 commits replayed on current `upstream/main`. Zero rebase conflicts. | upstream/main `4a848ccce` | `7bb11db6a` |
-| `dynamo/proto-bench-integration-v2` | **NEW.** Working integration branch — `dynamo/proto-rebased` + the 7 bench commits cherry-picked on top. | `dynamo/proto-rebased` | `5e9ee91c8` |
+| `dynamo/proto-rebased` | **Pre-alignment snapshot** — prototype's 2 original commits replayed on `upstream/main @ 4a848ccce` with zero rebase conflicts. Kept as a historical reference for the conflict-free rebase. | upstream/main `4a848ccce` | `7bb11db6a` |
+| `dynamo/proto-bench-integration-v2` | Working integration branch (pre-alignment) — `dynamo/proto-rebased` + the 7 bench commits cherry-picked on top. Used for the original Phase A smoke verification. | `dynamo/proto-rebased` | `5e9ee91c8` |
+| `dynamo-integration-prototype-rebased` | **NEW.** Live working branch for PR #13045 — prototype rebased onto current `upstream/main @ 7b8413697` (95 commits ahead of original base) plus a third commit (`62ac40f6b`) that aligns the GMS and MX adapters with what was actually merged upstream. This is what the PR will be force-pushed to. | upstream/main `7b8413697` | `62ac40f6b` |
 
 ```text
-upstream/main (4a848ccce)
-└── dynamo/proto-rebased (7bb11db6a)              ← prototype's 2 commits replayed
-    │   • [feat] Add MX and GMS integration prototype       (0dcb9f920)
-    │   • [feat] Align GMS backend with merged GMS API #7575 (7bb11db6a)
-    └── dynamo/proto-bench-integration-v2 (5e9ee91c8)   ← +7 bench cherry-picks
+upstream/main (7b8413697)                          ← current upstream HEAD
+└── dynamo-integration-prototype-rebased (62ac40f6b)   ← LIVE: API-aligned PR #13045
+    │   • [feat] Add MX and GMS integration prototype          (b8f2f923d)
+    │   • [feat] Align GMS backend with merged GMS API #7575   (d5683cde5; original — kept for history)
+    │   • [feat] Update MX and GMS adapters to match merged    (62ac40f6b; this is the actual alignment)
+    │     upstream APIs                                          ← [NEW commit, see "API Alignment" below]
+
+# Pre-alignment historical snapshots (kept for traceability):
+upstream/main (4a848ccce)                          ← upstream HEAD as of 2026-04-17
+└── dynamo/proto-rebased (7bb11db6a)               ← prototype's 2 original commits replayed
+    └── dynamo/proto-bench-integration-v2 (5e9ee91c8)  ← + 7 bench cherry-picks
         ├── [feat] Add hierarchical startup profiling and benchmark instrumentation
         ├── [feat] Split HF cache probe and remote download timers
         ├── [feat] Add startup benchmark automation scripts
@@ -60,7 +67,7 @@ upstream/main (4a848ccce)
         └── [feat] Add failover floor benchmark script (Test 4a)
 ```
 
-These two new branches are throwaway — discard after validation completes.
+The `dynamo-integration-prototype-rebased` branch is the live working branch for PR #13045. Once review-ready, it will be force-pushed to `dynamo-integration-prototype` (the actual PR source). The `dynamo/proto-rebased` and `dynamo/proto-bench-integration-v2` branches are pre-alignment snapshots kept for traceability and can be discarded after validation completes.
 
 ### Setup commands (reproducible)
 
@@ -131,61 +138,95 @@ Confirmed the integration is healthy and the M1 (baseline AUTO/HF) path is unaff
 
 The MX-aware `if not mx_p2p_succeeded:` guard in `model_loader.py` correctly takes the standard HF path when no MX server is configured, and `executor.apply_model_weights.main_weights: 2.288s` confirms `_call_load_weights` runs as expected.
 
-### ⚠️ Phase B — Blocked on GMS API Alignment
+### ✅ API Alignment — Prototype ↔ Current GMS / MX (DONE)
 
-The Phase B verification tests require either MX (`nvidia-modelexpress`) or GMS (`gpu-memory-service`) to be installed and runnable.
+Phase A's smoke verification confirmed that the prototype's GMS adapter (`tensorrt_llm/_torch/memory/gpu_memory_backend.py`) was written against an **unmerged** iteration of the GMS Python API that did not survive PR #7575. A parallel mismatch existed for the MX adapter (`tensorrt_llm/_torch/models/checkpoints/mx/checkpoint_loader.py`) against current `modelexpress` v0.3.0. Both adapters have now been refactored against the actually-merged upstream APIs, on the new `dynamo-integration-prototype-rebased` branch (commit `62ac40f6b`).
 
-#### GMS install: package OK, prototype API mismatch found
+#### What was wrong (briefly)
 
-| Step | Outcome |
-|------|---------|
-| Install GMS (`pip install -e dynamo/lib/gpu_memory_service`) | ✅ `gpu-memory-service 0.9.0` installed, daemon binary works, package importable |
-| Prototype's `GMSBackend.connect()` against installed GMS | ❌ **API mismatch — blocker** |
-
-Specifically, the prototype's `tensorrt_llm/_torch/memory/gpu_memory_backend.py` (commit `7bb11db6a`, message: *"Align GMS backend with merged GMS library API (PR #7575)"*) calls a high-level convenience API:
+GMS — prototype called convenience functions that don't exist in merged GMS:
 
 ```python
-# Prototype expects:
+# Prototype expected:
 from gpu_memory_service import client as gms_client
 self._client = gms_client.connect(self._socket_path, mode="rw")
-self._is_rw = not self._client.has_committed_weights(self._tag)
-gms_client.get_mem_pool(self._client)                                # RW path
-gms_client.materialize_module_from_gms(self._client, model)          # RO path
+gms_client.get_mem_pool(self._client)
+gms_client.materialize_module_from_gms(self._client, model)
+gms_client.register_module_tensors(self._client, model)
+gms_client.commit(self._client, tag)
+gms_client.disconnect(self._client)
+
+# Actually merged in ai-dynamo/dynamo (verified 2026-04-20):
+from gpu_memory_service.client.torch.allocator import (
+    get_or_create_gms_client_memory_manager, gms_use_mem_pool,
+)
+from gpu_memory_service.client.torch.module import materialize_module_from_gms
+from gpu_memory_service.integrations.common.utils import finalize_gms_write
+mgr = get_or_create_gms_client_memory_manager(socket, device, mode=lock_mode, tag="weights")
+with gms_use_mem_pool("weights", torch.device("cuda", device)):
+    ...
+materialize_module_from_gms(mgr, model, device_index=device)   # keyword required
+finalize_gms_write(mgr, model)   # register + sync + commit + RO + remap
 ```
 
-But the actual merged API in `ai-dynamo/dynamo` post-PR #7575 exposes a **class-based low-level API** plus a **monkey-patch integration**:
+MX — prototype called methods that no longer exist in `modelexpress` v0.3.0:
 
 ```python
-# What's actually merged (verified Apr 18):
-from gpu_memory_service.client.memory_manager import GMSClientMemoryManager
-from gpu_memory_service.client.torch.allocator import gms_use_mem_pool   # context manager
-from gpu_memory_service.client.torch.module import materialize_module_from_gms
+# Prototype expected:
+from modelexpress import client as mx_client, proto as mx_proto
+connection = mx_client.connect(self._mx_server_url)
+sources = connection.list_sources(identity)        # returned a list directly
+connection.receive(source)                         # one-call transfer
+connection.register_source(model, identity)        # one-call publish
+mx_proto.SourceIdentity(model_name=..., extra_params={...})  # dict-of-strings schema
 
-mgr = GMSClientMemoryManager(socket_path, device=N)
-mgr.connect(lock_type=RequestedLockType.RW)  # explicit lock_type, no auto-mode wrapper
-# Allocate via context manager:
-with gms_use_mem_pool(tag, device):
-    ...
-materialize_module_from_gms(mgr, model, device_index=N)  # requires keyword arg
+# Actually merged in ai-dynamo/modelexpress v0.3.0:
+from modelexpress.trtllm_live_transfer import MxLiveWeightLoader, publish_model_params
+loader = MxLiveWeightLoader(mx_server=url)
+fallback = loader.load_weights(checkpoint_dir, mapping=mapping, model=model)  # returns size-mismatch dict
+publish_model_params(model)   # sets up NIXL + publishes to gRPC
+# SourceIdentity now uses structured fields:
+#   mx_version, mx_source_type, model_name, backend_framework,
+#   tensor_parallel_size, pipeline_parallel_size, expert_parallel_size, dtype
+# (no extra_params dict)
 ```
 
-There is also an **official TRT-LLM integration shim** at `gpu_memory_service.integrations.trtllm.setup_gms()` (added by PR #7575 itself) that monkey-patches TRT-LLM's `ModelLoader` from outside — this is the supported way to enable GMS in TRT-LLM today. The prototype's `GMSBackend` is a parallel re-implementation of that integration that pre-dates the merge.
+#### What the alignment commit does
 
-Diagnostic facts:
+Single commit on the prototype branch — `62ac40f6b [None][feat] Update MX and GMS adapters to match merged upstream APIs`:
 
-- PR #7575 ("feat: add TRT-LLM sleep/wake integration with GMS") merged into `ai-dynamo/dynamo` main on **2026-04-15** (commit `d96a2cf1`).
-- Zero commits to `lib/gpu_memory_service/client/` between #7575 and our checkout (verified 2026-04-18). The installed API is exactly the post-#7575 API.
-- Prototype's "Align GMS backend…" commit is dated **2026-04-16** (one day after #7575 merged) but was clearly written against an earlier, un-merged iteration of the API.
+1. **`tensorrt_llm/_torch/memory/gpu_memory_backend.py`** — full rewrite of `GMSBackend` against the merged class-based API. Notable surface-level change: `get_mem_pool() -> torch.cuda.MemPool` is replaced with `mem_pool_scope(device) -> ContextManager` so the call site uses the upstream pattern (`with gms_use_mem_pool(tag, device): ...`) directly. `_move_untracked_params()` mirrors the upstream `gpu_memory_service.integrations.trtllm.model_loader._move_untracked_params` (iterate via `_iter_module_tensors`, dedup by storage pointer, allocate via `create_mapping()`, rebind via `_tensor_from_pointer`).
+2. **`tensorrt_llm/_torch/models/checkpoints/mx/checkpoint_loader.py`** — rewritten to delegate the actual NIXL transfer to upstream `MxLiveWeightLoader.load_weights(model=...)` (which handles agent setup, source matching, dtype-cast handling, PVC fallback). `publish_as_source()` delegates to upstream `publish_model_params()`. We keep the `HfCheckpointLoader` subclass shell so disk fallback is inherited.
+3. **`tensorrt_llm/_torch/pyexecutor/model_loader.py`** — switches the GMS-RW branch to the new `mem_pool_scope` context manager API and adds an `empty_cache()` drain inside the scope (mirrors the upstream RW reference).
+4. **`tensorrt_llm/llmapi/llm_args.py`** — adds `mx_preshard_strategy: per_module | global` (default `per_module`). `gms_tag` default changes from `"model_weights"` to `"weights"` to match the GMS library convention. New validators reject bad values for both.
+5. **`setup.py`** — adds optional extras: `pip install tensorrt_llm[mx]`, `[gms]`, or `[dynamo]` (both). Pinned upper bounds (`modelexpress>=0.3.0,<0.4.0`, `gpu-memory-service>=0.9.0,<0.10.0`) protect against future drift across the dependency boundary.
+6. **`tests/unittest/api_stability/references/llm.yaml`** — reflects the new field and the changed `gms_tag` default.
 
-Impact: any attempt to launch with `--load-format gms` will throw `AttributeError: module 'gpu_memory_service.client' has no attribute 'connect'`. M2 (GMS-only), M4 (MX+GMS), B2 (shadow memory), and B6 (failover E2E) are all blocked until this is resolved.
+#### Design decisions made during alignment
 
-Available paths forward (decision pending):
+- **No monkey-patching.** We deliberately do **not** use the upstream `setup_gms()` entry point (which patches `ModelLoader.load` from outside). TRT-LLM owns the integration policy; this adapter just calls the GMS library's stable per-call primitives. This preserves the prototype's two-axis composition design.
+- **Three-layer separation.** TRT-LLM owns Layer 3 (integration policy: where in the loading pipeline we call GMS/MX, and how it composes with TRT-LLM's MoE loader, weight mapper, post-load hooks). We call upstream Layer 2 (stable per-call primitives: `GMSClientMemoryManager`, `gms_use_mem_pool`, `MxLiveWeightLoader`, `publish_model_params`). We never duplicate Layer 1 (wire protocol, NIXL RDMA, CUDA VMM mechanics).
+- **`mx_preshard_strategy='global'` parked for now.** It would map onto `LoadFormat.PRESHARDED`, which the MX team's PR #12898 proposed but was closed in favor of the per-module flag. Selecting `global` raises a friendly `NotImplementedError`. When `LoadFormat.PRESHARDED` lands upstream, the wiring is one branch in `model_loader.py`.
+- **Mixed-success MX case is conservative.** When `MxLiveWeightLoader` returns size-mismatched fallback weights, we currently fall through to a full disk load to avoid mixing presharded and non-presharded weights in the same model. Per-tensor presharded marking will need `LoadFormat.PRESHARDED` to be plumbed through.
+- **MX team alignment.** The `LoadFormat.PRESHARDED` vs per-module flag question is a real divergence point with the MX team's design (their `MxLiveCheckpointLoader` docstring explicitly says `LoadFormat.PRESHARDED`). The `mx_preshard_strategy` knob preserves both options as future paths so we can converge once the upstream design conversation lands.
 
-1. **Patch the prototype's `GMSBackend`** to use the current `GMSClientMemoryManager` + `gms_use_mem_pool` context-manager API. Estimated: a few hours of focused refactor on the `dynamo/proto-bench-integration-v2` branch (or directly on the prototype). We own the code and it's an explicit prototype.
-2. **Adopt the official `setup_gms()` integration** from PR #7575 and remove the prototype's custom `GMSBackend`. Cleaner long-term, but the prototype's "two-axis MX+GMS" composition (e.g., GMS RW path that also publishes for MX P2P readers) would need to be reworked on top of the monkey-patch model.
-3. **File the API gap upstream** against PR #13045 / the prototype owner; pause GMS validation until the prototype catches up.
+#### Smoke verification on the API-aligned branch
 
-#### MX install: not feasible on this node
+Verified import-level correctness on `dynamo-integration-prototype-rebased`:
+
+| Check | Result |
+|-------|--------|
+| All TRT-LLM-side adapter symbols import | ✅ |
+| All Pydantic config fields present (`mx_server_url`, `mx_preshard_strategy`, `gms_socket_path`, `gms_mode`, `gms_tag`) | ✅ |
+| Defaults align with current GMS conventions (`gms_tag='weights'`, `mx_preshard_strategy='per_module'`) | ✅ |
+| `GMSBackend` exposes `connect`, `is_rw`, `has_committed_weights`, `mem_pool_scope`, `materialize_module`, `finalize_write`, `move_untracked_params`, `cleanup`, `DEFAULT_TAG` | ✅ |
+| `MXCheckpointLoader` exposes `load_weights`, `publish_as_source`, `p2p_succeeded`, `mx_server_url`, `checkpoint_format == "MX"` | ✅ |
+| All upstream GMS Layer 2 symbols resolve in installed `gpu-memory-service==0.9.0` | ✅ |
+| `mx_preshard_strategy='bad_value'` is rejected with friendly Pydantic error | ✅ |
+
+End-to-end runtime verification (boot `trtllm-serve` with `--load-format gms` and a real GMS daemon, plus `--checkpoint-format mx` with a real MX server) is the next step and is gated only on environment availability — see "MX install" and "GMS install" notes below.
+
+#### MX install: still needs a node with Rust + Docker
 
 | Requirement | Status on current node |
 |-------------|------------------------|
@@ -194,15 +235,18 @@ Available paths forward (decision pending):
 | Docker (for Redis metadata backend) | ❌ not installed |
 | `redis-server` | ❌ not installed |
 
-`nvidia-modelexpress` lives at [github.com/ai-dynamo/modelexpress](https://github.com/ai-dynamo/modelexpress) — Rust server + Python client; build from source via `cargo build` then run with `MX_METADATA_BACKEND=redis cargo run --bin modelexpress-server`. Setting this up would require either provisioning Rust + Docker on the current node or migrating to a node that already has them. Estimated: 30–60 min of one-time setup before any MX test can start.
+The MX server (Rust binary at `ai-dynamo/modelexpress`) is built via `cargo build` and runs against a Redis (or Kubernetes) metadata backend. The Python client (`pip install modelexpress`) is independent and works without the server, but `MxLiveWeightLoader.load_weights()` will hang in `_query_source` until a server is reachable. Setting up a server requires provisioning Rust + Docker on a test node or migrating to a node that already has them.
 
 Also relevant: per [modelexpress's known issues](https://github.com/ai-dynamo/modelexpress#known-issues), MLA-architecture models (DeepSeek-V2/V3, Kimi K2) are blocked from MX P2P transfer and silently fall back to disk. Our Qwen 72B (no MLA) and DeepSeek-R1-Distill-Llama-70B (Llama architecture, not MLA) are both safe.
 
 ### 🔭 Recommended Next Step
 
-Resolve the GMS API mismatch first (path 1 or 2 above) before investing in MX node prep. GMS-only validation (B2 + B6) gives an independent, high-value go/no-go signal on the prototype's most novel claim (zero-copy shadow + sub-5s failover) and exercises ~half the prototype's new code with the lighter dependency footprint. MX validation (B1 + B3 + B4) can follow once a node with Rust + Docker is available.
+The API-alignment blocker is resolved. The next gates are environment-side:
 
-In parallel, M1 baseline regression on `dynamo/proto-bench-integration-v2` (i.e., re-run a single §11 v3 config — Qwen 7B TP=1 S2 — and confirm startup-time delta is within run-to-run noise) is a cheap (~15 min) sanity check that the prototype's edits to the AUTO/HF path don't subtly regress the baseline. The smoke test above is consistent with no regression but it ran on warm NFS, not the §11 cold protocol.
+1. **Force-push the rebased + aligned branch to PR #13045.** `dynamo-integration-prototype-rebased` (commit `62ac40f6b`) replaces the current PR head (`84dfb2aa7`). Two new commits in the PR diff vs the prior version: (a) the rebase itself and (b) the API-alignment commit.
+2. **GMS-only end-to-end test** on this node (no MX needed): start a `gpu-memory-service` daemon for one GPU, launch `trtllm-serve --load-format gms` (RW), inspect committed bytes, then launch a second `trtllm-serve --load-format gms --gms-mode ro` and verify zero-copy import + correct inference. Exercises B2 and B6 (shadow memory + failover floor) — the prototype's most novel claims.
+3. **MX setup on a separate node** with Rust + Docker available; then B1 (bit-exactness), B3 (P2P throughput), B4 (cold-start headline), and the MX+GMS composition can run.
+4. **M1 baseline regression** on `dynamo-integration-prototype-rebased` (single §11 v3 config — Qwen 7B TP=1 S2) is still a cheap (~15 min) sanity check that the AUTO/HF path didn't regress through the rebase + alignment work. The pre-alignment smoke (Qwen 7B TP=1 warm NFS: 67.6s server / 36.3s worker) is consistent with no regression but ran on warm NFS, not the §11 cold protocol.
 
 ---
 
