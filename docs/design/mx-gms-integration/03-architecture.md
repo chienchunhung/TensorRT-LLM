@@ -69,8 +69,8 @@ flowchart TD
     PostLoadRO --> ImportGMS["materialize_module()<br/>(GMS RO, zero-copy import)"]
     ImportGMS --> Ready["Ready to serve<br/>(~100ms path)"]
 
-    CheckGMS -->|"No (RW mode)"| LoadUnderPool["Load from disk under<br/>torch.cuda.use_mem_pool(gms_pool)"]
-    LoadUnderPool --> CommitGMS["finalize_write() →<br/>commit to local GMS"]
+    CheckGMS -->|"No (RW mode)"| LoadUnderPool["Load from disk inside<br/>gms_backend.mem_pool_scope(device)<br/>(delegates to gms_use_mem_pool)"]
+    LoadUnderPool --> CommitGMS["move_untracked_params() +<br/>finalize_write() →<br/>commit to local GMS"]
     CommitGMS --> PublishMX["Publish as MX source<br/>(BEFORE post_load_weights)"]
     PublishMX --> PostLoad2["Run post_load_weights()"]
     PostLoad2 --> Ready2["Ready to serve<br/>(minutes path, first writer)"]
@@ -80,7 +80,7 @@ flowchart TD
 >
 > In the current prototype, `checkpoint_format="MX"` + `load_format=GMS` behaves **identically** to `checkpoint_format="HF"` + `load_format=GMS` (GMS-only). The MX checkpoint format provides no additional benefit when GMS is active. Here is why:
 >
-> **The root cause: CUDA memory pool isolation.** In GMS RW mode, all weight memory must live in the GMS-managed memory pool so that RO readers can later zero-copy import it. The loading path wraps weight loading in `torch.cuda.use_mem_pool(gms_pool)`, ensuring all CUDA allocations land in GMS memory. However, when MX receives weights via P2P RDMA, the MX/NIXL layer allocates CUDA buffers **inside the MX SDK** — outside the `use_mem_pool` context. Those received weights land in regular CUDA memory, not the GMS pool. This means GMS cannot track, manage, or share them with RO readers — defeating the entire purpose of GMS RW mode.
+> **The root cause: CUDA memory pool isolation.** In GMS RW mode, all weight memory must live in the GMS-managed memory pool so that RO readers can later zero-copy import it. The loading path wraps weight loading in `gms_backend.mem_pool_scope(device)` (a context manager that delegates to upstream `gms_use_mem_pool(tag, device)`), ensuring all CUDA allocations land in GMS memory. However, when MX receives weights via P2P RDMA, the MX/NIXL layer allocates CUDA buffers **inside the MX SDK** — outside the pool-scope context. Those received weights land in regular CUDA memory, not the GMS pool, so GMS cannot track, manage, or share them with RO readers — defeating the entire purpose of GMS RW mode. Aligning MX-NIXL to write into pre-allocated GMS-pool buffers is tracked as MX-5 in [§15 Upstream Alignment Requests](15-prototype-validation-plan.md#-api-alignment--prototype--current-gms--mx-done); until that lands, MX P2P is intentionally bypassed inside GMS RW mode and the GMS RW path falls back to disk loading.
 >
 > **What this means in practice:**
 >
@@ -163,12 +163,12 @@ flowchart LR
     end
 
     subgraph "Memory Mgmt Axis (LoadFormat)"
-        D3["GMS RW: load under<br/>torch.cuda.use_mem_pool(gms_pool)<br/>then finalize_write() + commit"]
+        D3["GMS RW: load inside<br/>gms_backend.mem_pool_scope(device)<br/>then move_untracked_params() + finalize_write()"]
         D4["GMS RO: post_load_weights() first<br/>then materialize_module()<br/>(zero-copy from GMS pool)"]
     end
 
     subgraph "Post-Load Hooks (TRT-LLM orchestration)"
-        D2["MX: publish_as_source(model, mapping, checkpoint_dir)<br/>BEFORE post_load_weights<br/>Fires for AUTO and GMS-RW modes"]
+        D2["MX: publish_as_source(model)<br/>delegates to publish_model_params()<br/>BEFORE post_load_weights<br/>Fires for AUTO and GMS-RW modes"]
     end
 
     D -.->|"checkpoint_format=MX"| D1

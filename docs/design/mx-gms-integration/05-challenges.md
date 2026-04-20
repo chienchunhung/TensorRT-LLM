@@ -52,15 +52,28 @@ def _handle_non_contiguous(tensor, name):
 **Challenge:** Each TP rank has different weight slices. Transferring rank 0's weights to rank 3 would produce wrong results.
 
 **Mitigation:**
-- Include `worker_rank`, `tp_size`, `pp_rank`, `ep_rank` in `MXSourceIdentity`
-- Filter sources by exact rank match during discovery
+- Include parallelism sizes (`tensor_parallel_size`, `pipeline_parallel_size`, `expert_parallel_size`, `dtype`) in [`p2p_pb2.SourceIdentity`](https://github.com/ai-dynamo/modelexpress/blob/main/modelexpress_client/python/modelexpress/p2p_pb2.py)
+- Filter `WorkerMetadata` by `worker_rank` (== MPI rank) during discovery
 - Validate parallelism config before transfer
 
 ```python
-sources = mx_client.list_sources(identity, status=READY)
-my_rank = mapping.tp_rank
-candidates = [s for s in sources if s.worker_rank == my_rank]
+from modelexpress.client import MxClient
+from modelexpress.trtllm_live_transfer import _build_trtllm_identity  # private today; see MX-2 in §15
+
+client = MxClient(server_url=mx_server_url)
+identity = _build_trtllm_identity(model_name, tp_size=mapping.tp_size, ep_size=mapping.moe_ep_size)
+list_resp = client.list_sources(identity=identity)
+
+# Per-rank metadata is fetched separately (avoids one giant response)
+my_rank = mapping.tp_rank  # for the no-MPI case; MPI deployments use MPI.COMM_WORLD.Get_rank()
+for inst in list_resp.instances:
+    meta = client.get_metadata(mx_source_id=inst.mx_source_id, worker_id=inst.worker_id)
+    if meta.found and meta.worker.worker_rank == my_rank:
+        # candidate found
+        ...
 ```
+
+> **Open upstream alignment:** the current `WorkerMetadata` schema only carries `worker_rank` (== MPI rank), not explicit `tp_rank`/`pp_rank`/`ep_rank` fields. For MPI deployments this works because MPI rank == TP rank in our setups, but Ray/K8s deployments without MPI need explicit per-rank addressing. Tracked as MX-3 in [§15 Upstream Alignment Requests](15-prototype-validation-plan.md#-api-alignment--prototype--current-gms--mx-done).
 
 ## 4. Pipeline Parallelism Layers
 
@@ -88,12 +101,12 @@ candidates = [s for s in sources if s.worker_rank == my_rank]
 
 **Mitigation:**
 - Use `torch.cuda.memory.CUDAPluggableAllocator` API (provided by the GMS client library)
-- The GMS library already implements the allocator (`CUDAPluggableAllocator` + `MemPool`), the CUDA VMM FD import/export (`cuda_utils.py`), and zero-copy tensor construction (`materialize_module_from_gms`). **TRT-LLM does not reimplement any of this** — it only wraps model loading inside `torch.cuda.use_mem_pool(gms_pool)` for the RW path, or calls `materialize_module_from_gms()` for the RO path. See [Implementation & API Design](04-implementation-plan.md#library-inventory) for a full inventory.
+- The GMS library already implements the allocator (`CUDAPluggableAllocator` + `MemPool`), the CUDA VMM FD import/export, and zero-copy tensor construction (`materialize_module_from_gms`). **TRT-LLM does not reimplement any of this** — it only wraps model loading inside the `gms_use_mem_pool(tag, device)` context manager for the RW path, or calls `materialize_module_from_gms(mgr, model, device_index=N)` for the RO path. See [Implementation & API Design](04-implementation-plan.md#library-inventory) for a full inventory.
 - Handle allocation/deallocation lifecycle at TRT-LLM orchestration level:
-  - RW mode: wrap model loading in GMS memory pool context manager; move stray params into pool via `move_untracked_params()`; finalize via `finalize_write()` which commits, disconnects RW, reconnects as RO, and remaps VAs
-  - RO mode: call `materialize_module_from_gms()` after `post_load_weights()`
-  - VMM safety: apply `patch_empty_cache()` on connect to prevent segfaults from `torch.cuda.empty_cache()` on VMM-backed allocations
-  - Shutdown: release GMS client connection (GMS handles cleanup)
+  - RW mode: wrap model loading in `gms_backend.mem_pool_scope(device)` context manager (which delegates to `gms_use_mem_pool`); move stray params into pool via `move_untracked_params()`; finalize via `finalize_write()` which delegates to upstream `finalize_gms_write()` (commits, disconnects RW, reconnects as RO, and remaps virtual addresses in one call)
+  - RO mode: call `materialize_module_from_gms(mgr, model, device_index=...)` after `post_load_weights()`
+  - VMM safety: `connect()` applies `patch_empty_cache()` from `gpu_memory_service.integrations.common.patches` to prevent segfaults from `torch.cuda.empty_cache()` on VMM-backed allocations
+  - Shutdown: `cleanup()` calls `mgr.close()` and `evict_gms_client_memory_manager()` to release the per-tag registry slot
 - **Risk mitigation:** Start with simple contiguous allocations; handle edge cases (views, in-place ops) incrementally
 
 **Known complexity from PR #7053:**
@@ -114,26 +127,32 @@ candidates = [s for s in sources if s.worker_rank == my_rank]
 
 ## 8. GMS API Stability
 
-**Challenge:** The GPU Memory Service (GMS) API used in the [prototype PR #7053](https://github.com/ai-dynamo/dynamo/pull/7053) may evolve before GA. The prototype demonstrates a working integration including `materialize_module_from_gms`, RW/RO lock semantics, and tagged memory operations, but the public API surface has not been formally stabilized.
+**Challenge:** The GPU Memory Service (GMS) API has stabilized as of [PR #7575](https://github.com/ai-dynamo/dynamo/pull/7575) (the official TRT-LLM sleep/wake integration). The prior `LoadFormat.GMS` integration in TRT-LLM PR #13045 was originally written against an unmerged convenience-function API that did not survive PR #7575; the API used in production today is the class-based [`GMSClientMemoryManager`](https://github.com/ai-dynamo/dynamo/blob/main/lib/gpu_memory_service/client/memory_manager.py) plus the helpers under `gpu_memory_service.client.torch.*` and `gpu_memory_service.integrations.common.utils.finalize_gms_write`. PR #13045 has been refactored to call this stable API (commit `62ac40f6b`).
 
 **Mitigation:**
-- Define a thin `GPUMemoryBackend` protocol in TRT-LLM (see [Implementation & API Design](04-implementation-plan.md#gms-api-stability-abstraction)) to insulate TRT-LLM from GMS API changes:
+- Keep a thin `GPUMemoryBackend` protocol in TRT-LLM (see [Implementation & API Design](04-implementation-plan.md#gms-api-stability-abstraction)) so all upstream API calls go through one adapter class. When the upstream Layer 2 API drifts, only this adapter needs to change — call sites in `model_loader.py` are stable:
   ```python
   class GPUMemoryBackend(Protocol):
-      def has_committed_weights(self, tag: str) -> bool: ...
-      def get_mem_pool(self) -> torch.cuda.MemPool: ...
+      def connect(self) -> bool: ...
+      @property
+      def is_rw(self) -> Optional[bool]: ...
+      def has_committed_weights(self) -> bool: ...
+      def mem_pool_scope(
+          self,
+          device: Optional[torch.device] = None,
+      ) -> "Iterator[None]": ...
       def materialize_module(self, model: torch.nn.Module) -> None: ...
-      def finalize_write(self, model: torch.nn.Module, tag: str) -> None: ...
+      def finalize_write(self, model: torch.nn.Module) -> int: ...
       def move_untracked_params(self, model: torch.nn.Module) -> None: ...
-      def release(self, tag: str) -> None: ...
       def cleanup(self) -> None: ...
   ```
-- `finalize_write()` mirrors the GMS library's `finalize_gms_write()` — after `register_module_tensors + commit`, it disconnects the RW client, reconnects as RO, and remaps virtual addresses so tensors remain valid under the new RO client
-- `move_untracked_params()` moves any parameters allocated outside the `use_mem_pool` context (stray buffers from `post_load_weights()` or transforms) into the GMS pool before `finalize_write()`, ensuring all model state is committed to shared memory
+- `mem_pool_scope(device)` is a context manager that scopes CUDA allocations to the GMS pool — replaces the older `get_mem_pool() -> torch.cuda.MemPool` style. Internally delegates to upstream `gms_use_mem_pool(tag, device)`.
+- `finalize_write()` delegates to upstream `gpu_memory_service.integrations.common.utils.finalize_gms_write()`, which performs `register_module_tensors → cuda.synchronize → commit → connect(RO) → remap_all_vas` in one call. Returns the total bytes committed.
+- `move_untracked_params()` mirrors the upstream private `gpu_memory_service.integrations.trtllm.model_loader._move_untracked_params` — iterates via `_iter_module_tensors`, dedups by storage pointer, allocates fresh GMS mappings via `create_mapping()`, and rebinds via `_tensor_from_pointer`. We intentionally re-implement instead of importing the private symbol; promoting it to public is tracked as GMS-2 in [§15 Upstream Alignment Requests](15-prototype-validation-plan.md#-api-alignment--prototype--current-gms--mx-done).
 - `connect()` applies `patch_empty_cache()` from `gpu_memory_service.integrations.common.patches` to prevent `torch.cuda.empty_cache()` from segfaulting on VMM-backed GMS allocations — this is critical for MoE models whose load balancer calls `empty_cache()` during `make_tensor_host_accessible()`
-- GMS client implements this protocol; if the API changes, only the adapter changes
-- Verify API stability with Dynamo team before Phase 2 starts
-- Have a fallback plan: if GMS API is unstable, a `CudaIpcBackend` could implement the same protocol (less featured — no crash resilience or zero-copy, but uses stable CUDA IPC APIs)
+- We deliberately do **NOT** use the upstream `setup_gms()` integration entry point. `setup_gms()` works by `_trt_loader.ModelLoader.load = patched_load` — runtime monkey-patching of TRT-LLM internals from outside, which is opaque at code-review time and conflicts with TRT-LLM's two-axis design. TRT-LLM owns the integration policy; the `GPUMemoryBackend` adapter is the explicit, reviewable boundary.
+- Pin the upstream dep to a tested major: `gpu-memory-service>=0.9.0,<0.10.0` (declared as the `gms` extra in `setup.py`).
+- Have a fallback plan: if GMS API drifts further, a `CudaIpcBackend` could implement the same protocol (less featured — no crash resilience or zero-copy, but uses stable CUDA IPC APIs)
 
 ## 9. Transfer Backend Selection
 
@@ -144,7 +163,7 @@ candidates = [s for s in sources if s.worker_rank == my_rank]
 | **NIXL** | vLLM-proven; MX default; broader fabric support | — |
 | **Mooncake TransferEngine** | MX proto suggests this for TRT-LLM; TRT-LLM already uses Mooncake for disagg | Less mature for weight transfer |
 
-**Recommendation:** Start with NIXL for Phase 1 (proven, matches vLLM). Evaluate Mooncake as an alternative backend in Phase 3. Note that the transfer backend selection is largely **transparent to TRT-LLM** — it is handled inside the MX client library. TRT-LLM calls `client.receive()` and `client.register_source()`; the MX library handles the underlying transfer mechanism (NIXL, Mooncake, etc.).
+**Recommendation:** Start with NIXL for Phase 1 (proven, matches vLLM). Evaluate Mooncake as an alternative backend in Phase 3. Note that the transfer backend selection is largely **transparent to TRT-LLM** — it is handled inside the MX client library. TRT-LLM calls `MxLiveWeightLoader(mx_server=url).load_weights(checkpoint_dir, mapping=, model=)` for the receive side and `publish_model_params(torch_model)` for the publish side; the MX library handles the underlying transfer mechanism (NIXL today; Mooncake or other backends in the future).
 
 ## 10. Coordination with MX Prototype (PR #12898)
 

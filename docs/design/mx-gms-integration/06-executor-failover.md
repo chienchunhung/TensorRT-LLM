@@ -2,7 +2,7 @@
 
 [< Back to Overview](README.md)
 
-> **This section is new** — the original proposal underspecified how shadow failover interacts with TRT-LLM's executor loop. This is the hardest part of the integration and requires careful design. Unlike the weight loading integration where much of the functionality is provided by MX/GMS libraries, **the executor integration is almost entirely new TRT-LLM code** — the GMS library only provides the lock upgrade API (`gms_client.upgrade_lock()`); all shadow lifecycle management, health checking, and executor state transitions are TRT-LLM responsibilities.
+> **This section is new** — the original proposal underspecified how shadow failover interacts with TRT-LLM's executor loop. This is the hardest part of the integration and requires careful design. Unlike the weight loading integration where much of the functionality is provided by MX/GMS libraries, **the executor integration is almost entirely new TRT-LLM code** — the GMS library only provides the lock primitives (`GMSClientMemoryManager.connect(lock_type=...)` to acquire RO/RW; `mgr.unmap_all_vas()` + `mgr.abort()` + reconnect-RW + `remap_all_vas()` to upgrade RO→RW); all shadow lifecycle management, health checking, and executor state transitions are TRT-LLM responsibilities.
 
 ## The Challenge
 
@@ -51,7 +51,7 @@ class ExecutorState(Enum):
 class PyExecutor:
     def __init__(self, ..., shadow_mode: bool = False):
         self._state = ExecutorState.SHADOW if shadow_mode else ExecutorState.INITIALIZING
-        self._gms_client = None  # Set if load_format involves GMS
+        self._gms_backend = None  # Set if load_format involves GMS
 
     def _shadow_loop(self):
         """Background loop for shadow workers. Lightweight — no GPU work."""
@@ -61,9 +61,10 @@ class PyExecutor:
                 self._activate_from_shadow()
                 return
 
-            # 2. Keep GMS connection alive
-            if self._gms_client:
-                self._gms_client.heartbeat()
+            # 2. (No explicit GMS heartbeat needed — the unix socket
+            #     connection is the lock; OS-level keepalives suffice.
+            #     Tracked as GMS-3 in §15: optional peek RPC could give us
+            #     a cheaper health signal here.)
 
             time.sleep(0.5)  # 500ms health check interval
 
@@ -72,10 +73,13 @@ class PyExecutor:
         self._state = ExecutorState.ACTIVATING
         t0 = time.perf_counter()
 
-        # Step 1: Upgrade GMS lock (RO -> RW) — ~10ms
-        # (This is the only GMS API call; rest is TRT-LLM code)
-        if self._gms_client:
-            self._gms_client.upgrade_lock()
+        # Step 1: Upgrade GMS lock (RO -> RW) — ~10-50ms
+        # The current GMS API doesn't expose a single upgrade_lock() call;
+        # instead: unmap_all_vas() + abort() + connect(RW) + remap_all_vas().
+        # Wrap this in GMSBackend.upgrade_to_rw() once the protocol grows
+        # the method.
+        if self._gms_backend:
+            self._gms_backend.upgrade_to_rw()  # see GMSBackend extension
 
         # Step 2: Allocate KV cache — ~1-3s (depends on cache size)
         self._resource_manager.allocate_kv_cache()
@@ -108,9 +112,11 @@ TRT-LLM already has `release_with_tag()` / `materialize_with_tag()` for memory l
 def _init_shadow_with_gms(self):
     """Initialize shadow worker using GMS RO import."""
 
-    # Import model weights from GMS — zero-copy
+    # Import model weights from GMS — zero-copy.
+    # The GMSBackend adapter wraps the upstream
+    # materialize_module_from_gms(mgr, model, device_index=N) call.
     self._model_engine.model = self._gms_loader.import_model(
-        gms_client=self._gms_client,
+        gms_backend=self._gms_backend,
         model_class=self._model_class,
         config=self._config,
     )
@@ -120,17 +126,19 @@ def _init_shadow_with_gms(self):
     # On activation, materialize_with_tag("kv_cache") equivalent = allocate fresh
 
     # Model weights are "materialized" via GMS import
-    # On deactivation, release_with_tag("model_weights") = release GMS RW lock
+    # On deactivation, release_with_tag("weights") = release GMS RW lock
 ```
+
+The GMS library convention uses `tag="weights"` for model weights and `tag="kv_cache"` for the KV cache (see [`gpu_memory_service.integrations.common.utils.GMS_TAGS`](https://github.com/ai-dynamo/dynamo/blob/main/lib/gpu_memory_service/integrations/common/utils.py#L20)).
 
 | TRT-LLM Sleep/Wake | GMS Library Call | TRT-LLM Code | When |
 |:-------------------|:----------------|:-------------|:-----|
-| `materialize_with_tag("model_weights")` | `gms_client.import(tag=...)` | Orchestration only | Shadow init, activation |
-| `release_with_tag("model_weights")` | `gms_client.release_lock()` | Orchestration only | Demotion, shutdown |
+| `materialize_with_tag("weights")` | `materialize_module_from_gms(mgr, model, device_index=N)` | Orchestration only (delegates to library) | Shadow init, activation |
+| `release_with_tag("weights")` | `mgr.unmap_all_vas()` + `mgr.abort()` | Orchestration only | Demotion, shutdown |
 | `materialize_with_tag("kv_cache")` | None (pure TRT-LLM) | `resource_manager.allocate_kv_cache()` | Activation only |
 | `release_with_tag("kv_cache")` | None (pure TRT-LLM) | `resource_manager.release_kv_cache()` | Demotion, shutdown |
-| `materialize_with_tag("compile_cache")` | `gms_client.import(tag="compile_cache")` | Deserialize artifacts | Shadow activation |
-| `release_with_tag("compile_cache")` | `gms_client.release_lock()` | Orchestration only | Demotion, shutdown |
+| `materialize_with_tag("compile_cache")` | `materialize_module_from_gms(mgr, ..., tag="compile_cache")` (when supported) | Deserialize artifacts | Shadow activation |
+| `release_with_tag("compile_cache")` | `mgr.unmap_all_vas()` + `mgr.abort()` | Orchestration only | Demotion, shutdown |
 
 ## Shadow Activation Budget
 
