@@ -23,6 +23,33 @@ Together, the three workstreams form a **layered reliability stack**: detect fai
 
 **Competitive context:** SGLang shipped Elastic EP in March 2026 (~6.5s recovery, tolerates up to 16/32 rank failures). vLLM has an active RFC (#27774) for fault-tolerant EP. TRT-LLM currently has no EP-level fault tolerance — this is a critical gap for production WideEP deployments.
 
+## Scope and Non-Goals
+
+### In Scope (Primary Track — Phase 1 Priority)
+
+- **Aggregated WideEP serving** — a single `trtllm-serve` instance runs prefill and decode on one EP group spanning 32-72+ GPUs (the DeepSeek-V3/R1 NVL72 configuration)
+- **PyTorch backend** (the default backend that WideEP is built on)
+- **NVLink communication backends** as the primary target: `NVLinkOneSided` (primary), `NVLinkTwoSided`, and `AllGatherReduceScatter` (NCCL fallback)
+- **Intra-node and multi-node EP** where the collective paths are the ones listed above
+- **Single GPU failure** in MVP; **multi-failure consensus** in full Phase 1
+
+### In Scope (Deferred Track — After Phase 1 MVP)
+
+- **Disaggregated serving fault tolerance.** Production TRT-LLM disagg separates prefill and decode into independent worker pools, each with its own EP group, connected by KV cache transfer (NIXL/UCX/MPI). A failure in one pool has different semantics from an aggregated failure:
+  - Request state is split across pools — prefill-side context and decode-side KV cache are separate
+  - KV cache transfers in flight at the time of failure have their own failure mode
+  - The orchestration layer (`trtllm-serve` proxy) has to coordinate recovery across pools, not just within one
+
+  This is scoped as a separate **Phase 1-DS** track that starts after Phase 1 MVP lands and can proceed in parallel with Phase 1 v1. The per-pool collective-level FT from the primary track applies unchanged within each pool; Phase 1-DS adds the cross-pool coordination layer. See [§09 Phase 1-DS](09-implementation-plan.md#phase-1-ds-disaggregated-serving-ft-p1) and [§10 Q7](10-risks.md#q7-how-does-wideep-ft-interact-with-disaggregated-serving).
+
+### Out of Scope (Explicit Non-Goals)
+
+- **DeepEP / DeepEPLowLatency backends** — masking requires a public NVSHMEM `mask_buffer_ptr` API that does not exist yet. In scope as a v1 target *if* the external API becomes available; otherwise deferred indefinitely. See [§10 Risk 2](10-risks.md#risk-2-deepep-backend-limitations).
+- **TensorRT engine backend** — legacy backend per `AGENTS.md`; FT work targets PyTorch only.
+- **Standard EP (≤8 GPUs)** — not the WideEP bottleneck. Today's infinite-hang failure mode is an issue specific to multi-node NVLink AlltoAll. Intra-node EP failures are handled adequately by process restart + PR #12718's error classification.
+- **Inference request durability** — if a request is mid-flight when a rank fails, that specific request is lost. Recovering individual requests across failures is an orchestration-layer concern, not a collective-layer one.
+- **Preemptive / predictive failure mitigation** — deferred to Phase 3.
+
 ## Why This Is Technically Hard
 
 This is not routine integration work. The design tackles several problems that are individually challenging and collectively require cross-layer systems expertise:
@@ -56,9 +83,11 @@ This is not routine integration work. The design tackles several problems that a
 
 | Phase | Priority | Timeline | Rationale |
 |:------|:---------|:---------|:----------|
-| Phase 1: Immediate Survival | **P0** | 0-3 months | Core fault tolerance — keeps WideEP serving after GPU failure |
-| Phase 2: Full Restoration | **P1** | 3-6 months | Restores full capacity; benefits from MX-GMS for fast recovery |
-| Phase 3: Proactive Resilience | **P2** | 6-12 months | Predictive failure detection, preemptive expert migration |
+| **Phase 1 MVP (v0)** | **P0** | **6-8 weeks** | **Single-failure survival on NVLinkOneSided (primary NVL72 backend); eliminates 7-8 min downtime for the dominant failure mode. Scope cuts: no NVLinkTwoSided, no full EPLB reconfigure, no multi-failure. See [§09 Phase 1 MVP](09-implementation-plan.md#phase-1-mvp-v0-vs-full-scope).** |
+| Phase 1 full (v1) | P0 | ~8-12 weeks after MVP | Broadens to all NVLink backends, adds full EPLB reconfigure with weight migration, multi-failure consensus |
+| **Phase 1-DS: Disagg FT** | **P1** | **~4-6 weeks, parallelizable with Phase 1 v1** | **Extends FT to disaggregated serving. Starts after Phase 1 MVP; does not block v1.** |
+| Phase 2: Full Restoration | P1 | 3-6 months | Process group reconstruction; restores full N-rank capacity; benefits from MX-GMS for fast recovery |
+| Phase 3: Proactive Resilience | P2 | 6-12 months | Predictive failure detection, preemptive expert migration |
 
 ## Related Work
 

@@ -148,6 +148,39 @@ With WideEP + PP (e.g., `tp=32, pp=2, ep=16`), each PP stage has its own EP grou
 
 **Current recommendation:** Treat each PP stage's EP group independently. If one stage loses a rank, that stage enters degraded mode. The batch size may need to be reduced to match the degraded stage's capacity. This is an advanced configuration that can be addressed in Phase 2.
 
+### Q7: How does WideEP FT interact with disaggregated serving?
+
+Production TRT-LLM disaggregated serving separates **prefill** and **decode** into independent worker pools, each with its own EP group, connected via a KV cache transceiver (NIXL / UCX / MPI). The current design implicitly assumes aggregated serving — a single EP group handling both phases — and does not address the disagg case.
+
+**Why disagg needs its own design:**
+
+- **Independent EP groups.** A prefill pool running `ep=32` and a decode pool running `ep=16` are two separate collectives. Rank masking and EPLB adaptation apply *within* each pool, but a failure in one pool does not propagate to the other through any shared collective. Detection and recovery must be pool-local.
+- **Request state is split across pools.** At the moment of failure:
+  - **Prefill rank dies mid-prompt processing:** the request's prompt context (tokenized input, early KV cache being generated) is on the dead rank. The decode pool has no KV cache for this request yet — nothing to recover; the request is lost and must be resubmitted.
+  - **Decode rank dies mid-generation:** the request's in-progress generation state (partial output tokens, KV cache for both prompt and generated tokens) is on the dead rank. The prefill pool has already completed its work and moved on. Recovery requires either dropping the request, restarting from the prompt (if the prompt is still available upstream), or partial-output recovery if the orchestrator streamed tokens out.
+- **In-flight KV cache transfers fail separately.** If the transceiver is mid-transfer when a rank dies, the transfer protocol (NIXL/UCX) surfaces its own failure — not an EP-level failure. The orchestration layer must correlate transfer failures with the underlying rank failure.
+- **Orchestration layer must coordinate.** `trtllm-serve`'s disagg router is the only component that sees both pools. It is the natural site for cross-pool failure handling — retry policy, request rerouting to a healthy decode pool, KV cache invalidation. This is a separate codepath from the collective-level recovery in this design.
+
+**What this design does cover in a disagg context:**
+
+- Within each pool (prefill *or* decode), the Phase 1 MVP + Phase 1 full scope apply unchanged — the pool's EP group detects the failure, masks the dead rank, and continues serving at reduced capacity. From each pool's point of view, the design works identically to aggregated.
+
+**What this design does not cover:**
+
+- Cross-pool failure propagation
+- In-flight request recovery when state is split across a failing pool boundary
+- KV cache transfer failure handling correlated with EP-level failure
+- Orchestration-layer retry / rerouting policy
+
+**Recommendation (updated):** Disagg FT is **in scope** but on a deferred track. The primary Phase 1 track (MVP → v1) covers aggregated serving first to keep the critical path focused. Disagg FT lands as **Phase 1-DS** (see [§09](09-implementation-plan.md#phase-1-ds-disaggregated-serving-ft-p1)), which:
+
+- Starts **after** Phase 1 MVP delivers per-pool survival on NVLinkOneSided
+- Runs **in parallel** with Phase 1 v1 and does not block it
+- Reuses the same Phase 1 primitives (EPGroupHealth, rank masking, EPLB emergency-mask) per-pool, unchanged
+- Adds the cross-pool coordination layer in the orchestrator (`trtllm-serve` proxy): KV transceiver failure correlation, cross-pool failure notification, retry/reroute policy
+
+This keeps the basic WideEP FT critical path clean while ensuring disagg is not orphaned.
+
 ## Risk Summary Matrix
 
 | Risk | Severity | Probability | Phase | Mitigation Status |
@@ -160,3 +193,4 @@ With WideEP + PP (e.g., `tp=32, pp=2, ep=16`), each PP stage has its own EP grou
 | Memory pressure | Low | Low | 1d | Small impact; monitor + alert |
 | False positive failure detection | Medium | Medium | 1c | Conservative timeouts; confirmation step |
 | PP + WideEP interaction | Medium | Low | 2+ | Defer to Phase 2 |
+| Disagg + WideEP FT interaction | Medium | Medium | Separate track | Explicitly out of scope; per-pool coverage only |
