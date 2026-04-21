@@ -239,6 +239,130 @@ The MX server (Rust binary at `ai-dynamo/modelexpress`) is built via `cargo buil
 
 Also relevant: per [modelexpress's known issues](https://github.com/ai-dynamo/modelexpress#known-issues), MLA-architecture models (DeepSeek-V2/V3, Kimi K2) are blocked from MX P2P transfer and silently fall back to disk. Our Qwen 72B (no MLA) and DeepSeek-R1-Distill-Llama-70B (Llama architecture, not MLA) are both safe.
 
+## Upstream Alignment Requests
+
+Concrete asks to the MX (`ai-dynamo/modelexpress`) and GMS (`ai-dynamo/dynamo`) teams. These are the workarounds the prototype currently carries; each one would shrink or disappear if the upstream change lands. Cross-references in [§3](03-architecture.md), [§4](04-implementation-plan.md), [§5](05-challenges.md), and [§6](06-executor-failover.md) point here.
+
+### To: MX team (`ai-dynamo/modelexpress`)
+
+#### MX-1. Decide: `LoadFormat.PRESHARDED` vs per-module `_weights_presharded` flag
+
+**Priority:** High — design conversation that blocks several downstream things.
+**Ask:** Take an explicit position. Two viable options:
+
+- **(a) Per-module flag** (what PR #13045 currently uses): MX P2P succeeds → mark each `Linear` module's `_weights_presharded = True`.
+- **(b) `LoadFormat.PRESHARDED`** (what `MxLiveCheckpointLoader`'s docstring assumes): MX P2P succeeds → use a `LoadFormat.PRESHARDED` enum value that short-circuits the entire weight pipeline.
+
+**Why now:** `MxLiveCheckpointLoader` ([trtllm_live_transfer.py:11–15](https://github.com/ai-dynamo/modelexpress/blob/main/modelexpress_client/python/modelexpress/trtllm_live_transfer.py#L11-L15)) explicitly uses `LoadFormat.PRESHARDED` but that enum doesn't exist in TRT-LLM `main`. The MX team's TRT-LLM PR [#12898](https://github.com/NVIDIA/TensorRT-LLM/pull/12898) proposed adding it but was closed. The two approaches differ at **mixed-success** time (some weights via P2P, rest via PVC fallback) — per-module can mark exactly the MX-delivered modules, while `LoadFormat.PRESHARDED` is global.
+
+**Our workaround:** `mx_preshard_strategy: per_module | global` config knob (default `per_module`); `global` raises `NotImplementedError` until (b) is taken upstream. See `tensorrt_llm/llmapi/llm_args.py` and `tensorrt_llm/_torch/pyexecutor/model_loader.py`.
+
+#### MX-2. Promote `_build_trtllm_identity` to a public API
+
+**Priority:** Medium — small ergonomic fix that removes a private-symbol dependency AND lets us drop two env-var dances.
+**Ask:** Promote [`_build_trtllm_identity`](https://github.com/ai-dynamo/modelexpress/blob/main/modelexpress_client/python/modelexpress/trtllm_live_transfer.py#L34) to a public `modelexpress.trtllm.build_identity(model_name, *, tp_size, pp_size=1, ep_size=1, dtype="bfloat16") -> p2p_pb2.SourceIdentity`.
+
+**Why:** Callers that need a `SourceIdentity` outside `MxLiveWeightLoader.load_weights()` currently can either re-implement `_build_trtllm_identity` (drift risk) or import a private symbol (stability risk).
+
+**Our workaround:** in `publish_as_source()` (`tensorrt_llm/_torch/models/checkpoints/mx/checkpoint_loader.py`) we set BOTH `MODEL_EXPRESS_URL` and `MODEL_NAME` env vars temporarily and call `publish_model_params(model)`, which then internally calls `_build_trtllm_identity` from those env vars. Two separate env-var dances would collapse into one direct function call if MX-2 lands. The `MODEL_NAME` resolution itself is plumbed cleanly: `llm_args.model → MXCheckpointLoader(model_name=...) → publish-time resolver` (with HF-snapshot path unmangling).
+
+#### MX-3. Expose explicit per-rank addressing in identity / metadata
+
+**Priority:** Medium — debuggability + flexibility for non-MPI deployments.
+**Ask:** Add `tp_rank: int`, `pp_rank: int`, `ep_rank: int` fields either to `p2p_pb2.SourceIdentity` (identity-level addressing) or to `WorkerMetadata` (queryable per-worker fields).
+
+**Why:** Today only `WorkerMetadata.worker_rank` (== MPI rank) is queryable. MPI-less deployments (Ray, K8s with TCP-based discovery) need explicit per-rank fields to map source/target topology cleanly.
+
+**Our workaround:** delegate matching to `MxLiveWeightLoader._query_source` and rely on MPI rank == TP rank invariant in our setups.
+
+#### MX-4. Non-blocking source-query API
+
+**Priority:** Medium — needed for fast disk-fallback and readiness checks.
+**Ask:** Add a non-blocking variant of source discovery, e.g. `MxClient.list_sources_now(identity) -> ListSourcesResponse` (returns immediately; empty `.instances` means "no source yet"), or a `timeout_ms=0` option on existing `list_sources`.
+
+**Why:** Today, [`MxLiveWeightLoader._query_source`](https://github.com/ai-dynamo/modelexpress/blob/main/modelexpress_client/python/modelexpress/trtllm_live_transfer.py#L496) polls every 5 s for up to `MX_SOURCE_QUERY_TIMEOUT` (default `3600` = **1 hour**) waiting for a source. This is correct for production targets (which should wait for a donor) but means **the very first replica on a cold cluster blocks for an hour before falling back to disk**.
+
+**Our workaround:** `MXCheckpointLoader.__init__` calls `os.environ.setdefault("MX_SOURCE_QUERY_TIMEOUT", "30")` whenever an MX server URL is configured. This caps cold-cluster first-replica delay at 30 s instead of 1 hour, with no new dependencies — we just configure the upstream library's existing knob to a defensive default. `setdefault` semantics mean an explicit user value still wins. A proper non-blocking probe (this MX-4 ask) would let us skip the timeout entirely when no source exists.
+
+#### MX-5. Clarify NIXL agent ownership across MX + GMS composition
+
+**Priority:** Medium — design clarification that affects the MX+GMS combined story.
+**Ask:** Confirm (or add support for) MX-RDMA-into-GMS-pool memory.
+
+**Why:** The prototype's PR description says *"MX P2P is NOT used in GMS RW mode. Model params are meta tensors at that point — no CUDA buffers for P2P to write into."* If MX-NIXL writes to **already-allocated** GPU buffers (the typical RDMA pattern), then in GMS RW mode we *could* allocate buffers under `gms_use_mem_pool("weights", device)` first and then have MX RDMA into those buffers, giving us true MX+GMS composition.
+
+**Our workaround:** PR #13045 supports MX-only, GMS-only, and explicitly does NOT use MX inside GMS-RW. This is a real cold-path optimization left on the table until the MX team confirms the contract.
+
+#### MX-6. MLA-architecture model support (informational)
+
+**Priority:** Low — already on the MX known-issues list.
+**Status:** MLA-arch models (DeepSeek-V2/V3, Kimi K2/K2.5) are blocked from MX P2P transfer per upstream; they silently fall back to disk. Tracked here only so our Section 11 impact projection can call this out.
+
+---
+
+### To: GMS team (`ai-dynamo/dynamo` `lib/gpu_memory_service`)
+
+#### GMS-1. Document and support a non-monkey-patch integration path
+
+**Priority:** High — direct feedback from a downstream integrator.
+**Ask:** Treat the class-based primitives (`GMSClientMemoryManager` + `gms_use_mem_pool` + `materialize_module_from_gms` + `finalize_gms_write`) as a first-class integration path, equally documented and supported alongside `setup_gms()`.
+
+**Why:** `gpu_memory_service.integrations.trtllm.setup_gms()` works by `_trt_loader.ModelLoader.load = patched_load` — runtime monkey-patching of TRT-LLM internals from outside. PR #13045 deliberately doesn't use it because: (1) opaque at code-review time, (2) future TRT-LLM `ModelLoader.load` refactors silently break it, (3) it conflicts with TRT-LLM's two-axis design where `--checkpoint-format mx` and `--load-format gms` should compose orthogonally.
+
+**Suggested resolution:** Add a "Non-monkey-patch integration path" section to the GMS README that walks through the class-based API with our `tensorrt_llm/_torch/memory/gpu_memory_backend.py` as a worked example. Commit to keeping the class-based API stable across 0.x.
+
+#### GMS-2. Promote `_move_untracked_params` to public API
+
+**Priority:** High — small change that removes a private-symbol copy-paste.
+**Ask:** Promote [`_move_untracked_params`](https://github.com/ai-dynamo/dynamo/blob/main/lib/gpu_memory_service/integrations/trtllm/model_loader.py#L237) to a public `gpu_memory_service.client.torch.module.move_untracked_params(model, gms_client, target_device, *, tag="weights")`.
+
+**Why:** Adapters that don't use `setup_gms()` (us, plus future vLLM/SGLang integrations that want to control the loading pipeline) need this exact functionality. Today it's private (leading underscore) and lives in the `trtllm`-specific submodule despite being model-engine-agnostic.
+
+**Our workaround:** `GMSBackend.move_untracked_params()` is a near-byte-for-byte port of the upstream private function. High maintenance burden — when upstream's logic changes (e.g., handling a new tensor type), we have to chase it.
+
+#### GMS-3. Lightweight "is anything committed?" peek RPC
+
+**Priority:** Medium — health checks, readiness gates, dashboards.
+**Ask:** Add a lightweight check that does NOT acquire a session lock, e.g. `gpu_memory_service.client.is_committed(socket_path, tag="weights", timeout_ms=100) -> bool`.
+
+**Why:** Today, to determine whether RO weights are ready, we have to call `connect()` and inspect `granted_lock_type`. This (a) acquires a session, which is heavyweight, (b) blocks if a writer is active, and (c) means readiness gates must connect-and-disconnect (polluting client-state metrics).
+
+**Our workaround:** `GMSBackend.has_committed_weights()` only returns a meaningful answer if we're already connected. Pre-connect peek isn't supported.
+
+#### GMS-4. Reconsider default tag name (informational)
+
+**Priority:** Low — discoverability.
+**Ask:** Document that `tag="weights"` (model weights) and `tag="kv_cache"` (KV cache) are the canonical names downstream integrators should use; mention this in the GMS README's "API conventions" section.
+
+**Why:** PR #13045 originally defaulted `gms_tag="model_weights"` (more descriptive English) before discovering the convention is just `"weights"` by reading [`GMS_TAGS`](https://github.com/ai-dynamo/dynamo/blob/main/lib/gpu_memory_service/integrations/common/utils.py#L20) in the source. A sentence in the README would have saved the rediscovery.
+
+#### GMS-5. Stable contract: `materialize_module_from_gms` keyword arg requirement (informational)
+
+**Priority:** Low — already documented by signature.
+**Status:** Confirms `materialize_module_from_gms(gms_client, model, *, device_index)` requires `device_index` as a keyword arg. PR #13045 handles correctly. No action needed.
+
+---
+
+### Summary table
+
+| ID | To | Title | Priority | Workaround in PR #13045? | Blocks merge? |
+|---|---|---|---|---|---|
+| MX-1 | MX | `LoadFormat.PRESHARDED` vs per-module flag | High | `mx_preshard_strategy='global'` raises until upstream lands | No |
+| MX-2 | MX | Promote `_build_trtllm_identity` to public | Medium | `MODEL_EXPRESS_URL` + `MODEL_NAME` env-var dance in `publish_as_source` | No |
+| MX-3 | MX | Per-rank addressing in identity/metadata | Medium | Rely on MPI-rank == TP-rank | No |
+| MX-4 | MX | Non-blocking source-query API | Medium | `MX_SOURCE_QUERY_TIMEOUT=30` defensive `setdefault` | No |
+| MX-5 | MX | Clarify NIXL ownership for MX+GMS composition | Medium | MX P2P bypassed in GMS-RW path | **Yes for MX+GMS validation** |
+| MX-6 | MX | MLA model support (informational) | Low | — | No |
+| GMS-1 | GMS | Document non-monkey-patch integration path | High | We avoid `setup_gms()` and own the integration in `GMSBackend` | No |
+| GMS-2 | GMS | Promote `_move_untracked_params` to public | High | Re-implemented in `GMSBackend.move_untracked_params()` | No (high maintenance burden) |
+| GMS-3 | GMS | Lightweight peek RPC | Medium | None — `has_committed_weights()` requires prior `connect()` | No |
+| GMS-4 | GMS | Document tag-name conventions | Low | `gms_tag` default is `"weights"` | No |
+| GMS-5 | GMS | Confirm `device_index` kwarg contract (informational) | Low | — | No |
+
+**MX-1 and MX-5 are the items most likely to come up in PR review** — both have working workarounds today, but both are real design conversations the MX team would want to weigh in on before TRT-LLM lands a stable design.
+
+---
+
 ### 🔭 Recommended Next Step
 
 The API-alignment blocker is resolved. The next gates are environment-side:

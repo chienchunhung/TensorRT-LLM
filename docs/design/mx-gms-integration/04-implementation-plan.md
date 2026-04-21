@@ -131,7 +131,7 @@ Key design decisions:
 - **Inherits `HfCheckpointLoader`**, reusing HF weight loader, config loader, and weight mapper registries. Fallback is simply `super().load_weights()`.
 - **Delegates transport to upstream `MxLiveWeightLoader`.** TRT-LLM does not re-implement NIXL setup, source matching, dtype-cast handling, or PVC fallback — `modelexpress.trtllm_live_transfer.MxLiveWeightLoader.load_weights(checkpoint_dir, mapping=, model=)` does all of that. We only invoke it at the right point in the loading pipeline.
 - **`p2p_succeeded` property.** The loader exposes a boolean. `ModelLoader.load()` reads this and sets `_weights_presharded` on the model's `Linear` modules — keeping the flag on the model (where it's consumed) rather than on the loader. Draft model modules are excluded (they load independently from disk).
-- **Mixed-success conservatism.** If `MxLiveWeightLoader.load_weights()` returns a non-empty fallback dict (size-mismatched tensors that need disk loading), we treat the whole load as MX-failed and run the standard disk path, rather than mixing presharded and non-presharded weights in the same model. Per-tensor presharded marking will land when [`LoadFormat.PRESHARDED`](15-prototype-validation-plan.md#-api-alignment--prototype--current-gms--mx-done) is plumbed upstream (tracked as MX-1).
+- **Mixed-success conservatism.** If `MxLiveWeightLoader.load_weights()` returns a non-empty fallback dict (size-mismatched tensors that need disk loading), we treat the whole load as MX-failed and run the standard disk path, rather than mixing presharded and non-presharded weights in the same model. Per-tensor presharded marking will land when [`LoadFormat.PRESHARDED`](15-prototype-validation-plan.md#upstream-alignment-requests) is plumbed upstream (tracked as MX-1).
 
 ```python
 @register_checkpoint_loader("MX")
@@ -222,7 +222,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
 
 ### Identity Schema (current MX library)
 
-Identity construction lives in the upstream `_build_trtllm_identity` helper (currently private; promotion to public is tracked as MX-2 in [§15](15-prototype-validation-plan.md#-api-alignment--prototype--current-gms--mx-done)). The current `p2p_pb2.SourceIdentity` schema uses structured fields — no more `extra_params` dict:
+Identity construction lives in the upstream `_build_trtllm_identity` helper (currently private; promotion to public is tracked as MX-2 in [§15](15-prototype-validation-plan.md#upstream-alignment-requests)). The current `p2p_pb2.SourceIdentity` schema uses structured fields — no more `extra_params` dict:
 
 ```python
 # What MxLiveWeightLoader builds internally:
@@ -238,7 +238,7 @@ p2p_pb2.SourceIdentity(
 )
 ```
 
-Per-rank addressing currently uses `WorkerMetadata.worker_rank` (== MPI rank). Adding explicit `tp_rank` / `pp_rank` / `ep_rank` fields to the schema is tracked as MX-3 in [§15](15-prototype-validation-plan.md#-api-alignment--prototype--current-gms--mx-done) — needed for non-MPI deployments (Ray, K8s with TCP-based discovery).
+Per-rank addressing currently uses `WorkerMetadata.worker_rank` (== MPI rank). Adding explicit `tp_rank` / `pp_rank` / `ep_rank` fields to the schema is tracked as MX-3 in [§15](15-prototype-validation-plan.md#upstream-alignment-requests) — needed for non-MPI deployments (Ray, K8s with TCP-based discovery).
 
 ### What TRT-LLM Implements vs. MX SDK
 
@@ -268,7 +268,7 @@ Key design decisions:
 - **`GMSBackend` class** wraps the GMS client SDK, encapsulating connection, mode resolution, and lifecycle. This is the concrete implementation of the `GPUMemoryBackend` protocol (see [API Stability](#gms-api-stability-abstraction) below).
 - **Mode resolved at connect time.** `GMSBackend.connect()` calls upstream `get_or_create_gms_client_memory_manager(socket, device, mode=RW_OR_RO, tag=...)` and inspects the returned `granted_lock_type` (`GrantedLockType.RW` or `RO`) to set the `is_rw` property. The `is_rw` property is then used to branch.
 - **Meta-init preserved.** The prototype skips `meta→CUDA` tensor init and `model.to("cuda")` for `LoadFormat.GMS`. The RW path allocates under the GMS pool via `mem_pool_scope`; the RO path replaces meta tensors via `materialize_module()`.
-- **No monkey-patching.** We deliberately do NOT use the upstream `gpu_memory_service.integrations.trtllm.setup_gms()` entry point — it works by patching `tensorrt_llm._torch.pyexecutor.model_loader.ModelLoader.load` from outside, which is opaque at code-review time and conflicts with TRT-LLM's two-axis design. TRT-LLM owns the integration policy; `GMSBackend` is the explicit, reviewable boundary. See GMS-1 in [§15 Upstream Alignment Requests](15-prototype-validation-plan.md#-api-alignment--prototype--current-gms--mx-done).
+- **No monkey-patching.** We deliberately do NOT use the upstream `gpu_memory_service.integrations.trtllm.setup_gms()` entry point — it works by patching `tensorrt_llm._torch.pyexecutor.model_loader.ModelLoader.load` from outside, which is opaque at code-review time and conflicts with TRT-LLM's two-axis design. TRT-LLM owns the integration policy; `GMSBackend` is the explicit, reviewable boundary. See GMS-1 in [§15 Upstream Alignment Requests](15-prototype-validation-plan.md#upstream-alignment-requests).
 
 ```python
 # In ModelLoader.load() — tensorrt_llm/_torch/pyexecutor/model_loader.py
@@ -363,7 +363,7 @@ class GPUMemoryBackend(Protocol):
 | `mem_pool_scope(device)` | `gms_use_mem_pool(tag, device)` (context manager) |
 | `materialize_module(model)` | `materialize_module_from_gms(mgr, model, device_index=N)` |
 | `finalize_write(model) -> int` | `finalize_gms_write(mgr, model)` (handles register + sync + commit + RO reconnect + remap) |
-| `move_untracked_params(model)` | re-implements upstream private `_move_untracked_params` (tracked as GMS-2 in [§15](15-prototype-validation-plan.md#-api-alignment--prototype--current-gms--mx-done)) |
+| `move_untracked_params(model)` | re-implements upstream private `_move_untracked_params` (tracked as GMS-2 in [§15](15-prototype-validation-plan.md#upstream-alignment-requests)) |
 | `cleanup()` | `mgr.close()` + `evict_gms_client_memory_manager(mgr)` |
 | `connect()` (post) | `patch_empty_cache()` (VMM safety) |
 

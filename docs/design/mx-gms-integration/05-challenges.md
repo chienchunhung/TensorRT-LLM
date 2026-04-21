@@ -73,7 +73,7 @@ for inst in list_resp.instances:
         ...
 ```
 
-> **Open upstream alignment:** the current `WorkerMetadata` schema only carries `worker_rank` (== MPI rank), not explicit `tp_rank`/`pp_rank`/`ep_rank` fields. For MPI deployments this works because MPI rank == TP rank in our setups, but Ray/K8s deployments without MPI need explicit per-rank addressing. Tracked as MX-3 in [§15 Upstream Alignment Requests](15-prototype-validation-plan.md#-api-alignment--prototype--current-gms--mx-done).
+> **Open upstream alignment:** the current `WorkerMetadata` schema only carries `worker_rank` (== MPI rank), not explicit `tp_rank`/`pp_rank`/`ep_rank` fields. For MPI deployments this works because MPI rank == TP rank in our setups, but Ray/K8s deployments without MPI need explicit per-rank addressing. Tracked as MX-3 in [§15 Upstream Alignment Requests](15-prototype-validation-plan.md#upstream-alignment-requests).
 
 ## 4. Pipeline Parallelism Layers
 
@@ -148,7 +148,7 @@ for inst in list_resp.instances:
   ```
 - `mem_pool_scope(device)` is a context manager that scopes CUDA allocations to the GMS pool — replaces the older `get_mem_pool() -> torch.cuda.MemPool` style. Internally delegates to upstream `gms_use_mem_pool(tag, device)`.
 - `finalize_write()` delegates to upstream `gpu_memory_service.integrations.common.utils.finalize_gms_write()`, which performs `register_module_tensors → cuda.synchronize → commit → connect(RO) → remap_all_vas` in one call. Returns the total bytes committed.
-- `move_untracked_params()` mirrors the upstream private `gpu_memory_service.integrations.trtllm.model_loader._move_untracked_params` — iterates via `_iter_module_tensors`, dedups by storage pointer, allocates fresh GMS mappings via `create_mapping()`, and rebinds via `_tensor_from_pointer`. We intentionally re-implement instead of importing the private symbol; promoting it to public is tracked as GMS-2 in [§15 Upstream Alignment Requests](15-prototype-validation-plan.md#-api-alignment--prototype--current-gms--mx-done).
+- `move_untracked_params()` mirrors the upstream private `gpu_memory_service.integrations.trtllm.model_loader._move_untracked_params` — iterates via `_iter_module_tensors`, dedups by storage pointer, allocates fresh GMS mappings via `create_mapping()`, and rebinds via `_tensor_from_pointer`. We intentionally re-implement instead of importing the private symbol; promoting it to public is tracked as GMS-2 in [§15 Upstream Alignment Requests](15-prototype-validation-plan.md#upstream-alignment-requests).
 - `connect()` applies `patch_empty_cache()` from `gpu_memory_service.integrations.common.patches` to prevent `torch.cuda.empty_cache()` from segfaulting on VMM-backed GMS allocations — this is critical for MoE models whose load balancer calls `empty_cache()` during `make_tensor_host_accessible()`
 - We deliberately do **NOT** use the upstream `setup_gms()` integration entry point. `setup_gms()` works by `_trt_loader.ModelLoader.load = patched_load` — runtime monkey-patching of TRT-LLM internals from outside, which is opaque at code-review time and conflicts with TRT-LLM's two-axis design. TRT-LLM owns the integration policy; the `GPUMemoryBackend` adapter is the explicit, reviewable boundary.
 - Pin the upstream dep to a tested major: `gpu-memory-service>=0.9.0,<0.10.0` (declared as the `gms` extra in `setup.py`).
