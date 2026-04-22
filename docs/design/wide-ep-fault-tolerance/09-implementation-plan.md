@@ -6,34 +6,39 @@
 
 ```mermaid
 graph LR
+    MXGMS>"External: MX-GMS Phase 2<br/>(GMS zero-copy import)"]
+
     subgraph "Phase 1: Immediate Survival (P0)"
-        MVP["MVP (v0)<br/>NVLinkOneSided only<br/>8-10 weeks"]
-        P1V1["v1 full scope<br/>All NVLink backends<br/>Full EPLB reconfigure<br/>Multi-failure<br/>+8-12 weeks"]
+        MVP["MVP (v0)<br/>NVLinkOneSided only<br/>6-7 weeks"]
+        P1V1["v1 full scope<br/>All NVLink backends<br/>Full EPLB reconfigure<br/>Multi-failure<br/>+6-9 weeks"]
         MVP --> P1V1
     end
 
     subgraph "Phase 1-DS: Disagg FT (P1)"
-        DS["DS.1-6<br/>Cross-pool coordination<br/>4-6 weeks"]
+        DS["DS.1-6<br/>Cross-pool coordination<br/>3-4 weeks"]
     end
 
     subgraph "Phase 2: Full Restoration (P1)"
-        P2A["2a: PG Reconstruction"]
-        P2B["2b: Shadow EP Ranks"]
-        P2C["2c: Orchestrator"]
+        P2A["2a: PG Reconstruction<br/>3-4 weeks"]
+        P2B["2b: Shadow EP Ranks<br/>3-4 weeks"]
+        P2C["2c: Orchestrator<br/>2-3 weeks"]
         P2A --> P2C
         P2B --> P2C
     end
 
     subgraph "Phase 3: Proactive (P2)"
-        P3A["3a: Latency Anomaly"]
-        P3B["3b: Preemptive Migration"]
+        P3A["3a: Latency Anomaly<br/>2-3 weeks"]
+        P3B["3b: Preemptive Migration<br/>2-3 weeks"]
         P3A --> P3B
     end
 
     MVP --> DS
     P1V1 --> P2A
+    MXGMS -.->|external prerequisite| P2B
     P2C --> P3A
 ```
+
+> **All calendar estimates below assume engineers are working with AI coding-agent assistance that reduces coding and review-iteration time by roughly 30-40% on straightforward S/M-size PRs and ~20-25% on L-size PRs where distributed-systems design (not coding bandwidth) is the gating factor. Without that assistance, add ~30% to every figure in this chapter.
 
 ## Prerequisites
 
@@ -57,13 +62,14 @@ Each numbered item (e.g., **1a.2**) maps to one PR — a focused, reviewable uni
 
 | Size | LOC | Engineer time | Calendar time |
 |:---|:---|:---|:---|
-| **S** | <300 | 1-3 days | 1-2 weeks |
-| **M** | 300-1000 | 3-7 days | 2-3 weeks |
-| **L** | 1000+ or deep complexity | 1-3 weeks | 3-6 weeks |
+| **S** | <300 | 0.5-2 days | 0.5-1 weeks |
+| **M** | 300-1000 | 2-5 days | 1-2 weeks |
+| **L** | 1000+ or deep complexity | 0.5-2 weeks | 2-4 weeks |
 
 - **Engineer time** is focused work on the change itself.
 - **Calendar time** includes design review, code review iterations, CI runs, pre-commit hook fixes, and serialization against other in-flight PRs in the same area. This is what affects the wall-clock delivery date.
-- The ratio (calendar ≈ 2-3× engineer time) reflects typical TRT-LLM review cycles for non-trivial PRs.
+- **AI coding-agent assumption:** figures above already factor in roughly a 30-40% reduction on S/M PRs (AI drafts + tests + addresses review comments in fewer human iterations) and ~20-25% on L PRs (design-heavy items — kernel work, distributed consensus, harness design — are gated by design uncertainty more than coding speed, so AI helps less). Without AI assistance, multiply each row by ~1.3×.
+- The ratio (calendar ≈ 2-3× engineer time) reflects typical TRT-LLM review cycles for non-trivial PRs, already adjusted for AI-assisted review.
 
 **Dependency semantics:** `Deps: 1a.1` means this PR needs 1a.1 merged (or at least landed behind a feature flag) before it can be reviewed for merge. PRs without listed deps can be opened in parallel.
 
@@ -77,7 +83,7 @@ Each numbered item (e.g., **1a.2**) maps to one PR — a focused, reviewable uni
 
 ### Phase 1 MVP (v0) vs Full Scope
 
-Phase 1 has a natural MVP that proves the rank-masking approach end-to-end on the primary backend with minimum risk, and a follow-up (v1) that broadens backend coverage and hardens EPLB reconfiguration. The MVP targets a **single-failure scenario on NVLinkOneSided** and is estimated at **8-10 weeks** (revised up from an initial 6-8 week estimate after the April 2026 source review surfaced three net-new components: `kMaxRanks` bump, NCCL FT wiring, and the MPI FT subcomm). The full Phase 1 scope (all NVLink backends, full EPLB reconfigure, multi-failure consensus) remains 3-4 months.
+Phase 1 has a natural MVP that proves the rank-masking approach end-to-end on the primary backend with minimum risk, and a follow-up (v1) that broadens backend coverage and hardens EPLB reconfiguration. The MVP targets a **single-failure scenario on NVLinkOneSided** and is estimated at **6-7 weeks** with AI coding-agent assistance. The estimate has evolved twice: (1) the initial pre-review estimate was 6-8 weeks; (2) the April 2026 source review surfaced four net-new components (`kMaxRanks` bump, NCCL FT wiring, MPI FT subcomm, fault-injection harness) that pushed a *baseline* (unassisted) estimate to 8-10 weeks; (3) the AI-assisted estimate absorbs that added scope, bringing the current figure back to 6-7 weeks. The full Phase 1 scope (all NVLink backends, full EPLB reconfigure, multi-failure consensus) is 2.5-3 months with AI assistance (vs. 3-4 months unassisted).
 
 **In MVP scope (v0):**
 
@@ -104,7 +110,7 @@ Phase 1 has a natural MVP that proves the rank-masking approach end-to-end on th
 
 Deliverable tags in the sub-phases below: **(MVP)** = required for v0 ship; **(v1)** = required for full Phase 1.
 
-### 1a: AlltoAll Timeout and Rank Masking (4-6 weeks)
+### 1a: AlltoAll Timeout and Rank Masking (3-4 weeks)
 
 **Scope:** Add timeout and rank masking to NVLink AlltoAll communication backends.
 
@@ -135,7 +141,7 @@ Deliverable tags in the sub-phases below: **(MVP)** = required for v0 ship; **(v
 - MVP: unit test with one rank masked, AlltoAll completes on N-1 ranks; integration test kills one process, surviving ranks complete AlltoAll.
 - v1: all NVLink backends pass the same test; steady-state overhead benchmark <0.1% regression.
 
-### 1b: EPLB Topology Adaptation (4-6 weeks, parallel with 1a)
+### 1b: EPLB Topology Adaptation (3-4 weeks, parallel with 1a)
 
 **Scope:** Add `reconfigure()` to the C++ MoeLoadBalancer for dynamic EP topology changes.
 
@@ -169,7 +175,7 @@ Deliverable tags in the sub-phases below: **(MVP)** = required for v0 ship; **(v
 - MVP: 4-GPU test, rank killed → `reconfigure_mask_only` completes in <10ms at iteration boundary → next forward routes around dead rank.
 - v1: reconfigure EP=32→31 with weight migration; all 256 experts reachable; <50ms total.
 
-### 1c: Failure Detection and Broadcast (3-4 weeks, parallel with 1a/1b)
+### 1c: Failure Detection and Broadcast (2-3 weeks, parallel with 1a/1b)
 
 **Scope:** Extend PR #12718's error infrastructure for per-EP-rank health tracking.
 
@@ -199,7 +205,7 @@ Deliverable tags in the sub-phases below: **(MVP)** = required for v0 ship; **(v
 - MVP: inject NCCL error for rank X, verify X marked failed within 2 iterations and broadcast consensus achieved.
 - v1: 2 ranks die within 1s window, both detected and masked correctly; no false positives from slow rank.
 
-### 1d: Integration, Productionization, and E2E Validation (3-4 weeks, after 1a/1b/1c)
+### 1d: Integration, Productionization, and E2E Validation (2-3 weeks, after 1a/1b/1c)
 
 **Scope:** Wire all Phase 1 components together, add production-readiness polish, and validate end-to-end.
 
@@ -264,7 +270,7 @@ Deliverable tags in the sub-phases below: **(MVP)** = required for v0 ship; **(v
 
 > **Why process group reconstruction lives here, not in Phase 1:** Phase 1 uses rank masking to avoid process group reconstruction entirely — the system serves at N-1 capacity without touching any NCCL/NVSHMEM/MPI groups. This is deliberate: process group reconstruction is the hardest distributed coordination problem in fault tolerance (requires all surviving ranks to agree, tear down collectively, and rebuild atomically — with deadlock risks from DeepEP barriers, NVSHMEM symmetric memory, and MPI collectives). By deferring it to Phase 2, we get two critical benefits: (1) Phase 1 ships faster and with lower risk, and (2) reconstruction happens in the background while the system is already serving, not while it's down. Process group reconstruction is not abandoned — it is the **core deliverable of Phase 2** and is required for restoring full N-rank capacity.
 
-### 2a: Process Group Reconstruction (4-6 weeks)
+### 2a: Process Group Reconstruction (3-4 weeks)
 
 **Scope:** Enable creating new NCCL/NVSHMEM/MPI process groups with N ranks (surviving + replacement).
 
@@ -284,7 +290,7 @@ Deliverable tags in the sub-phases below: **(MVP)** = required for v0 ship; **(v
 
 **Technical note:** 2a.1–2a.5 are the "coordinated teardown" piece flagged in [§10 Risk 3](10-risks.md#risk-3-process-group-reconstruction-deadlocks) — each comm backend has its own deadlock hazard that needs careful sequencing.
 
-### 2b: MX-GMS Shadow EP Ranks (4-6 weeks, parallel with 2a)
+### 2b: MX-GMS Shadow EP Ranks (3-4 weeks, parallel with 2a)
 
 **Scope:** Extend MX-GMS shadow worker concept to per-EP-rank shadows.
 
@@ -299,7 +305,7 @@ Deliverable tags in the sub-phases below: **(MVP)** = required for v0 ship; **(v
 
 **Dependency:** MX-GMS Phase 2 (GMS integration) must be available for 2b.1.
 
-### 2c: Orchestrator Integration (3-4 weeks, after 2a/2b)
+### 2c: Orchestrator Integration (2-3 weeks, after 2a/2b)
 
 **Scope:** Wire Phase 2 into Ray/K8s/Dynamo orchestration.
 
@@ -315,7 +321,7 @@ Deliverable tags in the sub-phases below: **(MVP)** = required for v0 ship; **(v
 
 **Goal:** Detect degrading ranks before they fail and preemptively migrate experts.
 
-### 3a: Latency Anomaly Detection (3-4 weeks)
+### 3a: Latency Anomaly Detection (2-3 weeks)
 
 **PR breakdown:**
 
@@ -325,7 +331,7 @@ Deliverable tags in the sub-phases below: **(MVP)** = required for v0 ship; **(v
 | **3a.2** | Anomaly detector (3× median rule) | 3 | `ep_metrics.py` | S | 3a.1 |
 | **3a.3** | Alerting integration with `trtllm-serve` metrics | 3 | metrics endpoint | S | 3a.2 |
 
-### 3b: Preemptive Expert Migration (3-4 weeks)
+### 3b: Preemptive Expert Migration (2-3 weeks)
 
 **PR breakdown:**
 
@@ -340,59 +346,61 @@ Phase totals account for parallelism: multiple PRs in the same sub-phase (e.g., 
 
 | Phase | PRs | Calendar time | Depends on | Deliverable |
 |:------|:----|:-------------|:-----------|:------------|
-| **Phase 1 MVP (v0)** | 1a.1–1a.4, 1b.1–1b.3, 1c.1–1c.4, 1d.1–1d.5 (12 PRs) | **8-10 weeks** with 2-3 engineers (was 6-8; +2 weeks for the 1c.3 MPI FT subcomm and 1d.4 fault-injection harness, both net-new) | Kernel source access; PR #12718 commits rebased into base branch | Single-failure survival on NVLinkOneSided; <10s recovery; no weight movement at recovery time |
-| **Phase 1 v1** | 1a.5–1a.8, 1b.4–1b.7, 1c.5–1c.6, 1d.6–1d.7 (12 PRs) | **8-12 weeks after MVP** | MVP landed | All NVLink backends, full EPLB reconfigure + weight migration, multi-failure, production polish |
-| **Phase 1-DS** | DS.1–DS.6 (6 PRs) | **4-6 weeks, parallelizable with v1** | MVP landed | Disagg serving FT with cross-pool coordination |
-| **Phase 2: Restoration** | 2a.1–2a.7, 2b.1–2b.4, 2c.1–2c.3 (14 PRs) | **14-20 weeks** | Phase 1 v1 complete (2a); MX-GMS Phase 2 (2b) | Full N-rank capacity restoration via process group reconstruction + shadow EP ranks |
-| **Phase 3: Proactive** | 3a.1–3a.3, 3b.1–3b.2 (5 PRs) | **6-8 weeks** | Phase 2 complete | Preemptive degradation detection + expert migration |
+| **Phase 1 MVP (v0)** | 1a.1–1a.4, 1b.1–1b.3, 1c.1–1c.4, 1d.1–1d.5 (12 PRs) | **6-7 weeks** with 2-3 engineers + AI coding-agent assistance (see "How to Read This Plan" for the multiplier rationale; absorbs the 4 net-new components surfaced in the April 2026 source review) | Kernel source access; PR #12718 commits rebased into base branch | Single-failure survival on NVLinkOneSided; <10s recovery; no weight movement at recovery time |
+| **Phase 1 v1** | 1a.5–1a.8, 1b.4–1b.7, 1c.5–1c.6, 1d.6–1d.7 (12 PRs) | **6-9 weeks after MVP** | MVP landed | All NVLink backends, full EPLB reconfigure + weight migration, multi-failure, production polish |
+| **Phase 1-DS** | DS.1–DS.6 (6 PRs) | **3-4 weeks, parallelizable with v1** | MVP landed | Disagg serving FT with cross-pool coordination |
+| **Phase 2: Restoration** | 2a.1–2a.7, 2b.1–2b.4, 2c.1–2c.3 (14 PRs) | **10-14 weeks** | Phase 1 v1 complete (2a); MX-GMS Phase 2 (2b) | Full N-rank capacity restoration via process group reconstruction + shadow EP ranks |
+| **Phase 3: Proactive** | 3a.1–3a.3, 3b.1–3b.2 (5 PRs) | **4-6 weeks** | Phase 2 complete | Preemptive degradation detection + expert migration |
 
 **Total PRs:** 49 across all phases. The MVP alone is 12 PRs.
 
-**Total wall-clock estimates:**
+**Total wall-clock estimates (with AI coding-agent assistance):**
 
-- **Phase 1 MVP:** 8-10 weeks (revised from 6-8 after April 2026 source-discovery review surfaced two net-new components: MPI failure-tolerant subcomm and fault-injection harness)
-- **Phase 1 complete (MVP + v1 + DS):** ~18-26 weeks ≈ 4-6 months
-- **Phase 2 complete:** +14-20 weeks ≈ +3.5-5 months after Phase 1
-- **Full program (Phase 1 + 2 + 3):** ~10-14 months
+- **Phase 1 MVP:** 6-7 weeks. History: initial pre-review 6-8 weeks → post-April-review baseline 8-10 weeks (added scope: `kMaxRanks` bump, NCCL FT wiring, MPI FT subcomm, fault-injection harness) → AI-assisted 6-7 weeks (the assistance absorbs the added scope, not the original scope).
+- **Phase 1 complete (MVP + v1 + DS):** ~13-20 weeks ≈ 3-5 months
+- **Phase 2 complete:** +10-14 weeks ≈ +2.5-3.5 months after Phase 1
+- **Full program (Phase 1 + 2 + 3):** ~7-10 months
+
+**Without AI assistance**, apply the ~1.3× multiplier per the size table: Phase 1 MVP reverts to 8-10 weeks; full program to ~10-14 months.
 
 **Honest caveats:**
 
-- These estimates assume 2-3 engineers with overlapping availability, not a single person.
+- These estimates assume 2-3 engineers with overlapping availability (not a single person) *and* AI coding-agent assistance on both implementation and review. Without AI assistance, apply ~1.3× to every figure (see "How to Read This Plan").
 - L-sized PRs in MVP (1a.2 NVLinkOneSided kernel, 1c.3 MPI FT subcomm, 1d.4 fault-injection harness) carry the most schedule risk. The April 2026 discovery review specifically called out:
-  - **1a.2:** straightforward modification of an existing kernel structure (not a from-scratch kernel) — confidence raised after source review.
-  - **1c.3:** more uncertain — `MPI_ERRORS_RETURN` + non-blocking poll patterns work in vanilla MPI but ULFM availability depends on the MPI build (OpenMPI ULFM is opt-in, MVAPICH support varies). Worst case: live with single-failure-only and skip ULFM in MVP.
-  - **1d.4:** harness design risk — getting a clean kernel-abort-mid-collective without poisoning the test runner is the unsolved piece.
-- v1 L-sized PRs (1b.4 mutable epSize/epRank, 1b.6 weight migration) reliably surface 2-4 weeks of unplanned edge cases beyond the initial design.
-- Calendar time includes code review iteration. If review bandwidth is constrained, multiply by 1.5×.
-- External blockers (PR #12718 sequencing, DeepEP NVSHMEM API, MX-GMS Phase 2 availability) affect their dependent items. PR #12718 sequencing is the only one on the MVP critical path.
+  - **1a.2:** straightforward modification of an existing kernel structure (not a from-scratch kernel) — confidence raised after source review. AI assistance helps with kernel-side boilerplate, mask-threading, and CI iteration, but the memory-ordering reasoning is still human-gated.
+  - **1c.3:** more uncertain — `MPI_ERRORS_RETURN` + non-blocking poll patterns work in vanilla MPI but ULFM availability depends on the MPI build (OpenMPI ULFM is opt-in, MVAPICH support varies). Worst case: live with single-failure-only and skip ULFM in MVP. AI assistance does not reduce this risk because the unknowns are external (MPI build configuration).
+  - **1d.4:** harness design risk — getting a clean kernel-abort-mid-collective without poisoning the test runner is the unsolved piece. AI assistance helps with the test-scaffolding/fixture plumbing once the design is settled, less with the design itself.
+- v1 L-sized PRs (1b.4 mutable epSize/epRank, 1b.6 weight migration) reliably surface 1.5-3 weeks of unplanned edge cases beyond the initial design (down from 2-4 weeks unassisted — AI agents help catch edge cases earlier in review).
+- Calendar time includes code review iteration. If review bandwidth is constrained and AI-assisted review is *not* available, multiply by 1.5×.
+- External blockers (PR #12718 sequencing, DeepEP NVSHMEM API, MX-GMS Phase 2 availability) affect their dependent items and are **not** improved by AI assistance. PR #12718 sequencing is the only external blocker on the MVP critical path.
 
 ### MVP Critical Path
 
 ```mermaid
 gantt
-    title Phase 1 MVP Critical Path (8-10 weeks)
+    title Phase 1 MVP Critical Path (6-7 weeks, AI coding-agent assisted)
     dateFormat X
     axisFormat %w
 
     section Python track
     1a.1 EPGroupHealth                   :a1, 0, 1w
     1a.4 AlltoAllWatchdog                :a2, after a1, 1w
-    1c.1-2 Error cls + per-rank tracker  :a6, after a2, 2w
+    1c.1-2 Error cls + per-rank tracker  :a6, after a2, 1w
 
     section CUDA track
-    1a.2 NVLinkOneSided kernel mask      :crit, a3, 0, 4w
+    1a.2 NVLinkOneSided kernel mask      :crit, a3, 0, 3w
     1a.3 NVLinkOneSided binding          :a4, after a3, 1w
 
     section EPLB track
-    1b.1-3 EPLB slot-remap + wire        :a5, 1w, 3w
+    1b.1-3 EPLB slot-remap + wire        :a5, 1w, 2w
 
     section Distributed track
-    1c.3 MPI FT subcomm + thread         :crit, ac3, 1w, 4w
+    1c.3 MPI FT subcomm + thread         :crit, ac3, 1w, 3w
 
     section Integration
     1c.4 Model engine integration        :a7, after ac3, 1w
-    1d.1-3 Flag + health + metrics       :a8, 6w, 1w
-    1d.4 Fault-injection harness         :crit, a9, 6w, 3w
+    1d.1-3 Flag + health + metrics       :a8, after a7, 1w
+    1d.4 Fault-injection harness         :crit, a9, after a7, 2w
     1d.5 Overhead regression             :a10, after a9, 1w
 ```
 

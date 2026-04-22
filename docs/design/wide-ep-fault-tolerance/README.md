@@ -63,7 +63,7 @@ This doc uses specific terms consistently. The same concept sometimes appears un
 | **Slot remap** | *EPLB-level* operation: rewrite `MoePlacementInfo` so the dead rank's slots point to surviving replicas. No H2D weight copy. Implemented in §06. |
 | **Emergency reconfigure** | The combined MVP recovery action = rank masking + slot remap. Triggered by failure detection; completes at the next iteration boundary. Target <10ms end-to-end. |
 | **Weight migration** | *v1-only* operation: H2D copy of expert weights into a new slot. Required when an expert loses all replicas (replication=1 case). The MVP avoids this by requiring replication ≥ 2. |
-| **MVP (v0)** | The first shipping milestone. Single failure, NVLinkOneSided backend only, slot-remap recovery (no weight move). 8-10 weeks. |
+| **MVP (v0)** | The first shipping milestone. Single failure, NVLinkOneSided backend only, slot-remap recovery (no weight move). 6-7 weeks with AI coding-agent assistance (8-10 weeks baseline). See [§09](09-implementation-plan.md) for the assumption. |
 | **v1** | Full Phase 1 scope: all NVLink backends, weight migration, multi-failure consensus. Ships after MVP. |
 | **Phase 2** | Full restoration: bring up a replacement rank and rebuild the process group. Optional — Phase 1 is sufficient for continued serving. |
 | **Work tracks 1a/1b/1c/1d** | Parallel engineering tracks inside Phase 1 (see §09). Not time-slices. |
@@ -102,11 +102,13 @@ This is not routine integration work. The design tackles several problems that a
 
 | Phase | Priority | Timeline | Rationale |
 |:------|:---------|:---------|:----------|
-| **Phase 1 MVP (v0)** | **P0** | **8-10 weeks** | **Single-failure survival on NVLinkOneSided (primary NVL72 backend); eliminates 7-8 min downtime for the dominant failure mode. Scope cuts: no NVLinkTwoSided, no full EPLB reconfigure, no multi-failure. Revised up from 6-8 weeks after April 2026 source review surfaced three net-new components (kMaxRanks bump, NCCL FT wiring, MPI FT subcomm). See [§09 Phase 1 MVP](09-implementation-plan.md#phase-1-mvp-v0-vs-full-scope).** |
-| Phase 1 full (v1) | P0 | ~8-12 weeks after MVP | Broadens to all NVLink backends, adds full EPLB reconfigure with weight migration, multi-failure consensus |
-| **Phase 1-DS: Disagg FT** | **P1** | **~4-6 weeks, parallelizable with Phase 1 v1** | **Extends FT to disaggregated serving. Starts after Phase 1 MVP; does not block v1.** |
-| Phase 2: Full Restoration | P1 | 3-6 months | Process group reconstruction; restores full N-rank capacity; benefits from MX-GMS for fast recovery |
-| Phase 3: Proactive Resilience | P2 | 6-12 months | Predictive failure detection, preemptive expert migration |
+| **Phase 1 MVP (v0)** | **P0** | **6-7 weeks** (AI-assisted) | **Single-failure survival on NVLinkOneSided (primary NVL72 backend); eliminates 7-8 min downtime for the dominant failure mode. Scope cuts: no NVLinkTwoSided, no full EPLB reconfigure, no multi-failure. Estimate history: initial 6-8 weeks → post-April-review baseline 8-10 weeks (added scope: kMaxRanks bump, NCCL FT wiring, MPI FT subcomm, fault-injection harness) → AI coding-agent assistance absorbs the added scope back to 6-7 weeks. See [§09 Phase 1 MVP](09-implementation-plan.md#phase-1-mvp-v0-vs-full-scope).** |
+| Phase 1 full (v1) | P0 | ~6-9 weeks after MVP (AI-assisted) | Broadens to all NVLink backends, adds full EPLB reconfigure with weight migration, multi-failure consensus |
+| **Phase 1-DS: Disagg FT** | **P1** | **~3-4 weeks, parallelizable with Phase 1 v1** | **Extends FT to disaggregated serving. Starts after Phase 1 MVP; does not block v1.** |
+| Phase 2: Full Restoration | P1 | 2.5-3.5 months (AI-assisted) | Process group reconstruction; restores full N-rank capacity; benefits from MX-GMS for fast recovery |
+| Phase 3: Proactive Resilience | P2 | 4-6 months (AI-assisted) | Predictive failure detection, preemptive expert migration |
+
+> **All timelines above assume engineers work with AI coding-agent assistance that reduces coding and review time by ~30-40% on S/M-size PRs and ~20-25% on design-heavy L-size PRs. Without that assistance, apply ~1.3× to every figure. See [§09 "How to Read This Plan"](09-implementation-plan.md#how-to-read-this-plan) for the rationale.
 
 ## Related Work
 
