@@ -378,31 +378,33 @@ Phase totals account for parallelism: multiple PRs in the same sub-phase (e.g., 
 
 ```mermaid
 gantt
-    title Phase 1 MVP Critical Path (6-7 weeks, AI coding-agent assisted)
-    dateFormat X
-    axisFormat %w
+    title Phase 1 MVP Critical Path (~7 weeks, AI coding-agent assisted)
+    dateFormat YYYY-MM-DD
+    axisFormat %b %d
 
     section Python track
-    1a.1 EPGroupHealth                   :a1, 0, 1w
-    1a.4 AlltoAllWatchdog                :a2, after a1, 1w
-    1c.1-2 Error cls + per-rank tracker  :a6, after a2, 1w
+    1a.1 EPGroupHealth                   :a1, 2026-05-04, 5d
+    1a.4 AlltoAllWatchdog                :a2, after a1, 5d
+    1c.1-2 Error cls + per-rank tracker  :a6, after a2, 7d
 
     section CUDA track
-    1a.2 NVLinkOneSided kernel mask      :crit, a3, 0, 3w
-    1a.3 NVLinkOneSided binding          :a4, after a3, 1w
+    1a.2 NVLinkOneSided kernel mask      :crit, a3, 2026-05-04, 21d
+    1a.3 NVLinkOneSided binding          :a4, after a3, 5d
 
     section EPLB track
-    1b.1-3 EPLB slot-remap + wire        :a5, 1w, 2w
+    1b.1-3 EPLB slot-remap + wire        :a5, 2026-05-11, 14d
 
     section Distributed track
-    1c.3 MPI FT subcomm + thread         :crit, ac3, 1w, 3w
+    1c.3 MPI FT subcomm + thread         :crit, ac3, 2026-05-11, 21d
 
     section Integration
-    1c.4 Model engine integration        :a7, after ac3, 1w
-    1d.1-3 Flag + health + metrics       :a8, after a7, 1w
-    1d.4 Fault-injection harness         :crit, a9, after a7, 2w
-    1d.5 Overhead regression             :a10, after a9, 1w
+    1c.4 Model engine integration        :a7, after ac3, 5d
+    1d.1-3 Flag + health + metrics       :a8, after a7, 5d
+    1d.4 Fault-injection harness         :crit, a9, after a7, 12d
+    1d.5 Overhead regression             :a10, after a9, 5d
 ```
+
+> The synthetic start date `2026-05-04` is illustrative — used only so GitHub's Mermaid renderer has valid `YYYY-MM-DD` anchors. Replace with the actual project kickoff date when scheduling.
 
 The MVP has **three critical-path items** (marked `crit`): 1a.2 (NVLinkOneSided kernel mask), 1c.3 (MPI FT subcomm), and 1d.4 (fault-injection harness). All three are net-new and have schedule risk that cannot be mitigated by parallelism — they each gate end-to-end demonstration of one capability. Everything else can parallelize.
 
