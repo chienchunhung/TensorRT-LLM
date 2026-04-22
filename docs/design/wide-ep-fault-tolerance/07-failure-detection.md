@@ -6,6 +6,10 @@
 
 Failure detection is the entry point for the entire fault tolerance system. The design extends [PR #12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718)'s error classification infrastructure from executor-level health (binary: healthy/fatal) to **per-EP-rank health** (each rank has independent health status).
 
+> **Status of PR #12718 (verified 2026-04-21):** Not yet on the `docs-and-plans` working tree HEAD. The relevant commits exist on other branches (`f32efd01e5`, `e3f84ceb02`, `1128c0ff54`, `4aab3c0afc`) and introduce `tensorrt_llm/_torch/pyexecutor/error_classification.py` (`ErrorBudget` dataclass + `classify_error()` returning string literals). **Sequencing:** PRs 1c.1–1c.4 in [§09](09-implementation-plan.md) require these commits to land or be rebased into the implementation base branch first.
+>
+> **Naming alignment:** PR #12718 uses **string literals** (`"immediate_fatal"`, `"severe"`, `"transient"`) returned by `classify_error()` — not an `enum.Enum` class. This design doc previously used C-style identifiers (`EP_IMMEDIATE_FATAL`, etc.); those should be read as the **EP-extension regex pattern lists** added to PR #12718's classifier, with the classifier itself still returning the same three string literals. If a typed enum is preferred, a separate up-front PR can promote PR #12718's strings to a `IntEnum`; that is a coordination decision with the PR #12718 author and not blocking for this design.
+
 ## Detection Layers
 
 ```mermaid
@@ -205,19 +209,27 @@ class EPLatencyMonitor:
 
 ## Error Classification Extensions
 
-PR #12718 defines three error tiers. For WideEP FT, we add EP-specific patterns:
+PR #12718 defines three error tiers as **string literals** returned by `classify_error()` (`"immediate_fatal"` / `"severe"` / `"transient"`), driven by regex match against the lowercased error message. PR #12718's MVP patterns:
+
+- `"immediate_fatal"`: `cudaerrorillegaladdress`, `cudaerrorlaunchfailure`, `illegal memory access`, `device-side assert`, `unrecoverable`
+- `"severe"`: `cuda out of memory`, `cuda error`, `nccl error`
+- `"transient"`: fallthrough
+
+For WideEP FT, we extend these regex pattern lists in `error_classification.py`. The classifier still returns the same three string-literal classes — we are adding patterns, not introducing new classes:
 
 ```python
-# Additions to error_classification.py
+# Additions to error_classification.py — extra regexes appended to the
+# existing IMMEDIATE_FATAL / SEVERE / TRANSIENT pattern lists.
+# (The return values stay "immediate_fatal" / "severe" / "transient".)
 
-EP_IMMEDIATE_FATAL_PATTERNS = [
+EP_IMMEDIATE_FATAL_EXTRA = [
     "nccl communicator abort",
     "nvshmem peer unreachable",
     "mpi rank terminated",
     "cuda context destroyed",
 ]
 
-EP_SEVERE_PATTERNS = [
+EP_SEVERE_EXTRA = [
     "alltoall timeout",
     "nccl timeout",
     "deep_ep buffer barrier hang",
@@ -225,12 +237,14 @@ EP_SEVERE_PATTERNS = [
     "rdma timeout",
 ]
 
-EP_TRANSIENT_PATTERNS = [
-    "alltoall slow",  # rank responded but took longer than expected
+EP_TRANSIENT_EXTRA = [
+    "alltoall slow",         # rank responded but took longer than expected
     "nccl retry",
     "ecc correctable error",
 ]
 ```
+
+The earlier `EP_IMMEDIATE_FATAL` / `EP_SEVERE` / `EP_TRANSIENT` identifiers in this doc refer to these extended pattern groups, not separate enum members.
 
 ## Failure Broadcast Protocol
 
@@ -238,16 +252,35 @@ When a rank failure is detected, all surviving ranks must learn about it before 
 
 The broadcast mechanism depends on the communication infrastructure:
 
-### Option A: Out-of-Band via MPI (Preferred)
+### Option A: Out-of-Band via MPI Failure-Tolerant Subcomm (Preferred)
 
-Use MPI's error-handling mode (`MPI_ERRORS_RETURN`) with a dedicated health communicator:
+> **Verified state of TRT-LLM's distributed channels (April 2026):**
+> - Primary: `MPIDist` (`tensorrt_llm/_torch/distributed/communicator.py:612`) over `mpi_comm()` from `tensorrt_llm._utils` → mpi4py `MPI.COMM_WORLD`. **A running MPI world exists in default WideEP launches** — this is what we'll use.
+> - `torch.distributed` is only initialized in Ray-orchestrated paths; not present in the typical WideEP MPI launch.
+> - PP uses `torch.classes.trtllm.NcclCommunicatorOp` — same NCCL failure mode as the AllGather backend.
+> - `Mapping` (`mapping.py:396`) holds *topology* only, not comm primitives. Cross-rank broadcasts must go through the `MPIDist` instance, not through `Mapping`.
+>
+> **Critical caveat:** plain `MPI_COMM_WORLD` is **not** failure-transparent. With a dead rank, subsequent collectives on `COMM_WORLD` will fail (or hang) on most common MPI implementations — the same way the NVLink AlltoAll hangs, just at a different layer. Naive "use MPI for out-of-band" without further engineering will break.
+
+The Phase 1 MVP "out-of-band" channel is therefore **not just an MPI broadcast**, but a small new component:
+
+1. **A dedicated MPI sub-communicator** (`MPI_Comm_split` from `COMM_WORLD` at startup) used **only** for FT signaling — never for collectives that gate the forward path.
+2. **`MPI_Errhandler_set(comm, MPI_ERRORS_RETURN)`** on this subcomm so a dead peer surfaces an error code instead of aborting the process.
+3. **Point-to-point `Isend` / `Irecv` with periodic `Test`** rather than blocking collectives — a blocking collective on a poisoned communicator deadlocks even with `MPI_ERRORS_RETURN` set.
+4. **A dedicated CPU thread** (separate from PyExecutor's forward thread, modeled after `HangDetector`'s asyncio loop) that polls the FT subcomm. It is unaffected by GPU-side hangs.
+5. **`MPI_Comm_revoke` / ULFM (User-Level Failure Mitigation)** if the linked MPI build supports it; otherwise we live with the subcomm becoming unusable after first failure (acceptable for single-failure MVP).
+
+Failure path:
 
 ```
-Rank 0 detects rank 37 failed
-  → MPI_Allgather on health communicator: "rank 37 dead"
-  → All surviving ranks update ep_group_health.mark_failed(37)
-  → All ranks agree on mask before next forward
+Rank 0 detects rank 37 hung (via AlltoAllWatchdog)
+  → Rank 0's FT thread Isends "rank 37 dead" to all surviving peers on FT-subcomm
+  → Each peer's FT thread Irecvs and updates ep_group_health.mark_failed(37)
+  → Each peer signals its model engine: "next iteration boundary, reconfigure_mask_only"
+  → Iteration N+1 starts with masked rank 37, EPLB pre-reconfigured
 ```
+
+This component is **net-new** — no equivalent exists in TRT-LLM today. PR 1c.3 in [§09](09-implementation-plan.md) is sized accordingly (L, not S).
 
 ### Option B: Piggyback on Existing Iteration Barrier (Elegant)
 

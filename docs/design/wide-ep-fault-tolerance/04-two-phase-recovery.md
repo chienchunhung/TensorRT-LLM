@@ -44,6 +44,8 @@ Phase 1 keeps the system serving after a GPU failure. No replacement rank is nee
 
 ### Recovery Sequence
 
+> **The diagram below depicts Phase 1 v1 behavior** — full reconfigure including weight migration (`doReplication()` + `doPlacement()` + `cudaMemcpy2D`). **MVP recovery is simpler:** slot remap only, no H2D copy, no `doReplication`/`doPlacement` re-run. MVP skips from "update active_rank_mask" straight to "update MoePlacementInfo on GPU" — the surviving replicas of every expert are already resident, and the remapped placement table points tokens to them. See §06 "Terminology — weight migration vs slot remapping for MVP" for why this is correct under the MVP precondition (replication factor ≥ 2).
+
 ```mermaid
 sequenceDiagram
     participant Dead as GPU 37 (Dead)
@@ -60,18 +62,25 @@ sequenceDiagram
     Detector->>Detector: Classify: severe → fatal for rank 37
     Detector->>Alive: Broadcast: rank 37 marked dead
 
-    Note over Alive: Phase 1 begins (~seconds)
+    Note over Alive: Emergency reconfigure begins (next iteration boundary)
 
     Alive->>Alive: Update active_rank_mask: bit 37 = 0
     Alive->>EPLB: reconfigure(ep_size=71, dead_ranks={37})
-    EPLB->>EPLB: doReplication() with 71 ranks × slots_per_rank
-    EPLB->>EPLB: doPlacement() distributing all 256 experts across 71 ranks
-    EPLB->>Host: Read Expert 37's weights from shared memory
-    Host-->>EPLB: Expert weights (~42 MB each in FP8)
-    EPLB->>Alive: cudaMemcpy2D: copy weights to new slots (~ms per expert)
-    EPLB->>Alive: Update MoePlacementInfo on GPU
 
-    Note over Alive: Phase 1 complete — serving resumes
+    alt MVP (slot remap only, replication ≥ 2)
+        EPLB->>Alive: Rewrite MoePlacementInfo: dead-rank slots → surviving replicas
+        Note over EPLB,Alive: Target: <10ms total (no H2D copy)
+    else v1 (full reconfigure with weight migration)
+        EPLB->>EPLB: doReplication() with 71 ranks × slots_per_rank
+        EPLB->>EPLB: doPlacement() distributing all 256 experts across 71 ranks
+        EPLB->>Host: Read zero-replica experts' weights from shared memory
+        Host-->>EPLB: Expert weights (~42 MB each in FP8)
+        EPLB->>Alive: cudaMemcpy2D: copy weights to new slots (~ms per expert)
+        EPLB->>Alive: Update MoePlacementInfo on GPU
+        Note over EPLB,Alive: Target: <50ms total across 58 MoE layers
+    end
+
+    Note over Alive: Emergency reconfigure complete — serving resumes
 
     Alive->>Alive: AlltoAll dispatch/combine with rank_mask (skip rank 37)
     Alive->>Alive: Tokens routed to experts on surviving ranks only
@@ -85,13 +94,13 @@ When rank 37 fails in a 72-rank EP group:
 
 2. **Mask** (<1ms): Set `active_rank_mask[37] = 0`. All communication backends check this mask before dispatching/combining.
 
-3. **Reconfigure EPLB** (~10ms): The C++ `MoeLoadBalancer` runs `doReplication()` + `doPlacement()` with the dead rank excluded. This produces a new expert-to-slot assignment covering all 256 experts across 71 ranks.
+3. **Emergency reconfigure** — two variants:
+   - **MVP (<10ms, no H2D copy):** `MoeLoadBalancer.reconfigure_mask_only()` rewrites `MoePlacementInfo` so dead-rank slots are unreachable; routing falls through to the surviving replicas that already exist. No weight movement. Requires replication ≥ 2 (the DeepSeek-V3 production default).
+   - **v1 (<50ms, includes H2D copy):** Full `MoeLoadBalancer.reconfigure()` — runs `doReplication()` + `doPlacement()` with the dead rank excluded, migrates weights for experts that now have zero replicas (reads from host shared memory, writes to GPU via `cudaMemcpy2D`), updates `MoePlacementInfo`.
 
-4. **Migrate Weights** (~1-5ms per layer): Experts that were exclusively on rank 37 need to be loaded onto other ranks. EPLB reads from host shared memory (already contains all expert weights) and copies to new GPU slots via gdrcopy.
+4. **Update Routing** (<1ms): New `MoePlacementInfo` is copied to all surviving ranks as part of step 3.
 
-5. **Update Routing** (<1ms): New `MoePlacementInfo` (the GPU-side routing table) is copied to all surviving ranks.
-
-6. **Resume** (next iteration): The next forward pass uses the new routing. AlltoAll dispatch sends tokens only to active ranks. Combine only waits for active ranks.
+5. **Resume** (next iteration): The next forward pass uses the new routing. AlltoAll dispatch sends tokens only to active ranks. Combine only waits for active ranks.
 
 ### Memory Impact
 
@@ -115,6 +124,14 @@ During degraded operation (N-1 ranks):
 - **Throughput:** Reduced proportionally. With 71/72 ranks, expect ~1.4% throughput reduction (approximately linear in expert computation capacity).
 - **Latency:** Slightly increased. The surviving ranks handle marginally more expert computation, and EPLB replication quality decreases slightly (fewer slots for hot expert copies).
 - **Correctness:** Fully preserved. Every expert is available on at least one surviving rank. The routing table ensures all tokens reach their target experts.
+
+### Policy for In-Flight Requests at the Moment of Failure
+
+**Requests that were mid-iteration when the rank died fail.** Specifically: the AlltoAll in progress at the moment of failure is abandoned (its kernel was either hung or completed partial work on the surviving ranks), and all requests whose tokens were being processed in that iteration receive an error response. PR #12718's `_handle_errors()` is invoked with `charge_budget=True` for these requests.
+
+Requests waiting in the executor queue but not yet scheduled into the failing iteration are **not** affected — they are picked up in the next iteration with the updated mask and new routing. New requests arriving after the emergency reconfigure are served normally at the reduced capacity.
+
+Recovering the *specific* in-flight requests that failed — for example, replaying them from the last emitted token — is an **orchestration-layer concern**, not a collective-layer one, and is out of scope for this design. In a disaggregated setup, the `trtllm-serve` router can retry a failed generation against a different pool; in an aggregated setup, the client is responsible for resubmission. See [§10 Q2](10-risks.md#q2-what-happens-to-in-flight-requests-during-phase-1-recovery) for the full discussion and alternatives.
 
 ## Phase 2: Full Restoration (P1, Target: <1s with GMS, <30s with MX, minutes with disk)
 
@@ -178,15 +195,7 @@ This process is a coordinated operation that requires all N ranks to participate
 
 ### Shadow EP Ranks (Future Enhancement with MX-GMS)
 
-With the [MX-GMS integration](https://docs.google.com/document/d/14SZmmFcoakgIx2OC4dt8pWcHU14PDTN9KlAKqLoZ15s/edit?usp=sharing), Phase 2 can be pre-staged via shadow EP ranks:
-
-- **Shadow rank:** A standby GPU that pre-loads expert weights via GMS read-only import. It participates in no communication and consumes no serving resources.
-- **Activation on failure:** When a rank dies, the shadow upgrades its GMS lock (RO → RW), joins the process group reconstruction, and begins serving. Total activation: <1s.
-- **Key advantage over competitors:** SGLang has no full restoration path — it permanently operates at reduced capacity. This design restores full capacity in sub-second with GMS shadows.
-
-### Why Shadow EP Ranks Are Fundamentally Faster Than General Shadow Workers
-
-A critical architectural insight: WideEP shadow EP ranks activate dramatically faster than general-purpose shadow workers described in the MX-GMS design. The MX-GMS design identifies KV cache allocation (1-3s) as the activation bottleneck for shadow workers. But with `enable_attention_dp=True`, individual EP ranks run data-parallel attention independently — they don't own per-request KV cache state. The EP ranks exchange *activations* (tokens routed to experts) via AlltoAll, not KV cache. So a shadow EP rank needs only expert weights and process group membership, not per-request state. This eliminates the primary bottleneck and enables <1s activation — a capability unique to WideEP's architecture and one that is **architecturally impossible** for general-purpose failover mechanisms that must handle KV cache.
+With MX-GMS integration, Phase 2 can be pre-staged via a standby GPU that pre-loads expert weights via GMS read-only import and activates (RO → RW) in <1s on failure. The full architectural argument for why shadow *EP* ranks are fundamentally faster than general-purpose shadow workers (KV-cache allocation bottleneck does not apply with `enable_attention_dp=True`) is covered in [§08 Shadow EP Ranks](08-mx-gms-integration.md#shadow-ep-ranks-sub-second-activation). It is the capability that differentiates this design from SGLang's Elastic EP, which has no full restoration path.
 
 ## Phase Comparison
 
@@ -197,6 +206,6 @@ A critical architectural insight: WideEP shadow EP ranks activate dramatically f
 | **Downtime** | <10s (target) | Transparent (Phase 1 covers while Phase 2 runs) |
 | **Requires replacement GPU** | No | Yes |
 | **Process group change** | No (rank masking) | Yes (reconstruction) |
-| **Expert redistribution** | Emergency: fill gaps with redundant copies | Optimal: full EPLB rebalance for N ranks |
+| **Expert redistribution** | MVP: slot remap to surviving replicas. v1: full reconfigure + weight migration for zero-replica experts | Optimal: full EPLB rebalance for N ranks |
 | **External dependency** | None | Orchestrator (Ray/K8s/Dynamo), optionally MX-GMS |
 | **Competitive parity** | Matches SGLang Elastic EP | **Exceeds** all competitors (full restoration) |

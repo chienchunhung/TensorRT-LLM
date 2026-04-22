@@ -2,7 +2,7 @@
 
 **Status:** Draft
 **Created:** 2026-04-10
-**Last Updated:** 2026-04-10
+**Last Updated:** 2026-04-22
 
 ---
 
@@ -50,11 +50,30 @@ Together, the three workstreams form a **layered reliability stack**: detect fai
 - **Inference request durability** — if a request is mid-flight when a rank fails, that specific request is lost. Recovering individual requests across failures is an orchestration-layer concern, not a collective-layer one.
 - **Preemptive / predictive failure mitigation** — deferred to Phase 3.
 
+## Terminology
+
+This doc uses specific terms consistently. The same concept sometimes appears under different labels in prior drafts or in adjacent work (MX-GMS design, SGLang papers); the definitions below are what this doc means.
+
+| Term | Definition |
+|:---|:---|
+| **WideEP** | Wide Expert Parallelism: MoE expert-parallel distribution across ≥32 GPUs (vs. standard EP within a single 8-GPU node). |
+| **EP group** | The set of ranks participating in a single AlltoAll collective. For DeepSeek-V3 on NVL72, `ep=72`. |
+| **EPLB** | **Expert-Parallel Load Balancer** — an *existing* TRT-LLM component (`cpp/tensorrt_llm/runtime/moeLoadBalancer/`, `tensorrt_llm/_torch/modules/fused_moe/moe_load_balancer.py`). Owns the (expert → rank, slot) placement table (`MoePlacementInfo`), updates it at iteration boundaries, and supports redundant expert replicas. **In scope:** extend EPLB with an out-of-band "emergency reconfigure" trigger and a mask-only fast path. **Out of scope:** rewriting EPLB's routing algorithm, changing its balancing heuristic, or replacing it. |
+| **Rank masking** | *Kernel-level* behavior: the AlltoAll kernel reads a bitmask and skips dead peers in its send/poll loops. Implemented in §05. |
+| **Slot remap** | *EPLB-level* operation: rewrite `MoePlacementInfo` so the dead rank's slots point to surviving replicas. No H2D weight copy. Implemented in §06. |
+| **Emergency reconfigure** | The combined MVP recovery action = rank masking + slot remap. Triggered by failure detection; completes at the next iteration boundary. Target <10ms end-to-end. |
+| **Weight migration** | *v1-only* operation: H2D copy of expert weights into a new slot. Required when an expert loses all replicas (replication=1 case). The MVP avoids this by requiring replication ≥ 2. |
+| **MVP (v0)** | The first shipping milestone. Single failure, NVLinkOneSided backend only, slot-remap recovery (no weight move). 8-10 weeks. |
+| **v1** | Full Phase 1 scope: all NVLink backends, weight migration, multi-failure consensus. Ships after MVP. |
+| **Phase 2** | Full restoration: bring up a replacement rank and rebuild the process group. Optional — Phase 1 is sufficient for continued serving. |
+| **Work tracks 1a/1b/1c/1d** | Parallel engineering tracks inside Phase 1 (see §09). Not time-slices. |
+| **Emergency mode / mask-only mode** | Older names for "emergency reconfigure." The API surface in code is `reconfigure_mask_only()`; the prose name is "emergency reconfigure." |
+
 ## Why This Is Technically Hard
 
 This is not routine integration work. The design tackles several problems that are individually challenging and collectively require cross-layer systems expertise:
 
-1. **GPU kernel-level synchronization modification.** The NVLink AlltoAll kernels implement multi-GPU coordination via completion flags in symmetric memory. GPU threads spin-wait on flag values written by peer GPUs — there is no timeout, no abort, no fallback. Adding rank masking requires modifying CUDA kernel code that interacts with multi-GPU memory ordering and synchronization primitives. This is fundamentally different from the API-level masking used by SGLang (Mooncake `activeRanks`) or proposed by vLLM (DeepEP `mask_buffer_ptr`), where masking is provided by an external library. We modify the kernel itself.
+1. **GPU kernel-level synchronization modification.** TRT-LLM's NVLinkOneSided AlltoAll kernel spins on PTX-level completion-flag polling with no host-side abort hook. Adding rank masking requires modifying the CUDA kernel itself — a different class of work from SGLang's and vLLM's API-level integration against third-party libraries (Mooncake, DeepEP). See [§03 "Why kernel-level, and not API-level"](03-competitive-landscape.md#why-kernel-level-and-not-api-level-like-sglang--vllm) for the full argument.
 
 2. **Distributed consensus without the dead participant.** When a rank dies, the surviving N-1 ranks must agree on which rank is dead — but the dead rank cannot participate in the agreement protocol, and the communication infrastructure is itself degraded. This is a variant of the classic failure detection problem in asynchronous distributed systems, where a slow process is indistinguishable from a dead one.
 
@@ -83,7 +102,7 @@ This is not routine integration work. The design tackles several problems that a
 
 | Phase | Priority | Timeline | Rationale |
 |:------|:---------|:---------|:----------|
-| **Phase 1 MVP (v0)** | **P0** | **6-8 weeks** | **Single-failure survival on NVLinkOneSided (primary NVL72 backend); eliminates 7-8 min downtime for the dominant failure mode. Scope cuts: no NVLinkTwoSided, no full EPLB reconfigure, no multi-failure. See [§09 Phase 1 MVP](09-implementation-plan.md#phase-1-mvp-v0-vs-full-scope).** |
+| **Phase 1 MVP (v0)** | **P0** | **8-10 weeks** | **Single-failure survival on NVLinkOneSided (primary NVL72 backend); eliminates 7-8 min downtime for the dominant failure mode. Scope cuts: no NVLinkTwoSided, no full EPLB reconfigure, no multi-failure. Revised up from 6-8 weeks after April 2026 source review surfaced three net-new components (kMaxRanks bump, NCCL FT wiring, MPI FT subcomm). See [§09 Phase 1 MVP](09-implementation-plan.md#phase-1-mvp-v0-vs-full-scope).** |
 | Phase 1 full (v1) | P0 | ~8-12 weeks after MVP | Broadens to all NVLink backends, adds full EPLB reconfigure with weight migration, multi-failure consensus |
 | **Phase 1-DS: Disagg FT** | **P1** | **~4-6 weeks, parallelizable with Phase 1 v1** | **Extends FT to disaggregated serving. Starts after Phase 1 MVP; does not block v1.** |
 | Phase 2: Full Restoration | P1 | 3-6 months | Process group reconstruction; restores full N-rank capacity; benefits from MX-GMS for fast recovery |

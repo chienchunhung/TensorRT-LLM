@@ -154,7 +154,27 @@ The competitive landscape reveals a spectrum of technical depth in how each fram
 | **vLLM** | Plans to call `mask_buffer_ptr` on DeepEP API | **Integration work** — depends on DeepEP exposing the masking API (not yet public). The hard work is in DeepEP. |
 | **TRT-LLM (this design)** | Modifies the actual CUDA AlltoAll kernels that spin on completion flags | **Kernel-level systems work** — we own the kernel code. This means modifying GPU synchronization primitives (completion flag protocols, symmetric memory access patterns) directly. Harder than API integration, but gives complete control on NVIDIA's primary hardware without third-party dependency. |
 
-This distinction matters: SGLang's Elastic EP is the current leader in production readiness, but its fault tolerance capability is fundamentally bounded by what the Mooncake EP API exposes. TRT-LLM, by owning the NVLink AlltoAll kernels, can implement masking, timeout, and future enhancements (e.g., partial AlltoAll completion, adaptive timeout) at the most fundamental level.
+### Why kernel-level, and not API-level like SGLang / vLLM?
+
+The backend primitive dictates where the mask has to live.
+
+**TRT-LLM's NVLinkOneSided AlltoAll** (the performance-critical backend for DeepSeek-V3 on GB200/NVL72) is a custom CUDA kernel that spins in SASS code on device memory, using raw PTX `ld.relaxed.sys.u32` / `st.relaxed.sys.u32` against a `completion_flags[kMaxRanks][kMaxRanks]` table in symmetric memory (see `cpp/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.cu:537-584` and `:1190-1217`). There is **no host-side abort hook**. When a peer dies, the peer's flag is never set; the kernel is stuck in a busy-wait with no cooperative yield the host can reach into:
+
+- `cudaStreamDestroy` / `cudaDeviceReset` end the process — they are not in-place recoveries.
+- The kernel's own 300s `check_timeout` at `moeAlltoAllKernels.cu:156-161` calls `asm volatile("trap;")`, which corrupts the CUDA context on the surviving rank — also not an in-place recovery.
+- NCCL has `NCCL_ASYNC_ERROR_HANDLING` + `ncclCommAbort` for exactly this purpose, but NVLinkOneSided is not NCCL — and a repo-wide search also found **zero uses** of `ncclCommAbort` / `NCCL_ASYNC_ERROR_HANDLING` anywhere in TRT-LLM outside tests, so even the NCCL-based `AllGatherReduceScatter` fallback needs that plumbing built before it can mask failures at the Python layer (see §05 and PR 1a.7 in §09).
+
+**Therefore** the skip decision — "don't poll peer N because N is dead" — must be evaluated *inside* the kernel, gated on a mask buffer the host can update between iteration boundaries. This is a kernel modification, not a Python wrapper change.
+
+**SGLang and vLLM** don't have this problem because:
+- **SGLang** uses Mooncake EP, which implements masking *inside* its own kernel but exposes it as an API parameter (`activeRanks`). From SGLang's perspective it's a one-line call. The hard work lives in Mooncake.
+- **vLLM**'s in-flight RFC targets DeepEP's planned `mask_buffer_ptr` — again an API parameter, with the kernel-level work hidden inside DeepEP.
+
+In both cases, the kernel-level systems work exists — it just happens in a third-party library the application framework consumes. **TRT-LLM does not have a third-party library to consume for NVLinkOneSided.** We own the kernel, and the masking has to be added there. The upside is full control (no external dependency, no API limitation, ability to evolve completion-flag protocol for future enhancements). The downside is that this is a deeper class of work — multi-GPU memory ordering, PTX memory-consistency guarantees, and race-free mask propagation across surviving ranks — than SGLang or vLLM's equivalent PRs look like.
+
+**The question "why not just switch to NCCL?" has a straightforward answer:** NVLinkOneSided is the *performance* backend for GB200/NVL72. Falling back to NCCL AllGatherReduceScatter sacrifices the perf that motivated WideEP in the first place, and NCCL FT still needs wiring (same tool, different layer) before it is a viable fallback. NVLinkOneSided is the primary MVP target by design.
+
+This distinction matters: SGLang's Elastic EP is the current leader in production readiness, but its fault-tolerance capability is fundamentally bounded by what the Mooncake EP API exposes. TRT-LLM, by owning the NVLink AlltoAll kernels, can implement masking, timeout, and future enhancements (e.g., partial AlltoAll completion, adaptive timeout) at the most fundamental level.
 
 ## TRT-LLM's Differentiation Opportunity
 
@@ -164,7 +184,7 @@ While SGLang's Elastic EP is the current leader, TRT-LLM has several architectur
 
 2. **NVLink-native rank masking (kernel-level, not API-level):** TRT-LLM's NVLink one-sided/two-sided backends are the primary paths for GB200/NVL72 — NVIDIA's target hardware. Unlike SGLang (which depends on Mooncake) or vLLM (which depends on DeepEP's unreleased `mask_buffer_ptr`), this design modifies the actual CUDA kernels that implement AlltoAll synchronization. This gives complete control over the masking behavior — no third-party dependency, no API limitation, and the ability to implement future optimizations (partial AlltoAll completion, adaptive per-rank timeouts) that external APIs cannot provide.
 
-3. **Full restoration path — a capability no competitor has:** SGLang permanently runs degraded after a failure. vLLM's RFC proposes elastic scale-up/down but has no implementation. This design includes Phase 2 full restoration via MX-GMS shadow EP ranks. A critical insight makes this especially powerful: with `enable_attention_dp=True`, individual EP ranks don't own per-request KV cache state — they only process expert computation. The MX-GMS design identifies KV cache allocation (1-3s) as the activation bottleneck for general shadow workers. For WideEP shadow EP ranks, this bottleneck doesn't exist, enabling sub-second activation that is **architecturally impossible** for general-purpose shadow failover.
+3. **Full restoration path — a capability no competitor has:** SGLang permanently runs degraded after a failure; vLLM's RFC proposes elastic scale-up/down but has no implementation. This design includes Phase 2 full restoration via MX-GMS shadow EP ranks with sub-second activation. The structural reason WideEP shadow *EP* ranks are architecturally faster than general-purpose shadow workers (the KV-cache allocation bottleneck that gates other failover mechanisms doesn't apply here) is detailed in [§08 Shadow EP Ranks](08-mx-gms-integration.md#shadow-ep-ranks-sub-second-activation).
 
 4. **Error classification foundation:** [PR #12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718) provides a sophisticated error classification and budget system that enables nuanced failure handling (transient vs. permanent, request-scoped vs. system-scoped) — a granularity that no competitor's fault tolerance system matches.
 

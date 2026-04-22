@@ -122,7 +122,7 @@ sequenceDiagram
 
 ### Current Fault Tolerance Infrastructure
 
-**What exists (from [PR #12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718), currently in review):**
+**What exists (from [PR #12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718), currently in review).** The table below summarizes the primitives; the per-EP-rank extensions built on top of them are specified in [§07](07-failure-detection.md). Note that PR #12718's commits are not yet on the `docs-and-plans` branch HEAD — see [§07 status callout](07-failure-detection.md#overview) for the sequencing implication.
 
 | Mechanism | What It Does | Limitation for WideEP |
 |:----------|:-------------|:---------------------|

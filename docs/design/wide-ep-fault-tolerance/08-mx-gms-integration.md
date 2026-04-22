@@ -100,55 +100,17 @@ gantt
 
 ## How PR #12718 Enables WideEP FT
 
-PR #12718 introduces several building blocks that WideEP FT directly extends:
+PR #12718 is the **foundation layer** of the three-workstream stack. It provides a small set of primitives that WideEP FT extends into per-rank variants. The detailed contract — pattern lists, `ErrorBudget` per-rank wiring, `EPRankHealthTracker`, the `charge_budget` table, the `_error_monitor_loop()` extension — is specified in [§07 Failure Detection](07-failure-detection.md). This chapter only states the *integration* relationship.
 
-### 1. Error Classification → EP-Specific Patterns
+| PR #12718 primitive | WideEP FT extension | Canonical spec |
+|:---|:---|:---|
+| `classify_error()` returning `"immediate_fatal"` / `"severe"` / `"transient"` | EP-specific regex patterns appended to the existing lists (`"alltoall timeout"`, `"nvshmem peer unreachable"`, etc.) | [§07 Error Classification Extensions](07-failure-detection.md#error-classification-extensions) |
+| `ErrorBudget` (token-bucket, system-wide) | Per-rank `ErrorBudget` instances, one per EP rank, consumed by rank-scoped errors | [§07 Layer 2: MPI Worker Death Detection](07-failure-detection.md#layer-2-mpi-worker-death-detection) |
+| `charge_budget=False` for request-scoped errors | Extended to tokens that would have been routed to a just-failed rank | [§07 Integration with PR #12718's charge_budget Pattern](07-failure-detection.md#integration-with-pr-12718s-charge_budget-pattern) |
+| `_error_monitor_loop()` (5s polling of MPI futures) | Extended with AlltoAll completion-flag monitoring and per-rank latency tracking | [§07 Detection Layers](07-failure-detection.md#detection-layers) |
+| Fatal shutdown drain (all queues) | Partial drain: rank failure drains only the current batch, not the waiting queue | [§04 Serving During Degraded Mode](04-two-phase-recovery.md#serving-during-degraded-mode) |
 
-PR #12718's `classify_error()` function categorizes errors by string pattern matching. WideEP FT adds EP-specific patterns:
-
-```python
-# PR #12718 existing patterns:
-IMMEDIATE_FATAL = ["cudaerrorillegaladdress", "device-side assert", ...]
-SEVERE = ["cuda out of memory", "nccl error", ...]
-TRANSIENT = [...]  # everything else
-
-# WideEP FT additions:
-EP_IMMEDIATE_FATAL = ["nccl communicator abort", "nvshmem peer unreachable", ...]
-EP_SEVERE = ["alltoall timeout", "deep_ep buffer barrier hang", ...]
-```
-
-**Key design point:** PR #12718's classification operates at the executor level (entire system). WideEP FT adds a **per-rank** dimension — the same error type can be fatal for one rank but not for the system.
-
-### 2. Error Budget → Per-Rank Budgets
-
-PR #12718's `ErrorBudget` (token-bucket with 1.0 capacity, 0.1/s recovery) determines when accumulated errors become fatal. WideEP FT creates **per-rank budgets**:
-
-- Each EP rank has its own `ErrorBudget` instance
-- A rank-specific severe error (e.g., AlltoAll timeout from rank 37) charges rank 37's budget, not the system budget
-- When rank 37's budget is exhausted, rank 37 is marked failed — but the system continues serving
-
-### 3. `charge_budget=False` → EP Routing Failures
-
-PR #12718 already uses `charge_budget=False` for KV transfer timeouts (request-scoped, not system-scoped). WideEP FT extends this pattern:
-
-- Tokens that **would have been routed** to a just-failed rank are treated as request-scoped failures
-- These tokens are re-routed to redundant expert copies on other ranks
-- The request continues (with slight latency increase), rather than failing entirely
-
-### 4. `_error_monitor_loop()` → EP Rank Health Loop
-
-PR #12718's background monitor thread (5s polling) checks MPI futures and the error queue. WideEP FT extends this to include EP-specific health checks:
-
-- AlltoAll completion flag monitoring (Layer 1 detection)
-- Per-rank latency tracking (Layer 3 detection)
-- EP group health status aggregation
-
-### 5. Fatal Shutdown Drain → Partial Drain
-
-PR #12718's fatal shutdown drains all queues (`active_requests`, `waiting_queue`, `executor_request_queue`). WideEP FT modifies this for partial failure:
-
-- **Rank failure:** Only drain the current batch (which was using the failed rank). Don't drain the waiting queue — those requests haven't been affected.
-- **System failure:** Full drain (same as PR #12718).
+**Key design point:** PR #12718's classification operates at the executor level (binary: entire system healthy/fatal). WideEP FT adds a **per-rank** dimension — the same error type can be fatal for one rank but not for the system — without changing the three string-literal classes PR #12718 defines. The enum vs. string-literal naming caveat that affects integration is documented once in [§07 status callout](07-failure-detection.md#overview).
 
 ## How MX-GMS Accelerates WideEP FT Phase 2
 
@@ -252,8 +214,7 @@ sequenceDiagram
     Detect->>Survive: mark_failed(rank=37)
 
     Survive->>Survive: Update active_rank_mask (< 1ms)
-    Survive->>Survive: EPLB emergency reconfigure (~10-35ms)
-    Survive->>Survive: Migrate weights from host shared memory (~1-5ms/layer)
+    Survive->>Survive: EPLB emergency reconfigure<br/>(MVP slot remap: <10ms; v1 with weight migration: <50ms)
     Survive->>Survive: Resume serving at N-1 capacity
 
     Note over Survive: Serving continues (degraded)

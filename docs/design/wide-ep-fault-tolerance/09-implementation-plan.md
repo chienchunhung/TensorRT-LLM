@@ -7,7 +7,7 @@
 ```mermaid
 graph LR
     subgraph "Phase 1: Immediate Survival (P0)"
-        MVP["MVP (v0)<br/>NVLinkOneSided only<br/>6-8 weeks"]
+        MVP["MVP (v0)<br/>NVLinkOneSided only<br/>8-10 weeks"]
         P1V1["v1 full scope<br/>All NVLink backends<br/>Full EPLB reconfigure<br/>Multi-failure<br/>+8-12 weeks"]
         MVP --> P1V1
     end
@@ -37,11 +37,15 @@ graph LR
 
 ## Prerequisites
 
-| Prerequisite | Status | Blocking? |
+| Prerequisite | Status (verified 2026-04-21) | Blocking? |
 |:-------------|:-------|:----------|
-| [PR #12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718) merged | In review | **Yes** for Phase 1c (error classification patterns) |
+| [PR #12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718) merged | **Not on `docs-and-plans` HEAD.** Commits exist on other branches (`f32efd01e5`, `e3f84ceb02`, `1128c0ff54`, `4aab3c0afc`); `tensorrt_llm/_torch/pyexecutor/error_classification.py` does not exist yet on this tree. | **Yes** for PRs 1c.1–1c.4. Must land or be rebased into the implementation base branch before 1c work can begin. |
 | EPLB correctness validated | In progress (Tier 1) | **Yes** for Phase 1b |
-| NVLink AlltoAll kernel source access | Available | **Yes** for Phase 1a |
+| NVLink AlltoAll kernel source access | Available — kernel verified at `cpp/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.cu` (1408 LOC) | **Yes** for Phase 1a |
+| `kMaxRanks = 64` constexpr bumped to ≥ 80 (NVL72) | Not done | **Yes** for any production NVL72 use; sub-task of PR 1a.2 |
+| NCCL fault-tolerant wiring (`NCCL_ASYNC_ERROR_HANDLING`, `ncclCommAbort`) | **Not wired in TRT-LLM today.** Zero matches outside test files. | **Yes** for PR 1a.7 (AllGather backend mask wiring) |
+| MPI failure-tolerant subcomm with `MPI_ERRORS_RETURN` | **Net-new component.** No equivalent in current `MPIDist`. | **Yes** for PR 1c.3 |
+| Fault-injection test harness (kernel-abort / rank-kill mid-collective) | **Not present in `tests/`.** Must be built from scratch. | **Yes** for PR 1d.4 |
 | DeepEP `mask_buffer_ptr` public API | Not available | **No** — NVLink is primary target; DeepEP is secondary |
 | MX-GMS Phase 2 (GMS) | Design complete | **No** — Phase 2 works without GMS (slower recovery) |
 
@@ -73,16 +77,17 @@ Each numbered item (e.g., **1a.2**) maps to one PR — a focused, reviewable uni
 
 ### Phase 1 MVP (v0) vs Full Scope
 
-Phase 1 has a natural MVP that proves the rank-masking approach end-to-end on the primary backend with minimum risk, and a follow-up (v1) that broadens backend coverage and hardens EPLB reconfiguration. The MVP targets a **single-failure scenario on NVLinkOneSided** and is estimated at **6-8 weeks**. The full Phase 1 scope (all NVLink backends, full EPLB reconfigure, multi-failure consensus) remains 3-4 months.
+Phase 1 has a natural MVP that proves the rank-masking approach end-to-end on the primary backend with minimum risk, and a follow-up (v1) that broadens backend coverage and hardens EPLB reconfiguration. The MVP targets a **single-failure scenario on NVLinkOneSided** and is estimated at **8-10 weeks** (revised up from an initial 6-8 week estimate after the April 2026 source review surfaced three net-new components: `kMaxRanks` bump, NCCL FT wiring, and the MPI FT subcomm). The full Phase 1 scope (all NVLink backends, full EPLB reconfigure, multi-failure consensus) remains 3-4 months.
 
 **In MVP scope (v0):**
 
-- NVLinkOneSided kernel masking — primary production backend for NVL72
+- NVLinkOneSided kernel masking — primary production backend for NVL72. Includes `kMaxRanks` bump to 128.
 - Host-side AlltoAll watchdog with 5s default timeout
-- EPLB **emergency-mask-only** mode — dead rank's slots become unreachable; requests route only to surviving replicas. No weight migration, no full redistribution.
-- MPI out-of-band failure broadcast (Option A from [§07](07-failure-detection.md))
+- EPLB **emergency slot-remapping mode** (formerly "mask-only") — dead rank's slots become unreachable in `MoePlacementInfo`; requests route only to surviving replicas. No H2D weight movement at recovery time (all weights already mapped via `HostMoeTensorSharer`'s node-local POSIX shm).
+- MPI **failure-tolerant subcomm + dedicated FT thread** for out-of-band broadcast (Option A from [§07](07-failure-detection.md), implemented in PR 1c.3 — net-new, not a simple `MPI_Allgather`)
 - Single-failure semantics — tolerate 1 dead rank, require replacement before a 2nd failure
-- Integration with PR #12718 error classification (`EP_IMMEDIATE_FATAL`)
+- EP-specific patterns added to PR #12718's `error_classification.py` (returns `"immediate_fatal"` / `"severe"` / `"transient"` string literals)
+- Net-new fault-injection test harness (no prior art in `tests/`)
 
 **Deferred to v1 (completes the 3-4 month full Phase 1):**
 
@@ -113,18 +118,18 @@ Deliverable tags in the sub-phases below: **(MVP)** = required for v0 ship; **(v
 | **1a.2** | NVLinkOneSided kernel mask (CUDA) | MVP | `cpp/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.{cu,h}` | **L** | — |
 | **1a.3** | NVLinkOneSided Python binding update | MVP | `_torch/modules/fused_moe/communication/nvlink_one_sided.py`, `communication_factory.py` | S | 1a.1, 1a.2 |
 | **1a.4** | `AlltoAllWatchdog` (host thread) | MVP | `_torch/modules/fused_moe/alltoall_watchdog.py` (new) | S | 1a.1 |
-| **1a.5** | NVLinkTwoSided kernel mask (CUDA) | v1 | `cpp/tensorrt_llm/kernels/communicationKernels/` (two-sided ops) | M | 1a.2 (pattern) |
+| **1a.5** | NVLinkTwoSided kernel mask (CUDA) | v1 | `cpp/tensorrt_llm/kernels/fusedMoeCommKernels.cu`, `cpp/tensorrt_llm/thop/moeCommOp.cpp` | M | 1a.2 (pattern) |
 | **1a.6** | NVLinkTwoSided Python binding update | v1 | `_torch/modules/fused_moe/communication/nvlink_two_sided.py`, `nvlink_two_sided_flashinfer.py` | S | 1a.5 |
-| **1a.7** | AllGatherReduceScatter (NCCL) mask wiring | v1 | `_torch/modules/fused_moe/communication/allgather_reducescatter.py` | S | 1a.1 |
-| **1a.8** | (Optional) Kernel-side `clock64()` timeout | v1 | `moeAlltoAllKernels.cu` | M | 1a.2 |
+| **1a.7** | NCCL fault-tolerant wrapper + AllGatherReduceScatter mask wiring | v1 | NCCL communicator wrapper (`cpp/tensorrt_llm/`), `_torch/modules/fused_moe/communication/allgather_reducescatter.py` | **M** (was S — NCCL wiring is net-new) | 1a.1 |
+| **1a.8** | Tighten kernel-side `check_timeout` + replace `trap;` with host-visible flag | v1 | `moeAlltoAllKernels.cu:156-161`, `:581`, `:1214` | M | 1a.2 |
 
 **Per-PR detail:**
 
 - **1a.1** — Bitmask-based rank health. Public API: `mark_failed(rank)`, `mark_active(rank)`, `is_active(rank)`, `get_mask()`. Internal: `uint64[2]` to support NVL72 (72 ranks) and future expansion. Thread-safe via `threading.Lock`. Unit tests cover single-threaded correctness + concurrent update races.
-- **1a.2** — Add `active_rank_mask` parameter (`uint64_t[2]`) to dispatch and combine kernels. Dispatch: skip symmetric-memory writes to masked ranks. Combine: skip flag polling for masked ranks. Performance gate: <0.1% overhead with all-ranks-active. Correctness tests with mocked mask on single GPU.
+- **1a.2** — Anchored to `cpp/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.cu`. Three sub-tasks within this PR: **(a)** Bump `kMaxRanks` constexpr from 64 to 128 in `moeAlltoAllKernels.h:31` (single-line, but easy to forget — must be done first to support NVL72). **(b)** Add `active_rank_mask_lo, active_rank_mask_hi` (uint64) to `DispatchKernelPointers` and `CombineKernelPointers`. **(c)** Guard **both** the release-write loop *and* the polling loop in dispatch (`:546-555`, `:558-584`) and combine (`:1190-1217`) — masking only one side leaves the dead-rank flag spin in place. Routing pass extension: `compute_target_rank_id` emits `dst_idx = -1` for masked-rank tokens; combine's existing `acc[k].fill(0.0f)` (`:727`) handles them. Performance gate: <0.1% overhead with all-ranks-active. Correctness tests with mocked mask on single GPU.
 - **1a.3** — Thread `EPGroupHealth` through `CommunicationFactory`; `NVLinkOneSided.forward()` pulls current mask and passes to kernel launch. Stateless — mask read per launch, not cached.
-- **1a.4** — Python thread polling `completion_flags` at configurable interval (default 100ms); 5s default timeout. On timeout, call `EPGroupHealth.mark_failed(rank)` and notify model engine. Unit tests with mocked flags verifying detection latency.
-- **1a.5–1a.8** deferred to v1; same pattern as MVP PRs.
+- **1a.4** — Python thread polling `completion_flags` at configurable interval (default 100ms); 5s default timeout. On timeout, call `EPGroupHealth.mark_failed(rank)` and notify model engine. Note: the kernel's pre-existing 300s `check_timeout` (`moeAlltoAllKernels.cu:156-161`) remains as a backstop — it's a `trap;`, not a recovery hook, so the host watchdog must fire well before it. Unit tests with mocked flags verifying detection latency.
+- **1a.5–1a.8** deferred to v1; same pattern as MVP PRs. **1a.7 (AllGather mask wiring)** has an extra prerequisite: NCCL fault-tolerant wiring is not present in TRT-LLM today (no `ncclCommAbort` / `NCCL_ASYNC_ERROR_HANDLING` calls outside test files). 1a.7 must include adding this wiring to the NCCL communicator wrapper, growing it from S to M.
 
 **Success criteria (per phase):**
 - MVP: unit test with one rank masked, AlltoAll completes on N-1 ranks; integration test kills one process, surviving ranks complete AlltoAll.
@@ -174,18 +179,18 @@ Deliverable tags in the sub-phases below: **(MVP)** = required for v0 ship; **(v
 
 | PR | Title | Scope | Target file(s) | Size | Deps |
 |:---|:---|:---|:---|:---|:---|
-| **1c.1** | EP-specific error classification patterns | MVP | `_torch/pyexecutor/error_classification.py` | S | PR #12718 merged |
+| **1c.1** | EP-specific error classification patterns | MVP | `_torch/pyexecutor/error_classification.py` | S | **PR #12718 commits rebased into base branch first** |
 | **1c.2** | `EPRankHealthTracker` — per-rank error budgets | MVP | `_torch/pyexecutor/ep_rank_health.py` (new) | S | 1c.1 |
-| **1c.3** | MPI out-of-band failure broadcast (Option A) | MVP | `_torch/pyexecutor/ep_failure_broadcast.py` (new) | M | 1a.1 |
+| **1c.3** | MPI failure-tolerant subcomm + out-of-band broadcast | MVP | `_torch/pyexecutor/ep_failure_broadcast.py` (new), `_torch/distributed/communicator.py` | **L** (was M — net-new component, not a simple broadcast) | 1a.1 |
 | **1c.4** | Model engine health-check hook | MVP | `_torch/pyexecutor/model_engine.py` | M | 1a.1, 1b.3, 1c.3 |
 | **1c.5** | Iteration-barrier piggyback broadcast (Option B) | v1 | `_torch/pyexecutor/ep_failure_broadcast.py` | M | 1c.3 |
 | **1c.6** | Multi-failure consensus + two-phase suspect/confirm | v1 | `_torch/pyexecutor/ep_failure_broadcast.py` | M | 1c.3 |
 
 **Per-PR detail:**
 
-- **1c.1** — Adds `EP_IMMEDIATE_FATAL`, `EP_SEVERE`, `EP_TRANSIENT` error patterns to PR #12718's classification dict. Examples: NCCL `unhandled system error` on an EP rank → `EP_IMMEDIATE_FATAL`; AlltoAll timeout with no MPI-worker death signal → `EP_SEVERE` (candidate for mask, pending confirmation).
-- **1c.2** — Per-rank `ErrorBudget` (token-bucket, reusing PR #12718's class) with EP-specific thresholds. Methods: `record_error(rank, error_type)`, `should_mask(rank)`.
-- **1c.3** — MPI message exchange on iteration boundary: each rank broadcasts its local health observations; consensus is computed from quorum of reports. Single-failure assumption → consensus is trivial (any rank reporting another as dead is authoritative).
+- **1c.1** — Adds EP-specific regex patterns to PR #12718's `IMMEDIATE_FATAL` / `SEVERE` / `TRANSIENT` lists in `error_classification.py`. The classifier still returns the same string literals (`"immediate_fatal"`, `"severe"`, `"transient"`) — we are extending pattern coverage, not introducing new classes. Example: NCCL `unhandled system error` on an EP rank → `"immediate_fatal"`; AlltoAll timeout with no MPI-worker death signal → `"severe"` (candidate for mask, pending confirmation). See [§07 Error Classification Extensions](07-failure-detection.md#error-classification-extensions) for the pattern lists.
+- **1c.2** — Per-rank `ErrorBudget` (token-bucket, reusing PR #12718's `ErrorBudget` dataclass) with EP-specific thresholds. Methods: `record_error(rank, error_type)`, `should_mask(rank)`.
+- **1c.3** — Builds the MPI failure-tolerant subcomm and the FT broadcast thread described in [§07 Option A](07-failure-detection.md#option-a-out-of-band-via-mpi-failure-tolerant-subcomm-preferred). Net-new component — TRT-LLM today has `MPIDist` for normal collectives but no fault-tolerant subcomm with `MPI_ERRORS_RETURN`, no `MPI_Comm_revoke` (ULFM) wiring, and no dedicated FT polling thread. PR scope: (a) build the FT subcomm at startup via `MPI_Comm_split` and `MPI_Errhandler_set`, (b) implement non-blocking `Isend`/`Irecv`-based broadcast, (c) start a dedicated thread that polls the subcomm independent of forward, (d) integrate with `EPGroupHealth` and the consensus protocol. Single-failure assumption → consensus is trivial (any rank reporting another as dead is authoritative).
 - **1c.4** — In `model_engine.py` forward loop: at iteration start, drain `EPGroupHealth` updates; if mask changed, invoke `reconfigure_mask_only` (1b.3) before forward; set `degraded` status on PyExecutor.
 - **1c.5** — Lower-overhead broadcast by piggybacking on the iteration barrier instead of a separate MPI exchange. Useful at high iteration rates.
 - **1c.6** — Handles two+ ranks dying within one detection window; implements two-phase suspect → confirm protocol to avoid split-brain.
@@ -205,7 +210,7 @@ Deliverable tags in the sub-phases below: **(MVP)** = required for v0 ship; **(v
 | **1d.1** | Feature flag + config gating | MVP | `tensorrt_llm/llmapi/llm_args.py`, `_torch/modules/fused_moe/interface.py` | S | 1c.4 |
 | **1d.2** | `check_health()` degraded reporting | MVP | `_torch/pyexecutor/py_executor.py`, `trtllm-serve` health endpoint | S | 1c.4 |
 | **1d.3** | Per-rank health telemetry / metrics | MVP | `_torch/modules/fused_moe/ep_metrics.py` (new), Prometheus hook | S | 1a.1 |
-| **1d.4** | 4-GPU E2E fault-injection test | MVP | `tests/integration/defs/fault_tolerance/test_wide_ep_ft.py` (new) | M | 1a–1c MVP items |
+| **1d.4** | 4-GPU E2E fault-injection test + harness | MVP | `tests/integration/defs/fault_tolerance/test_wide_ep_ft.py` (new) + new fault-injection fixture (zero prior art in `tests/`) | **L** (was M — harness is net-new) | 1a–1c MVP items |
 | **1d.5** | Steady-state overhead regression test | MVP | same test dir | S | 1a.3, 1a.4 |
 | **1d.6** | Multi-failure stress + chaos suite | v1 | same test dir | M | 1c.6, 1b.4–1b.7 |
 | **1d.7** | Cross-model matrix (DS-V3, DS-R1, others) | v1 | `tests/integration/test_lists/` | S | 1d.4 |
@@ -215,7 +220,7 @@ Deliverable tags in the sub-phases below: **(MVP)** = required for v0 ship; **(v
 - **1d.1** — Add `enable_wide_ep_fault_tolerance: bool = False` to `TorchLlmArgs`. Gate all Phase 1 code paths behind this flag for rollout safety. Validate incompatible combinations (e.g., warn if replication factor <2 when FT enabled; fail if DeepEP backend selected).
 - **1d.2** — `/health` endpoint reports `degraded` (not `unhealthy`) when running with masked ranks; includes surviving-rank count and dead-rank list.
 - **1d.3** — Per-rank health gauge, AlltoAll timeout counter, mask transition counter. Exposed via `trtllm-serve` metrics.
-- **1d.4** — 4+ GPU test: SIGKILL one rank, assert <10s recovery, no data corruption, throughput ≈ (N-1)/N of baseline.
+- **1d.4** — 4+ GPU test: SIGKILL one rank, assert <10s recovery, no data corruption, throughput ≈ (N-1)/N of baseline. **Includes harness:** repo has zero existing fault-injection infrastructure for kernel-level rank death (`tests/` has subprocess-kill utilities only — none simulate a GPU dying mid-collective). Harness pieces: (a) pytest fixture that launches multi-rank MPI workers and tracks their PIDs, (b) signal/CUDA-hook to abort rank N at a controllable point in dispatch/combine, (c) assertion helpers for end-to-end recovery and per-token correctness.
 - **1d.5** — Benchmark: enable FT flag with all ranks alive; measure throughput. Gate: <1% regression vs FT disabled.
 - **1d.6** — v1 exit criterion: multiple sequential failures, random chaos injection during serving.
 
@@ -335,7 +340,7 @@ Phase totals account for parallelism: multiple PRs in the same sub-phase (e.g., 
 
 | Phase | PRs | Calendar time | Depends on | Deliverable |
 |:------|:----|:-------------|:-----------|:------------|
-| **Phase 1 MVP (v0)** | 1a.1–1a.4, 1b.1–1b.3, 1c.1–1c.4, 1d.1–1d.5 (12 PRs) | **6-8 weeks** with 2-3 engineers | Kernel source access, PR #12718 merged | Single-failure survival on NVLinkOneSided; <10s recovery; no weight migration |
+| **Phase 1 MVP (v0)** | 1a.1–1a.4, 1b.1–1b.3, 1c.1–1c.4, 1d.1–1d.5 (12 PRs) | **8-10 weeks** with 2-3 engineers (was 6-8; +2 weeks for the 1c.3 MPI FT subcomm and 1d.4 fault-injection harness, both net-new) | Kernel source access; PR #12718 commits rebased into base branch | Single-failure survival on NVLinkOneSided; <10s recovery; no weight movement at recovery time |
 | **Phase 1 v1** | 1a.5–1a.8, 1b.4–1b.7, 1c.5–1c.6, 1d.6–1d.7 (12 PRs) | **8-12 weeks after MVP** | MVP landed | All NVLink backends, full EPLB reconfigure + weight migration, multi-failure, production polish |
 | **Phase 1-DS** | DS.1–DS.6 (6 PRs) | **4-6 weeks, parallelizable with v1** | MVP landed | Disagg serving FT with cross-pool coordination |
 | **Phase 2: Restoration** | 2a.1–2a.7, 2b.1–2b.4, 2c.1–2c.3 (14 PRs) | **14-20 weeks** | Phase 1 v1 complete (2a); MX-GMS Phase 2 (2b) | Full N-rank capacity restoration via process group reconstruction + shadow EP ranks |
@@ -345,7 +350,7 @@ Phase totals account for parallelism: multiple PRs in the same sub-phase (e.g., 
 
 **Total wall-clock estimates:**
 
-- **Phase 1 MVP:** 6-8 weeks (primary goal — eliminates today's 7-8 min downtime)
+- **Phase 1 MVP:** 8-10 weeks (revised from 6-8 after April 2026 source-discovery review surfaced two net-new components: MPI failure-tolerant subcomm and fault-injection harness)
 - **Phase 1 complete (MVP + v1 + DS):** ~18-26 weeks ≈ 4-6 months
 - **Phase 2 complete:** +14-20 weeks ≈ +3.5-5 months after Phase 1
 - **Full program (Phase 1 + 2 + 3):** ~10-14 months
@@ -353,37 +358,45 @@ Phase totals account for parallelism: multiple PRs in the same sub-phase (e.g., 
 **Honest caveats:**
 
 - These estimates assume 2-3 engineers with overlapping availability, not a single person.
-- L-sized PRs (1a.2, 1b.4, 1b.6) carry the most schedule risk — CUDA kernel work and EPLB internals reliably surface 2-4 weeks of unplanned edge cases beyond the initial design.
+- L-sized PRs in MVP (1a.2 NVLinkOneSided kernel, 1c.3 MPI FT subcomm, 1d.4 fault-injection harness) carry the most schedule risk. The April 2026 discovery review specifically called out:
+  - **1a.2:** straightforward modification of an existing kernel structure (not a from-scratch kernel) — confidence raised after source review.
+  - **1c.3:** more uncertain — `MPI_ERRORS_RETURN` + non-blocking poll patterns work in vanilla MPI but ULFM availability depends on the MPI build (OpenMPI ULFM is opt-in, MVAPICH support varies). Worst case: live with single-failure-only and skip ULFM in MVP.
+  - **1d.4:** harness design risk — getting a clean kernel-abort-mid-collective without poisoning the test runner is the unsolved piece.
+- v1 L-sized PRs (1b.4 mutable epSize/epRank, 1b.6 weight migration) reliably surface 2-4 weeks of unplanned edge cases beyond the initial design.
 - Calendar time includes code review iteration. If review bandwidth is constrained, multiply by 1.5×.
-- External blockers (DeepEP NVSHMEM API, MX-GMS Phase 2 availability) affect their dependent items but not the critical path for Phase 1 MVP.
+- External blockers (PR #12718 sequencing, DeepEP NVSHMEM API, MX-GMS Phase 2 availability) affect their dependent items. PR #12718 sequencing is the only one on the MVP critical path.
 
 ### MVP Critical Path
 
 ```mermaid
 gantt
-    title Phase 1 MVP Critical Path (6-8 weeks)
+    title Phase 1 MVP Critical Path (8-10 weeks)
     dateFormat X
     axisFormat %w
 
     section Python track
     1a.1 EPGroupHealth                   :a1, 0, 1w
     1a.4 AlltoAllWatchdog                :a2, after a1, 1w
-    1c.1-3 Error cls + broadcast         :a6, after a2, 3w
+    1c.1-2 Error cls + per-rank tracker  :a6, after a2, 2w
 
     section CUDA track
     1a.2 NVLinkOneSided kernel mask      :crit, a3, 0, 4w
     1a.3 NVLinkOneSided binding          :a4, after a3, 1w
 
     section EPLB track
-    1b.1-3 EPLB mask-only + wire         :a5, 1w, 3w
+    1b.1-3 EPLB slot-remap + wire        :a5, 1w, 3w
+
+    section Distributed track
+    1c.3 MPI FT subcomm + thread         :crit, ac3, 1w, 4w
 
     section Integration
-    1c.4 Model engine integration        :a7, 5w, 1w
-    1d.1-3 Flag + health + metrics       :a8, 5w, 1w
-    1d.4-5 E2E + overhead tests          :a9, 6w, 2w
+    1c.4 Model engine integration        :a7, after ac3, 1w
+    1d.1-3 Flag + health + metrics       :a8, 6w, 1w
+    1d.4 Fault-injection harness         :crit, a9, 6w, 3w
+    1d.5 Overhead regression             :a10, after a9, 1w
 ```
 
-The MVP's critical path is the NVLinkOneSided kernel modification (1a.2 — marked `crit`). Everything else can parallelize or stub — the kernel change is the piece that must work before anything is demonstrable end-to-end.
+The MVP has **three critical-path items** (marked `crit`): 1a.2 (NVLinkOneSided kernel mask), 1c.3 (MPI FT subcomm), and 1d.4 (fault-injection harness). All three are net-new and have schedule risk that cannot be mitigated by parallelism — they each gate end-to-end demonstration of one capability. Everything else can parallelize.
 
 ## Testing Strategy
 

@@ -6,7 +6,16 @@
 
 When a rank fails, EPLB must redistribute that rank's experts across the surviving ranks. This chapter describes the changes needed in the C++ `MoeLoadBalancer` and the Python `MoeLoadBalancer` wrapper to support dynamic topology changes.
 
-The good news: EPLB already performs live expert weight migration at runtime (online EPLB). The new capability is handling a **topology change** (rank count changes) rather than a **load balance change** (expert assignment changes within fixed topology). This distinction matters: EPLB was designed as a static-topology system — `MoeLoadBalanceMetaInfo` stores `epSize` and `epRank` as immutable constructor arguments, and the entire data structure hierarchy (CPU placement arrays, GPU routing tables, shared memory layout, per-layer state machines) assumes the rank count never changes. Extending it for dynamic topology changes while the system is actively serving — with concurrent worker and compute threads performing weight migrations, per-layer statistics collection, and routing table updates — is a qualitatively different design problem from what EPLB was built for.
+The good news: EPLB already performs live expert weight migration at runtime (online EPLB). The new capability is handling a **topology change** (rank count changes) rather than a **load balance change** (expert assignment changes within fixed topology). This distinction matters: EPLB was designed as a static-topology system — `MoeLoadBalanceMetaInfo` stores `epSize` and `epRank` as **immutable by convention** (plain `int` members in `cpp/tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h:331-332`; not `const`, not enforced — but every reader assumes they don't change), and the entire data structure hierarchy (CPU placement arrays, GPU routing tables, shared memory layout, per-layer state machines) assumes the rank count never changes. Extending it for dynamic topology changes while the system is actively serving — with concurrent worker and compute threads performing weight migrations, per-layer statistics collection, and routing table updates — is a qualitatively different design problem from what EPLB was built for.
+
+> **Source-verified facts shaping this design:**
+>
+> - `MoeLoadBalanceMetaInfo` (`cpp/tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceCommon.h:40-52`) has fields `expertCount, topK, epRank, epSize, slotCountPerRank` — no enable/disable bit, no rank-mask field. Mask plumbing is net-new.
+> - CPU placement: `MoePlacementCpuInfo` (`moeLoadBalancer.h:56-70`) stores `rankExpertIds` as `std::vector<std::vector<int>>` (`[epSize][slotCountPerRank]`) plus `oldRankExpertIds` for single-step rollback (no longer history).
+> - GPU placement (`moeLoadBalanceCommon.h:76-90`): three flat int arrays — `expertReplicaCount[expertCount]`, `expertReplicaStartOffset[expertCount]`, `globalSlotIds[epSize * slotCountPerRank]`.
+> - Propagation CPU→GPU (`moeLoadBalancer.cpp:523-542`): in-place `cudaMemcpyAsync` on a background stream — **no double buffer**, no epoch counter. Per-layer synchronization uses `MoeLoadBalanceSingleLayerSignal::stepAndOwner` (a 64-bit step+owner word at `moeLoadBalanceCommon.h:25-37`), but that's a producer/consumer ownership token, not a placement version.
+>
+> Implication for `reconfigure_mask_only`: there's no built-in "stage and atomically swap" primitive. Either the mask change must be small enough to land within one in-place memcpy at iteration boundary (MVP plan), or we add an explicit double-buffer (deferred to v1, PR 1b.4–1b.5).
 
 ## Current EPLB Data Flow
 
@@ -176,31 +185,36 @@ The routing kernel (`torch.ops.trtllm.moe_load_balance_routing`) uses the `globa
 
 ## Host Shared Memory Interaction
 
-`HostMoeTensorSharer` stores all expert weights in POSIX shared memory (`/dev/shm/moe_shared_*`). After a rank failure:
+`HostMoeTensorSharer` (`tensorrt_llm/_torch/modules/fused_moe/moe_load_balancer.py:127-340`) stores expert weights in POSIX shared memory. The relevant detail for FT is **how** it is shared: each local rank publishes one shm segment named `f"{base}_l{layer_id}_lr{local_rank}_all"` containing **all of its assigned experts' weights**, packed sequentially per weight name. All ranks on the **same node** then attach to all peer segments via `multiprocessing.shared_memory.SharedMemory(name=...)`. The shared subcomm is built via `global_mpi_comm.Split_type(MPI.COMM_TYPE_SHARED)` (`moe_load_balancer.py:894-902`), so the sharing scope is **node-local only**.
 
-- **If dead rank was on the same node:** Its shared memory segments survive (POSIX shared memory persists until explicitly unlinked). Other ranks on the same node can still read from them.
-- **If dead rank was on a different node:** Irrelevant — each node has its own `HostMoeTensorSharer` with all expert weights.
-- **Weight migration source:** When a surviving rank needs to load a new expert, it reads from its local `HostMoeTensorSharer` (which already contains all expert weights). No cross-node transfer needed.
+After a rank failure:
 
-This is a key advantage of TRT-LLM's EPLB design: **all expert weights are always available locally on every node**, enabling millisecond-scale weight migration without any network transfer.
+- **Same node, dead rank:** Its `_lr{local_rank}_all` segment survives (POSIX shm persists until explicit unlink). Other local-node ranks already have it attached and can keep reading.
+- **Different node, dead rank:** Irrelevant — each node has a full replica of all 256 experts' weights distributed across its local ranks. No cross-node transfer is needed for a within-node reassignment.
+- **Cross-node concern:** A failure that takes down a *whole node* loses all its unique expert replicas. With replication factor ≥ 2 (DeepSeek production), every other node still has the full set, so degraded-mode survival is unaffected. With replication factor = 1, a node-loss event is unrecoverable in Phase 1.
+
+**Terminology — "weight migration" vs "slot remapping" for MVP:** When a single rank dies and replication factor ≥ 2, MVP recovery is **not** weight migration in the classic sense. There is no H2D copy required at the moment of failure: every surviving rank already has every expert's weights mapped on host. The MVP `reconfigure_mask_only` operation is **expert-slot remapping** — mark the dead rank's slots as unreachable in `MoePlacementInfo` and let routing pick the surviving replica's slot. The next H2D `cudaMemcpyAsync` only happens on the routine EPLB cycle when load actually rebalances. This is why MVP can target <10ms reconfigure: it's a placement-pointer rewrite, not a weight move. Full-blown weight migration across 58 layers (PR 1b.6 in [§09](09-implementation-plan.md)) is the v1 path that handles the "zero surviving replica" case.
 
 ## Multi-Layer Coordination
 
 DeepSeek-V3 has 58 MoE layers. Reconfiguration must update all layers:
 
-- **Emergency mode:** Reconfigure all 58 layers in a single pass. The worker thread and compute thread are paused; reconfiguration happens on the main thread. With ~0.1-0.3ms per expert weight copy and ~1-2 experts to migrate per layer, total: ~10-35ms for all layers.
+- **MVP slot remap (`reconfigure_mask_only`, no weight migration):** Rewrite `MoePlacementInfo` for all 58 layers in a single pass. The worker thread and compute thread are paused; the main thread issues in-place `cudaMemcpyAsync` of the updated `globalSlotIds` array per layer. Target: **<10ms end-to-end** for all 58 layers.
 
-- **Full mode:** Can be spread across iterations like normal online EPLB, with `layer_updates_per_iter` layers updated per forward pass. This avoids a latency spike.
+- **v1 full reconfigure (zero-replica case, with weight migration):** Runs `doReplication` + `doPlacement` + `cudaMemcpy2D` for experts that now have zero surviving replicas. With ~0.1-0.3ms per expert weight copy and at most ~1-2 experts per layer that need new placement, total: **<50ms end-to-end** for all 58 layers.
+
+- **Background periodic rebalance (existing online EPLB):** Can be spread across iterations with `layer_updates_per_iter` layers updated per forward pass. This avoids a latency spike and is unrelated to failure recovery.
 
 ## Changes Summary
 
 | Component | Change | Complexity |
 |:----------|:-------|:-----------|
-| `MoeLoadBalanceMetaInfo` (C++) | Make `epSize`, `epRank` mutable; add `reconfigure()` | Medium |
-| `MoePlacementCpuInfo` (C++) | Dynamic reallocation of `rankExpertIds` | Medium |
-| `MoePlacementInfo` (GPU) | Reallocate `globalSlotIds` for new ep_size | Low |
-| `doReplication()` / `doPlacement()` (C++) | Already parameterized by `metaInfo` — no change needed | None |
-| `MoeLoadBalancer.reconfigure()` (C++) | New method: pause threads, update meta, redistribute, resume | High |
-| `MoeLoadBalancer` (Python) | New `reconfigure()` wrapper; coordinate with model engine | Medium |
-| `HostMoeTensorSharer` | No change — already has all expert weights | None |
-| Weight migration | Reuse existing `updateWeights()` path | None |
+| `MoeLoadBalanceMetaInfo` (C++) | Add `rankMask` field for MVP (no epSize/epRank change). Make `epSize`/`epRank` mutable for v1; full audit of every reader. | MVP: Low / v1: Medium |
+| `MoePlacementCpuInfo` (C++) | MVP: mark dead-rank slots as unreachable. v1: dynamic reallocation of `rankExpertIds`. | MVP: Low / v1: Medium |
+| `MoePlacementInfo` (GPU) | MVP: in-place memcpy of updated `globalSlotIds`. v1: reallocate for new ep_size. | MVP: Low / v1: Low |
+| `doReplication()` / `doPlacement()` (C++) | MVP: skipped (use existing assignments minus dead-rank slots). v1: already parameterized by `metaInfo` — no change needed. | None |
+| `MoeLoadBalancer.reconfigure_mask_only()` (C++) | **NEW (MVP)**: pause threads, mask dead-rank slots in GPU placement, resume. Target <10ms. | Medium |
+| `MoeLoadBalancer.reconfigure()` (C++) | **NEW (v1)**: full topology change, pause threads, redistribute, resume. | High |
+| `MoeLoadBalancer` (Python) | New mask-only + full reconfigure wrappers; coordinate with model engine | Medium |
+| `HostMoeTensorSharer` | No change — node-local POSIX shm already has all in-node experts' weights | None |
+| Weight migration (H2D) | MVP: not needed for masked-rank survival (slot remap suffices when replication ≥ 2). v1: reuse existing `HostMemoryMoeWeightUpdater::updateWeights` path for zero-replica experts. | MVP: None / v1: Medium |

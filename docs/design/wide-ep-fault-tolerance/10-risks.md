@@ -69,9 +69,33 @@ The `reconfigure()` method pauses the EPLB worker and compute threads. If the pa
 **Mitigation:**
 - Reconfiguration only happens between forward iterations (model engine iteration boundary)
 - EPLB worker thread checks for reconfigure signal at safe points (after completing current layer)
-- Emergency mode is designed to be fast (<50ms) to minimize serving interruption
+- Emergency reconfigure is designed to be fast — MVP slot remap <10ms, v1 with weight migration <50ms (see §06, §09) — to minimize serving interruption
 
-### Risk 6: Memory Pressure During Degraded Mode
+### Risk 6: MPI `COMM_WORLD` Failure-Poisoning
+
+**Severity:** High | **Probability:** High (default MPI) | **Phase:** 1c
+
+When a rank in `MPI_COMM_WORLD` dies, subsequent collectives on that communicator fail (or hang) on most common MPI implementations. TRT-LLM's `MPIDist` runs over `MPI.COMM_WORLD` (`tensorrt_llm/_torch/distributed/communicator.py:612`) — naive "use MPI for out-of-band failure broadcast" without further engineering hits exactly the failure mode we are trying to escape, just at a different layer. The April 2026 source review confirmed there is **no failure-tolerant communicator infrastructure in TRT-LLM today** (no `MPI_ERRORS_RETURN` handler, no `MPI_Comm_revoke`, no ULFM wiring, no dedicated FT subcomm).
+
+**Mitigation:** Addressed by PR 1c.3 (dedicated MPI FT subcomm with `MPI_ERRORS_RETURN`, non-blocking `Isend`/`Irecv`+`Test` on a dedicated CPU thread, opportunistic ULFM `MPI_Comm_revoke`). See [§07 Option A](07-failure-detection.md#option-a-out-of-band-via-mpi-failure-tolerant-subcomm-preferred) for the protocol and [§09 PR 1c.3](09-implementation-plan.md) for the implementation contract.
+
+### Risk 7: NCCL Fault-Tolerance Not Wired
+
+**Severity:** Medium | **Probability:** High | **Phase:** 1a (v1)
+
+The April 2026 source review found **zero uses** of `ncclCommAbort`, `NCCL_ASYNC_ERROR_HANDLING`, `ncclCommFinalize`, or `ncclGetLastError` outside test files in TRT-LLM. The only NCCL integration is via `torch.classes.trtllm.NcclCommunicatorOp` (P2P send/recv with no error hook). The original assumption that the AllGatherReduceScatter fallback "eventually times out via NCCL" is **false** for TRT-LLM as-shipped.
+
+**Mitigation:** Addressed by PR 1a.7 (wires `NCCL_ASYNC_ERROR_HANDLING=1` + `ncclCommAbort` + watchdog into the NCCL wrapper *before* enabling AllGatherReduceScatter as a mask-capable fallback). Until 1a.7 lands, backend-switch on rank failure routes to a different NVLink backend rather than NCCL. PR 1d.1 adds a feature-flag validator that warns if `enable_wide_ep_fault_tolerance=True` is configured against AllGatherReduceScatter as primary.
+
+### Risk 8: PR #12718 Sequencing Dependency
+
+**Severity:** Medium | **Probability:** High | **Phase:** 1c
+
+PR #12718's commits (`f32efd01e5`, `e3f84ceb02`, `1128c0ff54`, `4aab3c0afc`) introduce `tensorrt_llm/_torch/pyexecutor/error_classification.py` (`ErrorBudget` dataclass, `classify_error()` function returning string literals). These commits are **not on the `docs-and-plans` branch HEAD** as of 2026-04-21. PRs 1c.1–1c.4 import from `error_classification.py` and assume `ErrorBudget` exists.
+
+**Mitigation:** Addressed in [§09 Prerequisites](09-implementation-plan.md) — the MVP implementation base branch must have PR #12718 merged or rebased in; otherwise a drop-in `ErrorBudget` + `classify_error()` shim is built under `_torch/pyexecutor/` and reconciled when #12718 lands. Status is tracked weekly during MVP execution.
+
+### Risk 9: Memory Pressure During Degraded Mode
 
 **Severity:** Low | **Probability:** Low
 
@@ -185,11 +209,14 @@ This keeps the basic WideEP FT critical path clean while ensuring disagg is not 
 
 | Risk | Severity | Probability | Phase | Mitigation Status |
 |:-----|:---------|:------------|:------|:------------------|
-| NVLink kernel complexity | High | Medium | 1a | Minimal modification; comprehensive testing |
+| NVLink kernel complexity (kMaxRanks=64, kernel 300s `trap;`) | High | Medium | 1a | Bump kMaxRanks to 128; gate `check_timeout`; comprehensive testing |
 | DeepEP limitations | Medium | High | 1a | NVLink primary; DeepEP secondary |
 | PG reconstruction deadlocks | High | Medium | 2a | Coordinated teardown; ULFM MPI |
 | Failure broadcast consensus | Medium | Medium | 1c | Conservative detection; two-phase protocol |
 | EPLB reconfigure timing | Medium | Low | 1b | Iteration boundary only; safe points |
+| **MPI `COMM_WORLD` failure-poisoning** | High | High | 1c | Dedicated FT subcomm, `MPI_ERRORS_RETURN`, non-blocking Isend/Irecv+Test on dedicated thread; opportunistic ULFM |
+| **NCCL fault-tolerance not wired** | Medium | High | 1a (v1) | PR 1a.7 resized S→M; wire `ncclCommAbort` + `NCCL_ASYNC_ERROR_HANDLING` before AllGatherReduceScatter mask path |
+| **PR #12718 sequencing dependency** | Medium | High | 1c | Rebase onto #12718 or build drop-in `ErrorBudget` shim; track weekly |
 | Memory pressure | Low | Low | 1d | Small impact; monitor + alert |
 | False positive failure detection | Medium | Medium | 1c | Conservative timeouts; confirmation step |
 | PP + WideEP interaction | Medium | Low | 2+ | Defer to Phase 2 |
