@@ -293,6 +293,18 @@ Iteration N: AlltoAll times out for rank 37
   → Iteration N+1: new mask applied, EPLB reconfigured, serving resumes
 ```
 
+### Option A vs Option B: Relationship, Not Alternatives
+
+Option B is **not an independent alternative** to Option A. The dominant WideEP failure mode (see [§02 Failure Modes by Backend](02-current-state.md#failure-modes-by-backend)) is a GPU combine kernel spinning on `completion_flags[dead_rank]` with no in-kernel timeout. While that spin persists, the forward pass never completes, so the iteration boundary Option B depends on is never reached.
+
+Consequently:
+
+- **Option A is required** for the primary failure mode. Its dedicated host-side thread runs independently of GPU state and can both *detect* the hang (via the Layer 1 watchdog polling host-visible completion flags) and *signal* peers over the FT subcomm while the forward thread is still stuck.
+- **Option B is only useful as a simplification on top of Option A.** Once Option A's signal causes the mask to be installed and the hung kernel to exit, the iteration barrier becomes reachable again and can serve as a zero-cost consensus carrier for the final "everyone has the same mask" step.
+- **Option B alone** is sufficient only for the narrower failure modes where the rank completes the iteration and then fails (clean exception, CUDA error surfaced via `classify_error()`, rank death between iterations). These are not the modes driving this design.
+
+**Decision for the MVP:** Ship Option A. It carries both signaling and consensus in Phase 1. Option B is not a separate PR — it is already implicit in the existing iteration boundary and can be wired in as an optional consensus carrier in a later phase once the Option A detection layer is stable.
+
 ### Consensus Requirement
 
 All surviving ranks must agree on which ranks are dead. Split-brain scenarios (rank A thinks rank B is dead, but rank B is still running) could cause data corruption. The protocol must ensure:

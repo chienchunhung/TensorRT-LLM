@@ -29,14 +29,24 @@ graph TB
         EM["Error Monitor Loop<br/>5s background polling"]
     end
 
+    %% Layer 1 → Layer 2: detection primitives all drive the per-rank mask.
     EC --> Mask
-    EB --> EPLB_R
-    FE --> Shadow
     EM --> Mask
+    EB --> Mask
+    FE --> Mask
 
-    EPLB_R --> GMS
-    PG --> MX
-    Shadow --> PG
+    %% Within Layer 2 (Phase 1 survival path): mask change drives EPLB reconfigure.
+    Mask --> EPLB_R
+
+    %% Layer 2 → Layer 3 (Phase 2 recovery path, triggered once Phase 1 is stable
+    %% and the orchestrator provisions a replacement rank). Weights are imported
+    %% via GMS or MX first, then the process group is reconstructed, then the
+    %% shadow / replacement EP rank activates.
+    EPLB_R -.->|Phase 2 kickoff| GMS
+    EPLB_R -.->|Phase 2 kickoff| MX
+    GMS --> PG
+    MX --> PG
+    PG --> Shadow
 
     style MX fill:#4CAF50,color:#fff
     style GMS fill:#4CAF50,color:#fff
@@ -128,7 +138,7 @@ sequenceDiagram
 
     Note over Dead: Process crashes
     Note over GMS: GPU memory persists!<br/>(crash-resilient)
-    Dead->>GMS: Socket disconnects → lock auto-released
+    Note over Dead,GMS: OS tears down socket →<br/>GMS observes FD close →<br/>rank 37's RW lock auto-released
 
     New->>GMS: Request RW lock for rank 37's weights
     GMS-->>New: Lock granted (previous lock auto-released)
@@ -221,10 +231,14 @@ sequenceDiagram
     Note over Survive: Total Phase 1: ~5-10s
 
     par Background: Phase 2
-        Restore->>Restore: Orchestrator provisions replacement GPU
-        alt GMS available
+        alt Shadow EP rank pre-provisioned
+            Note over Restore: No cold-start cost;<br/>replacement rank is already running
+        else Cold provision
+            Restore->>Restore: Orchestrator provisions replacement GPU<br/>(seconds-class; depends on operator)
+        end
+        alt GMS available (same-node)
             Restore->>Restore: GMS zero-copy import (~100ms)
-        else MX available
+        else MX available (cross-node)
             Restore->>Restore: MX P2P RDMA (~1-2s for expert shard)
         else Disk only
             Restore->>Restore: Load from checkpoint (~1-3 min)
@@ -235,7 +249,7 @@ sequenceDiagram
     end
 
     Note over Restore: Full capacity restored
-    Note over Restore: Total Phase 2: <1s (GMS) / ~2s (MX) / ~3 min (disk)
+    Note over Restore: Phase 2 budget — pre-provisioned shadow + GMS: <1s<br/>cold provision + MX: ~2-10s (provision-dominated)<br/>cold + disk: ~3 min
 ```
 
 ## What Each Workstream Must NOT Do
