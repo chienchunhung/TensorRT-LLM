@@ -266,23 +266,26 @@ Concrete asks to the MX (`ai-dynamo/modelexpress`) and GMS (`ai-dynamo/dynamo`) 
 
 **Our workaround:** in `publish_as_source()` (`tensorrt_llm/_torch/models/checkpoints/mx/checkpoint_loader.py`) we set BOTH `MODEL_EXPRESS_URL` and `MODEL_NAME` env vars temporarily and call `publish_model_params(model)`, which then internally calls `_build_trtllm_identity` from those env vars. Two separate env-var dances would collapse into one direct function call if MX-2 lands. The `MODEL_NAME` resolution itself is plumbed cleanly: `llm_args.model → MXCheckpointLoader(model_name=...) → publish-time resolver` (with HF-snapshot path unmangling).
 
-#### MX-3. Expose explicit per-rank addressing in identity / metadata
+#### ~~MX-3. Per-rank addressing in identity / metadata~~ — **Resolved (non-issue)**
 
-**Priority:** Medium — debuggability + flexibility for non-MPI deployments.
-**Ask:** Add `tp_rank: int`, `pp_rank: int`, `ep_rank: int` fields either to `p2p_pb2.SourceIdentity` (identity-level addressing) or to `WorkerMetadata` (queryable per-worker fields).
+**Status:** Retracted. Upstream `MxLiveWeightLoader.load_weights` and `publish_model_params` both derive `worker_rank` from `MPI.COMM_WORLD.Get_rank()` internally. TRT-LLM workers are MPI processes, so the global MPI rank is already available on both publish and receive sides and matching works correctly (`worker_rank == mpi_rank`). Our `MXCheckpointLoader` delegates to these upstream functions without overriding rank derivation.
 
-**Why:** Today only `WorkerMetadata.worker_rank` (== MPI rank) is queryable. MPI-less deployments (Ray, K8s with TCP-based discovery) need explicit per-rank fields to map source/target topology cleanly.
+The original concern about `MPI rank != TP rank` in multi-node PP configs is moot: upstream matches on global MPI rank (not TP rank), which is correct regardless of the parallelism topology. MX engineer confirmed the global-rank design is intentional for simplicity.
 
-**Our workaround:** delegate matching to `MxLiveWeightLoader._query_source` and rely on MPI rank == TP rank invariant in our setups.
+#### MX-4. Adopt `RdmaStrategy`'s immediate-fallback source discovery in `MxLiveWeightLoader`
 
-#### MX-4. Non-blocking source-query API
+**Priority:** Medium — needed for fast disk-fallback on cold clusters.
 
-**Priority:** Medium — needed for fast disk-fallback and readiness checks.
-**Ask:** Add a non-blocking variant of source discovery, e.g. `MxClient.list_sources_now(identity) -> ListSourcesResponse` (returns immediately; empty `.instances` means "no source yet"), or a `timeout_ms=0` option on existing `list_sources`.
+**Ask:** Port the immediate-fallback source-discovery pattern from the vLLM-facing [`RdmaStrategy._find_source_instances`](https://github.com/ai-dynamo/modelexpress/blob/a8a2fd494f861ee654c4a29716b9c4a2989e9060/modelexpress_client/python/modelexpress/load_strategy/rdma_strategy.py#L70-L118) into the TRT-LLM-facing [`MxLiveWeightLoader._query_source`](https://github.com/ai-dynamo/modelexpress/blob/main/modelexpress_client/python/modelexpress/trtllm_live_transfer.py#L496), or deprecate `MxLiveWeightLoader` in favor of the strategy-chain API for all engines.
 
-**Why:** Today, [`MxLiveWeightLoader._query_source`](https://github.com/ai-dynamo/modelexpress/blob/main/modelexpress_client/python/modelexpress/trtllm_live_transfer.py#L496) polls every 5 s for up to `MX_SOURCE_QUERY_TIMEOUT` (default `3600` = **1 hour**) waiting for a source. This is correct for production targets (which should wait for a donor) but means **the very first replica on a cold cluster blocks for an hour before falling back to disk**.
+**Why:** The two upstream code paths have diverged:
 
-**Our workaround:** `MXCheckpointLoader.__init__` calls `os.environ.setdefault("MX_SOURCE_QUERY_TIMEOUT", "30")` whenever an MX server URL is configured. This caps cold-cluster first-replica delay at 30 s instead of 1 hour, with no new dependencies — we just configure the upstream library's existing knob to a defensive default. `setdefault` semantics mean an explicit user value still wins. A proper non-blocking probe (this MX-4 ask) would let us skip the timeout entirely when no source exists.
+- **`RdmaStrategy._find_source_instances`** (vLLM path): calls `mx_client.list_sources(identity=..., status_filter=SOURCE_STATUS_READY)` **once**, returns immediately if empty. Caller picks the next strategy (disk, GDS, etc.) with zero polling delay.
+- **`MxLiveWeightLoader._query_source`** (TRT-LLM path): polls every 5 s for up to `MX_SOURCE_QUERY_TIMEOUT` (default `3600` = **1 hour**) before raising `TimeoutError`. No `status_filter`, no multi-candidate retry, no shuffle.
+
+Both paths use the same underlying `MxClient` SDK and serve the same purpose (find-or-fallback). The TRT-LLM path should adopt the vLLM path's try-once-and-return semantics so TRT-LLM integrators don't need env-var workarounds to avoid a 1-hour hang.
+
+**Our workaround:** `MXCheckpointLoader.__init__` calls `os.environ.setdefault("MX_SOURCE_QUERY_TIMEOUT", "30")` whenever an MX server URL is configured. This caps the polling at 30 s instead of 1 hour — far better than the default, but still 30 s of unnecessary polling vs the correct "try once, fall back immediately" pattern that `RdmaStrategy` already implements. The workaround is removed once upstream updates `_query_source`.
 
 #### MX-5. Clarify NIXL agent ownership across MX + GMS composition
 
@@ -297,6 +300,15 @@ Concrete asks to the MX (`ai-dynamo/modelexpress`) and GMS (`ai-dynamo/dynamo`) 
 
 **Priority:** Low — already on the MX known-issues list.
 **Status:** MLA-arch models (DeepSeek-V2/V3, Kimi K2/K2.5) are blocked from MX P2P transfer per upstream; they silently fall back to disk. Tracked here only so our Section 11 impact projection can call this out.
+
+#### MX-7. Onboard `modelexpress` into NVIDIA's OSS package allowlist
+
+**Priority:** Medium — blocks CI and one-line install ergonomics.
+**Ask:** File the NVIDIA-internal OSS-allowlist onboarding request for `modelexpress` (Apache-2.0, PyPI, single Beta release `0.3.0`). This is a TRT-LLM-side administrative action (with MX team coordination for provenance docs).
+
+**Why:** NVIDIA's Blossom-CI `Vulnerability scan` job scans all dependencies declared in `setup.py`. `modelexpress` is a brand-new PyPI package (single release, Beta status) and is not yet in the internal OSS allowlist. Until onboarded, declaring `"modelexpress>=0.3.0,<0.4.0"` as an `extras_require` entry causes the scan to fail, blocking the entire L0 pipeline. PR #13045 removed the extras from `setup.py` as a workaround (users install manually); restoring the one-line `pip install tensorrt_llm[mx]` / `tensorrt_llm[dynamo]` ergonomics requires this onboarding.
+
+**Our workaround:** `[mx]` / `[gms]` / `[dynamo]` extras removed from `setup.py` with inline comment documenting the rationale and manual install instructions.
 
 ---
 
@@ -341,6 +353,15 @@ Concrete asks to the MX (`ai-dynamo/modelexpress`) and GMS (`ai-dynamo/dynamo`) 
 **Priority:** Low — already documented by signature.
 **Status:** Confirms `materialize_module_from_gms(gms_client, model, *, device_index)` requires `device_index` as a keyword arg. PR #13045 handles correctly. No action needed.
 
+#### GMS-6. Publish `gpu-memory-service` to PyPI
+
+**Priority:** Medium — blocks CI and one-line install ergonomics.
+**Ask:** Publish `gpu-memory-service` v0.9.0 to PyPI from `ai-dynamo/dynamo/lib/gpu_memory_service/`.
+
+**Why:** The package currently ships only as source inside the `ai-dynamo/dynamo` mono-repo. NVIDIA's Blossom-CI `Vulnerability scan` job cannot resolve a pinned version that isn't on PyPI, so declaring `"gpu-memory-service>=0.9.0,<0.10.0"` as an `extras_require` entry in TRT-LLM's `setup.py` causes the scan to fail (exit code 255), blocking the entire L0 pipeline from starting. This is the primary reason PR #13045's `[gms]` / `[dynamo]` extras were removed from `setup.py`.
+
+**Our workaround:** `[mx]` / `[gms]` / `[dynamo]` extras removed from `setup.py` with inline comment documenting the rationale and manual install instructions (`git clone ... && pip install ./dynamo/lib/gpu_memory_service`). Restoring one-line `pip install tensorrt_llm[gms]` / `tensorrt_llm[dynamo]` ergonomics is a single-hunk revert once this package is published to PyPI **and** onboarded into NVIDIA's OSS allowlist (see MX-7 for the allowlist step).
+
 ---
 
 ### Summary table
@@ -349,17 +370,21 @@ Concrete asks to the MX (`ai-dynamo/modelexpress`) and GMS (`ai-dynamo/dynamo`) 
 |---|---|---|---|---|---|
 | MX-1 | MX | `LoadFormat.PRESHARDED` vs per-module flag | High | `mx_preshard_strategy='global'` raises until upstream lands | No |
 | MX-2 | MX | Promote `_build_trtllm_identity` to public | Medium | `MODEL_EXPRESS_URL` + `MODEL_NAME` env-var dance in `publish_as_source` | No |
-| MX-3 | MX | Per-rank addressing in identity/metadata | Medium | Rely on MPI-rank == TP-rank | No |
-| MX-4 | MX | Non-blocking source-query API | Medium | `MX_SOURCE_QUERY_TIMEOUT=30` defensive `setdefault` | No |
+| ~~MX-3~~ | MX | ~~Per-rank addressing in identity/metadata~~ | ~~Medium~~ | **Resolved (non-issue)** — upstream uses global MPI rank on both sides | No |
+| MX-4 | MX | Adopt `RdmaStrategy` immediate-fallback in `MxLiveWeightLoader` | Medium | `MX_SOURCE_QUERY_TIMEOUT=30` defensive `setdefault` (30 s poll vs correct try-once) | No |
 | MX-5 | MX | Clarify NIXL ownership for MX+GMS composition | Medium | MX P2P bypassed in GMS-RW path | **Yes for MX+GMS validation** |
 | MX-6 | MX | MLA model support (informational) | Low | — | No |
+| MX-7 | MX / TRT-LLM | Onboard `modelexpress` into NVIDIA OSS allowlist | Medium | `[mx]`/`[dynamo]` extras removed from `setup.py`; manual install | No |
 | GMS-1 | GMS | Document non-monkey-patch integration path | High | We avoid `setup_gms()` and own the integration in `GMSBackend` | No |
 | GMS-2 | GMS | Promote `_move_untracked_params` to public | High | Re-implemented in `GMSBackend.move_untracked_params()` | No (high maintenance burden) |
 | GMS-3 | GMS | Lightweight peek RPC | Medium | None — `has_committed_weights()` requires prior `connect()` | No |
 | GMS-4 | GMS | Document tag-name conventions | Low | `gms_tag` default is `"weights"` | No |
 | GMS-5 | GMS | Confirm `device_index` kwarg contract (informational) | Low | — | No |
+| GMS-6 | GMS | Publish `gpu-memory-service` to PyPI | Medium | `[gms]`/`[dynamo]` extras removed from `setup.py`; manual install from source | No |
 
 **MX-1 and MX-5 are the items most likely to come up in PR review** — both have working workarounds today, but both are real design conversations the MX team would want to weigh in on before TRT-LLM lands a stable design.
+
+**MX-7 and GMS-6 are the blockers for restoring one-line `pip install tensorrt_llm[dynamo]` ergonomics** — both are administrative/publish steps, not design issues.
 
 ---
 
