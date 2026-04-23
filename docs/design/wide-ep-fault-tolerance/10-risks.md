@@ -207,17 +207,19 @@ This keeps the basic WideEP FT critical path clean while ensuring disagg is not 
 
 ## Risk Summary Matrix
 
-| Risk | Severity | Probability | Phase | Mitigation Status |
-|:-----|:---------|:------------|:------|:------------------|
-| NVLink kernel complexity (kMaxRanks=64, kernel 300s `trap;`) | High | Medium | 1a | Bump kMaxRanks to 128; gate `check_timeout`; comprehensive testing |
-| DeepEP limitations | Medium | High | 1a | NVLink primary; DeepEP secondary |
-| PG reconstruction deadlocks | High | Medium | 2a | Coordinated teardown; ULFM MPI |
-| Failure broadcast consensus | Medium | Medium | 1c | Conservative detection; two-phase protocol |
-| EPLB reconfigure timing | Medium | Low | 1b | Iteration boundary only; safe points |
-| **MPI `COMM_WORLD` failure-poisoning** | High | High | 1c | Dedicated FT subcomm, `MPI_ERRORS_RETURN`, non-blocking Isend/Irecv+Test on dedicated thread; opportunistic ULFM |
-| **NCCL fault-tolerance not wired** | Medium | High | 1a (v1) | PR 1a.7 resized S→M; wire `ncclCommAbort` + `NCCL_ASYNC_ERROR_HANDLING` before AllGatherReduceScatter mask path |
-| **PR #12718 sequencing dependency** | Medium | High | 1c | Rebase onto #12718 or build drop-in `ErrorBudget` shim; track weekly |
-| Memory pressure | Low | Low | 1d | Small impact; monitor + alert |
-| False positive failure detection | Medium | Medium | 1c | Conservative timeouts; confirmation step |
-| PP + WideEP interaction | Medium | Low | 2+ | Defer to Phase 2 |
-| Disagg + WideEP FT interaction | Medium | Medium | Separate track | Explicitly out of scope; per-pool coverage only |
+The **Residual** column reports the risk level expected to remain *after* the mitigation lands, accounting for execution risk, external dependencies, and items consciously accepted as out-of-scope. Readers should prioritize rows where Residual is Medium or higher.
+
+| Risk | Severity | Probability | Phase | Mitigation Status | Residual |
+|:-----|:---------|:------------|:------|:------------------|:---------|
+| NVLink kernel complexity (kMaxRanks=64, kernel 300s `trap;`) | High | Medium | 1a | Bump kMaxRanks to 128; gate `check_timeout`; comprehensive testing | **Low** — absorbed by PR 1a.2; in-repo kernel, fully in our control |
+| DeepEP limitations | Medium | High | 1a | NVLink primary; DeepEP secondary | **High (accepted)** — deferred indefinitely pending public `mask_buffer_ptr` |
+| PG reconstruction deadlocks | High | Medium | 2a | Coordinated teardown; ULFM MPI | **Medium** — novel work; execution risk realizes in Phase 2, not MVP |
+| Failure broadcast consensus | Medium | Medium | 1c | Conservative detection; two-phase protocol | **Low** — monotonic-failure invariant + suspect/confirm protocol |
+| EPLB reconfigure timing | Medium | Low | 1b | Iteration boundary only; safe points | **Low** — design constraint enforced by model-engine hook |
+| **MPI `COMM_WORLD` failure-poisoning** | High | High | 1c | Dedicated FT subcomm, `MPI_ERRORS_RETURN`, non-blocking Isend/Irecv+Test on dedicated thread; opportunistic ULFM | **Low–Medium** — ULFM availability depends on linked MPI build; single-failure MVP survives without ULFM |
+| **NCCL fault-tolerance not wired** | Medium | High | 1a (v1) | PR 1a.7 resized S→M; wire `ncclCommAbort` + `NCCL_ASYNC_ERROR_HANDLING` before AllGatherReduceScatter mask path | **Low** — fully in our control; v1 scope |
+| **PR #12718 sequencing dependency** | Medium | High | 1c | Rebase onto #12718 or build drop-in `ErrorBudget` shim; track weekly | **Medium** — external dependency on #12718 merge cadence; shim is a workaround, not a substitute |
+| Memory pressure | Low | Low | 1d | Small impact; monitor + alert | **Low** — headroom is ample on GB200 |
+| False positive failure detection | Medium | Medium | 1c | Conservative timeouts; confirmation step | **Low–Medium** — tuning reduces but does not eliminate; monotonic-failure means a false positive permanently masks a live rank until Phase 2 |
+| PP + WideEP interaction | Medium | Low | 2+ | Defer to Phase 2 | **Medium (deferred)** — cross-stage capacity coupling is a real design problem, unaddressed in Phase 1 |
+| Disagg + WideEP FT interaction | Medium | Medium | Separate track (Phase 1-DS) | Per-pool coverage works unchanged; cross-pool coordination added in Phase 1-DS | **Low** once Phase 1-DS lands; **Medium** in the interval between MVP and DS completion |
