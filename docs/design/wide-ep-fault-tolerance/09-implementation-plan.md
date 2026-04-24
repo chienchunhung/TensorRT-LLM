@@ -121,7 +121,7 @@ Deliverable tags in the sub-phases below: **(MVP)** = required for v0 ship; **(v
 | PR | Title | Scope | Target file(s) | Size | Deps |
 |:---|:---|:---|:---|:---|:---|
 | **1a.1** | `EPGroupHealth` class ([#13302](https://github.com/NVIDIA/TensorRT-LLM/pull/13302)) | MVP | `tensorrt_llm/_torch/modules/fused_moe/ep_group_health.py` (new) | S | — |
-| **1a.2** | NVLinkOneSided kernel mask (CUDA) | MVP | `cpp/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.{cu,h}` | **L** | — |
+| **1a.2** | NVLinkOneSided kernel mask (CUDA) ([#13404](https://github.com/NVIDIA/TensorRT-LLM/pull/13404)) | MVP | `cpp/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.{cu,h}` | **L** | — |
 | **1a.3** | NVLinkOneSided Python binding update | MVP | `_torch/modules/fused_moe/communication/nvlink_one_sided.py`, `communication_factory.py` | S | 1a.1, 1a.2 |
 | **1a.4** | `AlltoAllWatchdog` (host thread) | MVP | `_torch/modules/fused_moe/alltoall_watchdog.py` (new) | S | 1a.1 |
 | **1a.5** | NVLinkTwoSided kernel mask (CUDA) | v1 | `cpp/tensorrt_llm/kernels/fusedMoeCommKernels.cu`, `cpp/tensorrt_llm/thop/moeCommOp.cpp` | M | 1a.2 (pattern) |
