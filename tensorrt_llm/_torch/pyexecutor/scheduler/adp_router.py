@@ -235,9 +235,17 @@ class DefaultADPRouter(ADPRouter):
 
         num_new_requests_all_ranks = len(remaining_unscheduled)
         total_num_active_requests = sum(all_ranks_num_active_requests)
-        expected_num_active_requests = max(
-            (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
-            max(all_ranks_num_active_requests),
+        # Cap at max_num_active_requests to prevent the balancer from
+        # assigning more requests than a rank can physically schedule.
+        # Without this cap, bulk arrivals (e.g. benchmark disagg mode)
+        # can push expected above max_batch_size, leaving excess requests
+        # permanently stuck in INIT state (nvbug 6071070).
+        expected_num_active_requests = min(
+            max(
+                (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
+                max(all_ranks_num_active_requests),
+            ),
+            max_num_active_requests,
         )
 
         all_ranks_new_requests = self._balance_requests_across_ranks(
@@ -470,9 +478,14 @@ class KVCacheAwareADPRouter(ADPRouter):
 
         num_new_requests_all_ranks = len(remaining_unscheduled)
         total_num_active_requests = sum(all_ranks_num_active_requests)
-        expected_num_active_requests = max(
-            (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
-            max(all_ranks_num_active_requests),
+        # Cap at max_num_active_requests — same guard as DefaultADPRouter.
+        # See nvbug 6071070 for rationale.
+        expected_num_active_requests = min(
+            max(
+                (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
+                max(all_ranks_num_active_requests),
+            ),
+            max_num_active_requests,
         )
 
         # --- Prefix-affinity sorting ---

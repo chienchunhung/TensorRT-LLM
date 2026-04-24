@@ -760,3 +760,141 @@ class TestPrepareAndScheduleBatchNoBlock:
         ex._prepare_and_schedule_batch()
 
         mock_fetch.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# ADP router per-rank cap  (prevents overflow that caused nvbug 6071070)
+# ---------------------------------------------------------------------------
+
+_ROUTER_CLS_PATHS = [
+    pytest.param(
+        "tensorrt_llm._torch.pyexecutor.scheduler.adp_router.DefaultADPRouter",
+        id="DefaultADPRouter",
+    ),
+    pytest.param(
+        "tensorrt_llm._torch.pyexecutor.scheduler.adp_router.KVCacheAwareADPRouter",
+        id="KVCacheAwareADPRouter",
+    ),
+]
+
+
+def _make_router(cls_path: str, tp_size: int = 4):
+    """Instantiate a router from its dotted class path."""
+    import importlib
+
+    from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
+
+    module_path, cls_name = cls_path.rsplit(".", 1)
+    mod = importlib.import_module(module_path)
+    RouterCls = getattr(mod, cls_name)
+
+    dist = Mock()
+    dist.tp_rank = 0
+    dist.tp_size = tp_size
+
+    extra_kwargs = {}
+    if cls_name == "KVCacheAwareADPRouter":
+        kv_mgr = Mock()
+        kv_mgr.probe_prefix_match_length = Mock(return_value=0)
+        extra_kwargs["kv_cache_manager"] = kv_mgr
+
+    router = RouterCls(dist=dist, **extra_kwargs)
+    return router, cls_name, RankState
+
+
+def _make_unscheduled_request_item(req_id=None):
+    """Create a mock RequestQueueItem with no py_scheduling_params."""
+    req_item = Mock()
+    req_item.request.py_scheduling_params = None
+    req_item.request.input_token_ids = [1, 2, 3]
+    req_item.id = req_id if req_id is not None else id(req_item)
+    return req_item
+
+
+def _prep_kv_router(router, cls_name, tp_size):
+    """Populate prefix-match data for KVCacheAwareADPRouter (no-op for Default)."""
+    if cls_name == "KVCacheAwareADPRouter":
+        router._all_ranks_prefix_matches = [{} for _ in range(tp_size)]
+
+
+class TestADPRouterPerRankCap:
+    """Verify that the ADP router never proposes expected_num_active_requests
+    above max_num_active_requests, even when rank imbalance or bulk arrival
+    would produce a larger ceiling-division result.
+
+    This is the root cause of nvbug 6071070: without the cap, the router
+    could set expected=257 for a rank with max_batch_size=256, causing the
+    heap to push requests onto ranks that can never schedule them.
+    """
+
+    @pytest.mark.parametrize("router_cls_path", _ROUTER_CLS_PATHS)
+    def test_expected_capped_at_max(self, router_cls_path):
+        """When one rank is heavily loaded, expected must not exceed max."""
+        from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
+
+        router, cls_name, _ = _make_router(router_cls_path)
+        _prep_kv_router(router, cls_name, 4)
+
+        max_num_active = 4
+        all_rank_states = [
+            RankState(rank=0, num_active_requests=6, num_active_tokens=100),
+            RankState(rank=1, num_active_requests=0, num_active_tokens=0),
+            RankState(rank=2, num_active_requests=0, num_active_tokens=0),
+            RankState(rank=3, num_active_requests=0, num_active_tokens=0),
+        ]
+        requests = [_make_unscheduled_request_item(i) for i in range(3)]
+
+        result, expected = router.route_requests(all_rank_states, requests, max_num_active)
+
+        assert expected == max_num_active, (
+            f"expected_num_active_requests should be capped at {max_num_active}, got {expected}"
+        )
+        assert len(result[0]) == 0, "Overloaded rank 0 (already at 6) must not receive new requests"
+
+    @pytest.mark.parametrize("router_cls_path", _ROUTER_CLS_PATHS)
+    def test_no_rank_exceeds_max(self, router_cls_path):
+        """Near-capacity: no rank should be assigned beyond max_num_active."""
+        from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
+
+        router, cls_name, _ = _make_router(router_cls_path)
+        _prep_kv_router(router, cls_name, 4)
+
+        max_num_active = 256
+        all_rank_states = [
+            RankState(rank=0, num_active_requests=255, num_active_tokens=1000),
+            RankState(rank=1, num_active_requests=254, num_active_tokens=900),
+            RankState(rank=2, num_active_requests=250, num_active_tokens=800),
+            RankState(rank=3, num_active_requests=253, num_active_tokens=950),
+        ]
+        requests = [_make_unscheduled_request_item(i) for i in range(10)]
+
+        result, expected = router.route_requests(all_rank_states, requests, max_num_active)
+
+        assert expected <= max_num_active
+        for rank, assigned in result.items():
+            initial = all_rank_states[rank].num_active_requests
+            total = initial + len(assigned)
+            assert total <= max_num_active, (
+                f"Rank {rank}: {initial} existing + {len(assigned)} new = {total}, "
+                f"exceeds cap {max_num_active}"
+            )
+
+    @pytest.mark.parametrize("router_cls_path", _ROUTER_CLS_PATHS)
+    def test_cap_not_applied_when_below_max(self, router_cls_path):
+        """When the natural expected is within max, cap has no effect."""
+        from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
+
+        router, cls_name, _ = _make_router(router_cls_path)
+        _prep_kv_router(router, cls_name, 4)
+
+        max_num_active = 256
+        all_rank_states = [
+            RankState(rank=i, num_active_requests=0, num_active_tokens=0) for i in range(4)
+        ]
+        requests = [_make_unscheduled_request_item(i) for i in range(8)]
+
+        result, expected = router.route_requests(all_rank_states, requests, max_num_active)
+
+        assert expected == 2
+        total_assigned = sum(len(v) for v in result.values())
+        assert total_assigned == 8
