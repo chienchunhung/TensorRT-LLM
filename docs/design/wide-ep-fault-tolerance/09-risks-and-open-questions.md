@@ -12,16 +12,56 @@ Two audits are called out as named risks because they gate downstream work and t
 
 **Why it's named.** Phase 2's `< 1 s` recovery target assumes MNNVL fabric-memory teardown + re-allocate + handle re-exchange is achievable in the ~100 ms range. The audit confirms or refutes this empirically. NVSHMEM is a secondary audit target tied to the (deferred) DeepEP scope.
 
-**Scope.** 1–2 weeks, one engineer with MNNVL / NVSHMEM working knowledge:
+**Structured in two phases by hardware dependency.** Most of the audit work does not need NVL72 rack access and can start immediately on any ≥ 4-GPU node. A smaller set of items is specifically about rack-fabric behavior and needs NVL72 (or equivalent) time. Splitting this way lets Phase 1a surface most findings on commodity hardware, so Phase 1b rack time is efficient validation rather than from-scratch prototyping.
 
-1. **Survey** (1–2 days). NVSHMEM release notes for the version TRT-LLM ships against. CUDA driver semantics for `cuMemUnmap` of a fabric region whose owning process has died. DeepEP `Buffer.__del__` source path.
-2. **Minimal repro rig** (3–5 days). 4-GPU node, `MnnvlMemory` allocated symmetrically, small AlltoAll workload. SIGKILL one process mid-collective. Measure: (a) whether `cuMemUnmap` of the dead peer's region segfaults / hangs / succeeds on survivors; (b) full teardown latency (every survivor `cuMemRelease` on its own region); (c) whether kernel-side kernels still executing when mapping is invalidated cause instability.
-3. **Rebuild prototype** (3–5 days). Post-teardown, exchange new fabric handles among N-1 survivors, allocate new MNNVL workspace, rebuild completion-flag table, run correctness AlltoAll on the new workspace. Measure end-to-end "rank dies → first successful AlltoAll on new comm" latency.
-4. **DeepEP destructor exercise** (1–2 days). Construct a DeepEP `Buffer`, kill one rank, verify `__del__` → `intranode::barrier` deadlocks on gc. Test the explicit `destroy()` ordering proposed in PR 2a.4.
+#### Audit 1a — Intra-node (can start immediately on ≥ 4-GPU node)
 
-**Output:** empirical answer to "MNNVL rebuild on the NVL72 fabric is a 100 ms operation / 1 s operation / not feasible on this version." Sizes [§8.2 PR 2a.2](08-implementation-plan.md#2a--process-group-reconstruction).
+**Scope:** ~1 week, one engineer. Any DGX-class node with ≥ 4 NVLink-connected GPUs (H100 / A100 / B200). Does **not** require NVL72 access.
 
-**Mitigation if worse than expected:** if MNNVL rebuild is > 1 s in the best case, Phase 2's sub-second claim softens to "multi-second." Shadow+GMS still provides most of the win (weight load time dominated, ~100ms), but the overall Phase 2 target moves.
+| Day | Work | Output |
+|:---|:---|:---|
+| 1 | NCCL abort + reinit prototype with SIGKILL fault injection. Measure `ncclCommAbort` + new-comm-init latency on N=4. | Empirical NCCL rebuild latency; confirms PyTorch `destroy_process_group` / `init_process_group` pattern works against our NCCL version. |
+| 2 | MPI signal handler replacement prototype. Test the `_exit(2)` variant from [§5.4](05-phase-1-immediate-survival.md#54-mpi-path-ft-enabling-work). | Mechanism de-risked for PR 1d.0. |
+| 3 | `cuMemUnmap` semantics on dead-peer regions. Isolation test: `cuMemCreate` with posix handle type (not fabric), map cross-process, SIGKILL owner, test unmap on survivors. | Core CUDA driver behavior documented independent of fabric specifics. |
+| 3 | DeepEP destructor behavior. Construct `Buffer`, kill one rank, observe `__del__` → `intranode::barrier` deadlock on gc. Test explicit `destroy()` ordering (proposed in PR 2a.4). | Verified mitigation for known deadlock; sizes PR 2a.4 realistically. |
+| 4–5 | **Intra-node MNNVL teardown + reallocate prototype.** 4-GPU node, `MnnvlMemory` allocated symmetrically, small AlltoAll workload. SIGKILL one process mid-collective. Measure: (a) whether `cuMemUnmap` of dead peer's fabric region segfaults / hangs / succeeds; (b) full teardown latency; (c) rebuild via new fabric-handle exchange on N-1 survivors; (d) correctness AlltoAll on new workspace. | Partial MNNVL rebuild validation. Result generalizes to rack fabric with caveats (see Audit 1b). |
+| 5 | NVSHMEM teardown / `nvshmem_finalize` behavior on shipping version. | Version-specific notes for any future DeepEP / NVSHMEM work. |
+| 5 | Written report: what's validated, what's pending NVL72 access. | Sizes Phase 2 PRs within ±20 % uncertainty; inputs Audit 1b. |
+
+**What Audit 1a definitively answers:**
+- NCCL rebuild latency and correctness.
+- Signal handler replacement mechanism.
+- `cuMemUnmap` behavior under owner death.
+- DeepEP destructor deadlock mitigation.
+- Intra-node MNNVL rebuild latency and mechanism.
+- NVSHMEM teardown semantics on shipping version.
+
+**Output gates Phase 2 sizing** within ±20 %. Precise PR 2a.2 estimate still waits for Audit 1b but Phase 2 v0 planning can proceed against Audit 1a results.
+
+#### Audit 1b — Rack-fabric validation (pending NVL72 access)
+
+**Scope:** ~2–3 days of NVL72 time, executed *after* Audit 1a so rack time is validation rather than from-scratch prototyping.
+
+**Why it's separate.** What distinguishes NVL72 fabric memory from intra-node NVLink is the rack-scale fabric — direct P2P between GPUs on *different* nodes via NVSwitch's fabric manager. Some failure behaviors plausibly differ:
+
+- NVSwitch fabric manager's cleanup path when a rack member disappears (may or may not differ from intra-node NVLink cleanup).
+- Page table / handle invalidation across fabric boundaries vs within one node.
+- Scale-specific issues at 72 ranks (e.g., `kMaxRanks=128` layout, 72×72 completion-flag table interaction with fabric-page caching).
+
+**What Audit 1b must confirm:**
+1. Intra-node MNNVL teardown results from Audit 1a still hold when peers are across the fabric, not just across a local NVLink.
+2. Rebuild latency at 72-rank scale matches the intra-node 4-rank extrapolation (or doesn't — flag scaling artifacts).
+3. No rack-fabric-specific failure mode is surfaced (e.g., fabric manager retrying on a dead member indefinitely).
+
+**Deliverable:** single empirical number for Phase 2 sizing: "MNNVL rebuild on NVL72 with 1 rank failed completes in X ms in the median, Y ms in the tail." This resolves the provisional-sizing caveat on PR 2a.2.
+
+#### Combined deliverable
+
+After both 1a and 1b land: empirical answer to "MNNVL rebuild on the NVL72 fabric is a 100 ms operation / 1 s operation / not feasible on this version." Sizes [§8.2 PR 2a.2](08-implementation-plan.md#2a--process-group-reconstruction) definitively.
+
+**Mitigation if worse than expected.** If MNNVL rebuild is > 1 s in the best case, Phase 2's sub-second claim softens to "multi-second." Shadow+GMS still provides most of the win (weight load time dominated, ~100 ms), but the overall Phase 2 target moves.
+
+**Sequencing benefit.** Running 1a before 1b means rack time is ~2–3 days of targeted validation rather than 1–2 weeks of prototyping. Rack access is scarce and expensive; arrive with a working intra-node prototype.
 
 ### Audit 2 — Ray-path WideEP perf characterization
 

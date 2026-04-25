@@ -134,17 +134,23 @@ Three critical-path items: **1a.2** (kernel mask, in flight), **1c.3** (MPI FT s
 
 | PR | Title | Scope | Target | Size | Deps |
 |:---|:---|:---|:---|:---|:---|
-| **2a.0** | MNNVL/NVSHMEM teardown audit (prototype + report) | Prereq | 4-GPU rig, prototype code, written audit | **M** | — |
+| **2a.0a** | MNNVL/NVSHMEM teardown audit — intra-node phase | Prereq (can start now) | ≥ 4-GPU node, prototype code, partial-validation report | **M** | — |
+| **2a.0b** | MNNVL/NVSHMEM teardown audit — rack-fabric validation | Prereq | NVL72 (or equivalent) access, validation report | S | 2a.0a; NVL72 access |
 | **2a.1** | Coordinated NCCL teardown (custom ops) | 2 | `_torch/distributed/*` | M | Phase 1 complete, 1a.7 |
-| **2a.2** | MNNVL teardown + reallocate + handle re-exchange | 2 | `tensorrt_llm/_mnnvl_utils.py`, kernel launch path | **L** (audit-dependent) | 2a.0 |
-| **2a.3** | NVSHMEM safe deallocation (if DeepEP in scope) | 2 (deferred) | NVSHMEM wrappers | M | 2a.0 |
+| **2a.2** | MNNVL teardown + reallocate + handle re-exchange | 2 | `tensorrt_llm/_mnnvl_utils.py`, kernel launch path | **L** (audit-dependent) | 2a.0a (sizing); 2a.0b (final ship gate) |
+| **2a.3** | NVSHMEM safe deallocation (if DeepEP in scope) | 2 (deferred) | NVSHMEM wrappers | M | 2a.0a |
 | **2a.4** | DeepEP explicit `destroy()` sequencing | 2 (deferred) | `deep_ep.py`, `deep_ep_low_latency.py` | S | 2a.1 |
 | **2a.5** | NVLink workspace deallocation | 2 | NVLink backend teardown | S | 2a.1 |
 | **2a.6** | N-rank PG creation path | 2 | `CommunicationFactory` | M | 2a.1–2a.5 |
 | **2a.7** | EPLB full rebalance after PG rebuild | 2 | `moe_load_balancer.py` (uses 1b.5) | S | 2a.6, 1b.5 |
 | **2a.8** | Second-failure-during-rebuild handling | 2 | rebuild coordinator | M | 2a.6 |
 
-**2a.0 is the audit.** 1–2 weeks of prototyping on a 4-GPU rig: `MnnvlMemory` alloc, SIGKILL one rank, measure what happens to survivors' mappings, prototype teardown + reallocate + new handle exchange. Output: empirical latency + correctness answers that size 2a.2.
+**2a.0 is the audit, split by hardware dependency.**
+
+- **2a.0a (intra-node, can start immediately).** ~1 week on any ≥ 4-GPU NVLink-connected node (DGX H100/A100/B200). Validates NCCL rebuild, MPI signal-handler replacement, `cuMemUnmap` semantics under owner death, DeepEP destructor mitigation, intra-node MNNVL teardown + rebuild prototype, NVSHMEM teardown semantics. **Output sizes Phase 2 PRs within ±20%** — Phase 2 v0 planning can proceed against this.
+- **2a.0b (rack-fabric validation).** ~2–3 days of NVL72 (or equivalent) time. Confirms intra-node results extrapolate to rack scale; validates 72-rank scale-specific behavior; resolves the provisional-sizing caveat on PR 2a.2 definitively.
+
+Sequencing benefit: running 2a.0a first means rack time is targeted validation, not from-scratch prototyping. See [§9.1 Audit 1](09-risks-and-open-questions.md#audit-1--mnnvl--nvshmem-teardown-capability) for the day-by-day plan and full deliverable list.
 
 ### 2b — MX-GMS Shadow EP Ranks
 
@@ -205,7 +211,7 @@ Phase totals account for parallelism: multiple PRs in the same sub-phase run con
 | **Phase 1 MVP (v0)** | 1a.1–1a.4, 1b.1–1b.3, 1c.1–1c.4, 1d.0–1d.5 (13 PRs) | **6–7 weeks** with 2–3 engineers + AI coding assistance | Kernel access; PR #12718 rebased | Single-failure survival on NVLinkOneSided; <10s recovery; no weight movement at recovery time |
 | **Phase 1 v1** | 1a.5–1a.8, 1b.4–1b.7, 1c.5–1c.6, 1d.6–1d.7 (12 PRs) | **6–9 weeks after MVP** | MVP landed | All NVLink backends, full EPLB reconfigure with weight migration, multi-failure consensus, production polish |
 | **Phase 1-DS** | DS.1–DS.6 (6 PRs) | **3–4 weeks, parallelizable with v1** | MVP landed | Disagg serving FT with cross-pool coordination |
-| **Phase 2: Restoration** | 2a.0–2a.8, 2b.1–2b.4, 2c.1–2c.3 (16 PRs) | **10–14 weeks** | Phase 1 v1 complete; 2a.0 audit | Full N-rank restoration via PG rebuild + shadow EP ranks |
+| **Phase 2: Restoration** | 2a.0a/0b, 2a.1–2a.8, 2b.1–2b.4, 2c.1–2c.3 (17 items) | **10–14 weeks** | Phase 1 v1 complete; 2a.0a sizes the work, 2a.0b gates ship | Full N-rank restoration via PG rebuild + shadow EP ranks |
 | **Phase 3: Beyond failover** | 3a–3e tracks (not per-PR sized) | **~3 months** | Phase 2 complete + telemetry infra | Prevention, elastic scale, predictive |
 
 **Total PRs:** ~47 across Phases 1 + 2 (plus Phase 3 rough tracks). MVP alone is 13 PRs.
@@ -216,5 +222,5 @@ Phase totals account for parallelism: multiple PRs in the same sub-phase run con
 
 - **PR #12718 sequencing** is the only external blocker on the MVP critical path. Mitigation: shim path if merge is delayed.
 - **L-sized PRs in MVP** (1a.2 kernel mask, 1c.3 MPI FT subcomm, 1d.4 harness) carry the most schedule risk. 1a.2's confidence is raised since kernel source review confirmed tractability; 1c.3's uncertainty is driven by MPI build variance (ULFM availability); 1d.4's uncertainty is harness design (clean kernel-abort mid-collective without poisoning test runner).
-- **Phase 2 estimates are provisional** pending 2a.0 audit. If MNNVL teardown latency is worse than assumed, 2a.2 grows from L to L+ and the Phase 2 total stretches.
+- **Phase 2 estimates are provisional** pending 2a.0 audit. The audit is now split: **2a.0a (intra-node) can start immediately on a ≥ 4-GPU node and brings Phase 2 sizing to within ±20%**; 2a.0b (rack-fabric) needs NVL72 access to gate definitive ship sizing. If MNNVL teardown latency is worse than assumed, 2a.2 grows from L to L+ and the Phase 2 total stretches.
 - **External blockers** (PR #12718 sequencing, DeepEP NVSHMEM API, MX-GMS Phase 2 availability) affect dependent items and are not improved by AI assistance.

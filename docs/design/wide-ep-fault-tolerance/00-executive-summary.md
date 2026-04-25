@@ -59,7 +59,9 @@ Ray remains an open future-migration question, gated on a named perf-characteriz
 
 ## Two named audits
 
-- **Audit 1 (Phase 2 prerequisite):** MNNVL/NVSHMEM teardown capability. 1–2 weeks, 4-GPU rig, prototype + measure. Sizes Phase 2 sub-PRs realistically.
+- **Audit 1 (Phase 2 prerequisite), split by hardware dependency:**
+  - **1a — Intra-node, ~1 week, can start immediately on any ≥ 4-GPU NVLink node.** Validates NCCL rebuild, MPI signal-handler replacement, `cuMemUnmap` under owner death, DeepEP destructor mitigation, intra-node MNNVL teardown + rebuild, NVSHMEM teardown. Brings Phase 2 sizing within ±20%.
+  - **1b — Rack-fabric validation, ~2–3 days NVL72 time.** Confirms intra-node results extrapolate to rack scale; resolves provisional-sizing caveat. Sequenced after 1a so rack time is targeted validation, not from-scratch prototyping.
 - **Audit 2 (future-migration prerequisite):** Ray-path WideEP perf characterization. Gated on Ray-path CI existing at EP≥32 first. Empirical input for any future Ray pivot.
 
 ## What this design changes vs v1
