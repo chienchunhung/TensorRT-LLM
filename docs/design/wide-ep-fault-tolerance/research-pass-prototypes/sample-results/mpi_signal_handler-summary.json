@@ -1,0 +1,56 @@
+{
+  "recover_exit2": {
+    "mode": "recover_exit2",
+    "elapsed_s": 45.04448635998415,
+    "launcher_returncode": -1,
+    "launcher_timed_out": true,
+    "per_rank": {
+      "0": {
+        "rank": 0,
+        "max_completed_iter": 2
+      },
+      "1": {
+        "rank": 1,
+        "max_completed_iter": 2
+      },
+      "2": {
+        "rank": 2,
+        "victim_about_to_die": true,
+        "max_completed_iter": 2
+      },
+      "3": {
+        "rank": 3,
+        "max_completed_iter": 2
+      }
+    },
+    "stdout_tail": "",
+    "stderr_tail": "[LOG_CAT_ML] You must specify a valid HCA device by setting:\n-x HCOLL_MAIN_IB=<dev_name:port> or -x UCX_NET_DEVICES=<dev_name:port>.\nIf no device was specified for HCOLL (or the calling library), automatic device detection will be run.\nIn case of unfounded HCA device please contact your system administrator.\n[umb-b300-022:2758599] Error: coll_hcoll_module.c:310 - mca_coll_hcoll_comm_query() Hcol library init failed\n[LOG_CAT_ML] You must specify a valid HCA device by setting:\n-x HCOLL_MAIN_IB=<dev_name:port> or -x UCX_NET_DEVICES=<dev_name:port>.\nIf no device was specified for HCOLL (or the calling library), automatic device detection will be run.\nIn case of unfounded HCA device please contact your system administrator.\n[umb-b300-022:2758600] Error: coll_hcoll_module.c:310 - mca_coll_hcoll_comm_query() Hcol library init failed\n[LOG_CAT_ML] You must specify a valid HCA device by setting:\n-x HCOLL_MAIN_IB=<dev_name:port> or -x UCX_NET_DEVICES=<dev_name:port>.\nIf no device was specified for HCOLL (or the calling library), automatic device detection will be run.\nIn case of unfounded HCA device please contact your system administrator.\n[LOG_CAT_ML] You must specify a valid HCA device by setting:\n-x HCOLL_MAIN_IB=<dev_name:port> or -x UCX_NET_DEVICES=<dev_name:port>.\nIf no device was specified for HCOLL (or the calling library), automatic device detection will be run.\nIn case of unfounded HCA device please contact your system administrator.\n[umb-b300-022:2758598] Error: coll_hcoll_module.c:310 - mca_coll_hcoll_comm_query() Hcol library init failed\n[umb-b300-022:2758601] Error: coll_hcoll_module.c:310 - mca_coll_hcoll_comm_query() Hcol library init failed\n[umb-b300-022:2758594] PMIX ERROR: BAD-PARAM in file event/pmix_event_notification.c at line 1009\n\n[launcher: timeout after 45s]"
+  },
+  "recover_sigkill": {
+    "mode": "recover_sigkill",
+    "elapsed_s": 45.04402843400021,
+    "launcher_returncode": -1,
+    "launcher_timed_out": true,
+    "per_rank": {
+      "0": {
+        "rank": 0,
+        "max_completed_iter": 2
+      },
+      "1": {
+        "rank": 1,
+        "max_completed_iter": 2
+      },
+      "2": {
+        "rank": 2,
+        "victim_about_to_die": true,
+        "max_completed_iter": 2
+      },
+      "3": {
+        "rank": 3,
+        "max_completed_iter": 2
+      }
+    },
+    "stdout_tail": "",
+    "stderr_tail": "[LOG_CAT_ML] You must specify a valid HCA device by setting:\n-x HCOLL_MAIN_IB=<dev_name:port> or -x UCX_NET_DEVICES=<dev_name:port>.\nIf no device was specified for HCOLL (or the calling library), automatic device detection will be run.\nIn case of unfounded HCA device please contact your system administrator.\n[umb-b300-022:2759037] Error: coll_hcoll_module.c:310 - mca_coll_hcoll_comm_query() Hcol library init failed\n[LOG_CAT_ML] You must specify a valid HCA device by setting:\n-x HCOLL_MAIN_IB=<dev_name:port> or -x UCX_NET_DEVICES=<dev_name:port>.\nIf no device was specified for HCOLL (or the calling library), automatic device detection will be run.\nIn case of unfounded HCA device please contact your system administrator.\n[LOG_CAT_ML] You must specify a valid HCA device by setting:\n-x HCOLL_MAIN_IB=<dev_name:port> or -x UCX_NET_DEVICES=<dev_name:port>.\nIf no device was specified for HCOLL (or the calling library), automatic device detection will be run.\nIn case of unfounded HCA device please contact your system administrator.\n[LOG_CAT_ML] You must specify a valid HCA device by setting:\n-x HCOLL_MAIN_IB=<dev_name:port> or -x UCX_NET_DEVICES=<dev_name:port>.\nIf no device was specified for HCOLL (or the calling library), automatic device detection will be run.\nIn case of unfounded HCA device please contact your system administrator.\n[umb-b300-022:2759035] Error: coll_hcoll_module.c:310 - mca_coll_hcoll_comm_query() Hcol library init failed\n[umb-b300-022:2759038] Error: coll_hcoll_module.c:310 - mca_coll_hcoll_comm_query() Hcol library init failed\n[umb-b300-022:2759036] Error: coll_hcoll_module.c:310 - mca_coll_hcoll_comm_query() Hcol library init failed\n[umb-b300-022:2759031] PMIX ERROR: BAD-PARAM in file event/pmix_event_notification.c at line 1009\n\n[launcher: timeout after 45s]"
+  }
+}

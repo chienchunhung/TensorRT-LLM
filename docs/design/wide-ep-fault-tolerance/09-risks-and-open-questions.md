@@ -18,6 +18,8 @@ Two audits are called out as named risks because they gate downstream work and t
 
 **Scope:** ~1 week, one engineer. Any DGX-class node with ≥ 4 NVLink-connected GPUs (H100 / A100 / B200). Does **not** require NVL72 access.
 
+**Empirical findings (Days 1–3 complete, Days 4–5 + DeepEP/NVSHMEM gated on IMEX / container / nvshmem unblockers):** see [audit-1a-findings.md](audit-1a-findings.md) for the long-form Day-by-Day write-up, or the condensed version in [`redesign-research-pass-report.md` § Empirical follow-up](redesign-research-pass-report.md#-empirical-follow-up--audit-1a-partial-item-7). Runnable prototypes + 2 sample result files in [`research-pass-prototypes/`](research-pass-prototypes/).
+
 | Day | Work | Output |
 |:---|:---|:---|
 | 1 | NCCL abort + reinit prototype with SIGKILL fault injection. Measure `ncclCommAbort` + new-comm-init latency on N=4. | Empirical NCCL rebuild latency; confirms PyTorch `destroy_process_group` / `init_process_group` pattern works against our NCCL version. |

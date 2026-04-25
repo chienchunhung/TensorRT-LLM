@@ -1,0 +1,11 @@
+{"event": "peer_start", "device_id": 0, "role": "peer", "pid": 2769166, "t": 242904.268988492}
+{"event": "fd_received", "fd": 75, "role": "peer", "pid": 2769166, "t": 242909.924505}
+{"event": "cuMemImportFromShareableHandle_ok", "handle": 967235616, "role": "peer", "pid": 2769166, "t": 242909.92674394}
+{"event": "cuMemMap_ok", "va": 21606822838272, "size": 2097152, "role": "peer", "pid": 2769166, "t": 242909.928904412}
+{"event": "cross_process_read", "first_bytes_seen": "4f574e00000000000000000000000000", "cross_process_share_verified": true, "role": "peer", "pid": 2769166, "t": 242909.93326095}
+{"event": "post_kill_wait_done", "post_kill_wait_s": 2.0, "role": "peer", "pid": 2769166, "t": 242911.935285826}
+{"event": "post_kill_read_attempt", "rc": "0", "sync_rc": "0", "elapsed_ms": 1.621918985620141, "first_bytes_seen": "4f574e00000000000000000000000000", "role": "peer", "pid": 2769166, "t": 242911.938928618}
+{"event": "cuMemUnmap_attempt", "rc": 0, "rc_name": "CUDA_SUCCESS", "rc_desc": "no error", "elapsed_ms": 0.24807100999169052, "role": "peer", "pid": 2769166, "t": 242911.941250863}
+{"event": "cuMemRelease_attempt", "rc": 0, "rc_name": "CUDA_SUCCESS", "rc_desc": "no error", "elapsed_ms": 1.27210101345554, "role": "peer", "pid": 2769166, "t": 242911.944378616}
+{"event": "cuMemAddressFree_attempt", "rc": 0, "rc_name": "CUDA_SUCCESS", "rc_desc": "no error", "elapsed_ms": 0.007925991667434573, "role": "peer", "pid": 2769166, "t": 242911.946286808}
+{"event": "peer_done", "role": "peer", "pid": 2769166, "t": 242911.948315479}

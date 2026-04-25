@@ -50,6 +50,23 @@ cat /tmp/audit-1a-prototypes/mpi_signal_handler/summary.json | python3 -m json.t
 ls /tmp/audit-1a-prototypes/cumem_unmap_dead_peer/
 ```
 
+## Sample results
+
+Two representative output files from the original Audit 1a runs are
+checked in under [`sample-results/`](sample-results/) so readers can see
+the JSON / JSONL shape without having to re-run anything:
+
+- [`mpi_signal_handler-summary.json`](sample-results/mpi_signal_handler-summary.json)
+  — launcher summary from the last `mpi_signal_launcher.py` invocation
+  (`recover_exit2` + `recover_sigkill` modes). Shows the schema and the
+  "survivors stay alive but hang in collective" outcome with
+  `--mca orte_enable_recovery 1`.
+- [`cumem_unmap_dead_peer-peer.jsonl`](sample-results/cumem_unmap_dead_peer-peer.jsonl)
+  — one-process event log from the Day 3 posix-FD test. Shows the full
+  success path: receive FD → import → map → verify cross-process share
+  pre-kill → wait 2 s → verify share survives kill → cuMemUnmap (0.25 ms)
+  → cuMemRelease (1.27 ms) → cuMemAddressFree (0.008 ms).
+
 ## What's intentionally not here
 
 - Full per-run JSONL logs from the original test host. Logs are tied to a
