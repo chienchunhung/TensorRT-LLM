@@ -65,7 +65,7 @@
 
 ## 🧪 Empirical follow-up — Audit 1a partial (Item 7)
 
-**Hardware:** 8× B300 SXM6 single node, NVLink full mesh. **Software:** PyTorch 2.11 (NCCL 2.29.2), OpenMPI 4.1.9a1 (no ULFM), CUDA 13.1, cuda-python 13.1.1. **Date:** 2026-04-25. **Tracks completed:** NCCL rebuild (Day 1, 6 runs / 6 modes), MPI signal handler (Day 2, 7 runs / 7 modes), driver-side `cuMemUnmap` posix-FD variant (Day 3). Deep prototypes + per-run JSONL logs live at `/home/chienchunh/audit-1-mnnvl-teardown/` on the test host; this section captures the headline findings.
+**Hardware:** 8× B300 SXM6 single node, NVLink full mesh. **Software:** PyTorch 2.11 (NCCL 2.29.2), OpenMPI 4.1.9a1 (no ULFM), CUDA 13.1, cuda-python 13.1.1. **Date:** 2026-04-25. **Tracks completed:** NCCL rebuild (Day 1, 6 runs / 6 modes), MPI signal handler (Day 2, 7 runs / 7 modes), driver-side `cuMemUnmap` posix-FD variant (Day 3). Reproducible prototypes live in [`research-pass-prototypes/`](research-pass-prototypes/) (5 single-file scripts, see that subdir's README for run commands); this section captures the headline findings.
 
 ### Headline findings
 
