@@ -1,0 +1,220 @@
+# 8. Implementation Plan
+
+[< Back to Overview](README.md)
+
+This section breaks the design into named PRs. Phase 1 PRs are detailed (they're the next-to-ship work); Phase 2 PRs are sized but contingent on the audit ([§9](09-risks-and-open-questions.md)); Phase 3 is sized at work-track level because scope will refine after Phase 2 informs what matters most.
+
+## 8.1 Phase 1 PR breakdown
+
+**Goal:** Single-failure survival on NVLinkOneSided in 6–7 weeks (MVP), full scope in +6–9 weeks (v1). Timelines assume AI coding-agent assistance; without it, apply ~1.3× per the prior estimates.
+
+### How to read the tables
+
+- **Size:** S (<300 LOC, 0.5–1 wk calendar), M (300–1000 LOC, 1–2 wk), L (>1000 LOC or deep design complexity, 2–4 wk). Calendar time includes review cycles.
+- **Scope tag:** **MVP** (v0) = ships for single-failure NVLinkOneSided; **v1** = broadens coverage.
+- **Deps:** `X.Y` means that PR must land (or at least be reviewable behind a flag) before this one can be reviewed for merge.
+
+### 1a — Rank masking in communication kernels
+
+**Scope:** Add timeout + rank masking to NVLink AlltoAll kernels. Mode B fix at the kernel layer.
+
+| PR | Title | Scope | Target | Size | Deps |
+|:---|:---|:---|:---|:---|:---|
+| **1a.1** | `EPGroupHealth` class | MVP | `tensorrt_llm/_torch/modules/fused_moe/ep_group_health.py` (new) | S | — |
+| **1a.2** | NVLinkOneSided kernel mask (CUDA) | MVP | `cpp/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.{cu,h}` | **L** | — |
+| **1a.3** | NVLinkOneSided Python binding | MVP | `_torch/modules/fused_moe/communication/nvlink_one_sided.py`, `communication_factory.py` | S | 1a.1, 1a.2 |
+| **1a.4** | `AlltoAllWatchdog` host thread | MVP | `_torch/modules/fused_moe/alltoall_watchdog.py` (new) | S | 1a.1 |
+| **1a.5** | NVLinkTwoSided kernel mask | v1 | `cpp/tensorrt_llm/kernels/fusedMoeCommKernels.cu`, `thop/moeCommOp.cpp` | M | 1a.2 pattern |
+| **1a.6** | NVLinkTwoSided Python binding | v1 | `_torch/modules/fused_moe/communication/nvlink_two_sided.py`, `nvlink_two_sided_flashinfer.py` | S | 1a.5 |
+| **1a.7** | NCCL FT wrapper + AllGatherReduceScatter mask wiring | v1 | NCCL communicator wrapper in `cpp/tensorrt_llm/`, `_torch/modules/fused_moe/communication/allgather_reducescatter.py` | **M** | 1a.1 |
+| **1a.8** | Tighten kernel `check_timeout` + replace `trap;` with host-visible flag | v1 | `moeAlltoAllKernels.cu` | M | 1a.2 |
+
+**Status (April 2026):**
+- **1a.1 is in flight as PR #13302** — reviewed and refined based on reviewer feedback.
+- **1a.2 is in flight as PR #13404** — NVLinkOneSided kernel mask.
+
+**Per-PR notes:**
+
+- **1a.2** is the critical-path kernel work. Three sub-tasks inside it: (a) `kMaxRanks` 64 → 128; (b) add `active_rank_mask_lo, active_rank_mask_hi` to both `DispatchKernelPointers` and `CombineKernelPointers`; (c) guard both release-write and polling loops in dispatch (~lines 537–584) and combine (~lines 1190–1217). Performance gate: < 0.1 % overhead when all ranks active.
+
+- **1a.7** resizes S → M because NCCL FT wiring is net-new in TRT-LLM (zero prior uses of `ncclCommAbort`). Before this PR lands, `AllGatherReduceScatter` fallback is not a mask-capable path.
+
+- **1a.8** is optional for MVP but valuable — tightens the 300s backstop and replaces `trap;` (which corrupts the CUDA context) with a host-visible flag write, letting the host recover rather than requiring process restart.
+
+### 1b — EPLB topology adaptation
+
+**Scope:** Add `reconfigure_mask_only` (MVP) and `reconfigure` with weight migration (v1) to the C++ MoeLoadBalancer.
+
+| PR | Title | Scope | Target | Size | Deps |
+|:---|:---|:---|:---|:---|:---|
+| **1b.1** | `reconfigure_mask_only` C++ entry point | MVP | `cpp/tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceKernels.{cu,h}` | M | — |
+| **1b.2** | Python wrapper for mask-only reconfigure | MVP | `_torch/modules/fused_moe/moe_load_balancer.py` | S | 1b.1 |
+| **1b.3** | Iteration-boundary reconfigure integration | MVP | `_torch/modules/fused_moe/moe_load_balancer.py`, `_torch/pyexecutor/model_engine.py` | S | 1b.2 |
+| **1b.4** | Mutable `MoeLoadBalanceMetaInfo` (epSize/epRank rewrite) | v1 | `moeLoadBalanceKernels.{cu,h}`, `moeLoadBalanceCommon.h` | **L** | 1b.1 |
+| **1b.5** | Full `reconfigure(emergency_mode)` online | v1 | `moeLoadBalancer.cpp`, `moe_load_balancer.py` | M | 1b.4 |
+| **1b.6** | Weight migration path (cudaMemcpy2D + gdrcopy) | v1 | `moeLoadBalancer.cpp`, `HostMoeTensorSharer` integration | **L** | 1b.5 |
+| **1b.7** | Zero-replica expert handling | v1 | `moeLoadBalancer.cpp`, `moe_load_balancer.py` | M | 1b.5 |
+
+**MVP simplification.** Under replication ≥ 2 (the DeepSeek production default), 1b.1–1b.3 is sufficient — every dead-rank expert has a surviving replica, so slot remap reaches steady state with no weight movement.
+
+### 1c — Failure detection and broadcast
+
+**Scope:** Per-EP-rank health tracking layered on PR #12718.
+
+| PR | Title | Scope | Target | Size | Deps |
+|:---|:---|:---|:---|:---|:---|
+| **1c.1** | EP-specific error classification patterns | MVP | `_torch/pyexecutor/error_classification.py` | S | PR #12718 rebased |
+| **1c.2** | `EPRankHealthTracker` per-rank budgets | MVP | `_torch/pyexecutor/ep_rank_health.py` (new) | S | 1c.1 |
+| **1c.3** | MPI FT subcomm + broadcast thread | MVP | `_torch/pyexecutor/ep_failure_broadcast.py` (new), `_torch/distributed/communicator.py` | **L** | 1a.1 |
+| **1c.4** | Model engine health-check hook | MVP | `_torch/pyexecutor/model_engine.py` | M | 1a.1, 1b.3, 1c.3 |
+| **1c.5** | Iteration-barrier piggyback broadcast | v1 | `_torch/pyexecutor/ep_failure_broadcast.py` | M | 1c.3 |
+| **1c.6** | Multi-failure consensus (two-phase suspect/confirm) | v1 | `_torch/pyexecutor/ep_failure_broadcast.py` | M | 1c.3 |
+
+**1c.3 is the largest MVP risk.** Net-new component — no FT subcomm today. Scope: `MPI_Comm_split` at startup, `MPI_Errhandler_set(MPI_ERRORS_RETURN)`, non-blocking `Isend`/`Irecv`+`Test` on a dedicated CPU thread, opportunistic ULFM `MPI_Comm_revoke`. Single-failure consensus is trivial (any surviving rank's report is authoritative).
+
+### 1d — Integration, productionization, end-to-end validation
+
+**Scope:** Wire Phase 1 together, feature flag, telemetry, fault-injection harness.
+
+| PR | Title | Scope | Target | Size | Deps |
+|:---|:---|:---|:---|:---|:---|
+| **1d.0** | MPI signal handler replacement | **MVP** | `cpp/tensorrt_llm/runtime/utils/mpiUtils.cpp` | S | — |
+| **1d.1** | Feature flag + config gating | MVP | `tensorrt_llm/llmapi/llm_args.py`, `_torch/modules/fused_moe/interface.py` | S | 1c.4 |
+| **1d.2** | `check_health()` degraded reporting | MVP | `_torch/pyexecutor/py_executor.py`, `trtllm-serve` health endpoint | S | 1c.4 |
+| **1d.3** | Per-rank health telemetry / metrics | MVP | `_torch/modules/fused_moe/ep_metrics.py` (new), Prometheus hook | S | 1a.1 |
+| **1d.4** | 4-GPU E2E fault-injection harness + test | MVP | `tests/integration/defs/fault_tolerance/test_wide_ep_ft.py` (new) + net-new fault-injection fixture | **L** | 1a–1c MVP items |
+| **1d.5** | Steady-state overhead regression test | MVP | same test dir | S | 1a.3, 1a.4 |
+| **1d.6** | Multi-failure stress + chaos suite | v1 | same test dir | M | 1c.6, 1b.4–1b.7 |
+| **1d.7** | Cross-model matrix (DS-V3, DS-R1, others) | v1 | `tests/integration/test_lists/` | S | 1d.4 |
+
+**1d.0 is the Mode A fix** — signal handler replacement in `mpiUtils.cpp`, guarded by the FT feature flag. Small but critical; without it, Mode A kills the cluster before any of the rest of Phase 1 can run.
+
+**1d.4 harness** is net-new — TRT-LLM has no fault-injection infrastructure for kernel-level rank death today. Sub-tasks: (a) pytest fixture launching multi-rank MPI workers with tracked PIDs, (b) signal/CUDA-hook to abort rank N at controllable dispatch/combine points, (c) assertion helpers for end-to-end recovery + per-token correctness.
+
+### Phase 1 MVP critical path
+
+```mermaid
+gantt
+    title Phase 1 MVP Critical Path (~7 weeks, AI coding-agent assisted)
+    dateFormat YYYY-MM-DD
+    axisFormat %b %d
+
+    section Python track
+    1a.1 EPGroupHealth (in flight, PR #13302)   :done, a1, 2026-04-18, 12d
+    1a.4 AlltoAllWatchdog                       :a2, after a1, 5d
+    1c.1-2 Error cls + per-rank tracker         :a6, after a2, 7d
+
+    section CUDA track
+    1a.2 NVLinkOneSided kernel mask (in flight, PR #13404) :crit, active, a3, 2026-04-22, 21d
+    1a.3 NVLinkOneSided binding                 :a4, after a3, 5d
+
+    section EPLB track
+    1b.1-3 EPLB slot-remap + wire               :a5, 2026-05-01, 14d
+
+    section MPI-path track
+    1d.0 Signal handler replacement             :a0, 2026-05-01, 3d
+    1c.3 MPI FT subcomm + thread                :crit, ac3, 2026-05-01, 21d
+
+    section Integration
+    1c.4 Model engine integration               :a7, after ac3, 5d
+    1d.1-3 Flag + health + metrics              :a8, after a7, 5d
+    1d.4 Fault-injection harness                :crit, a9, after a7, 12d
+    1d.5 Overhead regression                    :a10, after a9, 5d
+```
+
+Three critical-path items: **1a.2** (kernel mask, in flight), **1c.3** (MPI FT subcomm, net-new), **1d.4** (harness, net-new). Each gates end-to-end demonstration of one capability; they can't be parallelized away.
+
+## 8.2 Phase 2 PR breakdown
+
+**Scope:** Full N-rank restoration via process-group reconstruction + replacement rank (optionally accelerated by MX-GMS shadow + GMS zero-copy).
+
+**Status:** **Sizes are provisional until the MNNVL/NVSHMEM teardown audit** ([§9](09-risks-and-open-questions.md) named risk) completes. Several estimates below carry the caveat "pending audit."
+
+### 2a — Process group reconstruction
+
+| PR | Title | Scope | Target | Size | Deps |
+|:---|:---|:---|:---|:---|:---|
+| **2a.0** | MNNVL/NVSHMEM teardown audit (prototype + report) | Prereq | 4-GPU rig, prototype code, written audit | **M** | — |
+| **2a.1** | Coordinated NCCL teardown (custom ops) | 2 | `_torch/distributed/*` | M | Phase 1 complete, 1a.7 |
+| **2a.2** | MNNVL teardown + reallocate + handle re-exchange | 2 | `tensorrt_llm/_mnnvl_utils.py`, kernel launch path | **L** (audit-dependent) | 2a.0 |
+| **2a.3** | NVSHMEM safe deallocation (if DeepEP in scope) | 2 (deferred) | NVSHMEM wrappers | M | 2a.0 |
+| **2a.4** | DeepEP explicit `destroy()` sequencing | 2 (deferred) | `deep_ep.py`, `deep_ep_low_latency.py` | S | 2a.1 |
+| **2a.5** | NVLink workspace deallocation | 2 | NVLink backend teardown | S | 2a.1 |
+| **2a.6** | N-rank PG creation path | 2 | `CommunicationFactory` | M | 2a.1–2a.5 |
+| **2a.7** | EPLB full rebalance after PG rebuild | 2 | `moe_load_balancer.py` (uses 1b.5) | S | 2a.6, 1b.5 |
+| **2a.8** | Second-failure-during-rebuild handling | 2 | rebuild coordinator | M | 2a.6 |
+
+**2a.0 is the audit.** 1–2 weeks of prototyping on a 4-GPU rig: `MnnvlMemory` alloc, SIGKILL one rank, measure what happens to survivors' mappings, prototype teardown + reallocate + new handle exchange. Output: empirical latency + correctness answers that size 2a.2.
+
+### 2b — MX-GMS Shadow EP Ranks
+
+| PR | Title | Scope | Target | Size | Deps |
+|:---|:---|:---|:---|:---|:---|
+| **2b.1** | Shadow EP rank lifecycle — pre-load via GMS RO | 2 | Shadow worker spawn path; GMS client integration | M | MX-GMS Phase 2 |
+| **2b.2** | Shadow health-check loop monitoring primary | 2 | `shadow_ep_rank.py` (new) | S | 2b.1 |
+| **2b.3** | Activation path: GMS RO→RW upgrade → join PG → serve | 2 | `shadow_ep_rank.py` | M | 2b.1, 2a.6 |
+| **2b.4** | MX P2P fallback for cross-node replacement | 2 | MX client integration; identity matching with `ep_rank` | M | MX-GMS Phase 1 |
+
+**Soft dependencies:** MX-GMS Phase 2 (GMS) for 2b.1; MX-GMS Phase 1 (MX P2P) for 2b.4. Phase 2 works without MX-GMS at minutes-class latency ([§6.3](06-phase-2-full-restoration.md#63-shadow-rank--gms-roles)).
+
+### 2c — Orchestrator integration
+
+| PR | Title | Scope | Target | Size | Deps |
+|:---|:---|:---|:---|:---|:---|
+| **2c.1** | Replacement rank provisioning API | 2 | orchestrator hooks (K8s/Ray/Dynamo) | M | 2a.6 |
+| **2c.2** | Join protocol for new rank entering EP group | 2 | handshake path, calls into 2b.3 | M | 2c.1, 2b.3 |
+| **2c.3** | E2E test: Phase 1 + Phase 2 full lifecycle | 2 | `tests/integration/defs/fault_tolerance/test_phase2_restoration.py` | M | 2c.1, 2c.2 |
+
+### Phase 1-DS — Disaggregated serving FT
+
+**Goal:** Extend Phase 1 to disaggregated serving. Starts after Phase 1 MVP; parallelizable with Phase 1 v1.
+
+**Scope:** Phase 1 primitives (EPGroupHealth, rank masking, `reconfigure_mask_only`) apply **unchanged within each disagg pool**. DS track adds cross-pool coordination in `trtllm-serve` proxy: KV transceiver failure correlation, cross-pool failure notification, retry/reroute policy.
+
+| PR | Title | Scope | Target | Size | Deps |
+|:---|:---|:---|:---|:---|:---|
+| **DS.1** | Per-pool FT validation harness | DS | `tests/integration/defs/fault_tolerance/test_disagg_per_pool.py` (new) | S | 1d.4 |
+| **DS.2** | KV transceiver failure surface audit + classification | DS | `_torch/pyexecutor/kv_cache_transceiver.py`, `error_classification.py` | M | 1c.1 |
+| **DS.3** | Cross-pool failure notification | DS | `trtllm-serve` proxy | M | DS.2 |
+| **DS.4** | Request retry/reroute policy on rank failure | DS | `trtllm-serve` proxy | M | DS.3 |
+| **DS.5** | KV transfer cancellation on rank failure | DS | `_torch/pyexecutor/kv_cache_transceiver.py` | M | DS.2 |
+| **DS.6** | Disagg E2E fault-injection test | DS | `tests/integration/defs/fault_tolerance/test_disagg_ft.py` (new) | M | DS.1–DS.5 |
+
+**Caveat:** Ray + disagg + NIXL is unsupported today (per research pass report — `test_disaggregated.py:597`). If Phase 1-DS ships on Ray, this gap is a prerequisite. On MPI, no such gap.
+
+## 8.3 Phase 3 rough plan
+
+Phase 3 is sized at work-track granularity because scope will refine post-Phase-2.
+
+| Track | Scope | Rough size | Prereq |
+|:---|:---|:---|:---|
+| **3a** Latency anomaly detection | CUDA-event instrumentation, 3×-median detector, alerting hook | 2–3 weeks | Phase 2 complete |
+| **3b** Preemptive expert migration | Reuses Phase 1 v1 weight-migration path; adds drain-state + hot-expert prioritization | 2–3 weeks | 3a, 1b.6 |
+| **3c** Elastic scaling up | Reuses Phase 2 rebuild for N → M > N; orchestrator API | 3–4 weeks | Phase 2, 2c.1 |
+| **3d** Elastic scaling down | Combines 3b drain + Phase 1 mask; orchestrator API | 2–3 weeks | 3b |
+| **3e** Predictive failure detection | Telemetry integration (NVML + per-rank history) + rule-based predictor | 3–4 weeks + telemetry infra | Telemetry infra (out of scope) |
+
+**Total Phase 3:** ~3 months of engineering effort, but gated on production experience from Phases 1 and 2 to prioritize correctly. Not on the MVP critical path.
+
+## 8.4 Timeline summary
+
+Phase totals account for parallelism: multiple PRs in the same sub-phase run concurrently across engineers. Calendar time per PR sums to more than the phase total because unblocked items overlap.
+
+| Phase | PRs | Calendar time | Depends on | Deliverable |
+|:---|:---|:---|:---|:---|
+| **Phase 1 MVP (v0)** | 1a.1–1a.4, 1b.1–1b.3, 1c.1–1c.4, 1d.0–1d.5 (13 PRs) | **6–7 weeks** with 2–3 engineers + AI coding assistance | Kernel access; PR #12718 rebased | Single-failure survival on NVLinkOneSided; <10s recovery; no weight movement at recovery time |
+| **Phase 1 v1** | 1a.5–1a.8, 1b.4–1b.7, 1c.5–1c.6, 1d.6–1d.7 (12 PRs) | **6–9 weeks after MVP** | MVP landed | All NVLink backends, full EPLB reconfigure with weight migration, multi-failure consensus, production polish |
+| **Phase 1-DS** | DS.1–DS.6 (6 PRs) | **3–4 weeks, parallelizable with v1** | MVP landed | Disagg serving FT with cross-pool coordination |
+| **Phase 2: Restoration** | 2a.0–2a.8, 2b.1–2b.4, 2c.1–2c.3 (16 PRs) | **10–14 weeks** | Phase 1 v1 complete; 2a.0 audit | Full N-rank restoration via PG rebuild + shadow EP ranks |
+| **Phase 3: Beyond failover** | 3a–3e tracks (not per-PR sized) | **~3 months** | Phase 2 complete + telemetry infra | Prevention, elastic scale, predictive |
+
+**Total PRs:** ~47 across Phases 1 + 2 (plus Phase 3 rough tracks). MVP alone is 13 PRs.
+
+**Full program:** 7–10 months (with AI assistance), 10–14 months (without).
+
+### Caveats & honest risk framing
+
+- **PR #12718 sequencing** is the only external blocker on the MVP critical path. Mitigation: shim path if merge is delayed.
+- **L-sized PRs in MVP** (1a.2 kernel mask, 1c.3 MPI FT subcomm, 1d.4 harness) carry the most schedule risk. 1a.2's confidence is raised since kernel source review confirmed tractability; 1c.3's uncertainty is driven by MPI build variance (ULFM availability); 1d.4's uncertainty is harness design (clean kernel-abort mid-collective without poisoning test runner).
+- **Phase 2 estimates are provisional** pending 2a.0 audit. If MNNVL teardown latency is worse than assumed, 2a.2 grows from L to L+ and the Phase 2 total stretches.
+- **External blockers** (PR #12718 sequencing, DeepEP NVSHMEM API, MX-GMS Phase 2 availability) affect dependent items and are not improved by AI assistance.
