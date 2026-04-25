@@ -1,0 +1,191 @@
+# 3. Failure Modes & FT Gaps in TRT-LLM's Stack
+
+[< Back to Overview](README.md)
+
+## 3.1 Two failure modes that today's stack does not survive
+
+When a GPU fails in a WideEP group, the failure surfaces in one of two distinct ways. Both are fatal on the current stack. The FT design has to survive both; addressing only one leaves a gap that is likely to be hit in practice.
+
+### Mode A — Signal-handler `MPI_Abort` propagation
+
+**When it happens.** The dying rank catches a signal (CUDA error, SIGSEGV on host side, OOM kill, hardware fault that surfaces through the OS).
+
+**What the handler does.** Verified in `cpp/tensorrt_llm/runtime/utils/mpiUtils.cpp` (~lines 195–215):
+
+```cpp
+previousHandler = std::signal(sig, [](int signal) {
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+});
+```
+
+And the `forwardAbortToParent` variant additionally:
+
+```cpp
+previousHandler = std::signal(sig, [](int signal) {
+    pid_t parentProcessId = getppid();
+    kill(parentProcessId, SIGKILL);
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+});
+```
+
+**The effect.** `MPI_Abort(MPI_COMM_WORLD, …)` is explicitly defined by MPI to terminate every process in the specified communicator. Because `MPI.COMM_WORLD` is the full 72-rank EP group, **every rank dies**. The `forwardAbortToParent` variant additionally sends `SIGKILL` to the launcher (e.g., the `mpirun` process), ensuring the job manager doesn't try to restart the stuck world.
+
+**Why this defeats in-kernel FT.** This fires *before* any user-space FT logic can run. Kernel rank masking, EPLB reconfigure, failure-broadcast subcomms — none of it has a chance. The survivors are dead before they notice rank 37 died.
+
+**Where this lives in the stack.** L1 (process orchestration). Has nothing to do with the AlltoAll kernel or the data plane; it's a consequence of the MPI orchestrator's default behavior.
+
+### Mode B — AlltoAll kernel hangs on a dead peer's completion flag
+
+**When it happens.** The dying rank stops responding before its signal handler fires — hardware failure that severs the NVLink port, GPU memory fault that hangs the kernel, loss of the fabric page's backing memory. The MPI world is still up; no signal handler ran; the other ranks see nothing.
+
+**What the surviving kernel does.** Verified in `cpp/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.cu`. Both the dispatch (around lines 537–584) and combine (around 1190–1217) loops spin on peer completion flags via raw inline PTX:
+
+```cpp
+for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize) {
+    bool flag_set = false;
+    auto s = clock64();
+    do {
+        uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
+        uint32_t flag_value;
+        asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
+        flag_set = flag_value == expected_value;
+    } while (!flag_set && !check_timeout(s));
+    if (!flag_set) { asm volatile("trap;"); return; }
+}
+```
+
+where `check_timeout(s)` is `(clock64() - (s)) > 300ll * 2000ll * 1000ll * 1000ll` — a **300-second** kernel-side budget. On expiry, the kernel runs `asm volatile("trap;")`, which **corrupts the CUDA context** and is unrecoverable in-place (process restart required).
+
+**The effect.** With no signal on the dying rank, `MPI_Abort` does not fire. Surviving kernels spin on `completion_flags[R][37]` for a full 300 seconds with no abort hook, then die by context corruption. The `HangDetector` at 300s also fires. Either way, 7–8 minutes of downtime.
+
+**Why this defeats L1 FT.** Pivoting to Ray fixes Mode A — Ray notices the dead actor and doesn't abort the others — but it does not fix Mode B. The kernel still spins with no abort hook; Ray cannot interrupt a running CUDA kernel any more than MPI can. **Mode B is a data-plane (L3) problem that L1 cannot solve.**
+
+### The two-mode picture
+
+```mermaid
+graph LR
+    Dying["Rank 37 dying"]
+    ModeA["Mode A<br/>catches signal<br/>(SIGSEGV, CUDA err)"]
+    ModeB["Mode B<br/>silent failure<br/>(fabric, memory)"]
+
+    Dying --> ModeA
+    Dying --> ModeB
+
+    ModeA --> HandlerFires["MPI signal handler<br/>fires MPI_Abort"]
+    HandlerFires --> AllDie["Every rank in<br/>COMM_WORLD dies<br/>(L1 problem)"]
+
+    ModeB --> SilentExit["Dying rank<br/>stops writing flags"]
+    SilentExit --> SurvivorsSpinl["Survivor kernels spin<br/>on completion_flags[*][37]<br/>until 300s trap;<br/>(L3 problem)"]
+
+    AllDie --> Downtime["7–8 min downtime"]
+    SurvivorsSpinl --> Downtime
+
+    style AllDie fill:#ff4444,color:#fff
+    style SurvivorsSpinl fill:#ff4444,color:#fff
+    style Downtime fill:#ff4444,color:#fff
+```
+
+**Design consequence.** Both modes must be closed. Ray fixes Mode A structurally but not Mode B. MPI-path signal-handler replacement fixes Mode A but not Mode B. Only kernel-level masking with a host-side abort path fixes Mode B. **The two fixes are complementary, not alternatives.** [§5](05-phase-1-immediate-survival.md) addresses Mode B (§5.1 kernel masking) *and* Mode A (§5.4 signal handler replacement on the MPI path).
+
+## 3.2 Gap analysis by layer
+
+For each layer of the stack (L1 / L2 / L3 / EPLB / Detection), what's missing today, mapped to which failure mode it enables or blocks. All findings anchored against current source per the research pass.
+
+### L1 — Process orchestration gaps
+
+| Gap | Current state | Failure mode it enables | Reference |
+|:---|:---|:---|:---|
+| Signal handlers abort `MPI_COMM_WORLD` | Verified at `mpiUtils.cpp:195–215`. Two variants; one additionally `kill(getppid(), SIGKILL)` | **Mode A** | Core source |
+| `MPIPoolExecutor` has no partial-failure path | Verified: `proxy.py:225–280`'s `mpi_done_callback` only enqueues exceptions; `MpiPoolSession.abort()` at `mpi_session.py:167–168` calls `comm.Abort(1)` which kills the world | Worsens Mode A (no recovery path even if the abort could be caught) | Core source |
+| No per-rank liveness tracking at L1 | MPI has no built-in liveness monitor; TRT-LLM has no shim | Amplifies both Mode A (can't tell whether to ignore the abort) and Mode B (can't tell whether a silent peer is dead) | — |
+
+### L2 — Control plane gaps
+
+| Gap | Current state | Failure mode it enables | Reference |
+|:---|:---|:---|:---|
+| No fault-tolerant MPI communicator | Zero non-test uses of `MPI_ERRORS_RETURN`, `MPI_Comm_revoke`, `MPI_Comm_shrink`, `MPI_Comm_agree`, or ULFM anywhere in TRT-LLM | Amplifies Mode A — even if we replace the signal handler, the next MPI collective on `COMM_WORLD` still poisons | — |
+| No out-of-band failure-broadcast channel | All control-plane traffic goes over `MPI.COMM_WORLD`; a poisoned `COMM_WORLD` takes down the broadcast too | Blocks Mode B recovery — surviving ranks can't reach consensus on which peer is dead | — |
+| `torch.distributed` not initialized on MPI path | Only initialized when `orchestrator_type="ray"` | On the Ray path, `torch.distributed` provides its own abort+reinit via `destroy_process_group` + `init_process_group`. Not available on MPI default path. | `llm_args.py:2903` |
+
+### L3 — Data plane gaps (per backend)
+
+| Backend | Used by | Gap | Failure mode | Reference |
+|:---|:---|:---|:---|:---|
+| **MNNVL** (`NVLinkOneSided`, primary) | NVL72 production AlltoAll | No host-visible abort hook; no rank mask in kernel; `kMaxRanks=64` constexpr doesn't fit NVL72 rack | **Mode B** | `moeAlltoAllKernels.h`, `moeAlltoAllKernels.cu` |
+| **MNNVL** (`NVLinkTwoSided`) | Intra-node variant | Same as above; FIFO-based sync with no timeout | **Mode B** | `fusedMoeCommKernels.cu` |
+| **NVSHMEM** (`DeepEP`, `DeepEPLowLatency`) | Cross-node fallback | No public `mask_buffer_ptr` API; `Buffer.__del__` → `intranode::barrier` deadlocks on peer death | **Mode B** (hang); amplifies Mode A (destructor deadlock during cleanup) | `deep_ep.py:86`, `deep_ep_low_latency.py:103`, `configurable_moe.py:422` |
+| **NCCL** (`AllGatherReduceScatter`, TP allreduces, `NcclCommunicatorOp`) | Fallback EP backend, TP, PP | `ncclCommAbort` / `NCCL_ASYNC_ERROR_HANDLING` not wired in TRT-LLM's custom NCCL ops (zero non-test uses) | **Mode B** (would be fixable via `ncclCommAbort` — see §5.1 PR 1a.7) | — |
+
+### EPLB gap
+
+The load balancer was designed as a static-topology system. `MoeLoadBalanceMetaInfo` stores `epSize` and `epRank` as `int` fields (verified at `moeLoadBalanceCommon.h:40–52`); every reader assumes these don't change; the data structures (`rankExpertIds[epSize][slotCountPerRank]`, `globalSlotIds[epSize * slotCountPerRank]`) are sized at creation and not reallocated.
+
+**Consequence:** even after we detect a rank is dead and mask it in the AlltoAll kernel, tokens will still be routed to the dead rank unless EPLB's placement table is rewritten. §5.2 introduces `reconfigure_mask_only` for the MVP and full `reconfigure` for v1.
+
+### Detection gap
+
+The existing infrastructure in PR #12718 ([status verified in research pass report](redesign-research-pass-report.md)) provides executor-level error classification (`classify_error()` returns `"immediate_fatal"` / `"severe"` / `"transient"`) and a token-bucket `ErrorBudget`. This is the foundation WideEP FT extends.
+
+What's missing:
+- **Per-EP-rank health.** Today's model is binary (whole executor healthy or fatal). WideEP FT needs a per-rank state.
+- **AlltoAll timeout detector.** The kernel's `check_timeout` is 300s and destructive; no sub-5s host-side detector exists.
+- **MPI worker-death per-rank granularity.** `_error_monitor_loop` detects any worker crash but doesn't distinguish which rank.
+- **Cross-rank consensus on the failed set.** No out-of-band channel for the surviving ranks to agree on which peer is dead.
+
+## 3.3 Why not just pivot to Ray?
+
+The structural argument is strong, and we've heard it from reviewers: Ray at L1 + `torch.distributed` at L2 decouples process lifecycle from communicator management in exactly the way that Mode A requires. If we pivoted to Ray as the primary orchestrator for WideEP FT, we would inherit Mode A resistance for free — the Ray substrate wouldn't call `MPI_Abort` because there's no MPI. Additionally, `torch.distributed` carries PyTorch's in-place NCCL abort + reinit support, which gives the NCCL-based collectives a clean FT story.
+
+This section lays out the trade-off honestly and states the MVP decision.
+
+### What Ray would buy
+
+1. **Mode A structurally eliminated.** No MPI signal handlers, no `MPI_COMM_WORLD` poisoning, no `MPIPoolExecutor` brittleness. Ray sees actor deaths independently.
+2. **NCCL abort inherited from PyTorch.** The `torch.distributed` path already calls `ncclCommAbort` correctly in `destroy_process_group`. TRT-LLM's custom NCCL op wiring gap (PR 1a.7) is still required for the pipeline-parallel path but not for core EP collectives.
+3. **ULFM irrelevance.** ULFM's availability-by-MPI-build concern evaporates because ULFM is MPI-specific.
+4. **Cleaner Phase 2 rebuild.** `torch.distributed.destroy_process_group()` + `init_process_group()` is the well-understood pattern; MPI's `MPI_Comm_spawn` / ULFM path is more complex.
+5. **K8s + KubeRay alignment.** Production NVL72 deployments are trending toward KubeRay-managed clusters. A Ray-primary FT path aligns with where customers are going.
+
+### What Ray would cost
+
+1. **`HostMoeTensorSharer` is hard-baked to MPI.** Verified: `moe_load_balancer.py:896–897` calls `global_mpi_comm.Split_type(MPI.COMM_TYPE_SHARED)` with no `TLLM_DISABLE_MPI` guard anywhere in the file. On the Ray path, the current code would fail the node-local-peer discovery. This is real porting work — replace `MPI.COMM_TYPE_SHARED` with a hostname-based or Ray-placement-group-based discovery mechanism, audit every reader.
+2. **Ray-path CI is not characterized at WideEP scale.** Verified: Ray-tagged tests exist (`l0_dgx_b200.yml`, `l0_dgx_h100.yml`, `l0_h100.yml`, `tests/integration/defs/accuracy/test_llm_api_pytorch_ray.py`, `unittest/_torch/ray_orchestrator/multi_gpu/`) but the largest configurations are TP ≤ 4 (Llama-3.1-8B). There are no EP ≥ 32 tests, no DeepSeek-V3 tests on the Ray path, and no Ray-vs-MPI perf comparisons in the regression suite. Adopting Ray as the default FT path means running customer-facing WideEP on a substrate we haven't benchmarked at the scale it'll be used.
+3. **Disagg + Ray + NIXL is unsupported.** Verified at `tests/integration/defs/disaggregated/test_disaggregated.py:597`: explicit test-skip with the reason "Ray orchestrator is not supported with NIXL(DEFAULT) cache transceiver backend." Since NIXL is the production default for disagg, this is a hard gap that Phase 1-DS would have to close before disagg FT could ship on Ray.
+4. **Ecosystem inertia.** SLURM-launched, bare-metal MPI deployments are a real part of the installed base. A Ray-only MVP would leave those users on "no FT" for the duration.
+5. **Mode B is not addressed by pivoting.** The kernel hang is orthogonal to orchestrator choice. Pivoting to Ray still leaves the MNNVL kernel-level work to do.
+
+### Decision
+
+**MVP stays on MPI.** Ray is a future migration question, not a near-term answer. Rationale:
+
+- **Cost #2 is the blocker.** Shipping MVP on a code path with no EP ≥ 32 perf characterization is unacceptable for a production FT feature. The regressions we haven't seen yet could be large.
+- **Cost #1 is real engineering work** (HostMoeTensorSharer refactor + every-reader audit) that we would have to do before MVP could even run on Ray at WideEP scale.
+- **Benefit #1 is valuable but addressable on the MPI path.** Mode A is fixable by replacing the `mpiUtils.cpp` signal handler behavior, scoped in [§5.4](05-phase-1-immediate-survival.md#54-mpi-path-ft-enabling-work). It's net-new work but bounded.
+- **Benefit #5 does not favor Ray.** Mode B work has to happen regardless of orchestrator.
+
+The MPI-path FT-enabling work (§5.4) is the compensating investment. Net effect: MVP ships on MPI with Mode A fixed via handler replacement, Mode B fixed via kernel masking; Ray becomes a future migration we revisit after:
+
+- A Ray-path WideEP perf characterization audit (named risk in [§9](09-risks-and-open-questions.md)) confirms acceptable perf at EP ≥ 32.
+- The `HostMoeTensorSharer` MPI-hard-bake has been factored out (planning dependency).
+- The disagg + Ray + NIXL support gap is closed (pre-requisite for disagg FT on Ray).
+
+We treat the pivot as a **deferred architectural question**, not an MVP decision. The design keeps the Ray path open — nothing in the proposed MPI-path work prevents a later migration, and the kernel-level changes (Mode B work) port directly to Ray.
+
+## 3.4 Summary: gap × failure-mode matrix
+
+| Gap | Layer | Mode A | Mode B | Addressed in |
+|:---|:---|:---:|:---:|:---|
+| Signal handlers abort COMM_WORLD | L1 | ✓ (enables) | — | §5.4 |
+| `MPIPoolExecutor` no partial-failure | L1 | ✓ (worsens) | — | §5.4 |
+| No MPI FT communicator | L2 | ✓ (worsens post-handler-fix) | — | §5.4 |
+| No out-of-band broadcast | L2 | ✓ | ✓ (blocks consensus) | §5.3 |
+| MNNVL no rank mask / no abort hook | L3 | — | ✓ (enables) | §5.1 |
+| `kMaxRanks=64` doesn't fit NVL72 | L3 | — | ✓ (precondition) | §5.1 |
+| NCCL abort not wired in custom ops | L3 | — | ✓ (enables on fallback path) | §5.1 (PR 1a.7) |
+| DeepEP destructor deadlock | L3 | Amplifies | ✓ | §6.2 (deferred) |
+| EPLB static topology | — | — | ✓ (blocks recovery) | §5.2 |
+| No per-rank health / no AlltoAll watchdog | Detection | — | ✓ (no detection) | §5.3 |
+
+Every gap in this table is addressed in Phase 1 except the DeepEP destructor, which is deferred indefinitely pending public `mask_buffer_ptr` — [§9](09-risks-and-open-questions.md) tracks this as an accepted risk.
+
+The next section introduces the three-phase architecture that translates these gaps into work.
