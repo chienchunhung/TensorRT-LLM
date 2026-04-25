@@ -1,9 +1,9 @@
 # Pre-Drafting Research Pass — Findings Report
 
-**Created:** 2026-04-23
+**Created:** 2026-04-23 (research pass) | **Updated:** 2026-04-25 (Audit 1a Days 1–3 empirical follow-up to Item 7)
 **Companion to:** `redesign-research-pass.md` (the items list)
-**Time spent:** ~half a day
-**Status:** Items 1–6 verified; item 7 deferred to the named §9 audit; item 8 light-pass complete.
+**Time spent:** ~half a day pre-drafting + ~5 hr Audit 1a Days 1–3 prototyping
+**Status:** Items 1–6 verified; **item 7 partially answered by Audit 1a Days 1–3** (sections below); item 8 light-pass complete.
 
 ---
 
@@ -63,9 +63,46 @@
 
 3. **Two-mode launch path** (`mpirun + MPICommExecutor` vs `MpiPoolSession + MPIPoolExecutor`) — both exist, with different failure modes. The §1.1 user journey should specify which case it walks through (the production `mpirun` case).
 
+## 🧪 Empirical follow-up — Audit 1a partial (Item 7)
+
+**Hardware:** 8× B300 SXM6 single node, NVLink full mesh. **Software:** PyTorch 2.11 (NCCL 2.29.2), OpenMPI 4.1.9a1 (no ULFM), CUDA 13.1, cuda-python 13.1.1. **Date:** 2026-04-25. **Tracks completed:** NCCL rebuild (Day 1, 6 runs / 6 modes), MPI signal handler (Day 2, 7 runs / 7 modes), driver-side `cuMemUnmap` posix-FD variant (Day 3). Deep prototypes + per-run JSONL logs live at `/home/chienchunh/audit-1-mnnvl-teardown/` on the test host; this section captures the headline findings.
+
+### Headline findings
+
+1. **PT 2.11's `torch.distributed` has no recoverable peer-death path** for any documented mode. `dist.shrink_group(ranks_to_exclude=…, shrink_flags=SHRINK_ABORT)` — the API the design hoped for — itself hangs > 60 s after a peer SIGKILL in this build (with or without `ASYNC_ERROR_HANDLING`). Default config (`ASYNC=1, BLOCKING=0`) SIGABRTs all survivors at the watchdog timeout.
+2. **Detection in pure Python works.** `dist.all_reduce(…, async_op=True)` + main-thread `work.is_completed()` polling delivers a clean exception at exactly the configured deadline (5054 ms vs a 5000 ms budget; tunable freely). Validates §5.3 / 1c.4's design assumption that detection sits above NCCL.
+3. **Mode A needs a TWO-part fix.** Replacing `MPI_Abort` with `_exit(N)` in `mpiUtils.cpp` (PR 1d.0) is necessary but **not sufficient**: under default `mpirun`, a single rank exit (any code, including `_exit(0)` and `SIGKILL`) takes down all survivors in 18–60 s. Adding the launch flag `--mca orte_enable_recovery 1` stops the propagation; survivors then need `MPI_ERRORS_RETURN` (already PR 1c.3) plus bounded-wait collectives (1c.4-style) to escape the broken collective the dead rank was in.
+4. **Driver-side teardown of dead-peer regions is essentially free.** Posix-FD cross-process share + SIGKILL of owner: peer's `cuMemUnmap` returns `CUDA_SUCCESS` in **0.25 ms**, `cuMemRelease` in **1.27 ms**, `cuMemAddressFree` in **0.008 ms** — total **~1.5 ms**. The mapping survives the kill: 2 s after SIGKILL the survivor still reads the owner's pre-kill pattern. **Driver-side cleanup is not a Phase 2 bottleneck.**
+
+### Empirical numbers (intra-node, single survivor / single peer)
+
+| Metric | Value | Notes |
+|:---|:---|:---|
+| NCCL detection latency (main-thread polling, 5 s budget) | ~5054 ms | = budget + ~50 ms poll granularity |
+| NCCL detection latency (PT default watchdog, 15 s budget) | ~15044 ms | then SIGABRT |
+| `dist.shrink_group(SHRINK_ABORT)` post-failure latency | > 60 s (timeout) | never completed in 2 attempts |
+| MPI survivors lifetime under default mpirun (any death mode) | 18–60 s | mpirun terminates the world |
+| MPI survivors lifetime under `--mca orte_enable_recovery 1` | indefinite (test budget) | survivors stay alive but hang in collective |
+| `cuMemUnmap` on dead-peer region (posix-FD) | **0.25 ms** | `CUDA_SUCCESS` |
+| `cuMemRelease` on imported handle (posix-FD) | **1.27 ms** | `CUDA_SUCCESS` |
+| `cuMemAddressFree` on VA reservation (posix-FD) | **0.008 ms** | `CUDA_SUCCESS` |
+
+### What lands in §9.1 Audit 1b (deferred to NVL72-class hardware)
+
+- `cuMemUnmap` fabric-handle equivalence: `CU_MEM_HANDLE_TYPE_FABRIC` allocation requires the `nvidia-imex` daemon, which is not active on this single-node B300 (kernel-side `nv-caps-imex channel0 created` is present but no IMEX domain configured). `cuMemCreate(... FABRIC)` returns `CUDA_ERROR_NOT_PERMITTED`. The driver mechanism is proven (posix-FD); fabric-handle equivalence is a 5-minute re-run on an IMEX-configured node.
+- Intra-node MNNVL `MnnvlMemory` rebuild prototype (Days 4–5 in §9.1 plan): same IMEX gate.
+- DeepEP destructor + explicit `destroy()` ordering (Day 3 secondary item): blocked here on a `tensorrt_llm` package import error (pre-existing `fp4_quantize_with_residual` mirror issue in this dev tree). Needs a container with matching C++ binary.
+- NVSHMEM `nvshmem_finalize` behavior (Day 5): `nvshmem` Python module not installed in this env.
+
+### Caveats
+
+- Single-node intra-node only. Cross-node propagation (NCCL FT, MPI mpirun behavior, fabric memory teardown) may differ.
+- 4-rank scale on the rebuild and signal-handler tests; 1 owner / 1 peer on the cuMemUnmap test. Fan-out cost at 71 surviving peers per dead rank is unknown.
+- Did not run the full `--mca orte_enable_recovery 1` + `MPI_ERRORS_RETURN` + bounded-wait collective combination end-to-end. Each piece tested in isolation; integrated path is the next step (1–2 hr).
+
 ## ❓ Deferred (intentionally)
 
-- **Item 7 — NVSHMEM/MNNVL teardown literature.** Skipped pre-drafting; this is the substance of the named §9 audit risk and shouldn't be pre-decided. Rewrite preserves the audit-as-risk framing.
+- **Item 7 — NVSHMEM/MNNVL teardown.** No longer fully deferred: Audit 1a Days 1–3 done (above). Days 4–5 (intra-node MNNVL prototype, NVSHMEM teardown) and the rack-fabric portion (Audit 1b) remain.
 - **Item 8 — Disagg Ray (light pass complete)** — see new gap #1 above.
 
 ---
@@ -78,5 +115,8 @@
 4. §3.2 L1 gap — Item 1 finding lets us state confidently that today MPI worker death = full executor abort, no salvage path; cite `proxy.py:229–234` and `mpi_session.py:167–168`.
 5. §3.3 — HostMoeTensorSharer's hard-baked MPI dependency (no `TLLM_DISABLE_MPI` guards) is a concrete cost item for any future Ray pivot.
 6. §11 — Add new risk: "Disagg + Ray + NIXL unsupported" if §11 covers cross-track interactions.
+7. **§5.4 / PR 1d.0 (Audit 1a Day 2):** PR 1d.0 scope must include the launch-flag piece (`--mca orte_enable_recovery 1`), not only the `_exit(N)` source change. Without the flag, default `mpirun` propagates termination to survivors regardless of the in-process signal handler; with both, survivors stay alive long enough for `MPI_ERRORS_RETURN` (PR 1c.3) + bounded-wait collectives (1c.4) to drive recovery.
+8. **§8.2 PR 2a.1 (Audit 1a Day 1):** NCCL teardown for the AllGatherReduceScatter fallback path cannot be a thin wrapper around `dist.shrink_group(SHRINK_ABORT)` in PT 2.11 — that API hangs after peer death in this build. Either drop below `torch.distributed` (call `ncclCommAbort` + `ncclCommInitRank` directly via cython / C) or wait for an upstream fix. Sizing should reflect the lower-level option.
+9. **§8.2 PR 2a.2 (Audit 1a Day 3):** Driver-side cleanup of dead-peer fabric memory budgets at ~1–2 ms (posix-FD; fabric-handle equivalence pending Audit 1b validation). PR 2a.2 sizing previously had to assume "novel work, hard to bound" — now bounded.
 
 Ready to produce the per-section diff plan from these findings.
