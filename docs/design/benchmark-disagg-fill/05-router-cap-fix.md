@@ -92,24 +92,26 @@ Applied to both `DefaultADPRouter.route_requests` and
 
 ---
 
-## 4. Relationship to v3 (gate rewrite)
+## 4. Relationship to the state-based gate rewrite
 
-The v3 plan ([`03-step1-gate-rewrite-plan.md`](03-step1-gate-rewrite-plan.md))
-proposed rewriting the gate-completion predicate from count-based to
-state-based. That fix is orthogonal to the router cap:
+The state-based gate rewrite ([`03-step1-gate-rewrite-plan.md`](03-step1-gate-rewrite-plan.md))
+and the router cap fix solve different parts of the same failure:
 
-| Aspect | v2.1 (router cap) | v3 (gate rewrite) |
+| Aspect | Router cap | State-based gate rewrite |
 |--------|--------------------|--------------------|
 | **What it fixes** | Requests assigned to overflowing ranks | Gate not opening due to count imbalance |
 | **Where** | `adp_router.py` | `py_executor.py` |
 | **Scope** | 3 lines + comment | ~100 lines of predicate + fail-fast rework |
 | **Risk** | Minimal — pure arithmetic guard | Moderate — changes state machine |
 
-The router cap may make v3 unnecessary: if no rank ever receives more
-than `max_batch_size` requests, the count-based gate's `±1` imbalance is
-bounded and the gate opens normally. This hypothesis needs CI validation.
-If the wideep kimi-k2-thinking test passes with v2.1 alone, v3 can be
-deprioritized.
+The router cap is necessary but not sufficient by itself. It prevents
+new overflow INIT requests, but the original count-based gate can still
+depend on an exact per-rank request count. The current PR therefore keeps
+both fixes: state-based readiness for gate correctness and router capping
+for admission correctness.
+
+The follow-up structural cleanup is not another gate rewrite; it is the
+separation of admission control from routing discussed in §6.
 
 ---
 
@@ -127,6 +129,9 @@ class `TestADPRouterPerRankCap`.
 | `test_cap_not_applied_when_below_max` | Empty ranks, 8 new requests, max=256. Expected=2 (no cap effect). All 8 assigned. | ✓ (parameterized) |
 
 6 parameterized tests total (3 scenarios × 2 router implementations).
+
+This complements the state-based gate tests and the fill-phase fail-fast
+tests in [`06-fill-phase-fail-fast.md`](06-fill-phase-fail-fast.md).
 
 ### Integration validation
 

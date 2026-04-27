@@ -2,9 +2,15 @@
 
 This directory tracks the full lineage of the benchmark disaggregated-serving fill/gate mechanism in `PyExecutor`: what exists today, why it regressed, how to fix it short-term, and how to eliminate the class of bug long-term.
 
-## Current state (2026-04-24)
+## Current state (2026-04-26)
 
-Status: **root cause identified; deterministic fix in review**. The wide-EP Kimi-K2-Thinking gen-only test (nvbug 6071070) hangs because the ADP router can set `expected_num_active_requests` above `max_batch_size` during bulk request arrivals, causing excess requests to be permanently stuck in INIT state. The fix is a one-line `min()` cap in both `DefaultADPRouter` and `KVCacheAwareADPRouter` — see [`05-router-cap-fix.md`](05-router-cap-fix.md).
+Status: **three-part fix in review in [PR #13347](https://github.com/NVIDIA/TensorRT-LLM/pull/13347)**. The wide-EP Kimi-K2-Thinking gen-only test exposed three coupled issues:
+
+1. The original count-based fill gate depended on exact ADP router balance.
+2. The ADP router could set `expected_num_active_requests` above `max_batch_size` during bulk arrivals.
+3. The PR #12206 fail-fast could fire during the benchmark fill phase before the state-based gate had a chance to open.
+
+The current PR fixes all three: state-based gate predicate, ADP router per-rank cap, and fill-phase fail-fast suppression.
 
 See [`02-regression-investigation.md`](02-regression-investigation.md) for the full causal chain.
 
@@ -16,8 +22,8 @@ See [`02-regression-investigation.md`](02-regression-investigation.md) for the f
 | v1a | [#12091](https://github.com/NVIDIA/TensorRT-LLM/pull/12091) | Batched fill (`tp_size` per iteration) | Fixed some deadlock cases; still starved transfer servicing |
 | v1b | [#12206](https://github.com/NVIDIA/TensorRT-LLM/pull/12206) | Explicit fail-fast when GEN-side KV cache insufficient | Kept — needed to avoid silent hangs |
 | **v2** | [#12208](https://github.com/NVIDIA/TensorRT-LLM/pull/12208) | Eliminated fill loop; non-blocking `can_forward` gate; dummy suppression during fill | Merged. Docs in [`01-history-nonblocking-gate/`](01-history-nonblocking-gate/README.md) |
-| **v2.1** | [#13347](https://github.com/NVIDIA/TensorRT-LLM/pull/13347) | Cap ADP router `expected_num_active_requests` at `max_batch_size` | **In review.** Fixes nvbug 6071070. Docs in [`05-router-cap-fix.md`](05-router-cap-fix.md) |
-| v3 | this plan, step 1 | Gate-condition rewrite based on request state, not counts | Planned — may be superseded by v2.1 if router cap alone is sufficient |
+| **v2.1** | [#13347](https://github.com/NVIDIA/TensorRT-LLM/pull/13347) | State-based fill gate, ADP router cap, fill-phase fail-fast suppression | **In review.** Fixes nvbug 6071070 / nvbug 6093911. Docs in [`03-step1-gate-rewrite-plan.md`](03-step1-gate-rewrite-plan.md), [`05-router-cap-fix.md`](05-router-cap-fix.md), and [`06-fill-phase-fail-fast.md`](06-fill-phase-fail-fast.md) |
+| v3 | follow-up if needed | Separate admission control from routing; harden orchestration boundaries | Planned follow-up, not required for the current PR |
 | v4 | this plan, step 2 | Remove fill gate from `PyExecutor`; orchestrate from benchmark client | Planned |
 
 ## Documents
@@ -29,12 +35,13 @@ See [`02-regression-investigation.md`](02-regression-investigation.md) for the f
 | [`03-step1-gate-rewrite-plan.md`](03-step1-gate-rewrite-plan.md) | Code-level plan for v3. New fill-complete predicate, dummy handling changes, fail-fast trigger update, test additions. | Implementer |
 | [`04-step2-external-orchestrator-plan.md`](04-step2-external-orchestrator-plan.md) | Architecture-level plan for v4. Deletes the feature from `PyExecutor` entirely; moves orchestration to the benchmark client. | Design reviewer first, then implementer |
 | [`05-router-cap-fix.md`](05-router-cap-fix.md) | v2.1: ADP router cap fix — deterministic one-line fix at the admission layer. | Reviewer / implementer |
+| [`06-fill-phase-fail-fast.md`](06-fill-phase-fail-fast.md) | v2.1: why PR #12206 fail-fast must be suppressed during benchmark fill. | Reviewer / implementer |
 
 ## Reading order
 
 For context only: skim `01-history-nonblocking-gate/README.md`.
 
-For implementing the fix: read `02` in full → read `03` in full → execute `03`.
+For reviewing the current PR: read `02` for the regression, then `03`, `05`, and `06` for the three production fixes.
 
 For the structural redesign: read `03` (so you know what's being removed) → read `04` → discuss before starting.
 
