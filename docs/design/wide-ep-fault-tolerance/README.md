@@ -30,7 +30,7 @@ See [§0 Executive Summary](00-executive-summary.md) for the full headline pictu
 
 | Workstream | Status | Relationship to this design |
 |:---|:---|:---|
-| [PR #12718: Fatal Error Detection](https://github.com/NVIDIA/TensorRT-LLM/pull/12718) | In review | Foundation — provides `classify_error()` + `ErrorBudget` that §5.3 extends per-rank |
+| [PR #12718: Fatal Error Detection](https://github.com/NVIDIA/TensorRT-LLM/pull/12718) | In review (squashed; bench-shutdown regression fixed) | Foundation — provides `classify_error()` + `ErrorBudget` + `pre_shutdown()` non-blocking pattern that §5.3 extends per-rank. See [§5.3 *Lessons from PR #12718 implementation*](05-phase-1-immediate-survival.md#lessons-from-pr-12718-implementation) for design takeaways. |
 | MX + GMS + TRT-LLM Integration | Design complete | Acceleration — GMS zero-copy import cuts Phase 2 recovery from minutes to ~100ms; enables shadow EP ranks (§6.3) |
 
 ## In-flight PRs against this design

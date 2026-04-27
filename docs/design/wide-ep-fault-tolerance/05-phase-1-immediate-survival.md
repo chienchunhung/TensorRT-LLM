@@ -114,11 +114,13 @@ Detection is the entry point for everything in §5.1 and §5.2. The design exten
 
 ### Three-layer detection
 
-| Layer | Mechanism | Latency | Covers which mode |
-|:---|:---|:---|:---|
-| **Layer 1 — AlltoAll watchdog** (primary) | Host thread polling host-visible `completion_flags` table; flags ranks that haven't signaled within timeout | 1–5 s | Mode B (kernel hang) |
-| **Layer 2 — Worker death notification** | PR #12718's `_error_monitor_loop` extended for per-rank `_check_mpi_futures` | ~5 s (poll interval) | Mode A (signal handler) — once Mode A is fixed via §5.4, this notices the dead rank's process exit |
-| **Layer 3 — Latency anomaly** (Phase 3) | Per-rank AlltoAll latency via CUDA events; 3×-median anomaly detector | 10–30 s | Pre-failure degradation (Phase 3, deferred) |
+| Layer | Mechanism | Latency | Covers which mode | Deployment caveat |
+|:---|:---|:---|:---|:---|
+| **Layer 1 — AlltoAll watchdog** (primary) | Host thread polling host-visible `completion_flags` table; flags ranks that haven't signaled within timeout | 1–5 s | Mode B (kernel hang) | Always available |
+| **Layer 2 — Worker death notification** | PR #12718's `_error_monitor_loop` + per-rank `_check_mpi_futures` | ~5 s (poll interval) | Mode A (signal handler) — once §5.4 lands, this notices the dead rank's process exit | **Inert when `mpi_session = RemoteMpiCommSessionClient`** (workers in separate `mgmn_leader_node` process; `submit()` returns `[]`); see [§5.3 lessons](#lessons-from-pr-12718-implementation) below |
+| **Layer 3 — Latency anomaly** (Phase 3) | Per-rank AlltoAll latency via CUDA events; 3×-median anomaly detector | 10–30 s | Pre-failure degradation (Phase 3, deferred) | Always available |
+
+**Implication for `trtllm-llmapi-launch` deployments.** The `mgmn_leader_node`-based launcher path (used by `trtllm-bench`, `trtllm-serve` with `TLLM_SPAWN_PROXY_PROCESS=1`, and the layer-wise benchmark CI test) instantiates `RemoteMpiCommSessionClient`, whose `submit()` returns `[]`. PR #12718's `_check_mpi_futures()` therefore has no futures to inspect for those deployments and Layer 2 is silent. Layer 1 (the AlltoAll watchdog) is the **only** detection mechanism that fires there — it must not be treated as optional. Layer 1 is also strictly faster (1–5 s vs 5 s poll), so prefer it as the primary path everywhere, with Layer 2 as a redundant signal where available.
 
 ### Layer 1 — AlltoAll watchdog (the host-side abort hook)
 
@@ -157,7 +159,7 @@ The kernel's 300s `check_timeout` is a backstop — the watchdog should fire lon
 
 ### Layer 2 — Per-rank worker death
 
-PR #12718 introduces `_check_mpi_futures()` (`proxy.py:229–234`) that registers a `mpi_done_callback` on each future. Today, callback failures only enqueue exceptions to a shared `_error_queue` — there's no per-rank attribution. WideEP FT extends this to track which rank's future raised:
+PR #12718 introduces `GenerationExecutorProxy._check_mpi_futures()` and `_drain_error_queue()` helpers shared between `check_health()` and the daemon `_error_monitor_loop`. `mpi_done_callback` registered on each future enqueues exceptions to a shared `_error_queue` — there's no per-rank attribution. WideEP FT extends this to track which rank's future raised. Per-request errors (`RequestError` / `str`) are filtered out by PR #12718 in both paths so a single bad request can't promote into a per-rank failure; the per-rank tracker inherits that filter for free.
 
 ```python
 class EPRankHealthTracker:
@@ -229,6 +231,20 @@ The dominant Mode B failure (kernel spinning on dead-peer flag) is what makes th
 ### Single-failure consensus is trivial
 
 For MVP single-failure: any surviving rank's report is authoritative. Multi-failure consensus ([§8.2 PR 1c.6](08-implementation-plan.md#82-phase-2-pr-breakdown), v1) implements two-phase suspect → confirm to avoid masking a slow-but-alive rank.
+
+### Lessons from PR #12718 implementation
+
+PR #12718 went through several iterations and one production-affecting regression before merging. Three of those experiences directly inform this design:
+
+**1. Empty-collection predicates need explicit branches.** PR #12718's `pre_shutdown()` originally gated the quit-sentinel send on `all(not f.done() for f in self.mpi_futures)`, which is *vacuously True* for an empty list and therefore covered the `RemoteMpiCommSessionClient` case (no local futures) by accident. A later refactor to `any(...)` regressed that case — `any([]) == False` — and silently dropped the sentinel, hanging `dispatch_result_thread.join()` indefinitely. This manifested as a 2400 s `test_performance_alignment[1]` timeout. The fix is `if not self.mpi_futures or any(...)`. **Implication for WideEP FT:** every predicate over `self.ep_group_health.active_ranks()`, `pending` rank sets, etc. must explicitly handle the empty case. The Layer 1 `AlltoAllWatchdog.watch()` body already does this (`if not pending: return set()`); confirm the same for the failure-broadcast and suspect-set logic in §5.3.
+
+**2. PR #12718's `pre_shutdown()` is non-blocking by design — the FT broadcast must be too.** PR #12718 split shutdown into `pre_shutdown()` (instant: set flag, send sentinel) and `shutdown()` (blocks on `f.result()`, joins threads). The non-blocking half is exactly the right primitive for "rank N just died — tell everyone immediately and let recovery proceed without waiting for the dead rank's process to actually exit." The WideEP FT broadcast (§5.3 *Failure broadcast and cross-rank consensus* below) reuses this split: a non-blocking `pre_failover()` that updates `EPGroupHealth` and posts `Isend`s, followed by an asynchronous reconcile.
+
+**3. Per-request errors must never promote to per-rank failures.** PR #12718's `_drain_error_queue` filters `RequestError` and bare `str` errors before promoting anything to fatal. The same filter must apply when `EPRankHealthTracker.on_mpi_worker_death` examines the error queue — a malformed prompt that surfaces via the worker's `_error_queue` should not mark the rank failed. The current §5.3 `EPRankHealthTracker` sketch only inspects errors that come through `mpi_done_callback` (i.e., future-level exceptions, which can't be `RequestError`), so the filter is implicit — but if a future revision adds queue-based input it must apply the same `isinstance(e, (str, RequestError))` skip.
+
+**4. Detection from the bench-shutdown investigation: instrumentation, not watchdogs.** Four CI cycles of "test hangs at 2400 s" produced zero useful diagnostic output because pytest captured the inner subprocess and the SIGKILL on timeout destroyed the captures. What localized the bug in 5 minutes was per-step `time.monotonic()` markers around the proxy lifecycle (`pre_shutdown ENTER/EXIT`, `f.result() loop elapsed=`, `monitor join elapsed=`, `mpi_session.shutdown elapsed=`). The Layer 1 watchdog already follows this pattern — its host-thread polling loop is exactly the recipe Audit 1a recommended for detecting MPI/NCCL hangs that don't surface to user code. **Implication:** when Phase 1 PRs land, retain timing markers on every `EPGroupHealth.mark_failed()` / broadcast / reconfigure_mask_only call site. The next regression in this code path will look like the bench-shutdown one (silent hang, no exception) and only timing markers will localize it.
+
+See also: [`docs/investigations/nvbug-6043291-zombie-worker-pods/bench-shutdown-hang.md`](../../investigations/nvbug-6043291-zombie-worker-pods/bench-shutdown-hang.md) for the full investigation diary.
 
 ## 5.4 MPI-path FT-enabling work
 
