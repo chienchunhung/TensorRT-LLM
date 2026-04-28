@@ -175,7 +175,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 "will load from disk and become a source.")
             return False
         except Exception as e:
-            logger.warning("MX P2P transfer failed: %s", e, exc_info=True)
+            logger.warning("MX P2P transfer failed: %s", e)
             return False
 
     def publish_as_source(self, model, mapping: Mapping = None,
@@ -207,5 +207,4 @@ class MXCheckpointLoader(HfCheckpointLoader):
                         self._mx_server_url)
         except Exception as e:
             logger.warning(
-                "Failed to publish weights to MX server: %s", e,
-                exc_info=True)
+                "Failed to publish weights to MX server: %s", e)
