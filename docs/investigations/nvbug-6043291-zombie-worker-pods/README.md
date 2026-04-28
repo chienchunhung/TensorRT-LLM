@@ -5,8 +5,11 @@
 - **Affected model:** gpt-oss-120b
 - **Date:** 2026-03-18
 - **Branch:** `fix-zombie-worker-health-check`
-- **PR:** [#12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718)
-- **Status:** In review — all reviewer comments addressed, squashed to 3 commits
+- **PRs:** [#12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718)
+  (fatal engine / health detection),
+  [#13119](https://github.com/NVIDIA/TensorRT-LLM/pull/13119)
+  (request-level error propagation in disaggregated serving)
+- **Status:** In review — all reviewer comments addressed, squashed to 1 commit
 
 ---
 
@@ -21,7 +24,21 @@ recovery until replacement pods came online ~1 hour later.
 
 While the root routing failure is a Dynamo-side issue (it should detect dead
 engines and stop routing), TRT-LLM must add defensive mechanisms to prevent
-zombie processes.
+zombie processes.  Two TensorRT-LLM fixes now cover complementary parts of the
+failure surface:
+
+- **PR #12718**: system-level detection and handling.  Fatal engine / worker
+  failures are promoted into executor health, `/health` returns unhealthy, and
+  the serving process exits so the pod restarts.
+- **PR #13119**: request-level propagation.  Per-request or postprocessing
+  failures keep their real error messages through `GenerationResult`,
+  postprocessing, OpenAI/disaggregated HTTP clients, and response formatting so
+  callers see the real failure instead of a malformed response or generic
+  `400 Bad Request`.
+
+Together they establish the core split used throughout this investigation:
+**request failed → return the real error; engine died → mark unhealthy and
+restart.**
 
 ---
 
@@ -138,8 +155,13 @@ queue unprocessed, and return 503 so the orchestrator stops routing traffic.
   blocks on `f.result()`) and drain-all patterns (all queued errors processed
   in one call, so a fatal behind per-request errors is detected immediately)
 - Per-request errors (`RequestError`, `str`) are skipped in the drain
-- Fix `pre_shutdown()` sentinel condition: `all(not f.done())` → `any(not
-  f.done())` so surviving workers still get the quit signal when one has died
+- Fix `pre_shutdown()` sentinel condition:
+  `all(not f.done())` → `not self.mpi_futures or any(not f.done())`.  The
+  empty-list branch is required for `RemoteMpiCommSessionClient` /
+  `trtllm-llmapi-launch` where workers run in a separate `mgmn_leader_node`
+  process and no local future handles exist; the `any(...)` branch keeps the
+  partial-crash fix so surviving workers still get the quit signal when one has
+  died
 - Join `_error_monitor_thread` during `shutdown()` with a 5-second timeout,
   guarded by `threading.current_thread() is not self._error_monitor_thread`
   to prevent a self-join deadlock when the monitor thread initiates shutdown
@@ -223,6 +245,51 @@ restarts, even if the orchestrator keeps polling health.
 
 ---
 
+## Related Fix: PR #13119 (Request-Level Error Propagation)
+
+PR #12718 and PR #13119 address adjacent failure layers, not duplicate code.
+
+| Layer | PR #12718 | PR #13119 |
+|---|---|---|
+| Scope | Executor / worker / pod health | Individual request / disaggregated serving response |
+| Question answered | "Is this engine fatally broken and should the pod restart?" | "If this request failed, can the caller see the real error?" |
+| Main primitives | `_fatal_error`, `check_health()`, `_error_monitor_loop`, `ErrorBudget`, health-endpoint `SIGINT` | `GenerationResultBase.error`, `ErrorResponse` from postprocessing, preserved HTTP error bodies, disagg ID regeneration |
+| Expected outcome | Pod exits and restarts | Request fails with the real error; server can stay healthy |
+
+PR #13119 fixes several paths where a request-level error was being lost or
+mutated:
+
+- `GenerationResultBase` now stores `_error_msg` and exposes `result.error`.
+  When a response has `has_error()`, it records the error and returns early
+  instead of falling through to `response.result`.
+- `PostprocWorker` catches postprocessing exceptions and emits `ErrorResponse`
+  instead of crashing the postprocess worker.
+- `OpenAIServer` checks `promise.error` / `response.error` before formatting
+  chat/completion responses.
+- `OpenAIHttpClient` preserves HTTP response bodies for non-2xx disaggregated
+  calls instead of reducing everything to a generic `raise_for_status()`
+  message.
+- Disaggregated retries regenerate `disagg_request_id` to avoid worker-side
+  ID collisions, and `_verify_ctx_response()` messages now include
+  `finish_reason`, `disagg_request_id`, and `ctx_request_id`.
+
+The key interaction is that PR #13119 makes request errors more explicit, while
+PR #12718 must decide whether an error is request-scoped or process-fatal.
+That is why PR #12718 filters `RequestError` / `str` in executor queue drains
+and uses `_handle_errors(..., charge_budget=False)` for validation,
+KV-transfer timeout, guided-decoder, and cache-transfer request paths.  Without
+that separation, PR #13119's improved propagation could accidentally become a
+server-crash trigger under a burst of bad client requests.
+
+In short:
+
+```text
+PR #13119: request failed  -> preserve and return the real error
+PR #12718: engine died     -> mark unhealthy and restart the pod
+```
+
+---
+
 ## Detection Timeline (After Fix)
 
 ```
@@ -256,7 +323,7 @@ T+0s    Budget exhausted -> _fatal_error set, shutdown
 ## Test Coverage
 
 All unit tests are in
-`tests/unittest/executor/test_fatal_error_health_check.py` (63 tests total,
+`tests/unittest/executor/test_fatal_error_health_check.py` (74 tests total,
 heavily parametrized).  Tests use the **real** `classify_error()` function and
 `ErrorBudget` dataclass imported from `error_classification.py` via `importlib`
 (avoids C++ extension loading).
@@ -264,9 +331,10 @@ heavily parametrized).  Tests use the **real** `classify_error()` function and
 | Test class | Count | What's covered |
 |---|---|---|
 | `TestClassifyError` | 15 | Real `classify_error()`: three-tier classification, case insensitivity |
-| `TestErrorBudget` | 14 | Real `ErrorBudget` dataclass: immediate-fatal bypass, severe/transient exhaustion, time recovery, aliased-list fix, `is_shutdown` set on fatal, `waiting_queue` drain, `executor_request_queue` drain, `charge_budget=False` skips budget / never triggers fatal |
+| `TestErrorBudget` | 11 | Real `ErrorBudget` dataclass: immediate-fatal bypass, severe/transient exhaustion, time recovery, aliased-list fix, `is_shutdown` set on fatal, `waiting_queue` drain, `executor_request_queue` drain, `charge_budget=False` skips budget / never triggers fatal |
 | `TestGenerationExecutor` | 10 | `_set_fatal_error` first-wins, `is_shutdown` (4 states), `check_health` drain-all with per-request skip |
 | `TestProxyCheckHealth` | 6 | MPI future states via shared `_check_mpi_futures`/`_drain_error_queue` helpers |
+| `TestPreShutdownSentinel` | 6 | Empty-`mpi_futures` / `RemoteMpiCommSessionClient` sentinel regression, all-alive, all-done, partial-crash, idempotency, workers-not-started |
 | `TestErrorMonitorLoop` | 4 | Worker crash, error queue, per-request string skip, shutdown flag |
 | `TestGrpcHealthCheck` | 5 | Parametrized: healthy, fatal, no executor, no LLM, shutdown |
 | `TestOpenAIHealthEndpoint` | 3 | Parametrized: 200, 503, 503+SIGINT |
@@ -318,6 +386,13 @@ CodeRabbit), twelve issues were found and fixed:
 - **Integration test**: Start serving, kill MPI worker externally, verify
   `/health` returns 503 within ~10 seconds. Not yet automated — requires
   multi-GPU environment with K8s liveness probes.
+- **Disaggregated end-to-end error body test**: Cause a context server to fail,
+  verify that the disaggregated frontend returns the original error body and
+  request IDs from PR #13119 instead of a generic `400 Bad Request`.
+- **Health vs request-error separation test**: Send a burst of malformed
+  requests through the OpenAI/disaggregated server and assert (a) each request
+  receives its real error, and (b) `/health` remains healthy because
+  `charge_budget=False` was used for request-scoped paths.
 
 ---
 
@@ -342,6 +417,61 @@ CodeRabbit), twelve issues were found and fixed:
   difference for routing decisions.
 - Dynamo-side fix: Dynamo should implement circuit-breaker / health-aware
   routing independently. This TRT-LLM fix is defensive only.
+
+## Remaining Gaps Across Detection, Propagation, and Handling
+
+The two PRs substantially improve the failure story, but they do not close
+every gap.  The remaining gaps fall into three buckets:
+
+### Detection gaps
+
+- **Hung rank without process exit**: PR #12718 detects completed MPI futures
+  and queued background errors.  It does **not** detect a rank that is still
+  alive but stuck inside a CUDA/NCCL/MPI collective.  WideEP FT's AlltoAll
+  watchdog / main-thread polling work is still required for that class.
+- **`RemoteMpiCommSessionClient` visibility**: in the `trtllm-llmapi-launch`
+  / `mgmn_leader_node` path, `submit()` returns `[]`, so
+  `_check_mpi_futures()` has no local future handles to inspect.  This is why
+  the `pre_shutdown()` empty-list sentinel branch is required, and why
+  process-death detection for that deployment still depends on the remote
+  manager / queue path rather than local futures.
+- **GPU-context liveness probe**: no active CUDA context probe is run from
+  `/health`.  Known fatal CUDA messages are classified, but silent context
+  corruption with no queued error can still require a request or monitor signal
+  to surface.
+- **External orchestrator routing**: TRT-LLM now marks itself unhealthy, but
+  Dynamo / Kubernetes must consume that signal promptly and stop routing.
+  This investigation still treats Dynamo-side circuit breaking as an external
+  gap.
+
+### Propagation gaps
+
+- **Streaming SSE error format consistency**: PR #13119 adds checks before
+  normal response formatting, but streaming paths must consistently emit a
+  structured SSE error event and terminate with `[DONE]`.  CodeRabbit noted
+  this risk during PR #13119 review; audit current streaming helpers before
+  relying on this path operationally.
+- **Sanitized vs diagnostic detail**: gRPC health responses intentionally
+  return `TypeName: first line` while logging full tracebacks server-side.
+  That is correct for clients, but support/debug tooling must know where to
+  retrieve the full traceback.
+- **Postprocessing worker failures**: PR #13119 converts postprocessing
+  exceptions to `ErrorResponse`, but if the postprocessing process itself dies
+  hard (SIGKILL / OOM), it still becomes a worker/process-liveness problem
+  rather than a clean request error.
+
+### Handling gaps
+
+- **Serving in degraded mode**: PR #12718 is fail-fast at the pod level.  It
+  does not attempt rank masking, communicator rebuild, or serving on a reduced
+  EP group.  That work belongs to the WideEP FT design.
+- **Retry semantics after fatal**: after `_fatal_error` is set, queued and
+  active requests are failed.  Client-side retry policy is outside TRT-LLM and
+  must be handled by the caller/orchestrator.
+- **User-facing tuning knobs**: error-budget thresholds are intentionally not
+  exposed.  This is the right default for crash-fast serving, but deployments
+  with unusual retry/orchestration semantics may eventually want a coarse
+  `fail_fast_on_error`-style knob.
 
 ## Backend Coverage
 
