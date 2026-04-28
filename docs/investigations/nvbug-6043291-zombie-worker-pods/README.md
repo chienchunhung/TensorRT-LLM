@@ -362,9 +362,11 @@ CodeRabbit), twelve issues were found and fixed:
 6. **`check_health`/monitor called `shutdown()` inline**: `shutdown()` blocks
    on `f.result()` for surviving workers.  **Fix:** use `pre_shutdown()` which
    is non-blocking.
-7. **`pre_shutdown` sentinel used `all()`**: When one worker was already dead,
-   `all(not f.done())` was False, so the quit sentinel was never sent to
-   surviving workers. **Fix:** `any(not f.done())`.
+7. **`pre_shutdown` sentinel predicate was incomplete**: The first fix changed
+   `all(not f.done())` to `any(not f.done())` so surviving workers still get
+   the quit signal after a partial crash, but this regressed the empty-futures
+   `RemoteMpiCommSessionClient` case (`any([]) == False`). **Fix:**
+   `not self.mpi_futures or any(not f.done())`.
 8. **Duplicate MPI future / queue drain code**: `check_health()` and
    `_error_monitor_loop` had near-identical logic.  **Fix:** extract shared
    `_check_mpi_futures()` and `_drain_error_queue()` helpers.

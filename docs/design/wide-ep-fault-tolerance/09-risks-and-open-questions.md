@@ -139,6 +139,24 @@ Zero non-test uses of `ncclCommAbort` in TRT-LLM. PR 1a.7 wires it before AllGat
 
 PRs 1c.1–1c.4 import from `tensorrt_llm/_torch/pyexecutor/error_classification.py` which #12718 introduces. Mitigated by: (a) rebasing #12718 into the FT implementation base branch, or (b) a drop-in `ErrorBudget` + `classify_error()` shim that gets reconciled when #12718 lands. Tracked weekly during MVP execution.
 
+### Risk — PR #13119 error-propagation dependency
+
+**Severity × Probability:** Medium × Medium | **Phase:** 1c, Phase 1-DS | **Residual:** **Low–Medium** — merged into `main`, but streaming and hard-postproc-death paths still need audit
+
+PR #13119 makes request-scoped failures observable (`GenerationResultBase.error`, `ErrorResponse` from postprocessing, preserved HTTP response bodies, disagg ID regeneration). WideEP FT relies on this distinction: request failures must be returned to callers, while rank / engine failures mark health and trigger failover. Mitigations: keep PR #12718's `RequestError` / `str` filter when extending `_drain_error_queue()` to per-rank tracking, add disaggregated end-to-end error-body tests before Phase 1-DS, and audit streaming SSE paths so errors become structured `data: ...` events rather than unstructured stream crashes.
+
+### Risk — detection visibility gap in `RemoteMpiCommSessionClient`
+
+**Severity × Probability:** High × Medium | **Phase:** 1c | **Residual:** **Medium** — Layer 1 watchdog is mandatory for this deployment shape
+
+`trtllm-llmapi-launch` / `mgmn_leader_node` uses `RemoteMpiCommSessionClient`, whose `submit()` returns `[]` because workers are managed in a separate process. PR #12718's `_check_mpi_futures()` has no local future handles to inspect in that path. The bench-shutdown regression exposed this empty-list behavior: the sentinel must still be sent even when `mpi_futures` is empty. For WideEP FT, Layer 2 worker-death detection is inert in this path; Layer 1 AlltoAll watchdog and explicit health broadcast are mandatory.
+
+### Risk — hung-rank detection without process exit
+
+**Severity × Probability:** High × High | **Phase:** 1a, 1c | **Residual:** **Medium** — covered by Layer 1 watchdog, not by PR #12718 alone
+
+PR #12718 detects completed MPI futures and queued background errors. It does not detect a rank that is alive but stuck in a CUDA/NCCL/MPI collective. This is the exact Mode B risk: kernels can spin indefinitely waiting for a dead peer's flag. Mitigations: host-side AlltoAll watchdog with bounded polling (§5.3 Layer 1), per-step timing markers around `EPGroupHealth.mark_failed()` / broadcast / `reconfigure_mask_only`, and eventual main-thread polling for NCCL/torch distributed operations (Audit 1a showed watchdog modes either terminate or hang in PyTorch 2.11).
+
 ### Risk — Memory pressure in degraded mode
 
 **Severity × Probability:** Low × Low | **Phase:** 1d | **Residual:** **Low** — headroom is ample on GB200
@@ -220,6 +238,17 @@ Framework: revisit when all three of the following hold:
 
 Until all three land, MPI path remains the default.
 
+### Q9 — Error propagation vs failover trigger boundary
+
+Chosen: **request-scoped errors stay request-scoped; rank / engine failures trigger failover.**
+
+PR #13119 intentionally improves request-level propagation: context-server errors, postprocessing exceptions, malformed disaggregated responses, and HTTP error bodies should flow back to the caller with the original reason. PR #12718 intentionally filters `RequestError` / `str` and adds `_handle_errors(charge_budget=False)` for request-scoped paths so those same errors do not consume the process-fatal budget. WideEP FT inherits that boundary:
+
+- If the request is bad or the context response is invalid, fail the request and keep the EP group healthy.
+- If the worker process dies, CUDA/NCCL reports an immediate-fatal condition, or the AlltoAll watchdog times out a rank, mark the rank failed and enter Phase 1 recovery.
+
+Open item: streaming SSE helpers must be audited so they follow the same boundary (structured error event + `[DONE]`, not a process-fatal path).
+
 ## 9.4 Risk summary matrix
 
 | Risk | Severity | Probability | Phase | Mitigation | Residual |
@@ -235,6 +264,9 @@ Until all three land, MPI path remains the default.
 | **MPI `COMM_WORLD` poisoning (Mode A)** | High | High | 1c, 1d.0 | Signal handler replacement + FT subcomm | **Low–Medium** |
 | NCCL FT not wired | Medium | High | 1a (v1) | PR 1a.7 | **Low** |
 | PR #12718 sequencing | Medium | High | 1c | Rebase or shim | **Medium** |
+| PR #13119 error propagation | Medium | Medium | 1c / Phase 1-DS | Preserve request-vs-fatal boundary; add disagg e2e tests | **Low–Medium** |
+| RemoteMpiCommSessionClient detection visibility | High | Medium | 1c | Layer 1 watchdog mandatory; explicit empty-futures handling | **Medium** |
+| Hung rank without process exit | High | High | 1a / 1c | AlltoAll watchdog + bounded polling | **Medium** |
 | Memory pressure (degraded) | Low | Low | 1d | Small impact; ample GB200 headroom | **Low** |
 | False positive detection | Medium | Medium | 1c | Conservative timeouts + confirmation | **Low–Medium** |
 | Second failure during rebuild | Medium | Medium | 2a.8 | Abandon rebuild, re-mask, retry | **Medium** |
