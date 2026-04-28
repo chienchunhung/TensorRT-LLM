@@ -5,11 +5,11 @@
 | | |
 |---|---|
 | **JIRA** | [TRTLLM-11608](https://jirasw.nvidia.com/browse/TRTLLM-11608) |
-| **PRs** | [#12602](https://github.com/NVIDIA/TensorRT-LLM/pull/12602) (Phase 1a: V1 + Python transceiver), [#12469](https://github.com/NVIDIA/TensorRT-LLM/pull/12469) (Phase 1c: V2 + Python transceiver) |
+| **PRs** | [#12602](https://github.com/NVIDIA/TensorRT-LLM/pull/12602) (Phase 1a: V1 + Python transceiver), [#12907](https://github.com/NVIDIA/TensorRT-LLM/pull/12907) (Phase 1b: V1 + C++ transceiver), [#12469](https://github.com/NVIDIA/TensorRT-LLM/pull/12469) (Phase 1c: V2 + Python transceiver) |
 | **Author** | Chien-Chun Hung |
 | **Created** | 2026-03-24 |
-| **Last Updated** | 2026-04-09 |
-| **Status** | Phase 1a in review; Phase 1b (C++ transceiver) planned; Phase 1c follow-up |
+| **Last Updated** | 2026-04-28 |
+| **Status** | Phase 1a in review (foundation); Phase 1b drafted (#12907); Phase 1c drafted (#12469, gated on V2 default) |
 
 ## Problem Statement
 
@@ -102,14 +102,15 @@ A capability-detection gate (`hasattr`) connects layers 1 and 2/3, so each can b
 
 ### Implementation Strategy
 
-The work is split into two PRs for independent review and merge:
+The work is split into three PRs for independent review and merge:
 
 | Component | PR | Status |
 |-----------|-----|--------|
-| Shared chunking infrastructure | #12602 | V1 + shared infra |
-| V1 C++ `releasePrefixBlocks` | #12602 | V1 early release |
-| V2 `_KVCache.release_prefix` | #12469 | Follow-up, V2 early release |
-| `hasattr` callback gate | #12602 | Auto-activates V2 when #12469 merges |
+| Shared chunking infrastructure (Python) | #12602 | Phase 1a foundation |
+| V1 C++ `releasePrefixBlocks` API + binding | #12602 | Phase 1a foundation |
+| `hasattr` callback gate | #12602 | Auto-activates 1c when #12469 merges |
+| C++ transceiver `CacheFormatter` chunking + per-chunk callback | #12907 | Phase 1b, parallelizable with 1c after 1a |
+| V2 `_KVCache.release_prefix` | #12469 | Phase 1c, parallelizable with 1b after 1a |
 
 
 ### Shared Infrastructure (V1 and V2)

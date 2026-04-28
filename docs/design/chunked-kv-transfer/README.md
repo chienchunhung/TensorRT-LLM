@@ -3,11 +3,11 @@
 | | |
 |---|---|
 | **JIRA** | [TRTLLM-11608](https://jirasw.nvidia.com/browse/TRTLLM-11608) |
-| **PRs** | [#12602](https://github.com/NVIDIA/TensorRT-LLM/pull/12602) (Phase 1a), [#12469](https://github.com/NVIDIA/TensorRT-LLM/pull/12469) (Phase 1c), [#12781](https://github.com/NVIDIA/TensorRT-LLM/pull/12781) (Phase 2) |
+| **PRs** | [#12602](https://github.com/NVIDIA/TensorRT-LLM/pull/12602) (Phase 1a), [#12907](https://github.com/NVIDIA/TensorRT-LLM/pull/12907) (Phase 1b), [#12469](https://github.com/NVIDIA/TensorRT-LLM/pull/12469) (Phase 1c), [#12781](https://github.com/NVIDIA/TensorRT-LLM/pull/12781) (Phase 2) |
 | **Author** | Chien-Chun Hung |
 | **Created** | 2026-03-24 |
-| **Last Updated** | 2026-04-09 |
-| **Status** | Phase 1a in review; Phase 1b-1c planned; Phase 2 prototype |
+| **Last Updated** | 2026-04-28 |
+| **Status** | Phase 1a in review; Phase 1b/1c/2 drafted, awaiting rebase + promotion |
 
 ## Problem
 
@@ -33,10 +33,18 @@ The work spans two independent components, each with two implementations:
 
 | Phase | What | KV Cache | Transceiver | Scheduling | PR | Status |
 |-------|------|----------|-------------|------------|-----|--------|
-| **1a** | Chunked transfer + early release | V1 (C++) | Python | Any | [#12602](https://github.com/NVIDIA/TensorRT-LLM/pull/12602) | In review |
-| **1b** | Chunked transfer + early release | V1 (C++) | C++ | Context-first | Future | Planned |
-| **1c** | Chunked transfer + early release | V2 (Py) | Python | Any | [#12469](https://github.com/NVIDIA/TensorRT-LLM/pull/12469) | Follow-up |
-| **2** | Pipelined prefill-transfer | V1+V2 | Python | Gen-first | [#12781](https://github.com/NVIDIA/TensorRT-LLM/pull/12781) | Prototype |
+| **1a** | Chunked transfer + early release | V1 (C++) | Python | Any | [#12602](https://github.com/NVIDIA/TensorRT-LLM/pull/12602) | In review (foundation) |
+| **1b** | Chunked transfer + early release | V1 (C++) | C++ | Context-first | [#12907](https://github.com/NVIDIA/TensorRT-LLM/pull/12907) | Draft |
+| **1c** | Chunked transfer + early release | V2 (Py) | Python | Any | [#12469](https://github.com/NVIDIA/TensorRT-LLM/pull/12469) | Draft (gated on V2 default) |
+| **2** | Pipelined prefill-transfer | V1+V2 | Python | Gen-first | [#12781](https://github.com/NVIDIA/TensorRT-LLM/pull/12781) | Draft (prototype) |
+
+### Sequencing
+
+PR #12602 (Phase 1a) is the **foundation**: it adds the C++ `releasePrefixBlocks` API + nanobind binding + V1 Python wrapper, plus the Python chunking infrastructure shared by 1c and 2. Once 1a lands, the remaining three PRs (1b, 1c, 2) touch disjoint code surfaces and can proceed in parallel:
+
+- **1b** modifies C++ only (`CacheFormatter`, `CacheSender`, staging buffer).
+- **1c** is pure Python (`_KVCache.release_prefix`, `KVCacheManagerV2.release_prefix_blocks`); auto-activated by the `hasattr` gate already in 1a.
+- **2** modifies the Python transceiver / executor only (CUDA event plumbing, incremental session lifecycle, post-forward hook).
 
 **Why no Phase 2 for C++ transceiver?** The C++ transceiver uses context-first flow where the generation executor is not allocated until the full context forward completes. There is no receiver to send to during prefill. Pipelining requires gen-first flow, which is only supported in the Python transceiver.
 
@@ -97,12 +105,13 @@ The work spans two independent components, each with two implementations:
 - Auto-selection of Python transceiver when `chunk_size_blocks` is set (NIXL/DEFAULT)
 - Warning when `chunk_size_blocks` set with unsupported backend
 
-### Phase 1b: V1 + C++ Transceiver (Future)
+### Phase 1b: V1 + C++ Transceiver (PR #12907)
 
-- Modify `CacheFormatter::format` to partition blocks into chunk ranges (~500 lines C++)
-- Per-chunk callback in `CacheSender` calling existing `releasePrefixBlocks` API
+- Modify `CacheFormatter::format` to partition blocks into chunk ranges
+- Per-chunk callback in `CacheSender` calling existing `releasePrefixBlocks` API (added by 1a)
 - Reduce staging buffer from `max_tokens_in_buffer` to one chunk's worth
 - Enables chunking for UCX/MPI/MOONCAKE backends
+- **Coordination:** [PR #13055](https://github.com/NVIDIA/TensorRT-LLM/pull/13055) (arbitrary KV transfer) modifies the same `CacheFormatter` file (`getBlockRangeForSending`); coordinate landing order to avoid merge conflicts
 
 ### Phase 1c: V2 + Python Transceiver (PR #12469)
 
@@ -120,10 +129,11 @@ The work spans two independent components, each with two implementations:
 
 ### Dependency
 
-    Phase 1a: PR #12602 (V1 + Python transceiver)
+    Phase 1a: PR #12602 (foundation: C++ API + Python chunking infra)
       |
-      +---> Phase 1b (V1 + C++ transceiver)
-      |       |-- CacheFormatter chunking
+      +---> Phase 1b: PR #12907 (V1 + C++ transceiver)
+      |       |-- CacheFormatter::format chunking
+      |       |-- Per-chunk callback in CacheSender
       |       |-- Staging buffer reduction
       |
       +---> Phase 1c: PR #12469 (V2 + Python transceiver)
@@ -134,6 +144,8 @@ The work spans two independent components, each with two implementations:
               |-- CUDA event sync per chunk
               |-- Incremental session creation
               |-- Gen-first scheduling required
+
+After 1a lands, the three downstream PRs touch disjoint files (C++ transceiver / V2 KV cache Python / Python transceiver + executor) and can be reviewed and merged in parallel.
 
 ## Key Metrics to Track
 
