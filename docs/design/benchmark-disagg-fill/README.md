@@ -4,7 +4,7 @@ This directory tracks the full lineage of the benchmark disaggregated-serving fi
 
 ## Current state (2026-04-27)
 
-Status: **v2.1 three-part fix merged in [PR #13347](https://github.com/NVIDIA/TensorRT-LLM/pull/13347); v2.2 fill-phase admission cap in follow-up PR #TBD.** The wide-EP Kimi-K2-Thinking gen-only test exposed four coupled issues that v2.1 + v2.2 collectively fix:
+Status: **v2.1 + v2.2 four-part fix in review in [PR #13347](https://github.com/NVIDIA/TensorRT-LLM/pull/13347).** The wide-EP Kimi-K2-Thinking gen-only test exposed four coupled issues that the PR collectively fixes:
 
 1. The original count-based fill gate depended on exact ADP router balance. *(v2.1 — state-based gate.)*
 2. The ADP router could set `expected_num_active_requests` above `max_batch_size` during bulk arrivals. *(v2.1 — router cap.)*
@@ -23,8 +23,8 @@ See [`02-regression-investigation.md`](02-regression-investigation.md) for the v
 | v1a | [#12091](https://github.com/NVIDIA/TensorRT-LLM/pull/12091) | Batched fill (`tp_size` per iteration) | Fixed some deadlock cases; still starved transfer servicing |
 | v1b | [#12206](https://github.com/NVIDIA/TensorRT-LLM/pull/12206) | Explicit fail-fast when GEN-side KV cache insufficient | Kept — needed to avoid silent hangs |
 | **v2** | [#12208](https://github.com/NVIDIA/TensorRT-LLM/pull/12208) | Eliminated fill loop; non-blocking `can_forward` gate; dummy suppression during fill | Merged. Docs in [`01-history-nonblocking-gate/`](01-history-nonblocking-gate/README.md) |
-| **v2.1** | [#13347](https://github.com/NVIDIA/TensorRT-LLM/pull/13347) | State-based fill gate, ADP router cap, fill-phase fail-fast suppression | Merged. Fixes nvbug 6071070 / nvbug 6093911. Docs in [`03-step1-gate-rewrite-plan.md`](03-step1-gate-rewrite-plan.md), [`05-router-cap-fix.md`](05-router-cap-fix.md), and [`06-fill-phase-fail-fast.md`](06-fill-phase-fail-fast.md) |
-| **v2.2** | #TBD | Fill-phase admission cap (`tp_size` per iteration) reintroduced as explicit memory-pressure regulator | **In review.** Fixes burst-admission OOM that v2.1 uncovered on tight-memory configs. Docs in [`07-fill-phase-flow-control.md`](07-fill-phase-flow-control.md) |
+| **v2.1** | [#13347](https://github.com/NVIDIA/TensorRT-LLM/pull/13347) | State-based fill gate, ADP router cap, fill-phase fail-fast suppression | **In review** as part of PR #13347. Fixes nvbug 6071070 / nvbug 6093911. Docs in [`03-step1-gate-rewrite-plan.md`](03-step1-gate-rewrite-plan.md), [`05-router-cap-fix.md`](05-router-cap-fix.md), and [`06-fill-phase-fail-fast.md`](06-fill-phase-fail-fast.md) |
+| **v2.2** | [#13347](https://github.com/NVIDIA/TensorRT-LLM/pull/13347) | Fill-phase admission cap (`tp_size` per iteration) reintroduced as explicit memory-pressure regulator | **In review** as part of PR #13347 (4th commit). Fixes burst-admission OOM that v2.1 uncovered on tight-memory configs. Docs in [`07-fill-phase-flow-control.md`](07-fill-phase-flow-control.md) |
 | v3 | follow-up if needed | Separate admission control from routing; harden orchestration boundaries | Planned follow-up |
 | v4 | this plan, step 2 | Remove fill gate from `PyExecutor`; orchestrate from benchmark client | Planned |
 
@@ -45,15 +45,13 @@ See [`02-regression-investigation.md`](02-regression-investigation.md) for the v
 
 For context only: skim `01-history-nonblocking-gate/README.md`.
 
-For reviewing the v2.1 PR (#13347): read `02` for the regression, then `03`, `05`, and `06` for the three production fixes.
-
-For reviewing the v2.2 follow-up PR: read `07` (sufficient on its own; references `02` and `06` for context). Skim `08` to understand what was *not* fixed in this PR and why.
+For reviewing PR #13347 (which includes both v2.1 and v2.2): read `02` for the regression, then `03`, `05`, `06`, and `07` for the four production fixes (in commit order). Skim `08` to understand the latent gate-vs-transceiver finding that was discovered during v2.2 validation but is *not* part of this PR.
 
 For the structural redesign: read `03` (so you know what's being removed) → read `04` → discuss before starting.
 
 ## Relationship between the steps
 
-Step 1 (v2.1 + v2.2) is a bounded patch to `PyExecutor`. It keeps the feature in the same place it has lived through versions 0–2 and fixes its correctness and resource-budget behavior. Ships as two PRs: v2.1 first (state correctness), then v2.2 (memory-pressure regulator). Both are normal bug-fix PRs.
+Step 1 (v2.1 + v2.2) is a bounded patch to `PyExecutor`. It keeps the feature in the same place it has lived through versions 0–2 and fixes its correctness and resource-budget behavior. Ships as a single PR (#13347) that contains all four commits — v2.1 first (state correctness), then v2.2 (memory-pressure regulator) on top — because the PR's CI gate cannot pass without v2.2 anyway.
 
 Step 2 (v4) deletes the feature from `PyExecutor`. The gate becomes a client-side barrier in the benchmark harness, because that is what the gate logically is — measurement orchestration. Ships as a larger refactor once Step 1 is stable in CI.
 

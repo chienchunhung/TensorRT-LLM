@@ -2,7 +2,7 @@
 
 [< Back to index](README.md)
 
-**Status:** **Latent bug, separate from PR #13347 / v2.2.** Documented here because it was uncovered while validating v2.2 locally.
+**Status:** **Latent bug, separate from PR #13347's v2.1 + v2.2 fixes.** Documented here because it was uncovered while validating v2.2 locally.
 **Severity:** Affects benchmark-mode runs where the scheduler cannot fit all in-flight INIT requests after the per-rank capacity is reached. In practice this means: any deployment whose KV-cache pool is undersized relative to `max_batch_size × max_seq_len × tp_size`.
 **Bug references:** TBD (file as a separate NVBug)
 

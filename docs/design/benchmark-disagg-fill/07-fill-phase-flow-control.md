@@ -3,7 +3,7 @@
 [< Back to index](README.md)
 
 **Bug references:** nvbug 6094XXX (TBD)
-**PR:** [#TBD](https://github.com/NVIDIA/TensorRT-LLM/pull/TBD) (follow-up to [#13347](https://github.com/NVIDIA/TensorRT-LLM/pull/13347))
+**PR:** [#13347](https://github.com/NVIDIA/TensorRT-LLM/pull/13347) (4th commit, on top of the v2.1 three-part fix)
 **Prerequisite reading:** [`02-regression-investigation.md`](02-regression-investigation.md), [`03-step1-gate-rewrite-plan.md`](03-step1-gate-rewrite-plan.md), [`05-router-cap-fix.md`](05-router-cap-fix.md), [`06-fill-phase-fail-fast.md`](06-fill-phase-fail-fast.md)
 
 ---
