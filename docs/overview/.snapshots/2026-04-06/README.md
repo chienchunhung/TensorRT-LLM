@@ -2,7 +2,7 @@
 
 **Scope:** Deep-dive learning guide covering TensorRT-LLM's architecture, key features, end-to-end user journey, competitive landscape, and future development opportunities. Includes code references, design rationale, framework comparisons, and Mermaid diagrams.
 
-**Last updated:** 2026-04-29 — reflects TensorRT-LLM v1.3.0rc14 (main branch), vLLM v0.20.0, SGLang v0.5.10.post1, LMCache v0.4.4, NVIDIA Dynamo v1.0.0. *[Updated 2026-04-29: see [`CHANGELOG.md`](CHANGELOG.md) for the full delta vs. the 2026-04-06 baseline.]*
+**Last updated:** April 2026 — reflects TensorRT-LLM v1.3.0 (main branch), vLLM v0.19.0, SGLang v0.5.10, LMCache v0.4.2.
 
 ---
 
@@ -17,7 +17,7 @@ Backend overview (PyTorch, AutoDeploy, TensorRT), architecture diagram, request 
 - [2.3 KV Cache Manager V1 & V2](02-03-kv-cache-manager.md) — Block-based cache with radix tree, prioritized LRU, multi-tier storage
 - [2.4 Block Reuse (Prefix Caching)](02-04-block-reuse.md) — Cross-request KV cache sharing via radix tree matching
 - [2.5 Disaggregated Serving](02-05-disaggregated-serving.md) — Prefill/decode separation with NIXL/UCX/Mooncake KV transfer
-- [2.6 Speculative Decoding](02-06-speculative-decoding.md) — 8 algorithms (EAGLE3, EAGLE3 dynamic-tree, MTP, NGram, PARD, SA, Draft/Target, **DFlash**) + SA hybrids *[Updated 2026-04-29: DFlash added (#12794), EAGLE3 dynamic tree re-enabled (#13081); LoRA + spec-dec now supported (#12661).]*
+- [2.6 Speculative Decoding](02-06-speculative-decoding.md) — 7 algorithms (EAGLE3, MTP, NGram, PARD, SA, Draft/Target) + SA hybrids
 - [2.7 Parallelism Strategies](02-07-parallelism-strategies.md) — TP, PP, EP, ADP, CP, Wide-EP, DWDP
 - [2.8 Other Notable Features](02-08-other-features.md) — CUDA graphs, chunked prefill, guided decoding, LoRA, multimodal, visual generation, quantization
 
@@ -25,7 +25,7 @@ Backend overview (PyTorch, AutoDeploy, TensorRT), architecture diagram, request 
 Launch & initialization, model loading, request handling, failover & fault tolerance, auto-scaling.
 
 ### 4. [Framework Comparison](04-framework-comparison.md)
-Architecture comparison, feature matrix (TRT-LLM vs. vLLM vs. SGLang vs. LMCache vs. NVIDIA Dynamo), and performance positioning. *[Updated 2026-04-29: added Dynamo column; vLLM v0.20 brings FA4 default for MLA prefill, TurboQuant 2-bit KV, vLLM IR foundation, Model Runner V2.]*
+Architecture comparison, feature matrix (TRT-LLM vs. vLLM vs. SGLang vs. LMCache), and performance positioning.
 
 ### 5. Future Development Opportunities
 - [5.1 Critical Feature Gaps vs. Mainstream Frameworks](05-01-feature-gaps.md) — Multi-vendor GPU, model catalog, elastic fault tolerance, TTFT, LoRA, structured generation, multi-model serving, API compatibility

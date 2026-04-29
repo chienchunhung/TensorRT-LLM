@@ -16,13 +16,11 @@ Autoregressive decoding is inherently sequential — each token depends on the p
 graph TB
     subgraph "Speculative Decoding Algorithms"
         E3["EAGLE 3<br/>Separate draft model"]
-        E3DT["EAGLE 3 Dynamic Tree<br/>(re-enabled 2026-04, #13081)"]
         MTP["MTP<br/>Built-in model heads<br/>DeepSeek-specific"]
         NGram["NGram<br/>Pattern matching<br/>no draft model"]
         PARD["PARD<br/>Parallel mask prediction<br/>one-model + two-model"]
         SA["Suffix Automaton<br/>GPU pattern matching"]
         DT["Draft/Target<br/>Arbitrary smaller model"]
-        DFlash["DFlash<br/>(new 2026-04, #12794)<br/>one-model spec dec"]
         UP["User-Provided<br/>Custom Drafter"]
     end
 
@@ -43,15 +41,11 @@ graph TB
 | Algorithm | Draft Source | Draft Model Required? | Key Characteristics |
 |:----------|:-----------|:---------------------|:--------------------|
 | **EAGLE 3** | Lightweight trained model | Yes | Two-model or one-model; best with SA combination; MLA target + GQA draft support |
-| **EAGLE 3 Dynamic Tree** *[2026-04 #13081]* | EAGLE 3 + dynamic tree expansion | Yes | Re-enabled after revert; adapts tree shape per request based on draft confidence |
 | **MTP** | Built-in prediction heads | No (embedded) | DeepSeek-specific; relaxed acceptance for reasoning; MTP>1 for DeepSeek v3.2 |
 | **NGram** | Prompt/generation history | No | Prompt lookup decoding; zero extra model overhead |
 | **PARD** | Parallel mask-token prediction | Yes | All K drafts in one forward; one-model + two-model paths; target-independent |
 | **SA** | GPU suffix automaton | No | Model-free; very accurate on repetitive content; on-device processing |
 | **Draft/Target** | Arbitrary smaller model | Yes | Simplest form; requires same tokenizer |
-| **DFlash** *[New 2026-04 #12794]* | One-model speculative path | No (built-in) | One-model spec dec — see `_torch/speculative/dflash.py` (`DFlashWorker`, `DFlashSpecMetadata`) |
-
-*[Updated 2026-04-29: algorithm count corrected — registry in `_torch/speculative/__init__.py` exports 8 worker types (DFlash, DraftTargetOneModel, Eagle3, MTPEagle, MTP, NGram, PARD, SA + the SaveHiddenStates resource manager).]*
 
 ## Draft-Verify Loop
 
@@ -75,18 +69,13 @@ sequenceDiagram
     end
 ```
 
-**What's new (v1.2 → v1.3.0rc14, as of 2026-04-29):**
+**What's new (v1.2-v1.3):**
 - **PARD one-model path** — single-model speculative decoding without a separate draft model.
 - **Dynamic draft length** across all spec decode algorithms (expanding from one-model path).
 - **MTP>1** for DeepSeek v3.2 — multiple prediction heads for higher acceptance.
 - **Guided decoding + speculative decoding** combination now works.
 - **Suffix automaton on device** — GPU-side SA processing for lower latency.
 - **Eagle MLA target with GQA draft** support for mixed-architecture speculation.
-- *[New 2026-04 — closes prior gap]* **LoRA + speculative decoding** combination (#12661). Previously LoRA disabled spec-dec; now they coexist (note: `LoRA + EAGLE3` enabled via #13005).
-- *[New 2026-04]* **DFlash** added to the one-model spec-dec family (#12794, `[TRTLLM-11228]`).
-- *[New 2026-04]* **EAGLE3 dynamic-tree spec dec** re-enabled (#13081, `[TRTLLM-11540]`) after the earlier revert.
-- *[New 2026-04]* **`Mamba2` MTP custom op invocation path** added (#12787) — opens MTP-style spec dec for state-space and hybrid models.
-- *[Fixed 2026-04]* MTP + CUDA-graph padding correctness on Mamba cache (#13151); MTP+PP hang on last PP rank fixed by preserving spec-layer weights (#12555).
 
 **GPU-side acceptance** (`py_executor.py`): Uses `torch.cumprod` of equality comparisons to find the longest matching prefix, then gathers the final accepted next token.
 
@@ -98,13 +87,6 @@ sequenceDiagram
 
 | Framework | Support | Distinctive Feature |
 |:----------|:--------|:-------------------|
-| **TensorRT-LLM** | EAGLE3 (+ dynamic tree), MTP, NGram, PARD, SA, Draft/Target, **DFlash**, user-provided; SA+neural combos | *[Updated 2026-04]* 8 algorithms now; dynamic draft length; SA hybrid; guided-decoding combo; LoRA combo |
-| **vLLM v0.20** | EAGLE, draft models, NGram (GPU), rejection sampler; *[New 2026-04]* Eagle prefill full-CUDA-graph (Model Runner V2) | EAGLE-3 production-shipped; multimodal embeddings for spec decode |
-| **SGLang v0.5.10** | EAGLE, spec-dec with FlashAttention 4; *[Reference]* SuffixDecoding shipping in Snowflake's ArcticInference | FA4 integration for spec decode verification |
-
-## Academic Frontier (2026 Q1–Q2)
-
-*[New 2026-04-29]* — directly relevant work that could inform TRT-LLM's next-gen spec-dec roadmap:
-
-- **GOOSE** ([arXiv 2604.02047](https://arxiv.org/abs/2604.02047v1)): training-free anisotropic speculation trees combining n-gram matches and statistical predictions; **1.9–4.3× lossless speedup**. Recognizes ~6× median acceptance-rate gap between sources and adapts tree shape per source. Architecturally close to TRT-LLM's existing SA + EAGLE/MTP hybrids.
-- **StreamServe** ([arXiv 2604.09562](https://arxiv.org/abs/2604.09562)): adaptive online tuning of speculation depth coupled with disagg P/D — **11–18× latency reduction** vs. tensor-parallel vLLM baseline. Suggests promoting the existing `speculation_gate.py` from on/off to a multi-level depth controller.
+| **TensorRT-LLM** | EAGLE3, MTP, NGram, PARD, SA, Draft/Target, user-provided; SA+neural combos | Richest algorithm set; dynamic draft length; SA hybrid approach; guided decoding combo |
+| **vLLM** | EAGLE, draft models, NGram (GPU), rejection sampler with greedy/logprobs | Zero-bubble async scheduling + spec decode; multimodal embeddings for spec decode |
+| **SGLang** | EAGLE, spec-dec with FlashAttention 4 | FA4 integration for spec decode verification |

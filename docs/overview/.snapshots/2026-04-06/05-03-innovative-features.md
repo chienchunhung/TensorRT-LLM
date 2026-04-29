@@ -4,8 +4,6 @@
 
 These are forward-looking capabilities that could establish TRT-LLM as a leader for next-generation inference workloads.
 
-*[Updated 2026-04-29: §3.4 KVaaS and §3.6 Inference-Time Compute promoted from "speculative" to "academically validated" — citations added to GOOSE, StreamServe, PrfaaS, FlowKV, Anthropic prompt caching. §3.3 hardware co-design refreshed for Rubin / TPU v7 / MI355X. §3.8 self-optimizing engine reframed around the new Prometheus surface.]*
-
 ---
 
 ## 3.1 Multi-Modal Inference Platform
@@ -49,29 +47,16 @@ These are forward-looking capabilities that could establish TRT-LLM as a leader 
   - **Cross-GPU KV cache sharing via CXL:** Multiple GPUs accessing a shared CXL memory pool for KV cache — enabling zero-copy prefix sharing across GPUs without AllGather communication.
   - **Elastic GPU memory:** CXL allows dynamic memory allocation to GPUs based on workload. High-context requests get more memory; low-context requests release it to a shared pool.
 
-### Next-Generation NVIDIA Platforms *[Updated 2026-04-29 — Rubin moved from "future" to "near-term"]*
+### Next-Generation NVIDIA Platforms
 
-- **Vera Rubin co-design:** Rubin (R200/VR200) entered full production at CES 2026 with volume H2 2026 / sampling Q4 2026. Specs: 336B transistors, 288 GB HBM4, 22 TB/s memory bandwidth, 50 PF FP4 inference, NVLink 6 @ 3.6 TB/s per GPU, paired with the Vera CPU (88 ARM cores). Vera Rubin NVL144 CPX delivers 8 EF AI / 100 TB fast memory / 1.7 PB/s aggregate per rack. TRT-LLM's disaggregated serving + DWDP investment positions it well, but deeper HW-SW co-design — particularly **CPX (CPU-GPU co-execution) integration** — is needed to exploit hardware-native disaggregation features. ([NVIDIA Technical Blog](https://developer.nvidia.com/blog/inside-the-nvidia-rubin-platform-six-new-chips-one-ai-supercomputer/))
-- **NVLink 6 (3.6 TB/s) and beyond:** Future NVLink generations will increase bandwidth, enabling wider parallelism strategies. DWDP-like approaches could scale beyond NVL72 to NVL144 / NVL576-class clusters.
-
-### Multi-Vendor Inference Reality (the gap, restated) *[New 2026-04-29]*
-
-While Rubin sets the high-end ceiling, the multi-vendor floor matters too:
-- **AMD MI355X**: 288 GB HBM3E, 10 PF FP4 — surpassed 1M tok/s in MLPerf Inference 6.0 (April 2026), 3.1× over MI325X on Llama 2 70B Server. ROCm + vLLM is the operational stack. ([AMD blog](https://www.amd.com/en/blogs/2026/amd-delivers-breakthrough-mlperf-inference-6-0-results.html))
-- **Google TPU v7 (Ironwood)**: GA March 31, 2026, targets LLM/MoE/diffusion training & inference; Trillium (v6e) GA Dec 2024.
-- **Etched Sohu**: still pre-shipping as of March 2026 — claims unverified externally; unlikely to materially affect 2026 design choices.
-- **Groq LPU**: still LPU1 in production; no LPU2/LPU3 announced. The "GPU + LPU hybrid" idea above remains relevant but bound by what Groq actually ships.
+- **Vera Rubin co-design:** NVIDIA's next-generation platform will have hardware-level P/D split capabilities. TRT-LLM's disaggregated serving investment positions it well, but deeper HW-SW co-design is needed to exploit hardware-native disaggregation features.
+- **NVLink 6.0 and beyond:** Future NVLink generations will increase bandwidth, enabling wider parallelism strategies. DWDP-like approaches could scale to even larger GPU clusters.
 
 ---
 
-## 3.4 KV Cache as a Service (KVaaS) *[Updated 2026-04-29 — promoted from speculative to academically validated]*
+## 3.4 KV Cache as a Service (KVaaS)
 
-**Current state:** TRT-LLM has KV Cache Connector API and disaggregated serving with NIXL/UCX/Mooncake backends, and as of #12626 ships first-class shorthand connectors for `lmcache` and `kvbm`. LMCache v0.4.4 (April 2026) extends multi-tier storage with multi-path local-disk and ValkeyConnector cluster + TLS. NVIDIA Dynamo v1.0 adds a content-addressed cross-engine KV router above all of this.
-
-**Academic validation (April 2026):**
-- **PrfaaS — Prefill-as-a-Service** ([arXiv 2604.15039](https://arxiv.org/abs/2604.15039v1)): cross-datacenter KV transfer is feasible for hybrid-attention models with smaller KV footprints; 54% throughput gain over homogeneous baselines.
-- **FlowKV** ([arXiv 2504.03775](https://arxiv.org/pdf/2504.03775)): block-wise KV transfer + load-aware scheduler reduces avg transfer time 0.944s → 0.053s (96% reduction).
-- **Anthropic automatic prompt caching** (Claude 3.7 Sonnet): sets the user-visible UX bar — prompt caching is now table-stakes, not a differentiator.
+**Current state:** TRT-LLM has KV Cache Connector API and disaggregated serving with NIXL/UCX/Mooncake backends. LMCache demonstrates the value of cross-instance KV cache sharing.
 
 **Futuristic opportunities:**
 - **Distributed KV cache fabric:** A cluster-wide KV cache service that all serving instances can read from and write to. When any instance computes KV cache for a prefix, all instances can immediately reuse it. This extends the current disaggregated serving KV transfer to a persistent, shared fabric.
@@ -93,20 +78,15 @@ While Rubin sets the high-end ceiling, the multi-vendor floor matters too:
 
 ---
 
-## 3.6 Inference-Time Compute Scaling *[Updated 2026-04-29 — academically validated]*
+## 3.6 Inference-Time Compute Scaling
 
-**Current state:** TRT-LLM has blog13 on inference-time compute implementation (best-of-N, majority voting, etc.). The existing `speculation_gate.py` is a binary gate; an adaptive-depth controller would generalize it.
-
-**Academic validation (April 2026):**
-- **GOOSE — Anisotropic Speculation Trees** ([arXiv 2604.02047](https://arxiv.org/abs/2604.02047v1)): training-free 1.9–4.3× speedup by adapting tree shape to per-source acceptance rates. Architecturally close to TRT-LLM's existing SA + EAGLE/MTP hybrids — could be a near-term integration.
-- **StreamServe** ([arXiv 2604.09562](https://arxiv.org/abs/2604.09562)): adaptive online tuning of speculation depth × disagg P/D — 11–18× latency reduction vs. tensor-parallel vLLM. Suggests promoting `speculation_gate.py` from on/off to multi-level depth selection.
-- **Dual-Pool Token-Budget Routing** ([arXiv 2604.08075](https://arxiv.org/abs/2604.08075)): partitioning vLLM fleets into short-context vs. long-context pools cuts GPU-hours 31–42% and P99 TTFT 6%. Routing-layer optimization, but informs how Dynamo/Triton should orchestrate TRT-LLM replicas.
+**Current state:** TRT-LLM has blog13 on inference-time compute implementation (best-of-N, majority voting, etc.).
 
 **Futuristic opportunities:**
 - **Adaptive compute allocation:** Dynamically allocate more inference-time compute (more samples, longer chains-of-thought, more speculative paths) for difficult queries and less for easy ones. Use early-layer confidence estimation to decide compute budget per-request.
 - **Tree-of-thought serving:** Efficiently serve tree-structured generation where multiple branches are explored simultaneously. KV cache forking (copy-on-write) makes this memory-efficient. The scheduler would manage tree-width as a first-class scheduling dimension.
 - **Reward-model-guided generation:** Integrate reward model inference into the serving pipeline to steer generation in real-time. Use the reward signal to prune low-quality branches early, saving compute on dead-end generations.
-- **Test-time training (TTT) integration:** Apply lightweight parameter updates during inference based on the specific query context. This requires online gradient computation during serving — a fundamentally different execution pattern from pure inference. The new `verl async RL` abort/resume hooks (#12272, `[TRTLLM-10703]`) are the first piece of plumbing in this direction.
+- **Test-time training (TTT) integration:** Apply lightweight parameter updates during inference based on the specific query context. This requires online gradient computation during serving — a fundamentally different execution pattern from pure inference.
 
 ---
 
@@ -119,23 +99,10 @@ While Rubin sets the high-end ceiling, the multi-vendor floor matters too:
 
 ---
 
-## 3.8 Self-Optimizing Inference Engine *[Updated 2026-04-29 — substrate now exists]*
-
-**Current state:** The new Prometheus stack (#12545: iteration stats + token counters + phase histograms), modular logger with per-module filtering (#13202), and per-iteration `InflightBatchingStats` aggregate counters (#13199) together provide the **first-class telemetry substrate** that any RL/heuristic learner needs. `SchedulerConfig.use_python_scheduler` lets a researcher swap in custom scheduling policies without C++ rebuilds. Dynamo's AIConfigurator demonstrates an offline-search approach to similar choices (P/D split + HW selection).
+## 3.8 Self-Optimizing Inference Engine
 
 **Futuristic opportunities:**
-- **Auto-tuned scheduling policies:** Use reinforcement learning to learn optimal scheduling policies (batch sizes, prefill/decode mixing, eviction priorities) from production traffic patterns. Replace hand-tuned heuristics with learned policies that adapt to workload changes. *[Updated 2026-04: the telemetry side is now in place; the open question is whether the policy lives inside TRT-LLM (PyExecutor) or above it (Dynamo Planner / GlobalPlanner).]*
+- **Auto-tuned scheduling policies:** Use reinforcement learning to learn optimal scheduling policies (batch sizes, prefill/decode mixing, eviction priorities) from production traffic patterns. Replace hand-tuned heuristics with learned policies that adapt to workload changes.
 - **Kernel auto-selection:** Instead of static kernel selection based on problem size, dynamically profile and select the fastest kernel for each operation based on the current GPU state (thermal throttling, memory pressure, concurrent workloads).
 - **Predictive resource allocation:** Use request metadata (prompt length, expected output length from historical patterns, priority) to pre-allocate KV cache blocks and schedule prefill before the request enters the queue.
-- **Workload-aware quantization:** Dynamically switch quantization precision based on load. Under light load, run at FP16 for best quality. Under heavy load, switch to FP8/INT4/NVFP4 to serve more requests with acceptable quality trade-off. *[Updated 2026-04: the FP4 residual quant kernel without channel reorder (#13117) and tunable NVFP4 quantize via FlashInfer (#12126) are building blocks for a runtime quant-switch path.]*
-
----
-
-## 3.9 Production Reliability and Multi-Engine Orchestration *[New 2026-04-29]*
-
-The "Dynamo era" reframes what TRT-LLM should own vs. what its orchestration layer should own:
-
-- **Dynamo Snapshot for fast recovery** sets a new reliability bar — TRT-LLM should make its checkpoint/restore primitives Snapshot-compatible (deterministic state, idempotent restart).
-- **Dynamo's KV-block-utilization-driven autoscaling** consumes per-iteration stats. The new Prometheus surface (#12545) is the natural integration point — extend it with the metrics Dynamo Planner needs.
-- **AIConfigurator's offline P/D + HW-config search** is a candidate for upstream contribution: TRT-LLM has the deepest catalog of `examples/configs/database/` Pareto configs; surfacing them through AIConfigurator strengthens both projects.
-- **Cross-engine KV reuse** (Dynamo's content-addressed router) requires TRT-LLM's KV cache hashing scheme to be interoperable with vLLM and SGLang. This is a concrete spec/protocol opportunity.
+- **Workload-aware quantization:** Dynamically switch quantization precision based on load. Under light load, run at FP16 for best quality. Under heavy load, switch to FP8/INT4 to serve more requests with acceptable quality trade-off.

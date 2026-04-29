@@ -2,16 +2,19 @@
 
 [< Back to Overview](README.md)
 
-| Feature | Description | Impact | What's New (v1.2-v1.3) |
-|:--------|:-----------|:-------|:------------------------|
-| **CUDA Graph** | Captures kernel sequences as replayable graphs; padding to nearest captured size | Up to 22% throughput improvement | PDL (Programmatic Dependent Launch) now default |
-| **Chunked Prefill** | Splits long prompts across iterations, interleaving with decode | Reduces TPOT variance | Chunked Pipeline Parallelism for million-token context (SGLang) |
-| **Guided Decoding** | Grammar/schema-constrained generation (JSON mode) | Structural output guarantees | Now works with all spec decode methods and disagg serving |
-| **LoRA** | Runtime adapter loading without restart; per-request adapter selection | Multi-task serving efficiency | Still untested with EP, Helix, ADP, Disagg |
-| **Multimodal** | Vision-language models + audio + visual generation (LTX-2, WAN, FLUX) | Multi-modal inference | FA4 attention for diffusion; audio support; dynamic resolution |
-| **KV Cache Salting** | Security isolation for multi-tenant prefix caching | Prevents prompt theft attacks | — |
+| Feature | Description | Impact | What's New (v1.2 → v1.3.0rc14, as of 2026-04-29) |
+|:--------|:-----------|:-------|:--------------------------------------------------|
+| **CUDA Graph** | Captures kernel sequences as replayable graphs; padding to nearest captured size | Up to 22% throughput improvement | PDL (Programmatic Dependent Launch) now default; *[New 2026-04]* +64 batch sizes for padding-enabled CUDA graphs (#12895); stale CUDA graphs dropped on beam-width change (#13255) |
+| **Chunked Prefill** | Splits long prompts across iterations, interleaving with decode | Reduces TPOT variance | Chunked Pipeline Parallelism for million-token context (SGLang); *[New 2026-04]* mamba metadata prefill bubble fix in chunked prefill serving (#12736); KV-reuse + chunked-prefill compute-token accounting fixed (#12976) |
+| **Guided Decoding** | Grammar/schema-constrained generation (JSON mode) | Structural output guarantees | Now works with all spec decode methods and disagg serving; *[Fixed 2026-04]* GLM5 constrained decoding (#12869); VLM startup crash from missing `vocab_size_padded` (#12284) |
+| **LoRA** | Runtime adapter loading without restart; per-request adapter selection | Multi-task serving efficiency | *[Updated 2026-04]* Now combinable with **EAGLE3** spec dec (#13005) and broader **spec-dec + LoRA** path (#12661); Qwen3 LoRA fixed (#12785); Nemotron NAS over-allocation partially fixed (#12817). Combinations with EP, Helix, ADP, Disagg remain untested. |
+| **Multimodal** | Vision-language models + audio + visual generation (LTX-2, WAN, FLUX) | Multi-modal inference | FA4 attention for diffusion; audio support; dynamic resolution; *[New 2026-04]* audio extraction from video for Nemotron Nano VL (#12921); video temporal compression for Nemotron Nano + RADIO (#12649); ViT attention kernel optimized on Nemotron (#12911); image-as-tensor unification (#12994); multimodal data cleared upon prefill completion (#13259) |
+| **KV Cache Salting** | Security isolation for multi-tenant prefix caching | Prevents prompt theft attacks | HMAC key requirement now enforced in the codebase (#9850); HMAC enabled in VisualGen ZMQ IPC (#12680) |
 | **FlexKV** | Flexible KV cache backend | Configurable cache strategies | New in v1.3 |
-| **Quantization** | FP8, NVFP4, MXFP8, 2FP4/Arcquant | Memory/compute efficiency | Mixed quant for shared/routed MoE experts |
-| **Visual Generation** | Diffusion model support (LTX-2, WAN, FLUX) | Image/video generation | Fused DiT QK Norm + RoPE kernel; two-stage pipeline |
-| **Agentic Support** | Tool parsers (GLM-4), interleaved thinking, Harmony parser | Agentic workflows | Auto option for tool/reasoning parsers |
+| **Quantization** | FP8, NVFP4, MXFP8, 2FP4/Arcquant | Memory/compute efficiency | Mixed quant for shared/routed MoE experts; *[New 2026-04]* tunable NVFP4 quantize via FlashInfer backend (#12126); FP4 residual quantization kernel without channel reorder (#13117); NVFP4 fused norm dim guard (#12901) |
+| **Visual Generation** | Diffusion model support (LTX-2, WAN, FLUX) | Image/video generation | Fused DiT QK Norm + RoPE kernel; two-stage pipeline; *[New 2026-04]* **Cache-DiT + unified cache accelerator** (#12548); LTX-2 CUDA graph support (#12653); LTX-2 cached constant-text computations across denoise steps (#12677); FLUX scheduler off-by-one fix at high resolutions (#13091); fast PNG compression (#13074); double PNG-encoding eliminated (#12903); multi-node support for VisualGen diffusion workers via torchrun/SLURM (#13140) |
+| **Agentic Support** | Tool parsers (qwen3, qwen3_coder, glm4, glm47, deepseekv31, deepseekv32, minimax_m2), interleaved thinking, Harmony parser | Agentic workflows | *[Updated 2026-04]* Tool-parser surface significantly broadened: GLM-4.7/GLM-5 parser added (#13150). Code lives under `tensorrt_llm/serve/tool_parser/`. |
 | **Energy Metrics** | Power consumption monitoring via `trtllm-serve` | Cost tracking | New in v1.2 |
+| **Observability** *[New row 2026-04]* | Production-grade Prometheus metrics, modular logger, NvTelemetry/GXT usage telemetry | Required for SLO ops | Iteration stats + config info + token counters + phase histograms via Prometheus (#12545); modular logger with auto module detection + per-module filtering (#13202); NvTelemetry/GXT-compliant usage telemetry (#12384) |
+| **External KV connectors** *[New row 2026-04]* | First-class shorthand entries for `lmcache` and `kvbm` | Drop-in cache-sharing setup | `_torch/pyexecutor/connectors/registry.py` (#12626); guard added to disable attention DP when KV connector is in use (#13448) |
+| **Async RL hooks** *[New row 2026-04]* | abort + resume support for verl async RL | Closes the loop with RL training | (#12272, `[TRTLLM-10703]`) |

@@ -8,16 +8,24 @@ These are bugs, design debt, and inefficiencies in the current codebase that cau
 
 ## 2.1 Disaggregated Serving Reliability
 
-**Known bugs (recent fixes indicate systemic issues):**
-- **Gen-only hang** where 10s sleep blocks KV transfers and overflows CTX memory (#12640) — fixed but indicates fragile timing assumptions in the disagg pipeline.
-- **Disagg hang on DGX B200 8-GPU** PyTorch path (#12656) — hardware-specific reliability issue.
-- **Context pipeline parallelism + generation tensor parallelism hang** — documented known issue in release notes, not yet resolved.
-- **CacheTransceiver memory leak** in disaggregated serving — fixed in v1.1 but indicates the transfer path needs memory lifecycle hardening.
-- **Multimodal KV cache block reuse** broken for disaggregated serving (#12472) — fixed but shows multi-feature interaction bugs.
+**Recently-fixed bugs (2026-04 window):**
+- **Agg PP4 hang** (#12888, NVBug 6050489) — fixed.
+- **Real errors propagated to disagg server** (#13119, `[TRTLLM-11123]`) — replaces silent stalls.
+- **`aiohttp` session management consolidated** in disagg router (#13408) — drops a class of "connection died" failures.
+- **Conversation-affinity disagg router** (#12526) — sticks multi-turn requests to the same gen rank.
+- **Zombie worker pods detected via fatal-error tracking** (#12718, NVBug 6043291) — closes a long-standing operational gap; companion design under `docs/design/wide-ep-fault-tolerance/` on this branch.
+- **Gen-only hang** where 10s sleep blocks KV transfers and overflows CTX memory (#12640) — fixed.
+- **Prebuild ctx response to avoid `ctx_request_id` race** (#12466) — fixed.
+- **`disaggregated_params` propagation through `PostprocWorker`** (#12513) — fixed.
 
-**Systemic concern:** Disaggregated serving is a critical differentiator, but the combination of KV transfer, multiple communication backends, heterogeneous parallelism, and overlap optimization creates a large surface area for timing-dependent bugs. Each fix often reveals new edge cases.
+**Still open (carried forward):**
+- **Disagg hang on DGX B200 8-GPU** PyTorch path (#12656) — hardware-specific reliability issue (no clear close in this window).
+- **Context PP + generation TP hang** — still listed in release notes for v1.2 known issues.
+- **CacheTransceiver memory leak** — fixed in v1.1; lifecycle hardening still warranted given continued bug discovery.
 
-**Recommended action:** Comprehensive stress testing framework for disaggregated serving with failure injection (network delays, partial transfers, backend switching). Formal verification of the KV transfer state machine.
+**Systemic concern (still relevant):** Disaggregated serving is a critical differentiator, but the combination of KV transfer, multiple communication backends, heterogeneous parallelism, and overlap optimization creates a large surface area for timing-dependent bugs. Each fix often reveals new edge cases.
+
+**Recommended action:** Comprehensive stress testing framework for disaggregated serving with failure injection (network delays, partial transfers, backend switching). Formal verification of the KV transfer state machine. *[Updated 2026-04-29]* The recent run of fail-fast / error-propagation fixes (#13119, #13408, #12718) is a turning point — the right next step is a chaos-test harness that injects the exact failure modes those PRs handle.
 
 ---
 
@@ -42,38 +50,43 @@ These are bugs, design debt, and inefficiencies in the current codebase that cau
 
 ## 2.3 KV Cache V1/V2 Feature Divergence
 
-**Problem:** Two KV cache managers with different feature sets create reliability risks.
+**Problem:** Two KV cache managers with different feature sets create reliability risks. *[Updated 2026-04-29: V2 progress this window — multiple V2 fixes (#13104, #12306, #12968 SWA, #461f3b97fc V2 SWA capacity, #12882 gen-only sync transfer V2). V2 is **still default OFF** (`_torch/pyexecutor/_util.py:68`).]*
 
-**V2 gaps to close before becoming default:**
-- Beam search support
-- KV cache events for monitoring
-- KV connector for disaggregated serving (currently limited in V2)
-- Star attention / star CP support
-- Performance validation vs. C++ V1 (especially block allocation hot path)
+**V2 gaps to close before becoming default (status updated 2026-04):**
+- Beam search support — *still open*
+- KV cache events for monitoring — *still open*
+- KV connector for disaggregated serving — *partial: gen-only sync transfer V2 added (#12882)*
+- Star attention / star CP support — *still open*
+- Performance validation vs. C++ V1 (especially block allocation hot path) — *partial: cleanup commits #13280 (legacy `addSequence`), #10437 (unified reuse/non-reuse path), #13029 (batched two-phase claim) suggest V2-shaped allocator concepts are being absorbed into V1 too*
 
-**V2 advantages over V1:**
+**V2 advantages over V1 (unchanged):**
 - Constraint-based memory partitioning
 - SSM cache reuse for hybrid models
 - Heterogeneous `tokens_per_block`
 - Scheduler-driven suspend/resume
 - Python-first = faster experimentation and community contribution
 
-**Recommended action:** Close V2 gaps systematically, then make V2 default, then deprecate V1.
+**Recommended action:** Close V2 gaps systematically, then make V2 default, then deprecate V1. *[Updated 2026-04-29: trajectory looks correct but cadence is slow. A timeboxed "V2 default-on milestone with explicit gating criteria" would help avoid indefinite drift.]*
 
 ---
 
 ## 2.4 Feature Combination Matrix Gaps
 
-**Problem:** The feature combination matrix reveals several unsupported or untested combinations that block real-world deployments.
+**Problem:** The feature combination matrix reveals several unsupported or untested combinations that block real-world deployments. *[Updated 2026-04-29: 2 entries closed in this window (block-reuse + overlap, LoRA + spec-dec). Several others changed status.]*
 
 | Combination | Status | Why It Matters |
 |:------------|:-------|:---------------|
-| Spec decoding (MTP, EAGLE3) + PP | **No** | Cannot use spec decoding for models requiring PP |
+| **Block reuse + Overlap Scheduler** | ✓ **Now Yes** *[2026-04 #12816]* | Long-standing exclusivity removed |
+| **LoRA + Speculative decoding (generic)** | ✓ **Now Yes** *[2026-04 #12661]* | Per-customer adapters with spec dec |
+| **LoRA + EAGLE3 specifically** | ✓ **Now Yes** *[2026-04 #13005]* | EAGLE3 + LoRA path |
+| **Attention DP + KV connector** | **Asserted off** *[2026-04 #13448]* | Now explicitly guarded; documents previously-implicit incompatibility |
+| Spec decoding (MTP, EAGLE3) + PP | **Partially fixed** | MTP+PP hang fixed (#12555), but the broader spec-dec + PP combination is still constrained |
 | Helix + ADP | **Known issues** | Limits advanced parallelism for long-context MoE |
-| LoRA + EP/Helix/ADP/Disagg | **Untested** | Blocks production MoE deployments with LoRA |
+| LoRA + EP/Helix/ADP/Disagg | **Untested** | Blocks production MoE deployments with LoRA (spec-dec sub-row now resolved) |
 | Logits Post Processor + Disagg | **No** | Cannot do custom logits processing in disaggregated mode |
 | C++ Sampler + any spec decoding | **No** | Forces Python sampler (higher overhead) for spec decoding |
 | Helix + Overlap Scheduler | **Untested** | Uncertainty for long-context performance |
+| DWDP + Overlap Scheduler | **Asserted off** *[2026-04]* | DWDP requires `disable_overlap_scheduler=True` (`py_executor.py:578`) |
 
 **Deeper issue:** These gaps often reflect fundamental architectural assumptions (e.g., spec decoding + PP fails because the draft model and target model must be synchronized across PP stages). Fixing requires non-trivial executor changes.
 
@@ -83,9 +96,16 @@ These are bugs, design debt, and inefficiencies in the current codebase that cau
 
 ## 2.5 CUDA Event and Metrics Crashes
 
-**Known bug:** CUDA event crash with performance metrics (#12639) — performance instrumentation causing crashes indicates fragile resource lifecycle management in the metrics path.
+**Known bug:** CUDA event crash with performance metrics (#12639) — performance instrumentation causing crashes indicates fragile resource lifecycle management in the metrics path. *[Updated 2026-04-29: partial mitigation — `perf_metrics_manager` now guards `cuda.event.elapsed_time` to prevent executor crash (#12868). New Prometheus stack (#12545) is the right place to consolidate this hot-path safety.]*
 
 **Recommended action:** Audit all CUDA event creation/destruction patterns in the metrics and profiling code. Ensure proper event lifecycle management even under error conditions.
+
+**New crash-class fixes in this window:**
+- DSA illegal memory access with CUDA graph + host KV cache offload (#13124, NVBug 6018172) — fixed.
+- Stale CUDA graphs dropped on beam-width change (#13255, NVBug 6052050) — fixed.
+- VLM guided decoding startup crash from missing `vocab_size_padded` (#12284) — fixed.
+- WindowBlockManager destructor stats race (#12448) — fixed.
+- DS V3.2 IMA WAR + trtllm-gen cubin/lib/src refresh (#13379, NVBug 6098442) — fixed.
 
 ---
 

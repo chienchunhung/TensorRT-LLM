@@ -48,16 +48,12 @@ graph TB
 | **Unique features (V2)** | — | Scheduler-driven suspend/resume, SSM cache reuse, batched migration, heterogeneous `tokens_per_block` |
 | **Selection** | Default | `kv_cache_config.use_kv_cache_manager_v2 = True` |
 
-**What's new in V2 (v1.2 → v1.3.0rc14, as of 2026-04-29):**
+**What's new in V2 (v1.2-v1.3):**
 - **Constraint-based memory partitioning** — smarter allocation policies.
-- **SSM (State Space Model) cache support** — prefix caching for Mamba hybrid models (Qwen3.5, Nemotron Super V3); landed via #12185.
+- **SSM (State Space Model) cache support** — prefix caching for Mamba hybrid models (Qwen3.5, Nemotron Super V3).
 - **`max_gpu_total_bytes` control** — explicit memory budget capping.
 - **Heterogeneous `tokens_per_block`** — different block sizes for different use cases.
-- **KV cache statistics monitoring** for observability (#12413, surfaced via Prometheus #12545).
-- *[New 2026-04]* **Gen-only sync transfer V2 + manager V2** (#12882) — disaggregated-serving-side V2 plumbing.
-- *[Updated 2026-04]* SWA (sliding-window attention) capacity bug fixed in V2 (#12968); broader V2 bug-fix wave (#13104, #12306). **V2 still defaults OFF** — code switch in `_torch/pyexecutor/_util.py:68` (`KVCacheManagerV2 if kv_cache_config.use_kv_cache_manager_v2 else KVCacheManager`).
-
-*[Updated 2026-04-29: V2 is converging but not yet promoted to default; track issue is the dual-manager confusion called out in §5.2.]*
+- **KV cache statistics monitoring** for observability.
 
 **Design rationale for V2:** The C++ V1 is performant but difficult to prototype on. V2's Python-first approach enables:
 
@@ -91,9 +87,7 @@ Both V1 and V2 use **prioritized LRU** eviction:
 
 | Framework | KV Cache Design | Distinctive Capability |
 |:----------|:---------------|:-----------------------|
-| **TensorRT-LLM** | Block-based, radix tree, prioritized LRU, GPU-to-host offloading | Priority-based retention with time expiry; V2 suspend/resume; SSM cache reuse; *[Updated 2026-04]* first-class connectors for `lmcache` and `kvbm` (#12626, `_torch/pyexecutor/connectors/registry.py`) |
-| **vLLM v0.20** | PagedAttention — virtual memory metaphor with fixed-size pages | General CPU KV cache offloading with pluggable CachePolicy; zero-overhead prefix caching; *[New 2026-04]* TurboQuant 2-bit KV cache compression for ~4× capacity |
-| **SGLang v0.5.10** | RadixAttention — radix tree for automatic prefix discovery | Cache-aware scheduling; hierarchical caching (GPU L1 + host L2); HiSparse backend |
-| **LMCache v0.4.4** | External KV cache layer with multi-tier storage (GPU/CPU/disk/S3/Redis/NIXL) | Cross-engine, cross-instance KV cache sharing; GDS integration; k8s operator; *[New 2026-04]* multi-path local-disk backend, ValkeyConnector with cluster mode + TLS, L0 Subscriber |
-
-*[Updated 2026-04-29: vLLM TurboQuant + LMCache v0.4.4 features added; TRT-LLM connector registry highlighted.]*
+| **TensorRT-LLM** | Block-based, radix tree, prioritized LRU, GPU-to-host offloading | Priority-based retention with time expiry; V2 suspend/resume; SSM cache reuse |
+| **vLLM** | PagedAttention — virtual memory metaphor with fixed-size pages | General CPU KV cache offloading with pluggable CachePolicy; zero-overhead prefix caching |
+| **SGLang** | RadixAttention — radix tree for automatic prefix discovery | Cache-aware scheduling; hierarchical caching (GPU L1 + host L2) |
+| **LMCache** | External KV cache layer with multi-tier storage (GPU/CPU/disk/S3/Redis/NIXL) | Cross-engine, cross-instance KV cache sharing; GDS integration; k8s operator |

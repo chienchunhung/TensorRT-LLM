@@ -34,14 +34,10 @@ flowchart LR
 
 This two-phase design cleanly separates *resource availability* from *batch construction*. The C++ implementations (`BindCapacityScheduler`, `BindMicroBatchScheduler` in `scheduler/scheduler.py`) keep scheduling overhead minimal, while Python interfaces (`PyCapacityScheduler`, `PyMicroBatchScheduler`) allow custom policies.
 
-**What's new (v1.2 → v1.3.0rc14, as of 2026-04-29):**
+**What's new (v1.2-v1.3):**
 - The micro-batch scheduler now accounts for **reusable KV cache blocks** in capacity scheduling, improving admission decisions when prefix caching is active.
 - A **Python scheduler** is now exposed via `use_python_scheduler` in `SchedulerConfig`, enabling custom scheduling policies without C++ changes.
 - Request priority support in LLM API enables priority-based scheduling.
-- *[New 2026-04]* **Batched `addSequence` with two-phase claim** (#13029) and unified VSWA / non-reuse path support — replaces the legacy per-sequence add path (#13280), reducing host-side scheduling overhead per iteration.
-- *[New 2026-04]* **Per-iteration request-aggregate counters in `InflightBatchingStats`** (#13199) — first-class observability into scheduled / paused / completed / preempted counts per step, exposed via the new Prometheus metrics surface (#12545).
-- *[New 2026-04]* `llm.encode()` fast path for encoder-only models (#12801) bypasses the decode loop entirely.
-- *[New 2026-04]* `request_broadcast` is now skipped when `world_size == 1` (#13412), lowering per-step host overhead for single-GPU deployments.
 
 **Code path:** Every iteration, `_fetch_and_activate_new_requests()` polls the request queue, `_schedule()` calls `scheduler.schedule_request(active_requests, inflight_req_ids)`, and the result mixes continuing generation with new context work under `max_batch_size` and `max_num_tokens` constraints.
 
@@ -57,9 +53,6 @@ This two-phase design cleanly separates *resource availability* from *batch cons
 
 | Framework | Approach | Differentiation |
 |:----------|:---------|:----------------|
-| **TensorRT-LLM** | Two-phase scheduler (capacity + micro-batch) | Configurable C++ or Python schedulers; chunked prefill; cache-aware capacity; batched `addSequence` (#13029) |
-| **vLLM v0.20** | Continuous batching in V1 with unified scheduler; **Model Runner V2** | Token-uniform scheduling via `{request_id: num_tokens}` dict; zero-bubble async scheduling; Eagle prefill full-CUDA-graph; multiple prompt-logprobs |
-| **SGLang v0.5.10** | Continuous batching + cache-aware scheduling | Considers prefix cache hit rates for routing decisions |
-| **NVIDIA Dynamo v1.0** | Engine-agnostic orchestrator above TRT-LLM/vLLM/SGLang | KV-block-utilization-driven autoscaling; agent hints + priority scheduling for agentic workloads |
-
-*[Updated 2026-04-29: Dynamo row added; vLLM v0.20 Model Runner V2 noted; TRT-LLM batched addSequence highlighted.]*
+| **TensorRT-LLM** | Two-phase scheduler (capacity + micro-batch) | Configurable C++ or Python schedulers; chunked prefill; cache-aware capacity |
+| **vLLM** | Continuous batching in V1 with unified scheduler | Token-uniform scheduling via `{request_id: num_tokens}` dict; zero-bubble async scheduling |
+| **SGLang** | Continuous batching + cache-aware scheduling | Considers prefix cache hit rates for routing decisions |

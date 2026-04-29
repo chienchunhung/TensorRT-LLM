@@ -12,14 +12,10 @@ TensorRT-LLM is NVIDIA's open-source library for optimized LLM inference on NVID
 | **AutoDeploy** | Beta (maturing rapidly) | `_torch/auto_deploy/` shim | `torch.export` + graph transforms + MLIR elementwise fusion |
 | **TensorRT** | Legacy (maintenance mode) | `TrtLlmArgs` -> `trtllm.Executor` | TensorRT engine compilation |
 
-**What's changed (v1.2 → v1.3.0rc14, as of 2026-04-29):**
-- PyTorch backend remains the default and is under active development with CuTE DSL-based custom kernels.
-- AutoDeploy is maturing rapidly — now standalone-package-ready (#13155, #13418), with new model onboardings: DeepSeek-R1 (#12601), Gemma-4 / Gemma 4-31B incl. NVFP4 (#12710, #12866), MiniMax-M2.7 (#12963), and continuing Qwen3.5 perf work (#12265). The legacy EdgeLLM ONNX export pipeline was removed (#13418).
-- C++ sampler (`TLLM Sampler` → `TRTLLMSampler` in `tensorrt_llm/_torch/pyexecutor/sampler.py:4430`) remains the default since v1.1; `TorchSampler` (line 1152) is still required for beam search.
-- New observability surface area: production-grade Prometheus metrics (#12545), modular logger with auto module detection and per-module filtering (#13202), and NvTelemetry/GXT-compliant usage telemetry (#12384).
-- Disaggregated serving has shifted from a "TRT-LLM internal" feature toward an orchestration layer pattern: NVIDIA Dynamo v1.0.0 (released March 2026) wraps TRT-LLM, vLLM, and SGLang with KV-routing, GPU autoscaling, and Snapshot-based fast worker recovery.
-
-*[Updated 2026-04-29: refresh of v1.3 deltas; AutoDeploy + observability + Dynamo notes added.]*
+**What's changed (v1.2-v1.3):**
+- PyTorch backend is now stable and default since v1.0; actively developed with CuTE DSL-based custom kernels.
+- AutoDeploy is maturing rapidly — now supports DeepSeek-R1 and Qwen3.5, with MLIR-based auto-generated elementwise fusion (e.g., `SiLU+Mul` transform) and custom attention mask support.
+- C++ sampler (`TLLM Sampler`) is now default (breaking change in v1.1), replacing TorchSampler for most paths. TorchSampler still required for beam search.
 
 ## 1.2 Architecture Diagram
 
@@ -134,7 +130,4 @@ sequenceDiagram
 | `tensorrt_llm/serve/openai_server.py` | OpenAI-compatible HTTP server |
 | `tensorrt_llm/_torch/speculative/` | All speculative decoding algorithms |
 | `tensorrt_llm/_torch/auto_deploy/` | AutoDeploy backend with MLIR fusion |
-| `tensorrt_llm/_torch/pyexecutor/connectors/registry.py` | KV connector registry — first-class entries for `lmcache` and `kvbm` *[New 2026-04-29: #12626]* |
-| `tensorrt_llm/serve/tool_parser/` | Tool/function-call parsers (qwen3, qwen3_coder, glm4, glm47, deepseekv31, deepseekv32, minimax_m2) *[Expanded 2026-04: #13150 + others]* |
-| `tensorrt_llm/_torch/modules/ATTENTION_DEVELOPER_GUIDE.md` | Attention developer guide *[New 2026-04: #12693]* |
 | `docs/source/features/feature-combination-matrix.md` | Feature compatibility matrix |

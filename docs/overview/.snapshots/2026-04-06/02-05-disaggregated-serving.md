@@ -87,22 +87,17 @@ graph TB
     TX --> KVC
 ```
 
-**What's new (v1.2 → v1.3.0rc14, as of 2026-04-29):**
+**What's new (v1.2-v1.3):**
 - **KV Cache Connector API** (`docs/source/features/kv-cache-connector.md`): Plugin architecture for custom KV cache load/save/transfer logic with Scheduler/Worker split. Enables custom disaggregation implementations.
-- *[Updated 2026-04]* **First-class connector shorthand for `lmcache` and `kvbm`** in `_torch/pyexecutor/connectors/registry.py` (#12626) — drop-in LMCache integration without writing a custom connector.
 - **Mooncake transfer engine** as a cache transceiver backend.
 - **NIXL-LibFabric support** — broader RDMA fabric compatibility.
 - **Service discovery** for dynamic scaling (nodes joining/leaving).
 - **Request cancellation** in disaggregated mode.
-- **Python cache transceiver** for gen-first workflow, extended to Nemotron models, *[Updated 2026-04]* and now to Qwen-Next (#12772).
+- **Python cache transceiver** for gen-first workflow, extended to Nemotron models.
 - **Default KV cache transfer timeout** set to 60 seconds (breaking change in v1.3rc9).
-- **Dynamo integration** for orchestration. *[Updated 2026-04]* NVIDIA Dynamo v1.0.0 (March 2026) is now the recommended orchestration layer — adds GPU autoscaling driven by KV-block-utilization, Snapshot-based fast worker recovery, and the `v1beta1 DynamoGraphDeploymentRequest` Kubernetes API.
+- **Dynamo integration** for orchestration.
 - **Unique global request ID** for end-to-end tracking.
-- *[New 2026-04]* **Conversation-affinity disagg router** (#12526) — sticks multi-turn conversations to the same gen rank to maximize prefix reuse.
-- *[New 2026-04]* **CP cache transmission switched from contiguous to round-robin** (#13180) — better load-balancing across CP ranks during transfer.
-- *[New 2026-04]* **Real errors propagated to disagg server** (#13119) — replaces silent stalls with actionable failure modes.
-- *[New 2026-04]* **`aiohttp` session management consolidated in disagg router** (#13408) — drops a class of "connection died" failures.
-- Fixes wave: agg PP4 hang (#12888), gen-only `can_forward` 10s-sleep hang (#12640), prebuild ctx response to avoid `ctx_request_id` race (#12466), propagate `disaggregated_params` through `PostprocWorker` (#12513), zombie-worker-pod fatal-error detection (#12718, NVBug 6043291).
+- Fix for disagg gen-only hang where 10s sleep blocked KV transfers and overflowed CTX memory.
 
 **Overlap optimization:** While one request's KV cache is being transferred, other requests continue forward passes. This is default (`TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=0`).
 
@@ -122,16 +117,7 @@ graph TB
 
 | Framework | Disaggregated Serving | Distinctive Capability |
 |:----------|:---------------------|:-----------------------|
-| **TensorRT-LLM** | Full: NIXL/UCX/Mooncake backends, KV Connector API, heterogeneous parallelism, Dynamo integration | KV cache layout transformation for different TP/PP configs; plugin architecture; *[Updated 2026-04]* `lmcache`/`kvbm` shorthand connectors; conversation-affinity router; round-robin CP transfer |
-| **vLLM v0.20** | Disaggregated P/D in V1; elastic EP with NIXL | Growing feature; elastic expert parallelism for dynamic scaling; active community work on bidirectional KV transfer + request-level transfer-pathway customization (RFCs #32733, #25939) |
-| **SGLang v0.5.10** | PD disaggregation with mooncake/NIXL/InfiniBand; EPD for VLMs | GPU staging buffer (1000x fewer RDMA requests, 5x TPS/GPU); EPD disagg for vision-language models |
-| **LMCache v0.4.4** | External KV cache sharing across instances via NIXL/Redis/Valkey/S3/GDS | Cross-engine P2P cache sharing; MP mode with auto-discovery; *[New 2026-04]* multi-path local-disk backend; ValkeyConnector cluster + TLS; L0 Subscriber |
-| **NVIDIA Dynamo v1.0** | Engine-agnostic orchestrator wrapping TRT-LLM, vLLM, SGLang | Encoder disaggregation for multimodal; content-addressed hashing for cross-engine cache reuse; KV-block-utilization autoscaling; Dynamo Snapshot for fast worker recovery; AIConfigurator for P/D split + HW selection |
-
-## Academic Frontier (2026 Q1–Q2)
-
-*[New 2026-04-29]* — work that is not yet in TRT-LLM but is shaping the disagg landscape:
-
-- **PrfaaS — Prefill-as-a-Service** ([arXiv 2604.15039](https://arxiv.org/abs/2604.15039v1)): cross-datacenter KV transfer for hybrid-attention models with smaller KV footprints; reports 54% throughput gain over homogeneous baselines. Implies "disagg across regions" is becoming feasible.
-- **FlowKV** ([arXiv 2504.03775](https://arxiv.org/pdf/2504.03775)): block-wise KV transfer with load-aware scheduler — 0.944s → 0.053s (96% reduction) avg transfer time. Directly relevant to the KV-transfer hot path we currently fix bug-by-bug (#13119, #12640, #12466).
-- **StreamServe** ([arXiv 2604.09562](https://arxiv.org/abs/2604.09562)): combines disagg P/D with **adaptive speculative-depth tuning** — 11–18× latency reduction vs. tensor-parallel vLLM baseline. Suggests the natural next step is to couple disagg with spec-dec depth selection.
+| **TensorRT-LLM** | Full: NIXL/UCX/Mooncake backends, KV Connector API, heterogeneous parallelism, Dynamo integration | KV cache layout transformation for different TP/PP configs; plugin architecture |
+| **vLLM** | Disaggregated P/D in V1; elastic EP with NIXL | Growing feature; elastic expert parallelism for dynamic scaling |
+| **SGLang** | PD disaggregation with mooncake/NIXL/InfiniBand; EPD for VLMs | GPU staging buffer (1000x fewer RDMA requests, 5x TPS/GPU); EPD disagg for vision-language models |
+| **LMCache** | External KV cache sharing across instances via NIXL/Redis/S3/GDS | Cross-engine P2P cache sharing; MP mode with auto-discovery |

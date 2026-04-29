@@ -54,12 +54,10 @@ The implementation uses a `previous_batch` staging pattern in `py_executor.py` (
 4. **Sample batch N async** (`_sample_async`)
 5. **Store batch N as `previous_batch`** for next iteration
 
-**What's new (v1.2 → v1.3.0rc14, as of 2026-04-29):**
+**What's new (v1.2-v1.3):**
 - Overlap scheduler now supports **early exit** — removing redundant D2H synchronization for improved latency.
 - Now compatible with **guided decoding** and **speculative decoding** combinations.
 - PDL (Programmatic Dependent Launch) enabled by default for further kernel launch overhead reduction.
-- *[New 2026-04 — closes prior gap]* **Block reuse (prefix caching) is now compatible with the overlap scheduler** (#12816, `[TRTLLM-10939]`). Previously these two were mutually exclusive, forcing users to choose between throughput (overlap) and TTFT (prefix reuse). See `docs/design/block-reuse-overlap-scheduler/` on this branch for the full design (Phases 1–3).
-- *[Updated 2026-04]* DWDP requires `disable_overlap_scheduler=True` (`py_executor.py:578`) — DWDP-style contention optimization is now fully encapsulated in `DwdpConfig` (#12974) for cleaner config surface.
 
 **Trade-off:** One extra decoding step is introduced (the last batch's results are processed one iteration late). This is a minor cost for the 10-22% measured throughput improvement.
 
@@ -69,6 +67,6 @@ The implementation uses a `previous_batch` staging pattern in `py_executor.py` (
 
 | Framework | Overlap Strategy |
 |:----------|:----------------|
-| **TensorRT-LLM** | CPU/GPU overlap via `previous_batch` staging; default on; early-exit optimization; *[Updated 2026-04]* now compatible with block reuse (#12816) |
-| **SGLang v0.5.10** | Zero-overhead batch scheduler — similar overlap design (cited as inspiration) |
-| **vLLM v0.20** | DBO (Dual-Batch Overlap) generalized for all models; `EngineCore` multiprocessing isolates API server from scheduler+executor; *[Updated 2026-04]* Model Runner V2 + Eagle prefill full-CUDA-graph extend the same idea to spec-dec |
+| **TensorRT-LLM** | CPU/GPU overlap via `previous_batch` staging; default on; early-exit optimization |
+| **SGLang** | Zero-overhead batch scheduler — similar overlap design (cited as inspiration) |
+| **vLLM V1** | DBO (Dual-Batch Overlap) generalized for all models; `EngineCore` multiprocessing isolates API server from scheduler+executor |

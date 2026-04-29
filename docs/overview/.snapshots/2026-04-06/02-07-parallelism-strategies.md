@@ -94,43 +94,23 @@ Decouples **logical experts** from **physical slots**, enabling:
 
 **New in v1.3.** Designed for NVL72 rack-scale deployments. Distributes both model weights and data across all 72 GPUs for maximum throughput. Documented in blog19 (April 2026).
 
-## What's New (v1.2 → v1.3.0rc14, as of 2026-04-29)
+## What's New (v1.2-v1.3)
 
-- **DWDP** for NVL72 rack-scale deployments. *[Updated 2026-04]* contention optimization moved into `DwdpConfig` (#12974) — cleaner config surface; runtime flow described in blog19.
+- **DWDP** for NVL72 rack-scale deployments.
 - **One-sided AlltoAll over NVLink** for MoE expert dispatch — eliminates synchronization overhead in EP communication (blog18).
-- **KV cache-aware ADP router** with prefix-affinity request routing. *[New 2026-04]* Now includes a hit-rate gate + fair-share cap (#13198) to protect throughput on hot prefixes.
+- **KV cache-aware ADP router** with prefix-affinity request routing.
 - **Helix CP for DeepSeek v3.2 with GQA**.
 - **EPLB for TRTLLM-Gen** — expert load balancing integrated with the TRTLLM-Gen attention backend.
 - **CUDA graph support for DeepEP**.
 - **Dynamic SMEM block routing in MoE**.
 - **LM Head Sharding** — distributes the language model head across GPUs.
-- *[New 2026-04]* **Sparse MQA/GQA attention** support (#12470) — sparse attention extended beyond MHA.
-- *[New 2026-04]* **GEMM → AR fusion with output in registered buffers** (#11589, `[TRTLLM-10004]`) — collapses the GEMM + AllReduce pair into one launch with persistent buffers, reducing decode-step host overhead in TP.
-- *[New 2026-04]* **New sharding infrastructure** (#12419, `[TRTLLM-12291]`) — refactor of the sharding layer used by AutoDeploy and the PyTorch backend.
-- *[New 2026-04]* **`customMoeRouting` kernel extended for Qwen3.5** (#13433); **CuteDSL MoE backend onboarded for Qwen3.5** (#12799).
-- *[New 2026-04]* **CP cache transmission switched contiguous → round-robin** (#13180) — better CP-rank load balance during disagg KV transfer.
-- *[New 2026-04]* **AutoDeploy: TP deadlock in multi-stream MoE fixed** (#13220).
-- *[New 2026-04]* **Centralized perfect-router integration + validation** (#13250, `[TRTLLM-9120]`).
 
 ## Framework Comparison
 
 | Framework | Parallelism Support |
 |:----------|:-------------------|
 | **TensorRT-LLM** | TP, PP, EP, ADP, CP (Ulysses/Helix), Wide-EP + EPLB, DWDP — most comprehensive |
-| **vLLM v0.20** | TP, PP, EP; elastic EP with NIXL for dynamic scaling; *[Updated 2026-04]* extensive MoE refactor series consolidating components in v0.20 |
-| **SGLang v0.5.10** | TP, PP, EP, DP; elastic EP for partial failure tolerance |
+| **vLLM** | TP, PP, EP; elastic EP with NIXL for dynamic scaling |
+| **SGLang** | TP, PP, EP, DP; elastic EP for partial failure tolerance |
 
-TRT-LLM's **DWDP**, **Wide-EP with EPLB**, **Helix CP**, and **one-sided AlltoAll** are distinctive capabilities not matched by other frameworks. *[Updated 2026-04-29: gap remains, but the gap is narrowing on EP — vLLM v0.20 consolidated MoE substantially; SGLang's elastic EP continues to set the bar on fault tolerance.]*
-
-## Hardware Roadmap Implications (2026-04-29)
-
-Parallelism strategies are increasingly tied to specific hardware. Quick survey of the units that matter for parallelism design:
-
-| Hardware | Status | Implication for TRT-LLM parallelism |
-|:---------|:-------|:------------------------------------|
-| **NVIDIA Blackwell** (B200/GB200/B300/GB300) | Shipping | Wide-EP, EPLB, DWDP all designed against NVL72; remains the primary target |
-| **NVIDIA Rubin** (R200/VR200) | Full production CES 2026; volume H2 2026; sampling Q4 2026 | 288 GB HBM4 + 22 TB/s + NVLink 6 @ 3.6 TB/s + Vera CPU; NVL144 CPX = 8 EF AI / 100 TB / 1.7 PB/s per rack — DWDP-class strategies will need to scale; new co-design opportunities for CPX (CPU-GPU co-execution) |
-| **AMD MI355X** | Shipping; MLPerf Inference 6.0 results April 2026 (1M+ tokens/sec) | 288 GB HBM3E, 10 PF FP4; ROCm + vLLM is the target stack today; TRT-LLM parallelism doesn't apply, but **vLLM's MI355X numbers tighten the pressure on TRT-LLM throughput leadership** |
-| **Google TPU v7 (Ironwood)** | GA March 31, 2026 | Targets LLM/MoE/diffusion training & inference; vLLM ships on TPU v6e/v7 — multi-vendor gap (§5.1) widens |
-
-*[New 2026-04-29: hardware-roadmap section added to ground parallelism choices in shipping silicon.]*
+TRT-LLM's **DWDP**, **Wide-EP with EPLB**, **Helix CP**, and **one-sided AlltoAll** are distinctive capabilities not matched by other frameworks.

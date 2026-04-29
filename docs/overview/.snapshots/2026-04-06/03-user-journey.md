@@ -112,13 +112,7 @@ flowchart TD
 
 **What's missing:** Automatic request retry, hot-standby replicas, checkpoint/restore for in-flight requests, graceful degradation under partial failures, circuit breakers, elastic expert redistribution on GPU failure.
 
-**Contrast:** SGLang now has **elastic EP for partial failure tolerance** — when a GPU fails, experts are redistributed to surviving GPUs without restart. TRT-LLM has no equivalent. *[New 2026-04 — partial offset]* **NVIDIA Dynamo v1.0** ships **Snapshot-based fast GPU worker recovery** plus a new `v1beta1 DynamoGraphDeploymentRequest` Kubernetes API, providing production-grade restart story (but not the in-place failover SGLang offers).
-
-*[Updated 2026-04 — partial improvements landed]*
-- Real disagg errors now propagate to the disagg server instead of stalling silently (#13119, `[TRTLLM-11123]`).
-- Zombie worker pods detected via fatal-error tracking (#12718, NVBug 6043291).
-- `aiohttp` session management consolidated in disagg router (#13408) — fewer "connection died" tail failures.
-- Per-iteration request-aggregate counters in `InflightBatchingStats` (#13199) → exposed via Prometheus (#12545) → external schedulers can react to scheduling pressure.
+**Contrast:** SGLang now has **elastic EP for partial failure tolerance** — when a GPU fails, experts are redistributed to surviving GPUs without restart. TRT-LLM has no equivalent.
 
 ## 3.5 Auto-Scaling
 
@@ -132,11 +126,3 @@ The `DisaggClusterManager` (`serve/disagg_auto_scaling.py`) supports:
 - **Dynamo integration**: External orchestration for production scaling
 
 **What's missing:** HPA-style automatic replica scaling based on QPS/latency/GPU metrics, automatic GPU provisioning, queue-depth-based scaling policies. Production scaling is delegated to **Dynamo** or **Kubernetes operators**.
-
-*[Updated 2026-04-29]* **NVIDIA Dynamo v1.0 (March 2026)** is now the recommended orchestration layer:
-- KV-block-utilization-driven GPU autoscaling (Dynamo Planner) rebalances prefill/decode pools.
-- `v1beta1 DynamoGraphDeploymentRequest` API + rolling updates + GPU auto-discovery for Kubernetes-native deploys.
-- **AIConfigurator** (open-source companion) estimates end-to-end performance to choose P/D split + hardware without burning GPU-hours.
-- Cross-deployment autoscaling via GlobalPlanner + load-based scaling.
-
-This shifts the "TRT-LLM scope question": within the TRT-LLM repo we focus on per-engine throughput/latency, while Dynamo owns multi-engine, multi-replica autoscaling and snapshot recovery.

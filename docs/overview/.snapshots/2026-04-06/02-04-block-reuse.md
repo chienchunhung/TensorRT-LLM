@@ -34,15 +34,11 @@ graph TD
 
 **V2 (Python):** The `BlockRadixTree` uses chained SHA-256 hashing: `SHA256(previous_block_key || token_ids)`. The `match()` method walks the tree for exact prefix matches. `find_best_partial_match_in_next_nodes` handles partial matches among sibling branches.
 
-**What's new (v1.2 → v1.3.0rc14, as of 2026-04-29):**
-- **Prefix caching for hybrid models** — Mamba + attention hybrids (Qwen3.5, Nemotron Super V3) can now reuse SSM state cache (#12185).
+**What's new (v1.2-v1.3):**
+- **Prefix caching for hybrid models** — Mamba + attention hybrids (Qwen3.5, Nemotron Super V3) can now reuse SSM state cache.
 - **KV cache-aware ADP router** with prefix-affinity request routing — routes requests to the GPU that already has their prefix cached.
-- *[New 2026-04]* **ADP router hit-rate gate + fair-share cap** (#13198) — protects throughput when prefix-affinity collapses on a hot prefix.
-- **Multimodal KV cache block reuse** improvements (bugfix in #12472, also fixes the disagg-serving multimodal reuse path).
+- **Multimodal KV cache block reuse** improvements (bugfix in #12472).
 - **Reusable KV cache blocks** now accounted in micro-batch scheduler capacity decisions.
-- *[New 2026-04 — closes prior gap]* **Prefix reuse + overlap scheduler now coexist** (#12816, `[TRTLLM-10939]`) — the long-standing exclusivity is gone. See `docs/design/block-reuse-overlap-scheduler/` (Phases 1–3).
-- *[New 2026-04]* `analyzePrefixReuse` now does a **single radix-tree walk** (#13095) consolidating prior duplicated traversals — measurable per-iteration host-overhead drop on long-prefix workloads.
-- *[New 2026-04]* Compute-token accounting for KV cache reuse with **context chunking** fixed (#12976).
 
 **Security — cache salting:** `cache_salt` ensures only requests with matching salt values share cached blocks, preventing prompt theft in multi-tenant deployments.
 
@@ -50,10 +46,7 @@ graph TD
 
 | Framework | Prefix Caching | Key Differentiator |
 |:----------|:--------------|:-------------------|
-| **TensorRT-LLM** | Radix tree with prioritized eviction, partial reuse, salting, host offloading | Priority-based retention; cache-aware ADP routing (with hit-rate gate + fair-share cap); SSM cache reuse; *[Updated 2026-04]* now compatible with overlap scheduler (#12816) |
-| **vLLM v0.20** | Hash-based prefix caching; zero-overhead (enabled by default) | Simple, automatic, minimal overhead; *[New 2026-04]* TurboQuant 2-bit KV stretches effective cache 4× |
-| **SGLang v0.5.10** | RadixAttention — automatic prefix discovery via radix tree with cache-aware scheduling | Scheduling considers cache hits; most seamless UX |
-| **LMCache v0.4.4** | External KV cache layer with cross-instance sharing | Shared cache across multiple serving instances via NIXL/Redis/Valkey (cluster + TLS, new in v0.4.4)/S3; multi-path local disk for multi-device I/O |
-| **NVIDIA Dynamo v1.0** | Engine-agnostic KV router above TRT-LLM/vLLM/SGLang | Content-addressed hashing for cross-engine cache reuse; KV retention for long agent sessions |
-
-*[Updated 2026-04-29: Dynamo row added; LMCache features refreshed to v0.4.4; vLLM TurboQuant noted.]*
+| **TensorRT-LLM** | Radix tree with prioritized eviction, partial reuse, salting, host offloading | Priority-based retention; cache-aware ADP routing; SSM cache reuse |
+| **vLLM V1** | Hash-based prefix caching; zero-overhead (enabled by default) | Simple, automatic, minimal overhead |
+| **SGLang** | RadixAttention — automatic prefix discovery via radix tree with cache-aware scheduling | Scheduling considers cache hits; most seamless UX |
+| **LMCache** | External KV cache layer with cross-instance sharing | Shared cache across multiple serving instances via NIXL/Redis/S3 |
