@@ -34,3 +34,19 @@ Architecture comparison, feature matrix (TRT-LLM vs. vLLM vs. SGLang vs. LMCache
 
 ### 6. [Strategic Prioritization](06-strategic-prioritization.md)
 Investment priority matrix, prioritized roadmap (Tier 1-4), and where TRT-LLM should win.
+
+---
+
+## Maintenance
+
+This guide is refreshed periodically against the latest TRT-LLM `main`, the
+current state of competing frameworks (vLLM, SGLang, LMCache, NVIDIA Dynamo,
+etc.), and the latest hardware / academic landscape.
+
+- **Refresh prompt:** [`UPDATE-PROMPT.md`](UPDATE-PROMPT.md) — paste-and-run
+  instructions for the next periodic update. Designed to run autonomously and
+  produce a dated diff entry on completion.
+- **Change history:** [`CHANGELOG.md`](CHANGELOG.md) — dated per-refresh log
+  with per-file highlights, priority shifts, and source citations.
+- **Snapshots:** `.snapshots/<YYYY-MM-DD>/` — verbatim copies of the previous
+  version of each file, kept so future diffs work even without git history.
