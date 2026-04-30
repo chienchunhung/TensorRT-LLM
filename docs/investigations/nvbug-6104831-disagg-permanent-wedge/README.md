@@ -31,9 +31,11 @@
     detection / pod restart (mitigation for silent wedges, not a fix for the
     wedge)
 - **Status:** Investigation in progress. Signatures #1, #2, #4, and #5 have
-  fixes in flight or merged; signature #6 (control-path send stall) is the
-  next target. The full end-to-end reproducer still wedges in a fresh post-fix
-  run, so the chain is not yet root-caused at the system level.
+  fixes in flight or merged. Signature #6 has now been **root-caused** to a
+  recv-buffer index leak in `BaseTransBufferManager::assignBufferIndex()`
+  triggered by the `!isReady` early-return path in
+  `CacheReceiver::Impl::requestSync()`; the targeted fix is built and an
+  end-to-end validation run is currently in flight.
 
 ---
 
@@ -74,7 +76,7 @@ labelling we used in the chat session that produced this investigation:
 | **#3** | Decode-side `RuntimeError: bad optional access` | C++ `std::optional::value()` inside disagg gen path, surfaced through Python | Production logs (Dynamo `rc11` deploy) |
 | **#4** | Gen-side blocking hang in `CacheTransceiver::checkGenTransferStatus()` with `atLeastNum=1` | `cacheTransceiver.cpp` unconditional `future.get()` on selected-but-unready future | Local `trtllm-serve` 1P1D repro + Python thread-stack dump |
 | **#5** | Receiver-side `Broken promise` from queued cancel | `CacheReceiver::Impl::cancelRequest()` erasing queued request without fulfilling promise | Post-`#4`-fix C++ trace logs |
-| **#6** *(suspected)* | Control-path stall inside `sendRequestInfo()` / `AgentConnection::sendRequestAndBufferInfo()` before ready-signal wait | `dataTransceiver.cpp` + `agent_utils/connection.cpp` | Post-`#4`-fix gen-side request-lifecycle trace |
+| **#6** | Recv-buffer index leak via `!isReady` early-return; subsequent receives block forever in `BaseTransBufferManager::assignBufferIndex()` | `cpp/tensorrt_llm/batch_manager/baseTransBuffer.cpp` (unbounded `cv.wait`) leaked from `CacheReceiver::Impl::requestSync()` (`!isReady` path) | Fine-grained C++ instrumentation across `sendRequestInfo()` body in `run7` |
 
 The mapping of fixes is summarised at the end, in
 [Signature ↔ PR Map](#signature--pr-map).
@@ -443,27 +445,80 @@ session-building variant, which loops over counterparts), or
 inside `AgentConnection::sendRequestAndBufferInfo(...)`, which performs the
 control-path notify to the remote agent.
 
-**Root cause:** Not yet confirmed. The structural shape suggests one of:
-- a `notifySyncMessage()` to a remote agent that has already gone away
-  (e.g. the matching context request was cancelled and the sender side
-  tore down its agent state),
-- a counterpart that we are still waiting for in
-  `mManager->getConnections(commState)`,
-- or a control-path send into a transport that has already entered an
-  error state.
+**Root cause (confirmed in `run7`):** Recv-buffer index exhaustion caused
+by the `!isReady` early-return in `CacheReceiver::Impl::requestSync()`,
+which leaks the buffer index that was reserved at the top of
+`CacheReceiver::Impl::sendRequestInfo()`. The leak is then converted into
+a permanent global wedge by an unbounded `cv.wait` inside
+`BaseTransBufferManager::assignBufferIndex()`:
 
-**Status:** Not fixed yet. We added new gated trace markers around both
-sites — `gen_send_request_info_begin/end`,
-`gen_send_request_buffer_info_begin/notify/end` — so the next post-fix
-repro will pinpoint exactly which step is blocking. The same
-`TRTLLM_DISAGG_TRACE_PROMISE=1` env gates these; they cost nothing in
-normal runs.
+```cpp
+// cpp/tensorrt_llm/batch_manager/baseTransBuffer.cpp
+std::unique_lock lk(resource.mBuffersMutex);
+resource.mBuffersCV.wait(
+    lk, [&resource, bufferCount]() {
+        return static_cast<size_t>(resource.mConcurrence) < bufferCount;
+    });
+```
 
-**Reproducer:** Same end-to-end 1P1D + long-prompt burst harness; no minimal
-unit test yet. A first attempt at one will be made once we know which step
-is hanging.
+`mRecvBufferCount` defaults to `1` (it is only larger when
+`TRTLLM_REQUEST_KV_CACHE_CONCURRENT=1` is set), so a single leaked recv
+buffer index is enough to wedge **every subsequent** receive forever.
 
-**PRs:** None yet.
+The leak path itself is the cascade we expected from the earlier fixes:
+
+1. The signature `#1` fix on the **sender** side now correctly sends
+   `is_ready=false` for cancelled-after-ready requests.
+2. On the **receiver** side this becomes `bool isReady = false` from
+   `receiveReadySignal(session)`.
+3. `requestSync()` then sets `kDISAGG_TRANS_ERROR` and `return`s **without
+   calling `receiveSync()`**, so `unformat()` never runs, so
+   `freeBufferIndexForRecv()` is never called, and the recv buffer index
+   reserved at the top of `sendRequestInfo()` is leaked.
+4. The next request to call `assignBufferIndexForRecv()` blocks forever
+   inside the unbounded `cv.wait` above. The Python `optional-trace`
+   markers showed exactly one in-progress generation request stuck
+   between `gen_request_sync_begin` and `gen_send_request_buffer_info_*`
+   in `run6`; the new fine-grained markers in `run7`
+   (`gen_send_assign_buffer_begin / step / end`, plus
+   `gen_send_compute_counterparts_begin / end` etc.) showed exactly
+   `13` `assign_buffer_begin` events vs `12` `_step` and `_end` events
+   for the same request — confirming the stall is **inside the very
+   first `assignBufferIndexForRecv()` call** for the next request after
+   a leak.
+
+**Fix (Layer A — `sendRequestInfo` exception safety):** Track every
+`(BaseTransBufferManager*, std::optional<size_t>)` pair returned by
+`assignBufferIndexForRecv()`. Wrap the rest of `sendRequestInfo()` in a
+`try { ... } catch (...) { freeAssignedRecvBuffers(); throw; }` block so
+that any exception between assignment and the eventual `unformat()` call
+releases the indices. On the success path the local tracking vector is
+explicitly `clear()`-ed because ownership has been handed off to the
+`AgentConnection`'s `mCacheBufferIds`, which `unformat()` will free.
+
+**Fix (Layer B — `requestSync` `!isReady` cleanup):** Mirror what
+`unformat()` does on the success path. In the `!isReady` early-return
+branch of `CacheReceiver::Impl::requestSync()`, iterate the session's
+connections, look up each pre-assigned recv buffer ID via
+`agentConnection->getPreAssignedBufferId(static_cast<uint8_t>(mgr->getBufferKind()))`,
+and free it via `mgr->freeBufferIndexForRecv(id)`. The number of indices
+freed is logged as
+`gen_request_sync_not_ready_buffers_freed request=R count=N` so each
+post-fix run shows explicitly that the leak path is now closing.
+
+**Reproducer:** Same end-to-end 1P1D + long-prompt burst harness. A
+minimal unit test analogous to the signature `#1` reproducer is the
+natural next step: queue a generation request whose matching context is
+cancelled-after-ready, observe that the next generation request would
+have blocked in `assignBufferIndexForRecv()` pre-fix and completes
+normally post-fix.
+
+**Status:** Fix is built into the `local/rc11-disagg-repro` worktree;
+`run8` is the first end-to-end validation run with this fix and is
+currently in flight.
+
+**PRs:** None yet — will be split into a chained test+fix pair after
+end-to-end validation.
 
 ---
 
@@ -571,16 +626,49 @@ idle -- permanent wedge`, and two new patterns appear in the C++ traces:
   `sendRequestAndBufferInfo()` before reaching the ready-signal wait. The
   current instrumentation is not granular enough to say which.
 
-### Phase 8 — Signature #5 fix and signature #6 instrumentation (T+5 days, *current*)
+### Phase 8 — Signature #5 fix and signature #6 instrumentation (T+5 days)
 
 - Receiver-side fix: extract the queued promise under the lock and fulfill
   it with a structured `kNETWORK_ERROR` exception once released. Same shape
   as signature #1.
 - New trace markers around `sendRequestInfo()` (`gen_send_request_info_begin/end`)
   and `AgentConnection::sendRequestAndBufferInfo()`
-  (`gen_send_request_buffer_info_begin/notify/end`) so the next repro will
-  pinpoint signature #6.
-- Rebuild + rerun the repro — in progress at the time of writing.
+  (`gen_send_request_buffer_info_begin/notify/end`).
+- `run6` confirms signature #5 is gone (zero `Broken promise` events on the
+  generation side, `gen_request_promise_set_exception type=cancelled_before_send`
+  fires on the receiver's queued-cancel path) and confirms one in-progress
+  request is still stuck after `gen_request_sync_begin`. The wedge persists.
+
+### Phase 9 — Signature #6 root cause + fix (T+5 days, *current*)
+
+- Add fine-grained instrumentation across the entire `sendRequestInfo()`
+  body: `gen_send_validate_support_begin/end`, `gen_send_block_range_begin/end`,
+  `gen_send_assign_buffer_begin / step / end`,
+  `gen_send_compute_counterparts_begin/end`,
+  `gen_send_get_kv_counterparts_begin/end`,
+  `gen_send_get_connections_begin/end`,
+  `gen_send_counterpart_iter`, `gen_send_pick_recv_connections_begin/end`,
+  `gen_send_agent_dispatch_begin/end`, `gen_send_nonagent_dispatch_begin/end`.
+  Plus a defensive `mTerminate` check at the top of `sendRequestInfo()` and
+  inside the per-counterpart loop so receiver shutdown can interrupt the
+  worker thread.
+- `run7` shows exactly one in-progress generation request reaches
+  `gen_send_assign_buffer_begin` and never reaches `_step` or `_end`. Code
+  reading of `BaseTransBufferManager::assignBufferIndex()` confirms it does
+  an unbounded `cv.wait` with no timeout, and `mRecvBufferCount` defaults
+  to `1`. A single leaked recv buffer index permanently wedges every
+  subsequent receive.
+- The leak was a direct consequence of signature `#1`'s fix: the `!isReady`
+  early-return path in `CacheReceiver::Impl::requestSync()` skips
+  `receiveSync()` (and therefore `unformat()`'s `freeBufferIndexForRecv()`
+  call) for every cancelled-after-ready request.
+- Fix: RAII-style cleanup vector in `sendRequestInfo()` (Layer A), and
+  explicit free in the `!isReady` early-return path of `requestSync()`
+  (Layer B, mirrors `unformat()` via `getPreAssignedBufferId`). New marker
+  `gen_request_sync_not_ready_buffers_freed request=R count=N` shows the
+  leak path closing on every cancelled request.
+- `run8` is the first end-to-end validation run with this fix, currently
+  in flight.
 
 ---
 
@@ -605,11 +693,15 @@ isolation but not in combination. In particular:
   the signatures above are reproducible under that load shape — even
   signature #1, which exists on stock `rc11`, only fires when a request
   is actually cancelled while in flight.
-- **The bugs partially mask each other.** With signature #4 in place, the
-  gen event loop self-blocks before signatures #5 and #6 can manifest.
-  Removing signature #4 was a prerequisite for even seeing #5 and #6 in
-  the logs. This is also why "fix one bug, see another" is the dominant
-  pattern in the timeline above.
+- **The bugs partially mask each other and even create each other.** With
+  signature #4 in place, the gen event loop self-blocks before signatures
+  #5 and #6 can manifest. Removing signature #4 was a prerequisite for
+  even seeing #5 and #6 in the logs. Signature #6 is more pointed: it is
+  a **direct consequence** of the signature #1 fix — the new
+  cancelled-after-ready path on the sender turned into a `!isReady`
+  early-return on the receiver, which skipped the only `unformat()` call
+  site that would have released the recv buffer index. This is also why
+  "fix one bug, see another" is the dominant pattern in the timeline above.
 - **Companion fixes #12718 and #13119 are not in `rc11`.** Even when one
   of these signatures fires in the field on `rc11`, the failure-visibility
   improvements that would have made attribution easier
@@ -629,6 +721,166 @@ path with cancellations is still missing.
 
 ---
 
+## Architectural Reflections — What Was Missing in the First Place
+
+A reasonable question to ask after this many cascading bugs is: *why are
+there so many hidden bugs, and why are they only surfacing now?* This
+section is the answer I arrived at while running the investigation.
+
+### Why now
+
+Three things converged. None of them are individually new, but together
+they exercise a part of the disaggregated transceiver that prior workloads
+never reached in volume:
+
+1. **The subsystem is young.** Disaggregated serving is still flagged
+   "experimental" in the docs. NIXL is newer still. The transceiver was
+   built layer-by-layer (UCX → NIXL → cache-aware formatters → buffer
+   pool manager) with each layer adding its own thread, queue, future,
+   and condition-variable wait. The combined contract across the layers
+   was never formalised.
+2. **The customer load shape exercises the cleanup paths, not the happy
+   path.** Long prompts plus high concurrency plus client-side cancels
+   plus retries means almost every request can hit an abort, timeout, or
+   eviction mid-transfer. That is the surface where every signature in
+   this investigation lives. Most prior workloads — short prompts, low
+   concurrency, no aggressive timeouts — never reach the cleanup paths
+   in volume, so the bugs sat dormant.
+3. **The test pyramid is shaped wrong for this surface.** Each subsystem
+   has unit tests for happy-path completion. End-to-end disaggregated
+   integration tests use short prompts, low concurrency, and no
+   cancellations. There is essentially no test that drives the
+   combination "cancel during transfer at scale", which is the single
+   load shape every signature here requires.
+
+That alone explains the "many latent bugs surface in two weeks" pattern.
+But it does not explain why the bugs cluster so tightly on the same
+handful of code paths. That part is design.
+
+### The seven invariants the transceiver doesn't enforce
+
+Every signature in this investigation can be re-described as a violation
+of one of seven contracts that the transceiver doesn't actually have an
+explicit enforcement point for. Each is a missing invariant, not a bug —
+the bugs are individual instances, the invariant gaps are the architecture.
+
+1. **Ownership across the C++ ↔ Python boundary.** `mSenderFutures` and
+   `mRequesterFutures` hold raw `LlmRequest*` while Python (with
+   `shared_ptr<LlmRequest>` semantics) decides when the underlying
+   `LlmRequest` dies. That is a guaranteed use-after-free surface — Python
+   only has to terminate a request mid-transfer once. The right
+   architectural answer is `shared_ptr` all the way through; the fact
+   that raw pointers ever crossed a language-managed lifetime boundary
+   is the smell. **None of the six signatures here is the UAF, but every
+   single fix here lives next to one.**
+2. **Every promise must be fulfilled exactly once before destruction.**
+   Signatures `#1` and `#5` are the same architectural omission on
+   opposite sides: a code path erases a `(request, promise)` entry
+   without first calling `set_value` or `set_exception`. There is no
+   central invariant, no lint, no destructor that defaults to
+   `set_exception(unfulfilled)`. Every new cleanup path is a fresh
+   chance to forget. The two `set_exception(kNETWORK_ERROR)` fixes are
+   correct but they are patching individual sites of a missing invariant.
+3. **Every blocking wait must be interruptible.** The
+   `BaseTransBufferManager::assignBufferIndex()` `cv.wait`, the gen-side
+   `checkGenTransferStatus()` unconditional `future.get()`, the
+   ready-signal recv, and the underlying NIXL/UCX waits all blocked
+   unboundedly with no cancel-flag awareness. Signatures `#4` and `#6`
+   live exactly here. There is no cross-cutting "all blocking calls take
+   a cancel token / a deadline / a `mTerminate` check" rule.
+4. **Every acquired resource must release on every exit path (RAII).**
+   The recv-buffer pool slots had at least three exit paths from
+   `requestSync()` and only the happy one (success → `unformat()`)
+   released. The Layer-A and Layer-B fix for signature `#6` is a textbook
+   RAII fix; the question is why the original code did manual
+   `assignBufferIndex` / `freeBufferIndex` pairing instead of writing
+   the holder on day one.
+5. **Same operation, same semantics across language layers.** Signature
+   `#4` — the C++ `checkGenTransferStatus(atLeastNum=1)` blocks while the
+   Python `transceiver.py` wrapper for the same operation skips unready
+   entries — is a pure contract divergence. Two implementations of one
+   conceptual operation drifted; nothing checks they agree.
+6. **A configuration knob without an enforcement point is debt.**
+   `kv_transfer_timeout_ms` was plumbed all the way through config and
+   was never enforced as a hard deadline for the C++ blocking calls.
+   Signature `#6` would have surfaced as a per-request error long before
+   it became a global wedge if the receiver-side `cv.wait` had honored
+   that knob. This is symptomatic of feature-on-feature growth without
+   a designated enforcement layer for newly-added knobs.
+7. **Long-lived worker loops must be robust to any escape.** The
+   receiver drain worker uses `catch (std::exception)` but no
+   `catch (...)`. A non-`std` throw from NIXL or UCX strands the queue
+   and silently kills the worker thread, which then looks identical to
+   signature `#6` from outside. The investigation didn't end up needing
+   this fix, but the same "no rule" pattern is the reason it exists.
+
+### How to read these as a class
+
+It is more accurate to think of the transceiver as a textbook example of
+**inherited concurrency complexity without a unifying async contract**
+than as "fundamentally bad design". This is a depressingly common pattern
+in performance-focused C++ async code — not unique to TRT-LLM. The
+transceiver works under the happy path because each subsystem is
+individually correct. It breaks under cancel/timeout/exception paths
+because there is no shared notion of:
+
+- what it means to cancel a request mid-flight,
+- who owns an in-flight request's lifetime,
+- when a promise gets fulfilled,
+- where a blocking wait checks for shutdown / cancel / deadline,
+- which exits must release which resources, and
+- how errors propagate from C++ back to Python.
+
+In a more mature subsystem you would expect to see a single
+`TransferSession`-like type that bundles request lifetime + cancel token
++ buffer holders + promise + timeout into one RAII-managed object, with
+every send/receive path expressed as a method on it. The fixes in this
+investigation are incrementally bending the code in that direction
+(structured cancellation exceptions, the recv-buffer RAII guard, bounded
+non-blocking polls), but they are a retrofit rather than a clean redesign.
+
+### Why code review didn't catch any of this
+
+Honestly: because the review surface for "you forgot to fulfill a promise
+on this cleanup path" or "this `cv.wait` isn't cancellable" is invisible
+without the contracts written down. A reviewer looking at a 50-line PR
+adding a new cleanup branch has no way to spot that it violates an
+unwritten invariant the rest of the file follows by accident. This is
+exactly the failure mode that systematic invariants (or strong type-level
+abstractions) are supposed to prevent — and the transceiver currently
+has neither.
+
+### What this implies for follow-up work
+
+The actual remediation, in order of long-term value:
+
+1. **Document the seven invariants above** in the disaggregated-serving
+   developer guide, with a one-paragraph "if you're adding a new transfer
+   path, here is the checklist" section. Cheap, high leverage, prevents
+   the next field hit.
+2. **Introduce a `TransferSession`-like abstraction** that is the only
+   blessed way to start a disagg KV transfer, with the seven invariants
+   baked into its type. Reviewers can then enforce by type, not by
+   discipline.
+3. **Add an integration test** specifically for the cancel-during-transfer
+   surface: long prompts, high concurrency, aggressive client-side
+   timeouts, retries. This is the single load shape that exercises every
+   signature documented here, and the absence of such a test is the
+   single biggest reason this bug class went undetected for so long.
+4. **Audit other early-return paths** in the C++ disagg transceiver for
+   leaks of similarly cv-waited resources (other concurrence resources,
+   request-side state, etc.). The signature `#6` pattern — "fix the
+   visible failure path on side A, surface a resource leak on side B" —
+   is likely to repeat if other paths share the same RAII gap.
+
+The point of this section is that the next contributor adding a new
+transfer mode is one cleanup path away from re-introducing the same class
+of bug if these invariants stay implicit. A short architectural note that
+names the seven contracts above would pay for itself in one prevented
+field hit.
+
+---
+
 ## Signature ↔ PR Map
 
 | Signature | Status | Test PR | Fix PR | Notes |
@@ -638,7 +890,7 @@ path with cancellations is still missing.
 | **#3** Decode-side `RuntimeError: bad optional access` | Field-only; not yet localised | — | — | Python-side trace markers added; will localise on next field hit. |
 | **#4** Gen-side blocking hang in `checkGenTransferStatus(atLeastNum=1)` | Fix + regression test in `local/rc11-disagg-repro` worktree | (pending split) | (pending split) | To be split into a chained test+fix pair before submission. |
 | **#5** Receiver-side `Broken promise` from queued cancel | Fix in `local/rc11-disagg-repro` worktree | — (still needed) | (pending split) | Mirror of `#1`. Unit test analogous to `#1` reproducer is the next step. |
-| **#6** *(suspected)* Control-path stall inside `sendRequestInfo()` / `sendRequestAndBufferInfo()` | Instrumentation only; not fixed | — | — | New trace markers added; next post-fix repro will pinpoint the blocking step. |
+| **#6** Recv-buffer index leak via `!isReady` early-return; subsequent receives block in `BaseTransBufferManager::assignBufferIndex()` | Fix in `local/rc11-disagg-repro` worktree; `run8` validation in flight | — (still needed) | (pending split) | Two-layer fix: RAII cleanup in `sendRequestInfo()` (Layer A) + explicit free in `requestSync()` `!isReady` path (Layer B). Direct cascade from `#1` fix. |
 
 Companion fixes (already in `main`, not in `rc11`):
 
@@ -658,14 +910,18 @@ Companion fixes (already in `main`, not in `rc11`):
 
 In rough priority order:
 
-1. **Confirm signature #6 with the new instrumentation.** The post-fix repro
-   currently in flight should produce `gen_send_request_info_*` /
-   `gen_send_request_buffer_info_*` markers that pinpoint the exact blocking
-   step.
-2. **Implement and unit-test signature #5 fix.** Mirror of the signature #1
-   reproducer; should be a small, focused test in
-   `tests/unittest/others/test_kv_cache_transceiver.py`.
-3. **Split signatures #4 and #5 fixes into chained PR pairs** matching
+1. **Validate the signature #6 fix end-to-end with `run8`** (in flight).
+   Expectation: `gen_request_sync_not_ready_buffers_freed` markers fire on
+   every cancelled-after-ready request, no future `gen_send_assign_buffer_begin`
+   sits without a matching `_step` / `_end`, and the burst harness reports
+   `RECOVERY at idle=…s` instead of `NO RECOVERY`.
+2. **Implement focused unit tests for signatures #5 and #6.** The #5 test
+   mirrors the #1 reproducer (cancel a queued generation request and assert
+   the future is fulfilled with a structured exception, not `Broken
+   promise`). The #6 test forces a cancelled-after-ready transfer, then
+   issues a follow-up generation request and asserts that
+   `assignBufferIndexForRecv()` returns immediately instead of blocking.
+3. **Split signatures #4, #5, and #6 fixes into chained PR pairs** matching
    `#13571 / #13572` and `#13639 / #13640`.
 4. **Backport** `#13119` (request-level error propagation) to the `rc11`
    field branch so future field hits are easier to attribute to a specific
@@ -674,6 +930,11 @@ In rough priority order:
    long-prompt + retries + cancels load shape used by the local burst
    harness. This is the single largest coverage gap surfaced by this
    investigation.
+6. **Audit other early-return paths** in the C++ disagg transceiver for
+   leaks of similarly cv-waited resources (other concurrence resources,
+   request-side state, etc.). The `#6` pattern — "fix the visible failure
+   path on side A, surface a resource leak on side B" — is likely to repeat
+   if other paths share the same RAII gap.
 
 ---
 
@@ -687,9 +948,19 @@ In rough priority order:
   - `run5` (post-signature-#4 fix): permanent wedge persists; surfaces
     signatures #5 and #6. Archived at
     `~/trtllm-experiment-archives/run5_fixsig4_final_20260429_224332/`.
-  - `run6` (post-signature-#5 fix + signature-#6 instrumentation): in
-    progress at the time of writing. Logs preserved under `.repro/logs/`
-    in the `local/rc11-disagg-repro` worktree.
+  - `run6` (post-signature-#5 fix + first round of signature-#6
+    instrumentation): permanent wedge persists; pinpoints the stall to a
+    single in-progress request stuck after `gen_request_sync_begin` but
+    before `gen_send_request_buffer_info_*`. Archived at
+    `~/trtllm-experiment-archives/run6_recvfix_final_20260429_233258/`.
+  - `run7` (fine-grained signature-#6 instrumentation across the
+    `sendRequestInfo()` body): permanent wedge persists; pinpoints the
+    stall to the first `assignBufferIndexForRecv()` call for the next
+    request after a leak. Logs preserved under `.repro/logs/` in the
+    `local/rc11-disagg-repro` worktree (`run7_sig6_instr/`).
+  - `run8` (post-signature-#6 fix end-to-end validation): in flight at the
+    time of writing. Logs at `.repro/logs/run8_sig6_fix/` in the same
+    worktree.
 - New unit tests:
   - `cpp/tests/unit_tests/runtime/radixBlockTreeTest.cpp` (signature #2).
   - `tests/unittest/others/test_kv_cache_transceiver.py::test_cancel_request_in_transmission_fulfills_sender_future`
