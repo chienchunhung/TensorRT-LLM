@@ -1104,14 +1104,35 @@ In rough priority order:
    request-side state, etc.). The `#6` pattern — "fix the visible failure
    path on side A, surface a resource leak on side B" — is likely to repeat
    if other paths share the same RAII gap.
-7. **Enforce `kv_transfer_timeout_ms` as a hard deadline** on the C++
-   blocking entry points of the transceiver — primarily
-   `CacheSender::Impl::recvRequestInfo()` and `receiveSync()`. The `run8`
-   stack dumps show that with the current code path a NIXL UCX-internal
-   `pthread_mutex_lock` deadlock can wedge the entire ctx-side
-   `CacheSender::response()` thread indefinitely. With a deadline, the same
-   condition would surface as a per-request `kNETWORK_ERROR` and let the
-   client retry, instead of producing a global silent wedge.
+7. **Enforce `kv_transfer_timeout_ms` as a hard deadline** on the
+   transceiver's blocking entry points. As of `rc11` the knob is fully
+   plumbed through Python config, C++ config class, serialization,
+   getters/setters — but **never consumed in the request execution
+   path** of `cacheTransceiver.cpp` / `dataTransceiver.cpp`.
+   *Important caveat (added in Phase 10):* a deadline on the TRT-LLM
+   side can convert the silent wedge into structured per-request
+   `kNETWORK_ERROR`s, but it cannot by itself unwedge the surviving
+   ctx-side thread that is stuck inside
+   `nixlUcxThreadEngine::getNotifs()` on a `pthread_mutex_lock`. The
+   underlying NIXL/UCX mutex stays held; the TRT-LLM deadline only
+   gives the *caller* an escape, not the *callee*. Concretely:
+
+   | path | makes the local reproducer pass? | who owns it |
+   |---|---|---|
+   | TRT-LLM deadline alone | **no** — symptom shifts from silent hang to fast per-request errors; the wedge persists | TRT-LLM |
+   | TRT-LLM deadline + orchestrator (e.g. K8s liveness, Dynamo) restart on sustained error rate | **yes** — restart cycle clears the wedge in seconds-to-minutes | TRT-LLM + orchestrator |
+   | NIXL/UCX root-cause fix for the internal `pthread_mutex_lock` deadlock | **yes** — clean fix at the right layer | NIXL/UCX team |
+   | TRT-LLM in-process NIXL agent reset on timeout | theoretically yes, but heavy and may not be safe to recreate the agent while a thread is stuck on its internal mutex | TRT-LLM (substantial design work) |
+
+   The deadline is still worth landing because:
+   - it bounds `mRequesterFutures` growth (no eventual OOM on the
+     gen side under sustained NIXL deadlock);
+   - it gives orchestration a real signal (high error rate) instead of
+     a silent stall;
+   - it is the prerequisite for any retry / restart loop above
+     TRT-LLM.
+
+   See "Effort estimate for the deadline enforcement" below.
 8. **File a NIXL/UCX bug** with the canonical reproducer being the
    `ctx_worker_*_gdb.txt` stack from the `run8` archive. The wedge
    originates inside the NIXL UCX plugin
@@ -1125,6 +1146,167 @@ In rough priority order:
    its job, not actual drops. Renaming to
    `cancelled_after_ready_handled` removes the false-positive in future
    forensic readings.
+
+### Effort estimate for the deadline enforcement (Next Steps item 7)
+
+Decomposed into four implementation layers, each with its own
+trade-off between effort, blast radius, and how much of the wedge
+class it actually covers. Calendar estimates assume one engineer
+familiar with the disagg transceiver code path.
+
+#### Layer A — Python-level deadline + structured cancel (1 engineer, ~1 week)
+
+**Where:** `tensorrt_llm/_torch/pyexecutor/py_executor.py` and
+`kv_cache_transceiver.py` — the existing per-iteration loops that
+already call `check_context_transfer_status()` /
+`check_gen_transfer_status()`.
+
+**How:**
+1. Track `req.kv_transfer_started_at` when the request enters the
+   transceiver path.
+2. After each non-blocking poll cycle, scan in-flight requests; if
+   `now - started_at > kv_transfer_timeout_ms`, call
+   `transceiver.cancel_request(req)`, mark the request
+   `kDISAGG_TRANS_ERROR`, fulfil the Python-side completion future
+   with a structured timeout exception, and remove from the in-flight
+   tracker.
+3. Surface the timeout cleanly to the OpenAI-style HTTP layer as a
+   structured 5xx (e.g. `kNETWORK_ERROR` body), so the orchestrator
+   sees real signal.
+
+**Pros:**
+- ~50–100 lines of Python; no C++ rebuild.
+- Testable with the existing `test_kv_cache_transceiver.py` plus a
+  small mock-NIXL fixture.
+- Immediately surfaces the silent wedge as a clean per-request error.
+
+**Cons:**
+- The C++ side already restricts `cancelRequest()` to requests that
+  are *not currently being processed* (see
+  `dataTransceiver.cpp:431`); the request actually wedged inside
+  `nixlAgent::getNotifs()` will return "Cannot cancel". Python
+  effectively has to "abandon and report timeout" without the C++
+  side cleaning up.
+- The wedged C++ thread keeps consuming its slot. Layer A buys a
+  bounded number of clean errors but does *not* buy sustained
+  recovery; for that, the orchestrator must restart the wedged pod.
+
+**Verdict:** This is the right starting point. Cheap, low risk,
+unblocks orchestrator-driven recovery, immediate operability win.
+
+#### Layer B — C++-side deadline on slice-able blocking paths (1 engineer, ~2 weeks)
+
+**Where:** Every `cv.wait(...)` and unbounded `future.get()` in
+`dataTransceiver.cpp`, `cacheTransceiver.cpp`, and
+`baseTransBuffer.cpp`. The four obvious candidates are the
+`assignBufferIndex()` `cv.wait`, the `CacheSender::Impl::response()`
+outer `mSenderCv.wait`, the inner ready-signal recv in
+`CacheReceiver::Impl::sendRequestInfo()`, and the
+`CacheTransceiver::checkGenTransferStatus()` future probe (already
+fixed for `atLeastNum=1` via the signature `#4` patch — extend to a
+deadline-aware variant).
+
+**How:**
+1. Add a `std::chrono::steady_clock::time_point deadline` (or
+   `std::optional<int> timeoutMs`) parameter to the relevant private
+   methods.
+2. Replace each `cv.wait(lk, predicate)` with a
+   `cv.wait_for(lk, slice_ms, predicate)` loop that checks
+   `mTerminate || past_deadline` on each slice.
+3. On deadline expiry: set the request future with
+   `kNETWORK_ERROR`, set state to `kDISAGG_TRANS_ERROR`, *free any
+   reserved buffer indices via the same RAII helper used for the
+   signature `#6` fix*, continue serving other requests.
+4. Add unit tests for each deadline path (mirroring the
+   `test_check_gen_transfer_status_at_least_one_does_not_block_on_unready_future`
+   regression test added for signature `#4`).
+
+**Pros:**
+- Real per-request timeout behaviour across every TRT-LLM-owned
+  blocking primitive.
+- Cleans up properly on timeout — closes the same RAII gap that
+  signature `#6` exposed.
+- Defends against many slow-path hangs, not just NIXL deadlocks.
+
+**Cons:**
+- Does **not** cover the NIXL `pthread_mutex_lock` wedge: that's a
+  single C call into NIXL, not a `cv.wait` in TRT-LLM code. Slicing
+  only works on blocking primitives that TRT-LLM owns.
+- Larger surface for race conditions; needs careful review.
+- Requires C++ rebuild, full test sweep.
+
+**Verdict:** Right follow-up to Layer A. Closes the architectural
+"every blocking wait must be interruptible" invariant from the
+Architectural Reflections section, and bounds the failure surface for
+all TRT-LLM-owned blocking calls.
+
+#### Layer C — `std::async` watchdog around NIXL calls (1 engineer, ~2 weeks, with caveats)
+
+**Where:** Each call into a NIXL primitive that today blocks
+indefinitely — primarily `nixlAgent::getNotifs()`,
+`nixlAgent::genNotif()`, and the underlying UCX waits. Wrap with the
+`std::async` + `future.wait_for(timeout)` pattern.
+
+**How:**
+```cpp
+auto fut = std::async(std::launch::async, [&]() { return recvRequestInfoImpl(); });
+if (fut.wait_for(timeout) == std::future_status::ready) { return fut.get(); }
+throw TimeoutException(...); // detached worker keeps running until NIXL returns (or never)
+```
+
+**Pros:**
+- Caller actually escapes; can serve other requests until thread pool
+  exhaustion.
+
+**Cons:**
+- **Thread leak per timeout.** Eventually OOM on threads if NIXL
+  truly stays wedged.
+- Doesn't prevent further wedges; subsequent NIXL calls hit the same
+  internal mutex.
+- Higher per-call overhead than slicing.
+- Detecting "NIXL agent is poisoned, refuse new traffic" requires a
+  higher-order recovery contract — that itself is design work
+  (Layer D).
+
+**Verdict:** Pursue only if Layer A + Layer B aren't enough and the
+NIXL fix is far away. Otherwise the cost-to-benefit is poor compared
+with the orchestrator-restart contract.
+
+#### Layer D — In-process NIXL agent reset on timeout (1 engineer, ~3–4 weeks, design-heavy)
+
+**Where:** New "NIXL recovery" subsystem that detects sustained
+timeouts, tears down the wedged NIXL agent, recreates it, and
+re-establishes connections with all peers.
+
+**Pros:**
+- Actually unwedges the system without external orchestration.
+
+**Cons:**
+- Likely needs NIXL API support for clean shutdown of an agent that
+  has threads stuck on internal mutexes (this API may not exist
+  today).
+- Potentially unsafe — recreating an agent while internal threads are
+  blocked on its mutex risks state corruption.
+- Significant design + cross-team coordination + extensive testing.
+
+**Verdict:** Last resort. If NIXL ships a fix for the underlying
+`pthread_mutex_lock` deadlock (Next Steps item 8), Layer D becomes
+unnecessary.
+
+#### Recommended order
+
+1. **Layer A** (1 week) — land the Python-level deadline + structured
+   cancel + per-request 5xx. Pair with the orchestrator-restart
+   contract to deliver actual recovery on the field reproducer.
+2. **Layer B** (2 weeks) — extend the deadline into C++ for every
+   TRT-LLM-owned blocking primitive. Closes the architectural gap and
+   prevents the "fix-on-side-A surfaces leak-on-side-B" pattern from
+   recurring.
+3. **NIXL/UCX bug** (Next Steps item 8) — the only path that makes
+   the local reproducer pass *without* an orchestrator restart loop.
+   Out of TRT-LLM scope but should be filed in parallel with Layer A.
+4. Layer C and Layer D should not be pursued unless Layers A+B and
+   the NIXL fix all fall through.
 
 ---
 
