@@ -12,8 +12,12 @@
 - **Branches in this worktree:**
   - `local/sig1-broken-promise-test` (signature #1 reproducer test)
   - `local/sig1-broken-promise-fix` (signature #1 fix)
+  - `local/sig4-checkgen-nonblocking-test` (signature #4 reproducer test)
+  - `local/sig4-checkgen-nonblocking-fix` (signature #4 fix)
+  - `local/sig5-recv-cancelrequest-fulfill` (signature #5 combined test + fix)
+  - `local/sig6-recv-buffer-leak` (signature #6 combined test + fix, chained on `local/sig1-broken-promise-fix`)
   - `local/rc11-disagg-repro` (isolated `rc11` worktree with cumulative fixes
-    + instrumentation)
+    + instrumentation; the testbed used for `run4`–`run8`)
 - **Related PRs:**
   - [#13571](https://github.com/NVIDIA/TensorRT-LLM/pull/13571) — signature #2
     reproducer test
@@ -23,18 +27,31 @@
     reproducer test
   - [#13640](https://github.com/NVIDIA/TensorRT-LLM/pull/13640) — signature #1
     fix
+  - [#13674](https://github.com/NVIDIA/TensorRT-LLM/pull/13674) — signature #4
+    reproducer test
+  - [#13671](https://github.com/NVIDIA/TensorRT-LLM/pull/13671) — signature #4
+    fix (carries the test commit too as 2 commits; targets `main` directly)
+  - [#13672](https://github.com/NVIDIA/TensorRT-LLM/pull/13672) — signature #5
+    combined test + fix
+  - [#13673](https://github.com/NVIDIA/TensorRT-LLM/pull/13673) — signature #6
+    combined test + fix (chained on `#13640` because the `!isReady` early-return
+    path is only reachable once `#13640` sends `is_ready=false`)
 - **Companion fixes in main (not in `rc11`):**
   - [#13119](https://github.com/NVIDIA/TensorRT-LLM/pull/13119) — request-level
     error propagation (cleaner failure visibility, not a fix for the wedge)
   - [#12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718) — fatal engine
     detection / pod restart (mitigation for silent wedges, not a fix for the
     wedge)
-- **Status:** Investigation in progress. Signatures #1, #2, #4, and #5 have
-  fixes in flight or merged. Signature #6 has now been **root-caused** to a
-  recv-buffer index leak in `BaseTransBufferManager::assignBufferIndex()`
-  triggered by the `!isReady` early-return path in
-  `CacheReceiver::Impl::requestSync()`; the targeted fix is built and an
-  end-to-end validation run is currently in flight.
+- **Status:** All six TRT-LLM signatures (`#1`, `#2`, `#4`, `#5`, `#6`)
+  have chained PRs in review. Signature `#3` is field-only and is
+  expected to disappear or change shape once `#1`, `#4`, and `#5` land
+  (NIXL-layer blocking from `#7` is also a candidate cause; see that
+  signature's section). Signature `#7` (NIXL UCX-internal
+  `pthread_mutex_lock` deadlock) is the **terminal wedge driver** under
+  the customer load shape but lives **outside TRT-LLM**; the TRT-LLM-side
+  follow-up is the `kv_transfer_timeout_ms` deadline work documented in
+  Next Steps item 7 as a fallback / mitigation, paired with a NIXL/UCX
+  bug filed under Next Steps item 8 as the ultimate fix.
 
 ---
 
@@ -171,8 +188,12 @@ fix in isolation (run 5). The system never recovers without process restart.
 - 1P1D with overlap disabled: no wedge.
 - 1P1D with no client-side timeouts (no cancels): no wedge.
 - Single-process unit tests of the cache transceiver alone (without the
-  disagg HTTP layer): only signature #1, #2, and #4 reproduce; #3, #5, #6
-  require the full HTTP path with cancellation and retries.
+  disagg HTTP layer) reproduce signatures `#1`, `#2`, `#4`, `#5`, and
+  `#6` (the latter two via the new tests added in `#13672` and
+  `#13673` respectively). Signatures `#3` and `#7` are field-only:
+  `#3` requires the full HTTP path with cancellation and retries, and
+  `#7` requires the NIXL/UCX runtime under a contention pattern that
+  hasn't been mock-injected yet.
 
 ---
 
@@ -310,13 +331,18 @@ empty even though downstream code unconditionally calls `.value()`. The
 the request in this half-initialised state.
 
 **Status:** Not fixed yet. Likely to disappear (or change shape) once
-signatures #1, #4, and #5 are all in place, because those are the conditions
-under which the half-initialised state is reached. We have added Python-side
-trace logs around the gen event loop's `_event_loop_wrapper` and
-`_check_disagg_gen_cache_transfer_status` (gated on
-`TRTLLM_DISAGG_TRACE_OPTIONAL=1`) so the next field hit will produce a
-labelled stack with the active-request summary instead of just a bare
-`RuntimeError`.
+signatures `#1`, `#4`, and `#5` are all in place, because those are the
+conditions under which the half-initialised state is reached. After the
+`run8` post-mortem there is a second candidate trigger to keep in mind:
+a NIXL-layer wedge (signature `#7`) can also strand a request mid-transfer
+and leave receiver-side state in the same half-initialised shape, so a
+field hit *after* the chained PRs land should be checked against the
+`#7` signature before being attributed to a fresh TRT-LLM bug. We have
+added Python-side trace logs around the gen event loop's
+`_event_loop_wrapper` and `_check_disagg_gen_cache_transfer_status`
+(gated on `TRTLLM_DISAGG_TRACE_OPTIONAL=1`) so the next field hit will
+produce a labelled stack with the active-request summary instead of
+just a bare `RuntimeError`.
 
 **Reproducer:** None yet. This signature is currently field-only.
 
@@ -448,7 +474,7 @@ request lands in `kDISAGG_TRANS_ERROR` cleanly and stderr stays clean.
 (combined test + fix). Independent of the `#1` chain — the queued-cancel
 path does not require the `#1` fix to be present.
 
-### Signature #6 — Control-path stall inside `sendRequestInfo()` / `sendRequestAndBufferInfo()` *(suspected)*
+### Signature #6 — Recv-buffer index leak via `!isReady` early return; subsequent receives wedge in `assignBufferIndexForRecv()`
 
 **Symptom (gen-side request lifecycle trace, post-`#4` fix):**
 
@@ -460,13 +486,20 @@ gen_wait_ready_signal_end → gen_receive_sync_begin → gen_receive_sync_end �
 gen_request_promise_set_value`. Exactly one request stops between
 `gen_request_sync_begin` and the next marker.
 
-**Where it lives (most likely):** Either
+**Where it lives (confirmed in `run7`):** The visible stall is on the
+*caller* of
+[`cpp/tensorrt_llm/batch_manager/baseTransBuffer.cpp`](../../../cpp/tensorrt_llm/batch_manager/baseTransBuffer.cpp)'s
+`BaseTransBufferManager::assignBufferIndex()` `cv.wait`, namely
 [`cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp`](../../../cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp)
-inside `CacheReceiver::Impl::sendRequestInfo(LlmRequest const&)` (the
-session-building variant, which loops over counterparts), or
-[`cpp/tensorrt_llm/executor/cache_transmission/agent_utils/connection.cpp`](../../../cpp/tensorrt_llm/executor/cache_transmission/agent_utils/connection.cpp)
-inside `AgentConnection::sendRequestAndBufferInfo(...)`, which performs the
-control-path notify to the remote agent.
+inside `CacheReceiver::Impl::sendRequestInfo()`'s recv-buffer
+reservation loop. The *leak* is in the same file's
+`CacheReceiver::Impl::requestSync()` `!isReady` early-return path,
+which skips the `receiveSync()` → `unformat()` →
+`freeBufferIndexForRecv()` chain that would normally release the slot.
+The control-path notify in
+[`cpp/tensorrt_llm/executor/cache_transmission/agent_utils/connection.cpp`](../../../cpp/tensorrt_llm/executor/cache_transmission/agent_utils/connection.cpp)'s
+`AgentConnection::sendRequestAndBufferInfo(...)` was an early
+suspect but was ruled out by the `run7` per-marker accounting.
 
 **Root cause (confirmed in `run7`):** Recv-buffer index exhaustion caused
 by the `!isReady` early-return in `CacheReceiver::Impl::requestSync()`,
@@ -740,6 +773,13 @@ implementation in `transceiver.py` shows that the C++ path takes an
 unbounded blocking wait when `atLeastNum=1`, while the Python path does
 not. This is signature **#4**.
 
+(In hindsight, the underlying terminal driver of the Phase-5 wedge was
+already signature `#7` — the NIXL UCX-internal `pthread_mutex_lock`
+deadlock identified in Phase 10 — but `#4` was the *visible* TRT-LLM-side
+symptom because the gen event loop was self-blocking before any of the
+later layers could surface. Fixing `#4` was a prerequisite for *seeing*
+`#5` and `#6`, which were prerequisites for *seeing* `#7`.)
+
 ### Phase 6 — Signature #4 fix and regression test (T+3 days)
 
 - Fix: in the non-`blockAll` path, probe each selected future with
@@ -748,8 +788,11 @@ not. This is signature **#4**.
   `test_check_gen_transfer_status_at_least_one_does_not_block_on_unready_future`
   fails on stock `rc11` (asserts the wrong behaviour) and passes post-fix.
 
-This is the regression test for signature #4. It is currently isolated in
-the `local/rc11-disagg-repro` worktree.
+This is the regression test for signature `#4`. It was subsequently
+split out of `local/rc11-disagg-repro` and submitted as the chained
+pair [#13674](https://github.com/NVIDIA/TensorRT-LLM/pull/13674)
+(test) → [#13671](https://github.com/NVIDIA/TensorRT-LLM/pull/13671)
+(fix).
 
 ### Phase 7 — Post-`#4` rerun: wedge persists, surfaces signature #5 and suspected signature #6 (T+4 days)
 
@@ -1168,7 +1211,7 @@ field hit.
 | **#3** Decode-side `RuntimeError: bad optional access` | Field-only; not yet localised | — | — | Python-side trace markers added; will localise on next field hit. |
 | **#4** Gen-side blocking hang in `checkGenTransferStatus(atLeastNum=1)` | Test merged; fix in review | [#13674](https://github.com/NVIDIA/TensorRT-LLM/pull/13674) | [#13671](https://github.com/NVIDIA/TensorRT-LLM/pull/13671) | `#13671` carries both the test and the fix as 2 commits; both PRs target `main` so `#13674` lands first and `#13671`'s duplicate test commit becomes a no-op. |
 | **#5** Receiver-side `Broken promise` from queued cancel | Combined test + fix in review | (combined into fix PR) | [#13672](https://github.com/NVIDIA/TensorRT-LLM/pull/13672) | Mirror of `#1` on the receiver side. New test `test_cancel_queued_gen_request_fulfills_receiver_future` keeps the receiver worker busy with a first orphan request, then enqueues and cancels a second; pre-fix `Broken promise` lands on stderr, post-fix the cancelled request reaches `kDISAGG_TRANS_ERROR` cleanly. |
-| **#6** Recv-buffer index leak via `!isReady` early-return; subsequent receives block in `BaseTransBufferManager::assignBufferIndex()` | Combined test + fix in review (chained on `#13640`) | (combined into fix PR) | [#13673](https://github.com/NVIDIA/TensorRT-LLM/pull/13673) | Two-layer fix: RAII cleanup in `sendRequestInfo()` (Layer A) + explicit free in `requestSync()` `!isReady` path (Layer B). Direct cascade from the `#1` fix; chained on `#13640` because the `!isReady` branch is only reachable once the sender-side cancellation correctly sends `is_ready=false`. New test `test_cancelled_after_ready_does_not_leak_recv_buffer_index` uses the NIXL backend (the only backend that goes through `assignBufferIndexForRecv`). |
+| **#6** Recv-buffer index leak via `!isReady` early return; subsequent receives wedge in `assignBufferIndexForRecv()` | Combined test + fix in review (chained on `#13640`) | (combined into fix PR) | [#13673](https://github.com/NVIDIA/TensorRT-LLM/pull/13673) | Two-layer fix: RAII cleanup in `sendRequestInfo()` (Layer A) + explicit free in `requestSync()` `!isReady` path (Layer B). Direct cascade from the `#1` fix; chained on `#13640` because the `!isReady` branch is only reachable once the sender-side cancellation correctly sends `is_ready=false`. New test `test_cancelled_after_ready_does_not_leak_recv_buffer_index` uses the NIXL backend (the only backend that goes through `assignBufferIndexForRecv`). |
 | **#7** NIXL UCX-internal `pthread_mutex_lock` deadlock (terminal wedge driver) | Identified, classified, documented; **not** a TRT-LLM bug | — (test would need to inject a NIXL mock or fault-inject the UCX layer; deferred) | NIXL/UCX root-cause fix is **out of TRT-LLM scope** (Next Steps item 8) | TRT-LLM-side **fallback / mitigation** is the `kv_transfer_timeout_ms` deadline work in Next Steps item 7 — converts silent wedge into per-request errors so orchestration can recover. **Not** the ultimate fix. |
 
 Companion fixes (already in `main`, not in `rc11`):
@@ -1464,11 +1507,16 @@ unnecessary.
     `pyspy/gen_worker_*_gdb.txt`, `pyspy/ctx_worker_*_gdb.txt` —
     the latter is the canonical NIXL deadlock evidence).
 - New unit tests:
-  - `cpp/tests/unit_tests/runtime/radixBlockTreeTest.cpp` (signature #2).
+  - `cpp/tests/unit_tests/runtime/radixBlockTreeTest.cpp` (signature `#2`).
   - `tests/unittest/others/test_kv_cache_transceiver.py::test_cancel_request_in_transmission_fulfills_sender_future`
-    (signature #1).
+    (signature `#1`).
   - `tests/unittest/others/test_kv_cache_transceiver.py::test_check_gen_transfer_status_at_least_one_does_not_block_on_unready_future`
-    (signature #4).
+    (signature `#4`).
+  - `tests/unittest/others/test_kv_cache_transceiver.py::test_cancel_queued_gen_request_fulfills_receiver_future`
+    (signature `#5`).
+  - `tests/unittest/others/test_kv_cache_transceiver.py::test_cancelled_after_ready_does_not_leak_recv_buffer_index`
+    (signature `#6`; uses the NIXL backend, which is the only backend
+    that goes through `assignBufferIndexForRecv()`).
 - Trace gating env summary:
   - `TRTLLM_DISAGG_TRACE_PROMISE` — sender / receiver promise lifecycle and
     `checkGenTransferStatus` selection / get markers.
