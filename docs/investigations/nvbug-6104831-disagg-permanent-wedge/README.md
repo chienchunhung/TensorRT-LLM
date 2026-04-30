@@ -391,9 +391,11 @@ that `check_gen_transfer_status(0)` returns immediately, asserts that
 the transfer completes cleanly. The test fails on stock `rc11` and passes
 post-fix.
 
-**PRs:** Currently isolated in the `local/rc11-disagg-repro` worktree
-together with signature #5 fix. Will be split out into its own chained
-test+fix PR pair before submission.
+**PRs:** [#13674](https://github.com/NVIDIA/TensorRT-LLM/pull/13674)
+(test) → [#13671](https://github.com/NVIDIA/TensorRT-LLM/pull/13671)
+(fix). Both PRs target `main`; `#13671` carries both the test and the
+fix as 2 commits, so `#13674` lands first and `#13671`'s duplicate test
+commit becomes a no-op.
 
 ### Signature #5 — Receiver-side `Broken promise` from queued cancel
 
@@ -433,13 +435,18 @@ auto cancelledException = TLLM_REQUEST_EXCEPTION(cancelledId,
 queuedPromise->set_exception(std::make_exception_ptr(cancelledException));
 ```
 
-**Reproducer:** Currently observed only via the full 1P1D HTTP repro;
-no dedicated unit test yet. A test analogous to the signature #1 reproducer
-is the natural next step.
+**Reproducer:** New unit test
+`test_cancel_queued_gen_request_fulfills_receiver_future` (in
+`tests/unittest/others/test_kv_cache_transceiver.py`). It keeps the
+receiver worker thread busy with a first orphan generation request whose
+context counterpart will never respond, then enqueues a second orphan
+request and cancels it while it is still queued. Pre-fix the test fails
+because `Broken promise` appears on stderr; post-fix the cancelled
+request lands in `kDISAGG_TRANS_ERROR` cleanly and stderr stays clean.
 
-**PRs:** Currently isolated in the `local/rc11-disagg-repro` worktree
-together with the signature #4 fix. Will be split out into its own chained
-test+fix PR pair before submission.
+**PRs:** [#13672](https://github.com/NVIDIA/TensorRT-LLM/pull/13672)
+(combined test + fix). Independent of the `#1` chain — the queued-cancel
+path does not require the `#1` fix to be present.
 
 ### Signature #6 — Control-path stall inside `sendRequestInfo()` / `sendRequestAndBufferInfo()` *(suspected)*
 
@@ -529,19 +536,23 @@ cancelled-after-ready, observe that the next generation request would
 have blocked in `assignBufferIndexForRecv()` pre-fix and completes
 normally post-fix.
 
-**Status:** Fix is built into the `local/rc11-disagg-repro` worktree.
-`run8` validated the fix at the C++ trace level — every request now
-walks `gen_send_assign_buffer_begin → step → end` cleanly (33/33), and
-the new `gen_request_sync_not_ready_buffers_freed` marker fires on
-every cancelled-after-ready request (3/3 in `run8`). The wedge however
-still occurs at the harness level; the post-mortem stack dumps on the
-ctx worker show the wedge has shifted **off the TRT-LLM transceiver
+**Status:** Combined test + fix opened as
+[#13673](https://github.com/NVIDIA/TensorRT-LLM/pull/13673), chained on
+[#13640](https://github.com/NVIDIA/TensorRT-LLM/pull/13640) (the `#1`
+fix is a prerequisite for the `!isReady` early-return path to be
+reachable in production code). `run8` validated the fix at the C++
+trace level before submission — every request now walks
+`gen_send_assign_buffer_begin → step → end` cleanly (33/33), and the
+new `gen_request_sync_not_ready_buffers_freed` marker fires on every
+cancelled-after-ready request (3/3 in `run8`). The wedge however still
+occurs at the harness level; the post-mortem stack dumps on the ctx
+worker show the wedge has shifted **off the TRT-LLM transceiver
 entirely** and into a NIXL UCX-internal `pthread_mutex_lock` inside
-`recvRequestInfo()`. See Phase 10 of the timeline below for full
-details.
+`recvRequestInfo()` (signature `#7`). See Phase 10 of the timeline
+below for full details.
 
-**PRs:** None yet — will be split into a chained test+fix pair after
-end-to-end validation.
+**PRs:** [#13673](https://github.com/NVIDIA/TensorRT-LLM/pull/13673)
+(combined test + fix, chained on `#13640`).
 
 ### Signature #7 — NIXL UCX-internal `pthread_mutex_lock` deadlock surfacing as a transceiver-level wedge
 
@@ -1155,9 +1166,9 @@ field hit.
 | **#1** Sender-side `Broken promise` after ready signal | Test merged; fix in review | [#13639](https://github.com/NVIDIA/TensorRT-LLM/pull/13639) | [#13640](https://github.com/NVIDIA/TensorRT-LLM/pull/13640) | Chained: `#13640` builds on `#13639`. |
 | **#2** Trie `cascade prune` assertion | Test merged; fix in review | [#13571](https://github.com/NVIDIA/TensorRT-LLM/pull/13571) | [#13572](https://github.com/NVIDIA/TensorRT-LLM/pull/13572) | Chained: `#13572` builds on `#13571`. Independent of disagg networking. |
 | **#3** Decode-side `RuntimeError: bad optional access` | Field-only; not yet localised | — | — | Python-side trace markers added; will localise on next field hit. |
-| **#4** Gen-side blocking hang in `checkGenTransferStatus(atLeastNum=1)` | Fix + regression test in `local/rc11-disagg-repro` worktree | (pending split) | (pending split) | To be split into a chained test+fix pair before submission. |
-| **#5** Receiver-side `Broken promise` from queued cancel | Fix in `local/rc11-disagg-repro` worktree | — (still needed) | (pending split) | Mirror of `#1`. Unit test analogous to `#1` reproducer is the next step. |
-| **#6** Recv-buffer index leak via `!isReady` early-return; subsequent receives block in `BaseTransBufferManager::assignBufferIndex()` | Fix in `local/rc11-disagg-repro` worktree; `run8` validated at the C++ trace level | — (still needed) | (pending split) | Two-layer fix: RAII cleanup in `sendRequestInfo()` (Layer A) + explicit free in `requestSync()` `!isReady` path (Layer B). Direct cascade from `#1` fix. |
+| **#4** Gen-side blocking hang in `checkGenTransferStatus(atLeastNum=1)` | Test merged; fix in review | [#13674](https://github.com/NVIDIA/TensorRT-LLM/pull/13674) | [#13671](https://github.com/NVIDIA/TensorRT-LLM/pull/13671) | `#13671` carries both the test and the fix as 2 commits; both PRs target `main` so `#13674` lands first and `#13671`'s duplicate test commit becomes a no-op. |
+| **#5** Receiver-side `Broken promise` from queued cancel | Combined test + fix in review | (combined into fix PR) | [#13672](https://github.com/NVIDIA/TensorRT-LLM/pull/13672) | Mirror of `#1` on the receiver side. New test `test_cancel_queued_gen_request_fulfills_receiver_future` keeps the receiver worker busy with a first orphan request, then enqueues and cancels a second; pre-fix `Broken promise` lands on stderr, post-fix the cancelled request reaches `kDISAGG_TRANS_ERROR` cleanly. |
+| **#6** Recv-buffer index leak via `!isReady` early-return; subsequent receives block in `BaseTransBufferManager::assignBufferIndex()` | Combined test + fix in review (chained on `#13640`) | (combined into fix PR) | [#13673](https://github.com/NVIDIA/TensorRT-LLM/pull/13673) | Two-layer fix: RAII cleanup in `sendRequestInfo()` (Layer A) + explicit free in `requestSync()` `!isReady` path (Layer B). Direct cascade from the `#1` fix; chained on `#13640` because the `!isReady` branch is only reachable once the sender-side cancellation correctly sends `is_ready=false`. New test `test_cancelled_after_ready_does_not_leak_recv_buffer_index` uses the NIXL backend (the only backend that goes through `assignBufferIndexForRecv`). |
 | **#7** NIXL UCX-internal `pthread_mutex_lock` deadlock (terminal wedge driver) | Identified, classified, documented; **not** a TRT-LLM bug | — (test would need to inject a NIXL mock or fault-inject the UCX layer; deferred) | NIXL/UCX root-cause fix is **out of TRT-LLM scope** (Next Steps item 8) | TRT-LLM-side **fallback / mitigation** is the `kv_transfer_timeout_ms` deadline work in Next Steps item 7 — converts silent wedge into per-request errors so orchestration can recover. **Not** the ultimate fix. |
 
 Companion fixes (already in `main`, not in `rc11`):
@@ -1184,14 +1195,22 @@ In rough priority order:
    but the harness still reports `NO RECOVERY` because the wedge has
    shifted to signature `#7` (NIXL UCX-internal `pthread_mutex_lock`).
    See Phase 10 of the timeline for full details.
-2. **Implement focused unit tests for signatures #5 and #6.** The #5 test
-   mirrors the #1 reproducer (cancel a queued generation request and assert
-   the future is fulfilled with a structured exception, not `Broken
-   promise`). The #6 test forces a cancelled-after-ready transfer, then
-   issues a follow-up generation request and asserts that
-   `assignBufferIndexForRecv()` returns immediately instead of blocking.
-3. **Split signatures #4, #5, and #6 fixes into chained PR pairs** matching
-   `#13571 / #13572` and `#13639 / #13640`.
+2. **Implement focused unit tests for signatures #5 and #6** *(done)*.
+   - `#5` test (`test_cancel_queued_gen_request_fulfills_receiver_future`)
+     keeps the receiver worker busy with a first orphan generation request,
+     then enqueues and cancels a second; pre-fix `Broken promise` lands on
+     stderr, post-fix the cancelled request reaches `kDISAGG_TRANS_ERROR`
+     cleanly. Bundled into [#13672](https://github.com/NVIDIA/TensorRT-LLM/pull/13672).
+   - `#6` test (`test_cancelled_after_ready_does_not_leak_recv_buffer_index`)
+     uses the NIXL backend, drives a cancelled-after-ready transfer once,
+     then issues a follow-up generation request on a worker thread with a
+     10s probe timeout; pre-fix the worker thread stays alive past the
+     timeout, post-fix the follow-up completes normally. Bundled into
+     [#13673](https://github.com/NVIDIA/TensorRT-LLM/pull/13673).
+3. **Split signatures #4, #5, and #6 fixes into reviewable PRs** *(done)*.
+   - `#4`: chained pair [#13674](https://github.com/NVIDIA/TensorRT-LLM/pull/13674) (test) → [#13671](https://github.com/NVIDIA/TensorRT-LLM/pull/13671) (fix).
+   - `#5`: combined test + fix in [#13672](https://github.com/NVIDIA/TensorRT-LLM/pull/13672).
+   - `#6`: combined test + fix in [#13673](https://github.com/NVIDIA/TensorRT-LLM/pull/13673), chained on `#13640` (the `#1` fix is a prerequisite for the `!isReady` early-return path to be reachable).
 4. **Backport** `#13119` (request-level error propagation) to the `rc11`
    field branch so future field hits are easier to attribute to a specific
    signature.
