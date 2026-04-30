@@ -1210,6 +1210,180 @@ path with cancellations is still missing.
 
 ---
 
+## What We Would Do Differently — A Retrospective Process Reflection
+
+The investigation was sequential by necessity: one signature surfaced,
+got a fix, and the next signature emerged from the post-fix behaviour.
+Six rounds of "find bug → fix bug → find next bug" took ~6 days of
+calendar time. With the end-to-end view in hand, it is worth asking:
+*could we have done this differently from the start?* The honest answer
+has two parts.
+
+### What was not actually possible at T0
+
+A "design one comprehensive fix" approach is the natural counterfactual.
+Concretely: at T0, introduce a `TransferSession`-like abstraction that
+encapsulates request lifetime + RAII buffer holders +
+promise-fulfillment-on-destruct + deadline, and let it close all six
+TRT-LLM signatures in one PR. This sounds clean in retrospect but had
+two hard blockers:
+
+1. **You cannot design an abstraction to fix bugs you have not found
+   yet.** We knew about three signatures from the field at T0
+   (`#1`, `#2`, `#3`). The other four (`#4`, `#5`, `#6`, `#7`)
+   emerged from investigation. The architectural answer ("what
+   invariants does this abstraction enforce?") is the *output* of
+   finding the bugs, not the *input*. A `TransferSession` designed at
+   T0 against only `#1`/`#2`/`#3` would not have prevented `#5` or
+   `#6`, because we would not have known to enforce the invariants
+   those signatures violate.
+2. **The field was wedged.** Customers needed the smallest patches
+   that work, not a multi-thousand-line refactor of a critical path.
+   Review pressure on TRT-LLM also favours small focused changes; a
+   refactor of `dataTransceiver.cpp` that touched all three backends
+   (UCX/NIXL/MPI) would not have landed quickly.
+
+A single coordinated fix was therefore strictly impossible given the
+information state at T0. What we *should* have done is structurally
+different: change the **meta-process** so each subsequent bug discovery
+would have been faster, and so cascade relationships would have been
+caught at design time instead of after a build-and-rerun cycle.
+
+### What we should have done first (in priority order)
+
+#### 1. Add deadline enforcement (Next Steps item 7) as PR #0
+
+The single highest-leverage change. The `kv_transfer_timeout_ms` knob
+is already plumbed through Python config, the C++ config class,
+serialization, and getters/setters — it is just never consumed in the
+request execution path. Even Layer A alone (the ~1-week Python-level
+deadline) would have:
+
+- **Converted every cleanup-path bug from a *silent wedge* into a
+  *per-request error*.** Signatures `#1`, `#5`, `#6`, and `#7` all
+  surface as `kNETWORK_ERROR` 5xx responses with a real exception
+  message instead of the deployment going dark.
+- **Given each subsequent bug an attributable failure point**
+  (`request 4113 timed out in checkGenTransferStatus`) instead of
+  requiring `py-spy` / `gdb` post-mortem to figure out which request
+  was stuck and why.
+- **Given orchestration a real signal** so customers' production
+  wedges self-heal via pod restart while we work on root causes. Field
+  urgency drops from P0 to P2.
+
+The investigation would have shifted from "*the deployment is wedged,
+dump stacks, find the wedged thread*" to "*these 14 requests timed
+out, here are their lifecycle traces*". Phase 5 → Phase 10 of the
+timeline (currently ~6 days) would plausibly have collapsed to ~2
+days.
+
+The deadline enforcement is also retrospectively justified by the
+investigation itself: signature `#7` is the only signature TRT-LLM
+cannot fix at the source, and the deadline is the *only* TRT-LLM-side
+defence against it. We would have built this layer eventually anyway.
+Building it first makes everything else trivially debuggable.
+
+#### 2. Write down the seven invariants first, fix against them
+
+If the seven contracts in the Architectural Reflections section had
+been written down at T0 — even just as a paragraph in the
+disaggregated-serving developer guide — three concrete cascade
+relationships would have been caught at review time instead of after
+days of reproduction:
+
+- **`#5` would have been caught at `#1`'s PR review.** "This is the
+  sender-side fix for the missing-promise-fulfillment invariant; the
+  receiver-side mirror is structurally identical — fix both at once."
+  Two PRs collapse into one.
+- **`#6` would have been caught at `#1`'s PR review.** "The new
+  `!isReady` path on the receiver — under the 'every acquired resource
+  must release on every exit path' invariant, does it release every
+  resource the success path releases?" Type 1 cascade prevented at
+  design time, not after a 2-day reproduction cycle.
+- **`#4` would have been visible to any code search for unconditional
+  `future.get()`.** Under the "every blocking wait must be
+  interruptible" invariant it is a bug regardless of whether it
+  currently fires; a sweep against the invariants would have caught
+  it as a latent issue before the field hit it.
+
+The cost is a single document edit. The benefit is preventing the
+entire Type 1 cascade and most of the Type 2 cascades documented in
+the Signature Taxonomy and Cascade Map section above.
+
+#### 3. Add the cancel-during-transfer integration test first
+
+The single largest test-coverage gap surfaced by this investigation
+is the cancel-during-transfer load shape (long prompts, high
+concurrency, aggressive client timeouts, retries). If that test had
+existed at T0, all six TRT-LLM signatures would have been visible
+**as test failures in CI** instead of as a customer field hit. Even
+signature `#3` (currently field-only) would plausibly have been
+reproducible. The investigation would not have needed external
+infrastructure (Dynamo, mpi4py worker dumps, NIXL trace correlation,
+`py-spy` / `gdb` post-mortem).
+
+The cost is moderate (a few hundred lines of integration test
+infrastructure plus a CI lane to run it). The ongoing benefit is
+huge: every future PR that touches the disaggregated path is gated
+against this load shape.
+
+### What this implies for next time
+
+The cleaner approach is not a different *fix*; it is a different
+**order of operations**:
+
+```text
+What we did:
+    field hit → reproduce → find bug N → fix bug N → repeat 7 times
+        ↓
+    ~6 days, 6 cascading PRs, NIXL bug discovered last as a surprise
+
+What we should have done:
+    field hit → containment layer (deadline enforcement, ~1 week)
+              → integration test for the load shape (~few days)
+              → write down the seven invariants (~hours)
+              → bugs become CI-visible and individually attributable
+              → fix them in any order, each PR reviewable against invariants
+              → Type 1 cascade caught at review time, not after rebuild + rerun
+        ↓
+    same 7 signatures, identified in parallel from one CI run,
+    fixed individually but with no cascade surprises
+```
+
+The key insight is that the bottleneck of the investigation was
+**observability and attribution**, not fix complexity. Each fix
+individually is small (`#1` is ~5 lines, `#4` is ~17 lines, `#5` is
+~20 lines, `#6` is the largest at ~80 lines including the RAII
+helper). What ate the calendar time was not writing the fixes — it
+was figuring out what was wedged, why, and which fix to write next.
+The three meta-process changes above all attack that bottleneck
+directly.
+
+### What this section is *not* arguing
+
+A few clarifications to avoid over-reading the retrospective:
+
+- **It is not arguing for a `TransferSession` rewrite as PR #0.**
+  That refactor is still the right long-term direction (see "What
+  this implies for follow-up work" in Architectural Reflections), but
+  it is a separate, larger project that should follow the
+  per-signature fixes once the contracts are stable, not replace
+  them.
+- **It is not arguing that one PR could have fixed all seven
+  signatures.** Six of them are real, distinct bugs in different
+  functions, and `#7` lives in NIXL. They genuinely need separate
+  fixes. The argument is about how *quickly* they would have been
+  found and how *cleanly* they would have been reviewed, not about
+  collapsing them into a single patch.
+- **It is not arguing that the sequential discovery was avoidable in
+  absolute terms.** It was avoidable *given the meta-process changes
+  above*, but not avoidable given the meta-process we actually had.
+  The retrospective is about what we should change for the *next*
+  investigation of this shape, not about whether this one could have
+  been done differently after T0 with the same tooling.
+
+---
+
 ## Architectural Reflections — What Was Missing in the First Place
 
 A reasonable question to ask after this many cascading bugs is: *why are
