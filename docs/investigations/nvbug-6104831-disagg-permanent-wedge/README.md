@@ -993,6 +993,174 @@ ultimate fix.
 
 ---
 
+## Signature Taxonomy and Cascade Map
+
+A natural high-level question after reading the seven signatures is:
+*are they all triggered by the same thing, and do the fixes interact?*
+Both halves of that question have a precise answer worth writing down,
+because the answer governs how to split PRs, how to write regression
+tests, and how to interpret a future field hit.
+
+### What each signature is actually triggered by
+
+It is tempting to summarise the whole investigation as "burst of traffic
+→ timeouts → cancellations → mishandling". That is right for the
+*majority* of signatures but is not literally true for all seven. The
+honest taxonomy is:
+
+| Sig | Category | Triggered by |
+|---|---|---|
+| `#1` | **Cancellation-handling** (direct) | Sender erases `(req, promise)` entry on cancel-after-ready without fulfilling the promise → `Broken promise`. Needs a real cancellation in flight. |
+| `#3` | **Cancellation-handling** *(hypothesised)* | Field-only `bad optional access`. Hypothesised to be a downstream consequence of `#1`/`#4`/`#5` leaving a request half-initialised. NIXL-layer stranding (`#7`) is a second candidate trigger now that we know about it. |
+| `#5` | **Cancellation-handling** (direct) | Receiver `cancelRequest()` erases queued `(req, promise)` without fulfilling the promise — exact mirror of `#1`. Needs a real cancellation against a still-queued request. |
+| `#6` | **Cancellation-handling** (cascade) | Lives in the `!isReady` early return of the receiver. That branch is only reached *after the `#1` fix is in place* and the sender sends `is_ready=false`. Needs a cancel-after-ready in flight, plus the `#1` fix as a prerequisite. |
+| `#4` | **Structural, exposed by cancellation** | Pure structural defect: unconditional `future.get()` on a future that may not be ready. Doesn't *need* cancellation to exist; any reason a receiver-side future stays unresolved trips it. In practice on `rc11` the unresolved future is created by `#1`/`#5`/`#6`, which all are cancellation-driven. |
+| `#2` | **Eviction-driven, not cancellation-driven** | KV-block trie inconsistency surfaced via `freeBlockAndAllDescendants → detachDescendantsFromLookupTree`. Triggered by block eviction under memory pressure, *not* by cancellation. Burst traffic happens to drive frequent eviction (especially with prefix-overlapping prompts at high concurrency), so it shares the "burst exposes it" property, but it would also fire under any sustained workload with heavy eviction. |
+| `#7` | **NIXL-internal contention** | NIXL UCX-internal `pthread_mutex_lock` deadlock inside `nixlUcxThreadEngine::getNotifs()`. The customer load shape that triggers it includes cancellations, but the NIXL bug could be a pure lock-ordering issue between concurrent send + receive paths that would also fire under a different high-concurrency pattern. We don't have NIXL-internal visibility to say for sure. Safe to call it *contention-driven*; not safe to call it *strictly cancellation-driven*. |
+
+So the right one-sentence summary is: **four-of-seven (#1, #3, #5, #6)
+are cancellation-handling bugs; #4 is a latent blocking bug that
+cancellations expose; #2 is an eviction bug that burst traffic exposes
+via memory pressure; #7 is a NIXL-internal deadlock that the same
+load shape happens to trigger but which is not strictly a cancellation
+bug**.
+
+### Refined trigger chain
+
+```text
+long prompts                                         (~8K tokens, gauss(8000, 2000))
+  + high concurrency                                 (CONC=16)
+  + aggressive client-side timeouts                  (60 s wall, with retries)
+  + retries on every timeout
+        ↓
+high cancellation rate    +    frequent eviction
+        ↓                              ↓
+cleanup paths exercised       trie eviction exercised
+in volume                     in volume + memory pressure
+        ↓                              ↓
+sig #1 / #5 / #6 fire         sig #2 fires
+        ↓
+sig #4 exposed by unresolved futures from #1 / #5 / #6
+        ↓
+sig #3 exposed in decode by half-initialised state
+        ↓
+NIXL contention pattern                              (parallel path,
+        ↓                                             same load shape)
+sig #7 fires in NIXL UCX internal mutex
+```
+
+Two specific corrections to the naïve "burst → cancellation → bug"
+chain are worth being precise about:
+
+1. **Burst of traffic alone is not the trigger; aggressive client
+   timeouts + retries are.** Without aggressive client-side timeouts,
+   even a long burst at concurrency=16 would not produce the
+   cancellation rate that exercises the cleanup paths in volume.
+   Customers running production-grade serving with aggressive timeouts
+   is what surfaces the cleanup-path bugs; CI's integration tests
+   without aggressive timeouts is what hid them. (This is the same
+   point as the "test pyramid is wrong" item in the Architectural
+   Reflections section, said one layer up.)
+2. **"Cancellation" is itself one of several entry points to cleanup
+   paths.** Cancellations come from client HTTP disconnects,
+   client-side timeouts that become server-side cancellations,
+   server-side `kv_transfer_timeout_ms` *(not enforced today — see
+   Next Steps item 7)*, internal aborts from downstream errors,
+   block eviction under memory pressure (`#2`'s entry point), and
+   NIXL-internal contention (`#7`'s entry point). The unifying
+   property is **cleanup paths exercised in volume**, not
+   "cancellation" specifically.
+
+### How the signatures and their fixes tangle
+
+The signatures are not independent. A natural follow-up question is
+whether fixing one introduces another, or merely uncovers another
+that was already there. Both happen in this investigation, and the
+distinction matters for review and for how chained PRs are scoped.
+
+#### Type 1 cascade — a fix *produces* a new signature
+
+This is the strict case where a fix changes behaviour such that a
+previously-unreachable code path becomes reachable in production, and
+that code path has a latent bug. The fix isn't *wrong*, but it makes
+a new bug newly observable.
+
+There is **only one such case in this investigation: the `#1` fix
+produces `#6`.**
+
+- Pre-`#1`-fix: the sender on a cancelled-after-ready request just
+  erased the entry without sending anything to the receiver. The
+  receiver therefore never saw `is_ready=false` in production — the
+  receiver's `if (!isReady)` early-return branch was structurally
+  unreachable from the sender's behaviour.
+- Post-`#1`-fix: the sender correctly sends `is_ready=false`. The
+  receiver now hits the `!isReady` branch on every cancelled-after-ready
+  request. That branch returns *without* calling `receiveSync()`, which
+  means `unformat()` doesn't run, which means `freeBufferIndexForRecv()`
+  doesn't run, which means the recv-buffer slot reserved at the top
+  of `sendRequestInfo()` is leaked. With `mRecvBufferCount=1`, one
+  leak permanently wedges the receiver — that's `#6`.
+
+This is why the `#6` PR
+([#13673](https://github.com/NVIDIA/TensorRT-LLM/pull/13673)) is
+**explicitly chained on the `#1` fix PR
+([#13640](https://github.com/NVIDIA/TensorRT-LLM/pull/13640))**: the bug
+only exists in the world where `#1`'s fix is present.
+
+#### Type 2 cascade — a fix *exposes* a pre-existing signature
+
+Here the downstream bug already exists; it just wasn't observable
+because something upstream was masking it. Fixing the upstream removes
+the mask. The downstream bug is **not** a regression of the fix — it
+was a latent pre-existing issue.
+
+| Mask removed | Bug exposed |
+|---|---|
+| `#4` fix (gen event loop no longer self-blocks) | `#5` — the receiver-side broken-promise was already firing, but the polling loop wasn't running to surface it |
+| `#4` fix | `#6` — the recv-buffer leak was already happening, but the gen worker wedged in `#4` before the next request could exhibit the wedge |
+| `#6` fix (gen worker no longer wedges on `assignBufferIndex`) | `#7` — NIXL deadlock was already firing, but `#6` was wedging the gen worker before NIXL's wedge could surface as the *terminal* failure |
+
+Type 2 cascades are what the timeline calls "fix one bug, see the
+next one" — Phase 5 → 7 → 8 → 10 is essentially this pattern
+repeating four times.
+
+#### A subtler third relationship: `#4` as a defensive catcher
+
+`#4` is structurally a *catcher* for any upstream bug that produces a
+never-resolving receiver future. It would have stayed dormant forever
+in a world where no upstream bug created stuck futures. In `rc11` the
+upstream bugs (`#1`, `#5`, `#6`) all do create stuck futures, so `#4`
+fires constantly. After fixing `#1`/`#5`/`#6`, `#4` would have stopped
+firing on its own — but fixing `#4` is *independently valuable* as a
+defensive measure: any *future* bug (yours or someone else's) that
+creates a stuck receiver future would otherwise re-trigger `#4`. The
+`#4` fix is therefore a deliberate piece of defence-in-depth, not just
+a symptomatic patch.
+
+#### Do the fixes overlap in code?
+
+Not in any conflicting way. Mapping fixes to files:
+
+| Sig | File | Function |
+|---|---|---|
+| `#1` | `dataTransceiver.cpp` | `CacheSender::Impl::sendResponse` |
+| `#2` | `templatedTrie.h` | `clearNode` |
+| `#4` | `cacheTransceiver.cpp` | `CacheTransceiver::checkGenTransferStatus` |
+| `#5` | `dataTransceiver.cpp` | `CacheReceiver::Impl::cancelRequest` |
+| `#6` Layer A | `dataTransceiver.cpp` | `CacheReceiver::Impl::sendRequestInfo` |
+| `#6` Layer B | `dataTransceiver.cpp` | `CacheReceiver::Impl::requestSync` |
+
+Same file (`dataTransceiver.cpp`) for `#1`, `#5`, and `#6`, but
+different classes / functions. There are no merge conflicts; the PRs
+apply cleanly to `main` independently. The only structural dependency
+is the `#6` → `#1` chain documented in Type 1 above, and that's
+enforced by the chained PR base, not by line-overlapping diffs. A
+reviewer working through `#13639/#13640/#13674/#13671/#13672/#13673`
+in any order will not see textual conflicts; only `#13673` will fail
+to compile correctly without `#13640` first.
+
+---
+
 ## Why the Existing Tests Did Not Catch This
 
 The disaggregated-serving test suite covered each of these surfaces in
