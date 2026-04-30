@@ -1,8 +1,7 @@
 # NVBug 6104831: Permanent Disaggregated-Serving Wedge in `rc11`
 
 - **Severity:** P0 / Critical
-- **Affected component:** Disaggregated serving (`trtllm-serve` context worker
-  + generation worker + disaggregated front-end), `rc11` baseline
+- **Affected component:** Disaggregated serving (`trtllm-serve` context worker + generation worker + disaggregated front-end), `rc11` baseline
 - **Affected backend:** PyTorch executor, NIXL/UCX KV-cache transceiver
 - **Symptom (customer-facing):** Local 1P1D `trtllm-serve` deployment serves
   the first burst of requests, then stops responding. All probes after the
