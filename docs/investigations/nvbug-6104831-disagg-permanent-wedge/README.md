@@ -81,6 +81,20 @@ labelling we used in the chat session that produced this investigation:
 The mapping of fixes is summarised at the end, in
 [Signature ↔ PR Map](#signature--pr-map).
 
+> **Important caveat (added in Phase 10).** Even with all six TRT-LLM
+> signatures fixed, the local burst-harness reproducer still wedges
+> permanently. Post-mortem `gdb` stack dumps from the `run8` validation
+> show the surviving wedge is *one architectural layer below* TRT-LLM:
+> a NIXL UCX-internal `pthread_mutex_lock` deadlock inside
+> `nixlUcxThreadEngine::getNotifs()` blocks the ctx-side
+> `CacheSender::recvRequestInfo()` indefinitely. The TRT-LLM-side fixes
+> are necessary but not sufficient on their own — the field reproducer
+> will continue to wedge until the NIXL/UCX deadlock is fixed *and*
+> `kv_transfer_timeout_ms` is enforced as a hard deadline on the C++
+> blocking entry points (so a wedged NIXL agent surfaces as a
+> per-request error rather than a global stall). Full evidence is in
+> Phase 10 of the timeline.
+
 > Use this report alongside the upstream investigation for
 > [NVBug 6043291](../nvbug-6043291-zombie-worker-pods/README.md). That bug is
 > about *the engine dying without anyone noticing*; this bug is about
@@ -513,9 +527,16 @@ cancelled-after-ready, observe that the next generation request would
 have blocked in `assignBufferIndexForRecv()` pre-fix and completes
 normally post-fix.
 
-**Status:** Fix is built into the `local/rc11-disagg-repro` worktree;
-`run8` is the first end-to-end validation run with this fix and is
-currently in flight.
+**Status:** Fix is built into the `local/rc11-disagg-repro` worktree.
+`run8` validated the fix at the C++ trace level — every request now
+walks `gen_send_assign_buffer_begin → step → end` cleanly (33/33), and
+the new `gen_request_sync_not_ready_buffers_freed` marker fires on
+every cancelled-after-ready request (3/3 in `run8`). The wedge however
+still occurs at the harness level; the post-mortem stack dumps on the
+ctx worker show the wedge has shifted **off the TRT-LLM transceiver
+entirely** and into a NIXL UCX-internal `pthread_mutex_lock` inside
+`recvRequestInfo()`. See Phase 10 of the timeline below for full
+details.
 
 **PRs:** None yet — will be split into a chained test+fix pair after
 end-to-end validation.
@@ -639,7 +660,7 @@ idle -- permanent wedge`, and two new patterns appear in the C++ traces:
   fires on the receiver's queued-cancel path) and confirms one in-progress
   request is still stuck after `gen_request_sync_begin`. The wedge persists.
 
-### Phase 9 — Signature #6 root cause + fix (T+5 days, *current*)
+### Phase 9 — Signature #6 root cause + fix (T+5 days)
 
 - Add fine-grained instrumentation across the entire `sendRequestInfo()`
   body: `gen_send_validate_support_begin/end`, `gen_send_block_range_begin/end`,
@@ -667,8 +688,156 @@ idle -- permanent wedge`, and two new patterns appear in the C++ traces:
   (Layer B, mirrors `unformat()` via `getPreAssignedBufferId`). New marker
   `gen_request_sync_not_ready_buffers_freed request=R count=N` shows the
   leak path closing on every cancelled request.
-- `run8` is the first end-to-end validation run with this fix, currently
-  in flight.
+- `run8` is the first end-to-end validation run with this fix.
+
+### Phase 10 — `run8` validation: signature `#6` confirmed fixed, wedge driver pivots to NIXL/UCX (T+6 days, *current*)
+
+`run8` was run end-to-end with the signature `#6` Layer-A + Layer-B fix in
+place plus the new `[promise-trace]` markers. The harness reported
+`NO RECOVERY after 180s idle -- permanent wedge`, but the C++ trace
+counts and post-mortem stack dumps show that the wedge mechanism has
+**shifted off the TRT-LLM transceiver entirely**.
+
+#### Per-marker accounting (gen worker, `run8`)
+
+| marker | count | meaning |
+|---|---:|---|
+| `gen_request_enqueue` / `gen_request_dequeue` | 33 / 33 | every request is queued and pulled by the receiver worker |
+| `gen_request_sync_begin` / `gen_request_sync_end` | 33 / 33 | every request enters and exits `requestSync()` cleanly |
+| `gen_send_assign_buffer_begin` / `step` / `end` | 33 / 33 / 33 | **no `assignBufferIndex()` `cv.wait` stalls** (signature `#6` fix verified) |
+| `gen_request_sync_not_ready_buffers_freed` | 3 | new explicit free in the `!isReady` early return is firing on every cancelled-after-ready request |
+| `gen_request_promise_set_value` | 33 | every requester-side promise is fulfilled |
+| `gen_receive_sync_begin` / `gen_receive_sync_end` | 30 / 30 | 30 of 33 reach `receiveSync()`; the other 3 are the cancelled-after-ready cases |
+| `gen_future_get_ok` / `gen_future_get_exception` | 16 / 0 | only 16 of the 30 receiver-side futures are observed ready by `checkGenTransferStatus()` |
+
+#### Per-marker accounting (ctx worker, `run8`)
+
+| marker | count | meaning |
+|---|---:|---|
+| `create` | 43 | sender-side promises created |
+| `send_response_ready` | 33 | 33 requests reached the ready-signal dispatch |
+| `send_sync_begin` / `promise_set_value` / `future_get_ok` | 30 / 30 / 30 | 30 successful sends |
+| `mark_cancelled` / `cancel_rejected` | 12 / 40 | client-side cancels in flight; `cancel_rejected` counts the races where the request is no longer in the queue |
+| `promise_set_exception` / `future_get_exception` | 3 / 3 | signature `#1` fix path firing on cancelled-after-ready (ctx side) |
+| `drop_without_fulfill` | 3 | (see "trace marker correction" below — these are *not* drops) |
+
+#### Stack-trace evidence: the wedge is one layer below TRT-LLM
+
+Once the harness reported `NO RECOVERY`, `py-spy dump` and
+`gdb -p ... thread apply all bt` were run against both the gen-side and
+ctx-side mpi4py-spawned executor workers. The gen-side `CacheReceiver`
+request thread is parked correctly on its own `cv` waiting for new
+work — the receiver side is healthy. The actual wedge is on the
+**ctx-side `dataTransResp` thread**, stuck inside NIXL UCX:
+
+```text
+CacheSender::Impl::response()                                       [ctx, "dataTransResp"]
+  → CacheSender::Impl::recvRequestInfo()
+    → AgentConnectionManager::recvConnectionAndRequestInfo()
+      → AgentConnectionManager::updateUnhandledNotifications()
+        → NixlTransferAgent::getNotifiedSyncMessages()
+          → nixlAgent::getNotifs()
+            → nixlUcxThreadEngine::getNotifs()
+              → pthread_mutex_lock                 ← STUCK indefinitely
+```
+
+Two further ctx-side threads confirm the deadlock is internal to the
+NIXL UCX plugin (and not in TRT-LLM code):
+
+| thread | stack (top-most TRT-LLM/NIXL frame) |
+|---|---|
+| `nixl-comm-worker` | `nixlAgentData::commWorkerInternal()` → `sched_yield()` (NIXL spin) |
+| `nixl-ucx-shared` | `nixlUcxSharedThread::run()` → `nixlUcxWorker::arm()` → `ucp_worker_arm()` → `read(fd=129)` |
+| `dataTransResp` | `pthread_mutex_lock` inside `nixlUcxThreadEngine::getNotifs()` |
+
+This explains the otherwise-puzzling marker accounting:
+
+- The first 33 requests slipped through the request handshake before
+  NIXL got stuck (hence `gen_send_request_info_end:33`,
+  `gen_wait_ready_signal_end:33`).
+- Once NIXL deadlocks on its own internal mutex, `recvRequestInfo` on
+  the ctx side can't drain notifications anymore. From the gen side,
+  every subsequent `sendRequestInfo` either blocks on the recv-buffer
+  cv-wait (formerly signature `#6`, now fixed) or is silently never
+  acknowledged by ctx.
+- The harness's recovery probes (issued *after* the burst window) never
+  succeed because the ctx-side NIXL agent stays deadlocked for the
+  entire 180 s idle period.
+
+Stack-trace artifacts:
+`/home/.../disagg-investigation-archive/run8_sig6_fix/pyspy/`
+contains `gen_worker_*_gdb.txt` (gen worker, all-thread bt) and
+`ctx_worker_*_gdb.txt` (ctx worker, all-thread bt — contains the NIXL
+mutex frame).
+
+#### Trace marker correction: the `drop_without_fulfill` log line
+
+The 3 `drop_without_fulfill` events on the ctx side **are not actual
+drops**. The marker name is a leftover from before the signature `#1`
+fix landed, and currently fires on the line *immediately above* the new
+`set_exception(kNETWORK_ERROR)` call in
+`CacheSender::Impl::sendResponse()`. In other words, every
+`drop_without_fulfill` event is followed in the next 3 lines by the
+correct `promise_set_exception` + `future_get_exception` pair. The
+counts match: 3 / 3 / 3. There is no signature `#7a`; the marker should
+be renamed `cancelled_after_ready_handled` in a follow-up cleanup.
+
+#### Status of the suspected signature `#7b`
+
+The 14-future gap (`gen_receive_sync_end:30` vs
+`gen_future_get_ok:16`) on the gen side is real but, given the
+NIXL-layer evidence above, is best understood as a *downstream symptom*
+of either:
+
+1. The NIXL/UCX wedge — `receiveSync()` returns once the UCX recv has
+   been *posted*, but the actual UCX progress thread that would fire the
+   completion may itself be blocked by the same internal mutex contention,
+   leaving the receiver-side future technically `not_ready` even though
+   the upstream code already moved on; or
+2. The unresolved C++ ↔ Python lifetime ownership debt (the first
+   architectural invariant in the section above) — `mRequesterFutures`
+   stores raw `LlmRequest*`, and if Python releases its
+   `shared_ptr<LlmRequest>` mid-poll the consumer iteration becomes
+   undefined behaviour, with "future never observed" being one possible
+   visible outcome.
+
+Either way, the pragmatic conclusion is the same: **once NIXL/UCX is
+known to deadlock under cancel-during-transfer load, every TRT-LLM-level
+defense for that load must take a deadline / cancel token.** Adding more
+C++ markers around `set_value()` to disambiguate (1) vs (2) above is
+deferred until the NIXL-level deadlock has either been fixed or worked
+around with a hard `kv_transfer_timeout_ms` enforcement at the
+transceiver boundary.
+
+#### Updated wedge-driver picture
+
+Before this investigation: the wedge looked like a TRT-LLM-only set of
+six signatures (one assertion, three promise-lifetime issues, one
+blocking-wait issue, one resource-leak issue). After this investigation
+and the `run8` post-mortem:
+
+- Signatures `#1`, `#2`, `#4`, `#5`, `#6` are real TRT-LLM bugs and are
+  fixed by the chained PRs documented below. Their fixes are necessary.
+- Signature `#3` is a visibility issue, mitigated by upstream PRs not
+  in `rc11`.
+- Signatures `#7a` and `#7b` as initially suspected do **not** exist
+  as standalone TRT-LLM bugs in the form first hypothesised. `#7a` was
+  a misnamed trace marker; `#7b` is best treated as a downstream
+  symptom of the NIXL-layer deadlock (or, secondarily, of the
+  C++/Python ownership debt).
+- The actual *terminal* wedge driver under combined cancel + retry +
+  long-prompt load is a NIXL UCX-internal `pthread_mutex_lock`
+  contention on the ctx side. This is one architectural layer below
+  TRT-LLM and needs both a NIXL-level fix and a TRT-LLM-level
+  defensive deadline.
+
+This pivot is the single biggest update from the original investigation
+plan: the chained PRs land all the necessary TRT-LLM fixes, but they
+are not sufficient on their own — the field reproducer will continue to
+wedge until the NIXL/UCX deadlock is addressed and `kv_transfer_timeout_ms`
+is enforced as a hard deadline on `recvRequestInfo()` /
+`receiveSync()` so a stuck NIXL agent surfaces as a per-request error
+rather than a global wedge.
 
 ---
 
@@ -935,6 +1104,27 @@ In rough priority order:
    request-side state, etc.). The `#6` pattern — "fix the visible failure
    path on side A, surface a resource leak on side B" — is likely to repeat
    if other paths share the same RAII gap.
+7. **Enforce `kv_transfer_timeout_ms` as a hard deadline** on the C++
+   blocking entry points of the transceiver — primarily
+   `CacheSender::Impl::recvRequestInfo()` and `receiveSync()`. The `run8`
+   stack dumps show that with the current code path a NIXL UCX-internal
+   `pthread_mutex_lock` deadlock can wedge the entire ctx-side
+   `CacheSender::response()` thread indefinitely. With a deadline, the same
+   condition would surface as a per-request `kNETWORK_ERROR` and let the
+   client retry, instead of producing a global silent wedge.
+8. **File a NIXL/UCX bug** with the canonical reproducer being the
+   `ctx_worker_*_gdb.txt` stack from the `run8` archive. The wedge
+   originates inside the NIXL UCX plugin
+   (`nixlUcxThreadEngine::getNotifs()` blocked on `pthread_mutex_lock`),
+   not in TRT-LLM. Until that is addressed, any TRT-LLM defense is purely
+   damage-mitigation.
+9. **Rename the misleading `drop_without_fulfill` trace marker.** As
+   noted in Phase 10, the marker fires immediately *before* the
+   signature `#1` cancellation handler that already fulfills the
+   promise correctly. The 3 events per `run8` are the fix path doing
+   its job, not actual drops. Renaming to
+   `cancelled_after_ready_handled` removes the false-positive in future
+   forensic readings.
 
 ---
 
@@ -958,9 +1148,14 @@ In rough priority order:
     stall to the first `assignBufferIndexForRecv()` call for the next
     request after a leak. Logs preserved under `.repro/logs/` in the
     `local/rc11-disagg-repro` worktree (`run7_sig6_instr/`).
-  - `run8` (post-signature-#6 fix end-to-end validation): in flight at the
-    time of writing. Logs at `.repro/logs/run8_sig6_fix/` in the same
-    worktree.
+  - `run8` (post-signature-#6 fix end-to-end validation): completed.
+    Signature `#6` fix verified at the C++ trace level; harness-level
+    wedge persists with the wedge driver shifted to a NIXL UCX-internal
+    mutex contention on the ctx side. Logs and post-mortem stack dumps
+    archived at
+    `~/disagg-investigation-archive/run8_sig6_fix/` (includes
+    `pyspy/gen_worker_*_gdb.txt`, `pyspy/ctx_worker_*_gdb.txt` —
+    the latter is the canonical NIXL deadlock evidence).
 - New unit tests:
   - `cpp/tests/unit_tests/runtime/radixBlockTreeTest.cpp` (signature #2).
   - `tests/unittest/others/test_kv_cache_transceiver.py::test_cancel_request_in_transmission_fulfills_sender_future`
