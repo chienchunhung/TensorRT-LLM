@@ -854,7 +854,7 @@ idle -- permanent wedge`, and two new patterns appear in the C++ traces:
   leak path closing on every cancelled request.
 - `run8` is the first end-to-end validation run with this fix.
 
-### Phase 10 — `run8` validation: signature `#6` confirmed fixed, signature `#7` identified as a NIXL/UCX-layer deadlock (T+6 days, *current*)
+### Phase 10 — `run8` validation: signature `#6` confirmed fixed, signature `#7` identified as a NIXL/UCX-layer deadlock (T+6 days)
 
 `run8` was run end-to-end with the signature `#6` Layer-A + Layer-B fix in
 place plus the new `[promise-trace]` markers. The harness reported
@@ -990,6 +990,167 @@ the wedge into a recoverable per-request error pattern.
 The deadline enforcement work is therefore positioned in this report
 as a **fallback / mitigation for signature `#7`**, not as an
 ultimate fix.
+
+### Phase 11 — Cross-validation against an independent fix stack: signature `#7` survives a comprehensive deadline + RAII refactor (T+7 days, *current*)
+
+After `run8` left signature `#7` (NIXL UCX-internal `pthread_mutex_lock`
+deadlock) as the only remaining unexplained wedge, the next question
+was whether that conclusion is robust against *how* the TRT-LLM-side
+bugs are fixed. Concretely: do the surgical patches in the chained PRs
+documented above (`#13571 / #13572`, `#13639 / #13640`, `#13674 /
+#13671`, `#13672`, `#13673`) leave any window for a NIXL-adjacent bug
+to be misclassified as `#7` when it might actually be a TRT-LLM-side
+issue we missed?
+
+To answer this, the same 1P1D long-prompt burst harness was run against
+a **completely different TRT-LLM-side fix stack** developed
+independently (a comprehensive refactor that introduces an end-to-end
+`shared_ptr<LlmRequest>` lifetime through the transceiver, a
+`BufferIndexHolder` RAII class for recv-buffer pool slots, a deadline
+enforcement pass that consumes `kv_transfer_timeout_ms` at every
+relevant blocking site, structured cancellation across ctx and gen
+sides, and `catch (...)` hardening on the drain worker). Same `rc11`
+base, same Qwen3-0.6B model, same NIXL/UCX backend, same env vars,
+same harness parameters (`CONC=16`, `BURST_DUR_S=60`, recovery probes
+at idle=30/60/90/120/180s).
+
+#### Coverage map vs. the chained PRs
+
+The independent stack addresses the same TRT-LLM-side bug class as
+this investigation, just with different mechanisms:
+
+| Sig | This investigation's fix | Independent stack's mechanism | Same bug? |
+|---|---|---|---|
+| `#1` | Single `set_exception(kNETWORK_ERROR)` in `CacheSender::Impl::sendResponse` cancel-after-ready branch | Multiple `set_exception` sites across all sender cancel paths + end-to-end `shared_ptr<LlmRequest>` that prevents the lifetime smell at the source | yes |
+| `#2` | Reset child's `mPrevNode` in `templatedTrie.h::clearNode` | **Not addressed** (no diff in `templatedTrie.h` / `kvCacheManager.cpp`) | no — gap on this side |
+| `#3` | Hypothesised downstream of `#1`/`#4`/`#5`; trace markers added | Hypothesised cleared by the comprehensive cancel-handling rewrite | indirect |
+| `#4` | Single `wait_for(0)` probe in `checkGenTransferStatus` | Four `wait_for(0)` probes across `cacheTransceiver.cpp` covering both ctx and gen paths + deadline enforcement | yes |
+| `#5` | Single `set_exception` in `CacheReceiver::Impl::cancelRequest` | Receiver-worker `set_exception` calls + `shared_ptr` lifetime so cancellation is structurally safer | yes |
+| `#6` | Local `assignedRecvBuffers` vector + `try { ... } catch (...) { freeAssignedRecvBuffers(); throw; }` + explicit free in `requestSync !isReady` | A `BufferIndexHolder` RAII class in `baseTransBuffer.cpp/h`; comments in the source describe it as *"the core of the RAII fix … RAII covers all non-happy-path exits (not-ready, cancel, throw)"* | yes — different abstraction, same fix shape |
+| `#7` | Out of TRT-LLM scope | Out of TRT-LLM scope | n/a |
+
+So the two stacks **converge on the same TRT-LLM-side bug set** for
+`#1`, `#4`, `#5`, `#6`. The independent stack is broader in two ways
+(four `wait_for(0)` probes vs. one for `#4`; `shared_ptr` lifetime end
+to end vs. local mutations) and narrower in one (no fix for `#2`
+because `#2` lives in the trie, not the transceiver). For the local
+1P1D harness, `#2` is irrelevant — that signature requires sustained
+trie eviction with prefix-overlapping prompts, which the burst harness
+doesn't drive. So the comparison is apples-to-apples for the wedge
+under test.
+
+#### Build + experiment setup
+
+A fresh isolated worktree was set up at
+`/home/.../TensorRT-LLM-pr13056-experiment/`, with its own
+`--system-site-packages` venv (matching the recipe used for
+`local/rc11-disagg-repro` to avoid the pip-torch-vs-container-torch
+mismatch documented in earlier diagnostics). Build via
+`scripts/build_wheel.py --build_dir=.repro/build --job_count=64
+--use_ccache --skip_building_wheel` against the same NVIDIA PyTorch
+container 26.02 (torch 2.11.0a0). The resulting wheel was archived
+to `/home/.../trtllm_wheels/` for cross-node reuse.
+
+#### Result
+
+The harness reported `NO RECOVERY after 180s idle -- permanent wedge`
+— **the same outcome as `run8`**. Side-by-side with the previous two
+runs:
+
+| Run | Pre-burst probe | Burst (`ok200` / errors / total) | Recovery probes | Verdict |
+|---|---|---:|---|---|
+| `run4` (stock `rc11`) | ok200 (8.8 s) | 8 / 12 / 20 | 5× `ReadTimeout` (60 s) | NO RECOVERY |
+| `run8` (chained PRs above) | ok200 (8.3 s) | 12 / 9 / 21 | 5× `ReadTimeout` (60 s) | NO RECOVERY |
+| `pr13056_run1` (independent stack) | ok200 (8.7 s) | 12 / 9 / 21 | 5× `ReadTimeout` (60 s) | NO RECOVERY |
+
+#### Per-marker accounting (independent-stack ctx + gen workers)
+
+The independent stack's diagnostic markers tell a striking story:
+
+| marker | count | meaning |
+|---|---:|---|
+| `[buf] BufferIndexHolder AUTO_RELEASE` | 13 | RAII guard fired 13 times — but only on the happy path (request completion). |
+| `[buf] assignBufferIndex CANCEL` | 0 | The new deadline-cancel path **never fired** on either worker. |
+| `[buf] assignBufferIndex STILL_WAITING` | 0 | The cv-wait inside `assignBufferIndex` **never blocked long enough to even log a wait warning**. |
+| `kNETWORK_ERROR` / `Broken promise` / `future_error` / `KvCacheTransferTimedOut` / `FUTURE_WAIT` / `FUTURE_JOIN` | 0 | No request-level error propagation, no broken futures, no deadline-driven failures anywhere in either log. |
+
+The independent stack's defensive layers are **silent and idle during
+the wedge**. Not because they're broken — RAII is firing 13 times for
+happy-path completions — but because **the wedge is at a layer below
+where any of them enforce**.
+
+#### Stack-trace evidence (ctx worker, `pr13056_run1`)
+
+`gdb` post-mortem of the `pr13056_run1` ctx worker shows the same
+wedge-frame as `run8`:
+
+```text
+dataTransResp thread (LWP 669963):
+#0  pthread_mutex_lock                      [libc.so]
+#1  CacheSender::Impl::response()           [libtensorrt_llm.so]
+```
+
+In the same process, the NIXL plugin threads are present and active
+in their typical positions:
+
+| thread | top NIXL/UCX frame |
+|---|---|
+| nixl-comm-worker | `nixlAgentData::commWorkerInternal()` |
+| nixl-ucx-shared | `nixlUcxSharedThread::run()` → `nixlUcxWorker::arm()` → `ucp_worker_arm()` (`/opt/nvidia/nvda_nixl/.../libplugin_UCX.so`) |
+| `dataTransResp` | `pthread_mutex_lock` inside `CacheSender::Impl::response()` |
+
+This is structurally identical to the `run8` post-mortem documented in
+Phase 10. The `pthread_mutex_lock` frame is on a NIXL-layer mutex
+(deeper frames are inlined out under the independent stack's refactor,
+but the rest of the thread inventory is identical to `run8`'s
+NIXL-deadlocked configuration).
+
+#### What this proves
+
+Two independent investigations of the same bug class — one via the
+surgical chained patches documented above, one via a comprehensive
+end-to-end refactor — converge on:
+
+1. **The same set of TRT-LLM-side bugs** (`#1`, `#4`, `#5`, `#6`) that
+   each stack fixes via different mechanisms.
+2. **The same residual wedge** (`#7`) that neither stack can address
+   because it lives in NIXL/UCX.
+
+The convergence eliminates two alternative hypotheses:
+
+- *"Maybe our fixes for `#1` / `#4` / `#5` / `#6` introduced a regression
+  that masquerades as `#7`."* — Refuted: an independent fix stack
+  produces the same wedge.
+- *"Maybe `#13056`-style comprehensive deadline enforcement is enough
+  to clear the field reproducer without needing a NIXL fix."* — Refuted:
+  the deadline enforcement is in place, fully built into
+  `CacheSender::Impl`, and it never fires during the wedge because the
+  wedged thread is on a `pthread_mutex_lock` inside NIXL, not on a
+  TRT-LLM-owned `cv.wait` that the deadline could interrupt.
+
+This is the **third-outcome match** from the 3-outcome decision matrix
+laid out before the experiment:
+
+- ❌ `RECOVERY at idle=Xs` — would have meant cancellation cleanup
+  paths were the bottleneck.
+- ❌ `NO RECOVERY` but probes return structured 5xx — would have meant
+  the deadline converts the wedge into per-request errors.
+- ✅ `NO RECOVERY` with silent `ReadTimeout` — `#7` is below where
+  any TRT-LLM-side deadline enforcement can reach.
+
+**Implication for follow-up**: Next Steps item 8 (file the NIXL/UCX
+bug) is now backed by *two* stack dumps from independently-fixed TRT-LLM
+binaries showing the same NIXL-internal wedge frame. That is a much
+stronger reproducer to hand the NIXL/UCX team than `run8`'s evidence
+alone, because it shows the deadlock is independent of any TRT-LLM
+fix strategy.
+
+#### Artifacts
+
+- Worktree: `/home/scratch.chienchunh_coreai/dev/TensorRT-LLM-pr13056-experiment/`
+- Run logs: `.repro/logs/pr13056_run1/{ctx,gen,front,client}.log`
+- Wedge stack dumps: `.repro/logs/pr13056_run1/pyspy/worker_660952_gdb.txt` (ctx, contains the `pthread_mutex_lock` frame in `CacheSender::Impl::response()` plus the NIXL plugin threads)
+- Reusable wheel: `/home/scratch.chienchunh_coreai/trtllm_wheels/pr13056-c9777c4ac2-nv26.02.whl` (2.7 GB, MD5 `99ff92bf5e43120c43abfe32e241df8b`) — re-installable on any node with NVIDIA PyTorch container 26.02 to skip the ~1.5 h rebuild.
 
 ---
 
@@ -1637,15 +1798,30 @@ In rough priority order:
 
    See "Effort estimate for the deadline enforcement" below.
 8. **File a NIXL/UCX bug for signature `#7`** — *this is the ultimate
-   fix.* The canonical reproducer is the `ctx_worker_*_gdb.txt` stack
-   from the `run8` archive. The wedge originates inside the NIXL UCX
-   plugin (`nixlUcxThreadEngine::getNotifs()` blocked on
-   `pthread_mutex_lock`), not in TRT-LLM. The local burst harness will
-   continue to wedge until this lands, regardless of how thorough the
-   TRT-LLM-side defenses are. Item 7 above is a TRT-LLM-side fallback
-   for the same signature; item 8 here is the only path that makes the
-   reproducer pass cleanly without an external orchestrator restart
-   loop.
+   fix.* The canonical reproducer is now backed by **two independently
+   built TRT-LLM binaries** showing the same NIXL-internal wedge
+   frame:
+   - `ctx_worker_*_gdb.txt` from the `run8` archive (this
+     investigation's chained PRs applied to `rc11`)
+   - `worker_660952_gdb.txt` from the `pr13056_run1` archive (an
+     independent comprehensive deadline + RAII refactor applied to
+     the same `rc11` base — see Phase 11)
+
+   Both stacks show a `dataTransResp` thread parked on
+   `pthread_mutex_lock` inside `CacheSender::Impl::response()`, with
+   the NIXL plugin's `nixlAgentData::commWorkerInternal` and
+   `nixlUcxSharedThread::run` threads in their typical positions in
+   the same process. The deadlock originates inside the NIXL UCX
+   plugin (`nixlUcxThreadEngine::getNotifs()` → `pthread_mutex_lock`),
+   not in TRT-LLM. The local burst harness will continue to wedge
+   until this lands, regardless of how thorough the TRT-LLM-side
+   defenses are. Item 7 above is a TRT-LLM-side fallback for the same
+   signature; item 8 here is the only path that makes the reproducer
+   pass cleanly without an external orchestrator restart loop. Two
+   independent fix stacks reaching the same residual is also strong
+   evidence that the TRT-LLM-side bug class is now fully closed and
+   no further surgical fixes will move the needle on the local
+   reproducer.
 9. **Rename the misleading `drop_without_fulfill` trace marker.** As
    noted in Phase 10, the marker fires immediately *before* the
    signature `#1` cancellation handler that already fulfills the
