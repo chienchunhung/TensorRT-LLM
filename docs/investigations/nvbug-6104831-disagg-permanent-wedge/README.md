@@ -45,16 +45,24 @@
 - **Status:** All six TRT-LLM signatures (`#1`, `#2`, `#4`, `#5`, `#6`)
   have chained PRs in review. Signature `#3` is field-only and is
   expected to disappear or change shape once `#1`, `#4`, and `#5` land
-  (a `CacheSender::Impl` mutex wedge from `#7` is also a candidate
-  cause; see that signature's section). Signature `#7` (`pthread_mutex_lock`
-  wedge in `CacheSender::Impl::response()`) was initially classified
-  as a NIXL plugin bug in Phases 10–11 and reclassified in Phase 12
-  as a TRT-LLM-side mutex bug exposed by both NIXL and direct UCX
-  backends. The recommended next action is **Next Steps item 7** —
-  pin down the exact mutex with a live `gdb` register inspection and
-  fix the offending lock-ordering in `CacheSender::Impl`. Item 8
-  (`kv_transfer_timeout_ms` deadline) becomes defence-in-depth that
-  bounds this class of bug going forward.
+  (a `CacheSender::Impl` bug-class manifestation is also a candidate
+  cause; see signature `#7`'s section). Signature `#7` was initially
+  classified as a NIXL-plugin `pthread_mutex_lock` deadlock in
+  Phases 10–11, then reclassified in Phase 12 as a TRT-LLM-side
+  mutex bug exposed by both NIXL and direct UCX backends. **Phase 13**
+  broadens the framing further: the `gdb`-instrumented `run9` and
+  `run10` experiments expose two new SIGSEGV manifestations (a
+  Python-`getattr` use-after-free downstream of our fixes, and a
+  null-`shared_ptr<LlmRequest>` deref in `CacheSender::Impl::handleAsyncSend`
+  with PR `#13056`'s code); sig `#7` is now best understood as a
+  **class of bugs in `CacheSender::Impl::*`** with the mutex deadlock
+  as one of four observed manifestations. The recommended next action
+  is **Next Steps item 7** — capture the exact mutex address with a
+  live `gdb` register inspection in a deadlock-variant configuration
+  (NIXL backend or lower `CONC`) and fix the lock-ordering and the
+  `Response::mRequest` invariant in `CacheSender::Impl`. Item 8
+  (`kv_transfer_timeout_ms` deadline) is defence-in-depth that bounds
+  every variant in the bug class.
 
 ---
 
@@ -97,27 +105,35 @@ labelling we used in the chat session that produced this investigation:
 | **#4** | Gen-side blocking hang in `CacheTransceiver::checkGenTransferStatus()` with `atLeastNum=1` | `cacheTransceiver.cpp` unconditional `future.get()` on selected-but-unready future | Local `trtllm-serve` 1P1D repro + Python thread-stack dump |
 | **#5** | Receiver-side `Broken promise` from queued cancel | `CacheReceiver::Impl::cancelRequest()` erasing queued request without fulfilling promise | Post-`#4`-fix C++ trace logs |
 | **#6** | Recv-buffer index leak via `!isReady` early-return; subsequent receives block forever in `BaseTransBufferManager::assignBufferIndex()` | `cpp/tensorrt_llm/batch_manager/baseTransBuffer.cpp` (unbounded `cv.wait`) leaked from `CacheReceiver::Impl::requestSync()` (`!isReady` path) | Fine-grained C++ instrumentation across `sendRequestInfo()` body in `run7` |
-| **#7** | `pthread_mutex_lock` wedge in `CacheSender::Impl::response()` under cancel-during-transfer load; also a variant where the ctx-side mpi4py executor exits unexpectedly | `cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp::CacheSender::Impl::response()`; most plausibly on `mCondMutex` at the top of the response loop | `gdb` post-mortems of `run8` (NIXL backend), `pr13056_run1` (NIXL backend, comprehensive refactor), and `rc11_ucx_run1` (direct UCX backend) all show the same wedge frame |
+| **#7** | A bug class in `CacheSender::Impl::*` C++ code, observed as four manifestations: (a) `pthread_mutex_lock` wedge in `response()` under cancel-during-transfer load; (b) ctx-side mpi4py executor exits unexpectedly; (c) Python-`getattr` SIGSEGV downstream of cancellation cleanup (`run9`); (d) null `shared_ptr<LlmRequest>` deref in `handleAsyncSend` on first request (`run10`) | `cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp::CacheSender::Impl::*`; deadlock variant most plausibly on `mCondMutex` at the top of `response()`'s loop; null-deref variant at `handleAsyncSend`'s `resp.mRequest->mRequestId` | `gdb` post-mortems of `run8` (NIXL), `pr13056_run1` (NIXL + comprehensive refactor), `rc11_ucx_run1` (direct UCX), `run9` (rc11 + our fixes + UCX, ctx Python SIGSEGV), and `run10` (PR `#13056` + UCX, ctx C++ SIGSEGV in `handleAsyncSend`) |
 
 The mapping of fixes is summarised at the end, in
 [Signature ↔ PR Map](#signature--pr-map).
 
 > **Read this caveat before reading anything else.** Signatures `#1`
 > through `#6` are real TRT-LLM bugs and the chained PRs land their
-> fixes. Signature `#7` is the residual wedge that fires under the
-> cancel-during-transfer load shape after `#1`–`#6` are individually
-> fixed. Phases 10 and 11 of the timeline initially classified `#7`
-> as a NIXL UCX-plugin internal mutex deadlock (out of TRT-LLM
-> scope). Phase 12 falsifies that classification: the same
+> fixes. Signature `#7` is the residual class of bugs that fires
+> under the cancel-during-transfer load shape after `#1`–`#6` are
+> individually fixed. Phases 10–11 of the timeline initially
+> classified `#7` as a NIXL UCX-plugin internal mutex deadlock (out
+> of TRT-LLM scope). Phase 12 falsified that classification: the same
 > `pthread_mutex_lock` wedge frame inside
 > `CacheSender::Impl::response()` fires identically on TRT-LLM's
 > direct UCX backend (`rc11_ucx_run1`), in a process where
-> `libnixl.so` is not loaded at all. Sig `#7` is therefore a
-> **TRT-LLM-side mutex bug** in `CacheSender::Impl`, exposed by both
-> NIXL and direct UCX backends, **fixable in TRT-LLM**. The exact
-> mutex (most likely `mCondMutex`) and the holder thread still need
-> to be pinned down via runtime register inspection. Full evidence is
-> in Phases 10–12 of the timeline.
+> `libnixl.so` is not loaded at all. **Phase 13 broadens the framing
+> further**: with a `gdb`-instrumented capture loop, `run9` exposes
+> a Python `getattr` SIGSEGV downstream of our cancellation fixes and
+> `run10` (PR `#13056` + direct UCX) exposes a synchronous C++
+> SIGSEGV inside `CacheSender::Impl::handleAsyncSend` on the *first*
+> request — likely a null `shared_ptr<LlmRequest>` deref. Sig `#7`
+> is therefore a **TRT-LLM-side bug class in `CacheSender::Impl::*`**,
+> with at least four observed manifestations across two transports
+> and three fix bundles, **fixable entirely in TRT-LLM**. The exact
+> mutex in the deadlock variant (most likely `mCondMutex`) and the
+> producer that enqueues a null-`mRequest` `Response` in PR `#13056`'s
+> code path still need to be pinned down via runtime register
+> inspection and source-tracing respectively. Full evidence is in
+> Phases 10–13 of the timeline.
 
 > Use this report alongside the upstream investigation for
 > [NVBug 6043291](../nvbug-6043291-zombie-worker-pods/README.md). That bug is
@@ -678,43 +694,90 @@ perspective the wedge is identical — recovery probes time out
 silently — but the underlying mechanism is process exit rather than
 deadlock. Both manifestations point at the same code region.
 
+**Variant: Python-`getattr` SIGSEGV downstream of cancellation cleanup
+(Phase 13, `run9`).** With our chained fixes for sig `#1`/`#4`/`#5`/`#6`
+applied and the same UCX harness, the ctx mpi4py worker no longer
+deadlocks; instead it `SIGSEGV`s in
+`_PyObject_GenericGetAttrWithDict` → `PyObject_GetAttr` →
+`_PyEval_EvalFrameDefault` at iter 92 of the burst, with the sig `#1`
+fix path (`promise_set_exception` for `cancelled_after_ready_signal`)
+captured cleanly in the promise-trace log immediately before. This
+looks like a Python wrapper around a C++ object being destructed by
+one thread while another still holds a reference; the wedge in
+earlier runs was masking it.
+
+**Variant: null `shared_ptr<LlmRequest>` deref in `handleAsyncSend`
+on the first request (Phase 13, `run10`).** With PR `#13056`'s
+comprehensive `shared_ptr` lifetime + `BufferIndexHolder` RAII +
+deadline enforcement applied and the same UCX harness, the ctx
+mpi4py worker `SIGSEGV`s synchronously inside
+`CacheSender::Impl::handleAsyncSend(AsyncSendResource&)` on the
+**first** sanity-probe request — no concurrency, no burst, no
+cancellation. The MPI segfault handler captures only TRT-LLM frames;
+zero UCX or NIXL frames in the stack. Source inference points at
+[`dataTransceiver.cpp:594`](../../../cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp#L594)
+where `resp.mRequest->mRequestId` is dereferenced; PR `#13056`'s
+shared-ownership model assumes "every `Response` in `mSendQueue` has
+a non-null `mRequest`" but does not enforce that invariant at
+producer or consumer.
+
 **Reproducer:** Same end-to-end 1P1D + long-prompt burst harness.
-Three independently-built TRT-LLM binaries reach the same wedge:
+Five independently-built TRT-LLM binaries reach a manifestation in
+this bug class:
 
 - `~/disagg-investigation-archive/run8_sig6_fix/pyspy/` (NIXL
-  backend; this investigation's chained PRs)
+  backend; this investigation's chained PRs) — mutex-deadlock variant
 - `~/disagg-investigation-archive/pr13056_run1/pyspy/` (NIXL backend;
-  comprehensive refactor variant)
+  comprehensive refactor variant) — mutex-deadlock variant
 - `~/disagg-investigation-archive/rc11_ucx_run1/pyspy/` (direct UCX
-  backend; this investigation's chained PRs)
+  backend; this investigation's chained PRs) — mutex-deadlock variant
+- `~/disagg-investigation-archive/run9_rc11_ourfixes_ucx_segfault/`
+  (direct UCX, this investigation's chained PRs) — Python-`getattr`
+  SIGSEGV variant
+- `~/disagg-investigation-archive/run10_pr13056_ucx_segfault_handleAsyncSend/`
+  (direct UCX, PR `#13056`) — `handleAsyncSend` null-deref variant
 
-The `rc11_ucx_run1` archive is the **single most important artifact**
-for this signature because it shows the wedge in a process where
-`libnixl.so` is not loaded, falsifying the previous "NIXL plugin
-internal mutex" hypothesis.
+The `rc11_ucx_run1` archive remains the **single most important
+artifact** for the deadlock variant (wedge frame in a process with no
+`libnixl.so` loaded). The `run10` archive is the cleanest evidence
+that the bug class is purely TRT-LLM-internal (synchronous C++ crash,
+zero transport-library frames).
 
-**Fix (TRT-LLM scope, with a NIXL-side caveat):** Two layers of
+**Fix (TRT-LLM scope, with a NIXL-side caveat):** Three layers of
 remediation, in priority order:
 
-1. **Pin down the exact mutex** (~30–60 min) by attaching `gdb` to a
-   live wedge, dumping `info registers` for the `dataTransResp`
-   thread, examining the `pthread_mutex_t` at `$rdi`, and finding
-   which other thread's TID matches the mutex's `__owner` field. This
-   identifies whether the conflict is in `mCondMutex`,
-   `mSenderMutex`, or somewhere else, and which code path is holding
-   the lock while blocked downstream.
+1. **Pin down the exact mutex in the deadlock variant** (~30–60 min)
+   by attaching `gdb` to a live wedge, dumping `info registers` for
+   the `dataTransResp` thread, examining the `pthread_mutex_t` at
+   `$rdi`, and finding which other thread's TID matches the mutex's
+   `__owner` field. This identifies whether the conflict is in
+   `mCondMutex`, `mSenderMutex`, or somewhere else, and which code
+   path is holding the lock while blocked downstream. Phase 13
+   attempted this with a `gdb` capture loop but the wedge changed
+   character to a SIGSEGV under the rc11+our-fixes+UCX configuration
+   (`run9`); a follow-on Phase 14 should re-run with the NIXL backend
+   or a lower `CONC` to reach the deadlock variant cleanly.
 2. **Fix the deadlock in `CacheSender::Impl`.** Once the holder is
    identified, the fix is most likely a lock-ordering or
    release-before-blocking-call change in the offending code path.
    This is **fixable in TRT-LLM** without needing a NIXL or UCX
    change.
+3. **Enforce the `Response::mRequest` non-null invariant in
+   `CacheSender::Impl::handleAsyncSend` and at every `mSendQueue`
+   producer site** (Phase 13 follow-up). PR `#13056`'s shared-ownership
+   model is necessary but not sufficient — `run10` shows it can still
+   `SIGSEGV` on the first request via a null `shared_ptr<LlmRequest>`
+   reaching the consumer queue. Add `TLLM_CHECK(resp.mRequest)` at
+   line 594 (`handleAsyncSend`) and at each `mSendQueue.emplace_back`
+   site, then trace the failing case back to its producer.
 
 The previous narrative (file a NIXL/UCX bug, deploy `kv_transfer_timeout_ms`
 as a fallback) was based on the assumption that the mutex was inside
-the NIXL plugin. The `rc11_ucx_run1` evidence falsifies that
+the NIXL plugin. The `rc11_ucx_run1` evidence falsified that
 assumption. The fallback is still useful as defence-in-depth (see
-Effort Estimate Layer B below — it now covers `#7` directly), but the
-"NIXL/UCX bug filing" is **no longer the primary action**.
+Effort Estimate Layer B below — it now covers `#7` directly and
+bounds the worst-case impact of every variant in the bug class), but
+the "NIXL/UCX bug filing" is **no longer the primary action**.
 
 **There is still a possible NIXL/UCX-side issue.** While the wedge
 itself is in TRT-LLM-owned code, the `run8` and `pr13056_run1`
@@ -726,15 +789,27 @@ secondary issue. Worth noting in the NIXL/UCX bug filing but no
 longer the main story.
 
 **Status:** Identified, characterised, and documented. Re-classified
-from "out-of-TRT-LLM-scope NIXL plugin bug" to "TRT-LLM-side
-`CacheSender::Impl` mutex bug, exposed by the cancel-during-transfer
-load shape across both NIXL and direct UCX backends". A targeted
-runtime gdb session to pin down the exact mutex address and holder
-is the recommended next investigation step.
+in Phase 12 from "out-of-TRT-LLM-scope NIXL plugin bug" to
+"TRT-LLM-side `CacheSender::Impl` mutex bug, exposed by the
+cancel-during-transfer load shape across both NIXL and direct UCX
+backends". Phase 13 (`run9` and `run10`) further extends the
+classification to **a class of `CacheSender::Impl::*` bugs with at
+least four observed manifestations** (mutex deadlock, ctx-mpi4py
+exit, Python-`getattr` SIGSEGV, `handleAsyncSend` null deref). A
+targeted runtime `gdb` session to pin down the exact mutex address
+and holder in the deadlock variant remains the highest-leverage
+diagnostic — Phase 14 will re-run under a configuration that
+produces the deadlock variant rather than a SIGSEGV variant
+(NIXL backend, or lower `CONC`).
 
-**PRs:** No TRT-LLM PR open yet. Once the exact mutex and holder are
-identified, the fix is expected to be a small, surgical change in
-`CacheSender::Impl` (estimated ~30–80 lines).
+**PRs:** No TRT-LLM PR open yet. Three follow-up PR scopes are now
+distinguishable: (a) a small, surgical lock-ordering / release-before-
+blocking-call change for the deadlock variant (~30–80 lines, awaits
+the mutex address); (b) a `TLLM_CHECK(resp.mRequest)` precondition
+plus a producer audit for the `handleAsyncSend` null-deref variant;
+(c) an audit of the cancellation cleanup path for use-after-free of
+Python wrappers (the `run9` variant). All three sit inside
+`CacheSender::Impl::*` and `dataTransceiver.cpp`.
 
 ---
 
@@ -1192,7 +1267,7 @@ in-tree).
 - Wedge stack dumps: `.repro/logs/pr13056_run1/pyspy/worker_660952_gdb.txt` (ctx, contains the `pthread_mutex_lock` frame in `CacheSender::Impl::response()` plus the NIXL plugin threads)
 - Reusable wheel: `/home/scratch.chienchunh_coreai/trtllm_wheels/pr13056-c9777c4ac2-nv26.02.whl` (2.7 GB, MD5 `99ff92bf5e43120c43abfe32e241df8b`) — re-installable on any node with NVIDIA PyTorch container 26.02 to skip the ~1.5 h rebuild.
 
-### Phase 12 — Cross-backend validation: signature `#7` is *not* NIXL-specific (T+7 days, *current*)
+### Phase 12 — Cross-backend validation: signature `#7` is *not* NIXL-specific (T+7 days)
 
 After Phase 11 left an unresolved question — "is `#7` a NIXL-plugin
 bug or something deeper?" — a team member suggested switching the
@@ -1334,7 +1409,245 @@ fails with HTTP 500 at the very first request because UCX wireup
 between ctx and gen produces `Connection reset by remote peer`. This
 is **unrelated to sig `#7`** and is documented purely as feedback for
 future review of that refactor. Both `pr13056_ucx_run1` and
-`pr13056_ucx_run2_tlsall` reproduce it.
+`pr13056_ucx_run2_tlsall` reproduce it. Phase 13 (`run10`) revisits
+this with a `gdb` capture loop attached and finds the deeper cause:
+the ctx-side mpi4py worker `SIGSEGV`s inside
+`CacheSender::Impl::handleAsyncSend` on the first request; the
+HTTP 500 / `Connection reset by remote peer` is the gen-side
+manifestation of that crash.
+
+### Phase 13 — `run9` + `run10` mutex-capture experiments expose new SIGSEGV manifestations within `CacheSender::Impl::*` (T+8 days, *current*)
+
+After Phase 12 reclassified sig `#7` as a TRT-LLM-side mutex bug and
+recommended pinning down the exact mutex address with a live `gdb`
+register inspection (Next Steps item 7), the obvious next experiment
+was: re-run the harness with periodic `gdb` capture of the
+`dataTransResp` thread, dump `info registers rdi` at the
+`pthread_mutex_lock` frame to capture the mutex address, walk to the
+holding thread by scanning each `pthread_mutex_t::__owner`, and
+identify the conflicting code path.
+
+Two builds were prepared so we could compare both fix strategies under
+identical conditions:
+
+- **rc11 + our fixes** (sig `#1`/`#4`/`#5`/`#6` + instrumentation, the
+  bundle from this investigation's chained PRs) — wheel saved as
+  `/home/scratch.chienchunh_coreai/trtllm_wheels/rc11-sigfixes-1-4-5-6-instrumented-4e69c14f73-2026-05-01-nv26.02.whl`
+  (md5 `188cd534…`).
+- **rc11 + PR `#13056`** (the comprehensive `shared_ptr` lifetime +
+  `BufferIndexHolder` RAII + deadline enforcement variant) — wheel
+  saved as `/home/scratch.chienchunh_coreai/trtllm_wheels/pr13056-c9777c4ac2-nv26.02.whl`.
+
+A small `gdb_capture_loop.sh` was added under
+`.repro/harness/onepair/` in both worktrees: every 30 s it `pgrep`s
+`mpi4py.futures.server` workers, attaches `gdb -p <pid> -batch`, dumps
+all threads with `bt 30`, and every third iteration takes a
+"`_locks`" detail dump that includes a `up; up; …` walk and
+`info registers rdi rsi rax` snapshot. Both `ctx` and `gen` worker
+`/proc/<pid>/maps` files are saved alongside each dump for library
+attribution.
+
+Both runs target direct UCX (`backend: UCX`) so we are squarely on the
+falsified-NIXL substrate from Phase 12.
+
+#### `run9` — rc11 + our fixes + UCX
+
+The harness ran the standard pre-burst probe (`ok200 wall=6.2s`),
+then started the 60 s `CONC=16` burst. **The wedge changed
+character.** Instead of the silent `pthread_mutex_lock` deadlock that
+Phases 10–12 documented, the ctx mpi4py worker (`PID 827311`)
+**crashed with `SIGSEGV` at iter `92`** of the forward-step loop,
+~60 s into the burst. The MPI segfault handler captured:
+
+```text
+!!!!!!! Segfault encountered !!!!!!!
+  _PyObject_GenericGetAttrWithDict
+  PyObject_GetAttr
+  _PyEval_EvalFrameDefault
+  _PyEval_EvalFrameDefault
+  0xffffffffffffffff
+```
+
+The crash is in the **Python C-API**, not in C++ code directly —
+`PyObject_GetAttr` on an object whose type/dict pointer became
+invalid. From the gdb capture loop, iter 1–2 (during burst, before
+the crash) captured ctx `dataTransResp` parked normally inside
+`UcxConnectionManager::recvConnect` → `_M_futex_wait_until` (idle).
+Iter 3 onwards: `Unable to attach: program terminated with signal
+SIGSEGV. No threads. The program is not being run.` The gen mpi4py
+worker stayed alive but parked in `pthread_cond_wait` inside
+`CacheSender::Impl::response()` and `CacheReceiver::Impl::request(AsyncResource&)`
+— both gen-side TRT-LLM threads in their normal idle state, waiting
+on KV-cache work that will never arrive now that ctx is dead.
+
+`ctx.log` promise-trace summary tells the lifecycle story:
+
+| Event | Count | Interpretation |
+|---|---|---|
+| `[promise-trace] create` | 35 | promises created during the run |
+| `[promise-trace] promise_set_value` / `future_get_ok` | 13 / 13 | normal completions |
+| `[promise-trace] mark_cancelled` | 6 | deadline-driven cancellations (`kv_transfer_timeout_ms=60000ms` fired) |
+| `[promise-trace] cancel_rejected` | 6 | cancellation rejected because the request was already in transmission |
+| `[promise-trace] promise_set_exception` / `future_get_exception` | 1 / 1 | sig `#1` fix path firing cleanly (`kNETWORK_ERROR` set on cancelled-after-ready promise) |
+| `[promise-trace] drop_without_fulfill` | 1 | **misleading log line** — the trace at `dataTransceiver.cpp:644-645` runs *before* the `set_exception` call on line 650; the promise IS being fulfilled. Worth fixing the log order in a follow-up. |
+
+So sig `#1` fix is firing exactly as designed in the cancel-after-ready
+path. The new SIGSEGV emerges *downstream* of the fixed cancellation
+path — likely a Python/C++ lifecycle race that an earlier wedge
+previously masked. With the wedge no longer happening, the system
+runs further and exposes a Python wrapper around a C++ object being
+destructed by one thread while another still holds a reference; the
+next Python-side `getattr` crashes.
+
+#### `run10` — rc11 + PR `#13056` + UCX
+
+Same 1P1D + UCX harness setup, but pointing at the comprehensive-refactor
+wheel. The result was even more decisive: **ctx
+`mpi4py.futures.server` worker (`PID 1120697`) `SIGSEGV`'d on the
+very first sanity-probe request** — single chat completion, no
+concurrency, no burst, no cancellation. The MPI segfault handler
+captured:
+
+```text
+!!!!!!! Segfault encountered !!!!!!!
+  tensorrt_llm::batch_manager::CacheSender::Impl::handleAsyncSend(AsyncSendResource&)
+  std::_Function_handler<...>::_M_invoke(...)
+  std::__future_base::_State_baseV2::_M_do_set(...)
+  std::__future_base::_Async_state_impl<...>::_M_run()
+  0xffffffffffffffff
+```
+
+The top frame is unambiguously inside `libtensorrt_llm.so`, in
+`CacheSender::Impl::handleAsyncSend(AsyncSendResource&)`. **No UCX
+or NIXL frames anywhere in the stack** (and `libnixl.so` is never
+loaded in this configuration). This is the single cleanest evidence
+in the entire investigation that the bug class is TRT-LLM-internal:
+a faster failure path, a fully synchronous crash, zero transport
+frames.
+
+The gen worker is alive after the crash, parked exactly as in `run9`
+— `CacheReceiver::Impl::request(AsyncResource&)` `cv.wait` waiting
+for KV data from a now-dead ctx. The frontend's first
+`POST /v1/chat/completions` returned 200 OK (the request reached the
+gen with disagg params), but a follow-up retry got
+`400 Bad Request` from the gen because the disagg params reference
+a request the gen can't satisfy. This matches and clarifies Phase 12's
+`pr13056_ucx_run1` HTTP-500 finding: that earlier observation was the
+client-visible projection of *this same* ctx-side SIGSEGV; the gdb
+capture loop now lets us see the underlying crash directly.
+
+#### Most plausible PR `#13056` root cause
+
+Reading PR `#13056`'s `handleAsyncSend` body in
+[`cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp:572-596`](../../../cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp#L572):
+
+```cpp
+void handleAsyncSend(AsyncSendResource& resource) {
+    ...
+    while (!resource.mTerminate) {
+        Response resp;
+        {
+            std::unique_lock lk(resource.mMtxForQueue);
+            resource.mCVforQueue.wait(lk, [&]{ return !resource.mSendQueue.empty() || resource.mTerminate; });
+            if (resource.mTerminate) { ... break; }
+            resp = std::move(resource.mSendQueue.front());
+            resource.mSendQueue.pop_front();
+        }
+        sendAndRemoveResponse(resp.mRequest->mRequestId, std::move(resp));   // ← null deref here?
+    }
+}
+```
+
+The `Response` struct is defined at line 555 with
+`std::shared_ptr<LlmRequest> mRequest;`. PR `#13056`'s premise is
+that `shared_ptr` lifetime keeps the request alive — but **nothing
+enforces** "every `Response` in `mSendQueue` has a non-null
+`mRequest`". The deref `resp.mRequest->mRequestId` on line 594 will
+SIGSEGV if a `Response` with null `mRequest` ever reaches the queue,
+which is exactly what the captured backtrace shows. PR `#13056` adds
+shared-ownership safety against use-after-free but not against null
+shared_ptrs being inserted into the producer-consumer queue in the
+first place.
+
+#### What this proves about sig `#7` (extended)
+
+Sig `#7` is no longer well-described as just "the
+`pthread_mutex_lock` wedge in `CacheSender::Impl::response()`."
+Combining all data points to date, the honest framing is **a class
+of bugs in `CacheSender::Impl::*` C++ code**:
+
+| Manifestation | Where (top frame) | Fix substrate observed | Triggering condition |
+|---|---|---|---|
+| Mutex-deadlock variant (Phases 10–12) | `CacheSender::Impl::response()` → `pthread_mutex_lock` | rc11 stock NIXL (`run8`); PR `#13056` NIXL (`pr13056_run1`); rc11+our-fixes UCX (`rc11_ucx_run1`) | Cancel-during-transfer under `CONC=16` 60 s burst |
+| ctx-mpi4py-exit variant (Phase 12) | (parent `orted` survives, `mpi4py.futures.server` child exits, no signal trace) | rc11+our-fixes UCX (`rc11_ucx_run2_diag`) | Same burst + many `cancelled_after_ready_signal` logs |
+| Python-getattr-SIGSEGV variant (Phase 13, **new**) | `_PyObject_GenericGetAttrWithDict` → `PyObject_GetAttr` (downstream of ctx C++ cleanup) | rc11+our-fixes UCX (`run9`) | Same burst, mid-iter 92 |
+| Async-send-null-deref variant (Phase 13, **new**) | `CacheSender::Impl::handleAsyncSend(AsyncSendResource&)` directly | PR `#13056` UCX (`run10`) | **First request** — no concurrency required |
+
+All four manifestations sit inside the `CacheSender::Impl` lifecycle
+path. The mutex-deadlock variant lives in `response()`'s `cv.wait`;
+the async-send variant lives in `handleAsyncSend`'s queue consumer;
+the Python-getattr variant lives in the cleanup path that runs after
+a successful sig `#1` fix path; the executor-exit variant lives
+somewhere between these (likely the ctx-side process exits
+unexpectedly during this same window). They share a producer-consumer
+KV-send architecture and a brittle ownership model around
+`Response::mRequest`.
+
+#### Implications for the fix strategy
+
+- **Neither fix bundle is sufficient on its own.** Our chained PRs
+  (sig `#1`/`#4`/`#5`/`#6`) clear the four most reproducible bugs but
+  expose the lifecycle race that becomes the `run9` SIGSEGV. PR
+  `#13056`'s `shared_ptr` lifetime + `BufferIndexHolder` RAII clears
+  different bugs but introduces a new failure mode (`run10`
+  null-deref in `handleAsyncSend`) and still hits the original mutex
+  deadlock under NIXL.
+- **A targeted set of follow-up fixes is needed** in
+  `CacheSender::Impl::*`. Specifically:
+  - Enforce a strict invariant that `Response::mRequest` is non-null
+    at every enqueue site, with `TLLM_CHECK` at both producer and
+    consumer.
+  - Audit the cancellation cleanup path for use-after-free of any
+    Python wrapper objects bound to a request's lifetime.
+  - Pin down the exact mutex in the deadlock variant (still the
+    highest-leverage diagnostic — Next Steps item 7) and fix the
+    lock-ordering.
+- **The `kv_transfer_timeout_ms` deadline enforcement remains the
+  right defence-in-depth.** Phase 12 already promoted it to "directly
+  addresses `#7`"; with the new evidence it now bounds the worst-case
+  impact of every variant in the table above.
+
+#### Artifacts
+
+- `~/disagg-investigation-archive/run9_rc11_ourfixes_ucx_segfault/` —
+  539 MB, 56 gdb dumps, 4 server logs, `PROVENANCE.txt`. Includes the
+  iter-1/iter-2 ctx captures (alive, before crash), iter-3+ ctx
+  attempt failure (ctx already dead), and full gen-side capture
+  sequence showing stable parked state across iters 4–7.
+- `~/disagg-investigation-archive/run10_pr13056_ucx_segfault_handleAsyncSend/` —
+  3.2 MB, 13 gdb dumps, 4 server logs, `PROVENANCE.txt`. Critically
+  lean evidence — only one request was needed to trigger the
+  failure.
+- Both archives explicitly cross-reference each other in their
+  `PROVENANCE.txt` files for side-by-side analysis.
+
+#### Note on the original mutex-capture goal
+
+The Phase 13 experiments did **not** reach a clean `info registers
+rdi` capture of the wedged mutex address. That goal is still open —
+it would need a configuration that produces the *deadlock* variant
+of sig `#7` (not the SIGSEGV variants), captured live before the
+worker exits. Two options for a follow-on Phase 14:
+
+1. Re-run rc11 + our fixes + **NIXL** (not UCX) — Phases 10–11
+   evidence shows this configuration reliably wedges into
+   `pthread_mutex_lock` rather than crashing.
+2. Re-run rc11 + our fixes + UCX with a **lower CONC** (e.g.
+   `CONC=4`) — slow the cancellation rate enough to expose the
+   deadlock variant before the SIGSEGV variant.
+
+Either reroute lets us capture `$rdi`, walk to the holder, and pin
+down the exact mutex (Next Steps item 7).
 
 ---
 
@@ -1974,6 +2287,51 @@ In rough priority order:
    The estimated fix is small (~30–80 lines of C++), confined to
    `dataTransceiver.cpp`. The diagnostic step itself is ~30–60 min;
    the fix + chained test PR is probably ~1–2 days.
+
+   **Phase 13 status update**: an instrumented `gdb` capture loop was
+   added (`gdb_capture_loop.sh`, 30s interval, both workers, all
+   threads + `info registers rdi rsi rax`) and run against rc11+
+   our-fixes+UCX (`run9`) and rc11+PR `#13056`+UCX (`run10`). Both
+   runs surfaced **SIGSEGV variants** of the bug class instead of the
+   target deadlock variant — `run9` ctx died at iter 92 with
+   `PyObject_GetAttr` SIGSEGV (cleanup-path use-after-free), and
+   `run10` ctx died on the very first request with a synchronous
+   crash inside `CacheSender::Impl::handleAsyncSend` (likely null
+   `shared_ptr<LlmRequest>` deref at line 594). The deadlock variant
+   should be reachable by running rc11+our-fixes with the **NIXL
+   backend** (Phases 10–11 evidence) or with a **lower `CONC`** on
+   UCX. Suggested Phase 14 retry uses `backend: NIXL` so the wedge
+   manifests as the deadlock variant cleanly, then attaches `gdb`
+   live before any worker dies.
+
+7a. **`handleAsyncSend` null-`shared_ptr` audit (Phase 13 follow-up)**.
+    `run10` shows a fast deterministic SIGSEGV on the first request
+    when running PR `#13056`'s code:
+    `CacheSender::Impl::handleAsyncSend(AsyncSendResource&)` →
+    `resp.mRequest->mRequestId` deref of a null
+    `std::shared_ptr<LlmRequest>`. Recommended fixes:
+    - Add `TLLM_CHECK(resp.mRequest != nullptr)` at
+      [`dataTransceiver.cpp:594`](../../../cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp#L594)
+      and at every `mAsyncSendResource.mSendQueue.emplace_back` site
+      so the bug is caught at the producer rather than the consumer.
+    - Trace back the producer that put a null-`mRequest` `Response`
+      onto the queue and fix the invariant at the source.
+    - Add a unit test that exercises the cancel-during-`handleAsyncSend`
+      path with `shared_ptr<LlmRequest>` ownership semantics. Without
+      this, PR `#13056`'s `shared_ptr` lifetime model is necessary
+      but not sufficient.
+
+7b. **Cancellation cleanup-path lifecycle audit (Phase 13 follow-up)**.
+    `run9` shows that with sig `#1`/`#4`/`#5`/`#6` fixed, ctx still
+    SIGSEGVs in `_PyObject_GenericGetAttrWithDict` ~60 s into the
+    burst — a Python wrapper around a C++ object is being destructed
+    by one thread while another still holds a reference to it. Audit
+    every Python↔C++ wrapper bound to a request lifetime in the
+    cancellation cleanup path; ensure RAII / GIL semantics match
+    across thread boundaries. Likely candidate areas: the executor
+    binding's response object, the `LlmRequest` Python proxy, and
+    any callback registered through `pybind`/`nanobind` that touches
+    a destructed-on-cancel object.
 
 8. **Enforce `kv_transfer_timeout_ms` as a hard deadline** on the
    transceiver's blocking entry points. As of `rc11` the knob is
