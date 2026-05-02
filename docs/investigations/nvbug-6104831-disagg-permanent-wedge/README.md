@@ -61,10 +61,17 @@
   `sendAndRemoveResponse(resp.mRequest->mRequestId, std::move(resp))`
   after PR `#13056` changed `mRequest` from a raw pointer to a
   `std::shared_ptr`. Materializing `reqId` before moving `resp` fixes the
-  first-request UCX SIGSEGV, and `CONC=4` plus one `CONC=16` harness run
-  recover. A later repeat surfaced a new gen-side
-  `KVCacheManager::add_sequence` assertion (`emplaceDone`), which is now
-  the next unresolved follow-up before declaring the whole e2e issue fixed.
+  first-request UCX SIGSEGV. A later `CONC=24` repeat exposed an
+  independent Python-side idempotency gap: the scheduler can surface the
+  same logical `DISAGG_GENERATION_INIT` request across many iterations, so
+  `prepare_resources()` and generation KV receive start must be guarded by
+  `py_request_id`. Adding per-resource-manager prepare guards and a
+  receive-start guard prevents duplicate `KVCacheManager::addSequence()`
+  / duplicate `request_and_receive_*()` side effects. With those guards
+  plus transfer tracing, the latest `CONC=24` direct-UCX run recovered at
+  idle 30 s. It still produced KV-transfer timeouts and HTTP errors during
+  the burst, but did not reproduce the first-request SIGSEGV, duplicate
+  `addSequence` assertion, Broken promise, or permanent wedge.
 
 ---
 
@@ -134,9 +141,12 @@ The mapping of fixes is summarised at the end, in
 > **TRT-LLM-side bug class in `CacheSender::Impl::*`**,
 > with at least four observed manifestations across two transports
 > and three fix bundles, **fixable entirely in TRT-LLM**. The exact
-> mutex in the deadlock variant (most likely `mCondMutex`) and the new
-> gen-side `emplaceDone` assertion that appears after the eval-order fix
-> still need to be pinned down. Full evidence is in Phases 10–14 of the
+> mutex in the deadlock variant (most likely `mCondMutex`) still needs
+> to be pinned down. The later gen-side `emplaceDone` assertion is now
+> best understood as a missing Python-side idempotency guard for repeated
+> disaggregated generation-init side effects; after adding per-request-id
+> prepare and receive-start guards, the assertion did not reproduce in the
+> latest `CONC=24` repeat. Full evidence is in Phases 10–14 of the
 > timeline.
 
 > Use this report alongside the upstream investigation for
@@ -801,19 +811,21 @@ least four observed manifestations** (mutex deadlock, ctx-mpi4py
 exit, Python-`getattr` SIGSEGV, `handleAsyncSend` first-request
 SIGSEGV). Phase 14 confirms and fixes the first-request SIGSEGV as an
 argument-evaluation-order hazard; that fix lets direct UCX complete a
-single request, `CONC=4`, and one `CONC=16` recovery run. A targeted
-runtime `gdb` session to pin down the exact mutex address and holder
-in the deadlock variant remains open, and the new gen-side
-`emplaceDone` assertion needs separate follow-up.
+single request, `CONC=4`, multiple `CONC=16` recovery runs, and the
+latest `CONC=24` recovery run after Python-side idempotency guards.
+A targeted runtime `gdb` session to pin down the exact mutex address
+and holder in the deadlock variant remains open.
 
-**PRs:** No TRT-LLM PR open yet. Three follow-up PR scopes are now
-distinguishable: (a) a small, surgical lock-ordering / release-before-
-blocking-call change for the deadlock variant (~30–80 lines, awaits
-the mutex address); (b) the confirmed `handleAsyncSend` eval-order fix
-plus a `TLLM_CHECK(resp.mRequest)` precondition; (c) a gen-side
-`KVCacheManager::add_sequence` / `emplaceDone` investigation; (d) an
-audit of the cancellation cleanup path for use-after-free of Python
-wrappers (the `run9` variant).
+**PRs:** No TRT-LLM PR open yet for the Phase 14 findings. Four
+follow-up PR scopes are now distinguishable: (a) a small, surgical
+lock-ordering / release-before-blocking-call change for the deadlock
+variant (~30–80 lines, awaits the mutex address); (b) the confirmed
+`handleAsyncSend` eval-order fix plus a `TLLM_CHECK(resp.mRequest)`
+precondition; (c) Python-side idempotency guards for
+`_prepare_disagg_gen_init()` and `_recv_disagg_gen_cache()` keyed by
+`py_request_id` (applies regardless of PR `#13056`); (d) an audit of
+the cancellation cleanup path for use-after-free of Python wrappers
+(the `run9` variant).
 
 ---
 
@@ -1664,7 +1676,7 @@ worker exits. Two options for a follow-on Phase 14:
 Either reroute lets us capture `$rdi`, walk to the holder, and pin
 down the exact mutex (Next Steps item 7).
 
-### Phase 14 — First-request PR `#13056` + UCX SIGSEGV root cause confirmed and fixed; original local harness recovers once, then exposes `emplaceDone` (T+8 days, *current*)
+### Phase 14 — First-request PR `#13056` + UCX SIGSEGV fixed; idempotency gap identified; latest `CONC=24` repeat recovers (T+8 days, *current*)
 
 Phase 14 starts from the strongest Phase 13 artifact: `run10`
 crashed on the very first direct-UCX request with a top frame in
@@ -1792,7 +1804,7 @@ The `400 Bad Request` errors during the burst are still undesirable,
 but they are not the permanent wedge. The key old failure condition
 was `NO RECOVERY after 180s idle`; this run recovered at idle 30 s.
 
-#### Repeat-run caveat: `emplaceDone` assertion after the eval-order fix
+#### Repeat-run caveats before idempotency guards: one intermittent `emplaceDone` assertion, then a no-recovery run
 
 Follow-up attempts to repeat the full stress run had one invalid run
 because a fragile inline shell command interleaved cleanup, launch, and
@@ -1826,6 +1838,130 @@ answer what `emplaceDone` means at `kvCacheManager.cpp:2992`, whether
 the same `py_request_id` is inserted twice, and whether cancellation
 or partial cleanup leaves stale gen-init state behind.
 
+We then instrumented `KVCacheManager::addSequence()` and
+`KVCacheManager::removeSequence()` with `[kvseq-trace]` to capture the
+request id and `mSequences` state around the assertion. The next clean
+script-based repeat (`run14d`) did **not** reproduce `emplaceDone`, but
+it did reproduce the original no-recovery symptom:
+
+```text
+[16:08:25 PROBE-PRE] result=ok200 wall=6.5s
+[BURST-1   90.0s] done ok200=10 errors=11 total=21
+[16:11:25 PROBE-T+30] result=exc:ReadTimeout wall=60.1s
+[16:13:25 PROBE-T+60] result=exc:ReadTimeout wall=60.1s
+[16:15:56 PROBE-T+90] result=exc:ReadTimeout wall=60.1s
+[16:18:56 PROBE-T+120] result=exc:ReadTimeout wall=60.1s
+[16:22:56 PROBE-T+180] result=exc:ReadTimeout wall=60.1s
+[  877.2s] CONC=16 NO RECOVERY after 180s idle -- permanent wedge
+```
+
+The `kvseq-trace` output in this no-recovery run shows that the gen-side
+sequence map is not obviously leaking the timed-out requests:
+
+```text
+[kvseq-trace] addSequence_begin request=967070423568425 inputLength=22931 beamWidth=1 alreadyExists=0 sequences_size=0 hasLlmRequest=1
+[kvseq-trace] addSequence_inserted request=967070423568425 sequences_size=1 held=0
+...
+[kvseq-trace] removeSequence_extract request=967070423568425 found=1 sequences_size_before=1
+[kvseq-trace] removeSequence_done request=967070423568425 removed=1 held=0 lastStored=0
+```
+
+Instead, the repeated pattern is generation KV-transfer timeout:
+
+```text
+Timed out waiting for generation KV cache transfer for request ... after 10000 milliseconds (per-iteration).
+Generation KV cache transfer for request ... exceeded total timeout: elapsed 60004 ms > limit 60000 ms. Marking as error.
+```
+
+On the ctx side, overlapping context requests also time out and many
+sender-side cancellations report `Cannot cancel request <reqId>` after
+`cancel_check ... inReady=0 isCurrent=0`. That means the ctx sender no
+longer finds the request in the ready queue, and it is not the current
+request, but the in-flight cancel flag lookup also failed. This is now
+the most suspicious transfer/cancellation lifecycle gap for the
+remaining no-recovery path.
+
+#### Python-side idempotency guards: real fix, not PR `#13056`-specific
+
+The `emplaceDone` assertion turned out to be more useful as a signal
+than as the primary remaining wedge. The generation scheduler can
+surface the same logical `DISAGG_GENERATION_INIT` request over many
+iterations while it waits for KV transfer to complete. That means the
+following Python operations must be idempotent by logical
+`py_request_id`, not by Python object identity:
+
+1. `_prepare_disagg_gen_init()` calling each resource manager's
+   `prepare_resources()` (especially `KV_CACHE_MANAGER`, where the side
+   effect is `KVCacheManager::addSequence()`).
+2. `_recv_disagg_gen_cache()` starting `request_and_receive_async()` or
+   `request_and_receive_sync()`.
+
+The local PR `#13056` experiment now has two guards:
+
+- `_disagg_gen_init_prepared_ids`, keyed per `ResourceManagerType`, so
+  each resource manager prepares a given `py_request_id` at most once.
+- `_disagg_gen_kv_recv_started_ids`, so the receive side is only started
+  once for a given `py_request_id`. The synchronous path discards the id
+  on exception so a real failed start can still be retried.
+
+This fix applies regardless of PR `#13056`; it is a scheduler/resource
+manager invariant in disaggregated generation init. PR `#13056` merely
+made the problem easier to see because the eval-order crash was removed
+and the system progressed far enough to hit repeated init scheduling.
+
+#### Latest transfer-instrumented repeat: recovered, no ctx `sendSync` wedge
+
+After adding the idempotency guards, we added one more layer of transfer
+instrumentation around:
+
+- ctx `sendSync()` before/after formatter send (`sendSync_before_format`,
+  `[transfer-send] begin/end`, `sendSync_after_format`,
+  `sendAndRemove_exit`);
+- gen `requestSync()` request-info send and ready-signal receive
+  (`post-sendRequestInfo`, `pre/post-receiveReadySignal`,
+  `post-requestSync`).
+
+The next script-based direct-UCX run used the higher stress shape
+`CONC=24`, `BURST_DUR_S=90` and recovered:
+
+```text
+[22:34:25 PROBE-PRE] result=ok200 wall=6.1s
+[BURST-1  120.1s] done ok200=12 errors=24 total=36
+[22:37:01 PROBE-T+30] sending 1 request
+[22:37:36 PROBE-T+30] result=ok200 wall=35.3s
+[  191.5s] CONC=24 RECOVERY at idle=30s
+```
+
+The transfer markers rule out a permanent ctx formatter/send wedge in
+that run:
+
+| Marker | Count |
+|---|---:|
+| `sendSync_before_format` | 37 |
+| `[transfer-send] begin` | 37 |
+| `[transfer-send] end` | 37 |
+| `sendSync_after_format` | 37 |
+| `sendAndRemove_exit` | 37 |
+
+On the gen side, request-info send also balanced:
+
+| Marker | Count |
+|---|---:|
+| `pre-sendRequestInfoDirect` | 45 |
+| `post-sendRequestInfoDirect` | 45 |
+| `post-receiveReadySignal ... isReady=1` | 37 |
+| `post-receiveReadySignal ... isReady=0` | 8 |
+| `post-requestSync` | 45 |
+
+A representative timed-out request (`1061848395403279`) shows the new
+shape clearly: gen successfully sends request info and reaches
+`post-receiveReadySignal ... isReady=0`; ctx had already timed out the
+same request before the response worker selected it for sending. That
+points at head-of-line / backlog / timeout interaction, not a stuck
+ctx `sendSync()` call. It is still a serving-quality problem (many
+burst errors and KV-transfer timeouts), but it did **not** produce a
+permanent wedge in this run.
+
 #### Phase 14 conclusion
 
 The Phase 14 evidence is strong enough to split the work:
@@ -1833,13 +1969,18 @@ The Phase 14 evidence is strong enough to split the work:
 1. **Confirmed fix candidate**: materialize `reqId` before
    `std::move(resp)` in `CacheSender::Impl::handleAsyncSend`. This
    fixes the deterministic PR `#13056` + direct-UCX first-request
-   SIGSEGV and allows at least one `CONC=16` local repro run to
-   recover.
-2. **Still unresolved**: a gen-side `KVCacheManager::add_sequence`
-   assertion (`emplaceDone`) can appear after the eval-order fix.
-   This is a new signature and should not be conflated with the
-   first-request async-send crash.
-3. **Still open from earlier phases**: the mutex-deadlock variant of
+   SIGSEGV and allows `CONC=4` and at least two `CONC=16` local repro
+   runs to recover.
+2. **Confirmed general fix candidate**: make generation-init resource
+   preparation and KV receive start idempotent by `py_request_id`. This
+   is not specific to PR `#13056`; repeated scheduler visits should not
+   re-run non-idempotent side effects.
+3. **Latest direct-UCX pause point**: after the two fixes above, the
+   latest `CONC=24` run recovered. The remaining observed failures are
+   burst-time KV-transfer timeouts / `400` errors, with evidence pointing
+   at head-of-line backlog and timeout interaction rather than a stuck
+   ctx `sendSync()` or gen `requestSync()` call.
+4. **Still open from earlier phases**: the mutex-deadlock variant of
    sig `#7` still needs an exact `$rdi` mutex-address capture in a
    configuration that reliably produces the deadlock rather than one
    of the SIGSEGV/assertion variants.
@@ -1869,14 +2010,14 @@ honest taxonomy is:
 | `#6` | **Cancellation-handling** (cascade) | Lives in the `!isReady` early return of the receiver. That branch is only reached *after the `#1` fix is in place* and the sender sends `is_ready=false`. Needs a cancel-after-ready in flight, plus the `#1` fix as a prerequisite. |
 | `#4` | **Structural, exposed by cancellation** | Pure structural defect: unconditional `future.get()` on a future that may not be ready. Doesn't *need* cancellation to exist; any reason a receiver-side future stays unresolved trips it. In practice on `rc11` the unresolved future is created by `#1`/`#5`/`#6`, which all are cancellation-driven. |
 | `#2` | **Eviction-driven, not cancellation-driven** | KV-block trie inconsistency surfaced via `freeBlockAndAllDescendants → detachDescendantsFromLookupTree`. Triggered by block eviction under memory pressure, *not* by cancellation. Burst traffic happens to drive frequent eviction (especially with prefix-overlapping prompts at high concurrency), so it shares the "burst exposes it" property, but it would also fire under any sustained workload with heavy eviction. |
-| `#7` | **NIXL-internal contention** | NIXL UCX-internal `pthread_mutex_lock` deadlock inside `nixlUcxThreadEngine::getNotifs()`. The customer load shape that triggers it includes cancellations, but the NIXL bug could be a pure lock-ordering issue between concurrent send + receive paths that would also fire under a different high-concurrency pattern. We don't have NIXL-internal visibility to say for sure. Safe to call it *contention-driven*; not safe to call it *strictly cancellation-driven*. |
+| `#7` | **TRT-LLM sender-lifecycle / transfer contention** | Initially looked like a NIXL UCX-internal `pthread_mutex_lock` deadlock because deeper frames included `nixlUcxThreadEngine::getNotifs()`. Phase 12 direct-UCX reproduction falsified the "NIXL-only" classification. The honest current framing is a TRT-LLM-owned `CacheSender::Impl::*` bug class exposed by the cancel-during-transfer / high-contention load shape, with separate manifestations in the response mutex path, Python cleanup path, and PR `#13056` async-send path. |
 
 So the right one-sentence summary is: **four-of-seven (#1, #3, #5, #6)
 are cancellation-handling bugs; #4 is a latent blocking bug that
 cancellations expose; #2 is an eviction bug that burst traffic exposes
-via memory pressure; #7 is a NIXL-internal deadlock that the same
-load shape happens to trigger but which is not strictly a cancellation
-bug**.
+via memory pressure; #7 is a TRT-LLM sender-lifecycle / transfer
+contention bug class that the same load shape triggers but which is
+not strictly a cancellation bug**.
 
 ### Refined trigger chain
 
@@ -1897,9 +2038,9 @@ sig #4 exposed by unresolved futures from #1 / #5 / #6
         ↓
 sig #3 exposed in decode by half-initialised state
         ↓
-NIXL contention pattern                              (parallel path,
+TRT-LLM sender/transfer contention pattern           (parallel path,
         ↓                                             same load shape)
-sig #7 fires in NIXL UCX internal mutex
+sig #7 fires in CacheSender::Impl / transfer lifecycle
 ```
 
 Two specific corrections to the naïve "burst → cancellation → bug"
@@ -1917,8 +2058,8 @@ chain are worth being precise about:
 2. **"Cancellation" is itself one of several entry points to cleanup
    paths.** Cancellations come from client HTTP disconnects,
    client-side timeouts that become server-side cancellations,
-   server-side `kv_transfer_timeout_ms` *(not enforced today — see
-   Next Steps item 8)*, internal aborts from downstream errors,
+   server-side `kv_transfer_timeout_ms` deadline handling (added /
+   instrumented in later fix stacks), internal aborts from downstream errors,
    block eviction under memory pressure (`#2`'s entry point), and
    the `CacheSender::Impl::response()` mutex contention (`#7`'s
    entry point — see Phase 12). The unifying property is
@@ -2491,8 +2632,9 @@ In rough priority order:
    target deadlock variant — `run9` ctx died at iter 92 with
    `PyObject_GetAttr` SIGSEGV (cleanup-path use-after-free), and
    `run10` ctx died on the very first request with a synchronous
-   crash inside `CacheSender::Impl::handleAsyncSend` (likely null
-   `shared_ptr<LlmRequest>` deref at line 594). The deadlock variant
+   crash inside `CacheSender::Impl::handleAsyncSend` (Phase 14 later
+   confirmed this as an argument-evaluation-order bug, not a queued
+   null `shared_ptr<LlmRequest>`). The deadlock variant
    should be reachable by running rc11+our-fixes with the **NIXL
    backend** (Phases 10–11 evidence) or with a **lower `CONC`** on
    UCX. Suggested Phase 14 retry uses `backend: NIXL` so the wedge
@@ -2526,11 +2668,9 @@ In rough priority order:
     that separately. Add a regression test that exercises the direct-UCX
     async-send path where `Response` carries a `std::shared_ptr`.
 
-7b. **Investigate the gen-side `KVCacheManager::add_sequence`
-    `emplaceDone` assertion surfaced after the eval-order fix
-    (Phase 14 follow-up).** Repeat full-stress runs no longer hit the
-    first-request async-send SIGSEGV, and at least one `CONC=16` run
-    recovers at idle 30 s. A later repeat shows:
+7b. **Land Python-side disaggregated generation-init idempotency guards
+    (Phase 14 follow-up).** One repeat after the eval-order fix showed a
+    gen-side `KVCacheManager::add_sequence` / `emplaceDone` assertion:
 
     ```text
     RuntimeError: [TensorRT-LLM][ERROR] Assertion failed: emplaceDone
@@ -2538,14 +2678,31 @@ In rough priority order:
     self.impl.add_sequence(req.py_request_id, ...)
     ```
 
-    Next questions: what invariant does `emplaceDone` protect; is the
-    same `py_request_id` being inserted twice; and does cancellation or
-    partial cleanup leave stale gen-init state around? Start with
-    `kvCacheManager.cpp:2992` and the call path
-    `resource_manager.py::prepare_resources` →
-    `_prepare_disagg_gen_init`.
+    Later instrumentation showed that the scheduler can revisit the same
+    logical `DISAGG_GENERATION_INIT` request across iterations. Guard
+    `_prepare_disagg_gen_init()` per resource manager by `py_request_id`
+    before calling `prepare_resources()`, and guard `_recv_disagg_gen_cache()`
+    by `py_request_id` before starting `request_and_receive_async/sync()`.
+    This is a general disagg scheduler invariant and is not specific to
+    PR `#13056`.
 
-7c. **Cancellation cleanup-path lifecycle audit (Phase 13 follow-up)**.
+7c. **Investigate burst-time KV-transfer timeout / backlog behaviour
+    after the eval-order and idempotency fixes.** The latest direct-UCX
+    `CONC=24` run recovered at idle 30 s, but it still produced many
+    burst-time generation/context KV-transfer timeouts and `400` errors.
+    Transfer instrumentation balanced in that run (`sendSync_before_format`
+    / `[transfer-send] begin` / `[transfer-send] end` /
+    `sendSync_after_format` / `sendAndRemove_exit` all counted 37; gen
+    `pre-sendRequestInfoDirect`, `post-sendRequestInfoDirect`, and
+    `post-requestSync` all counted 45). The next question is therefore
+    not "where is ctx permanently stuck inside `sendSync()`?" but why
+    requests age out before the ctx response worker selects them. Add
+    lower-volume queue-age / queue-depth instrumentation around the gen
+    drain queue and ctx ready/send queues; also reduce repetitive Python
+    skip logging before re-running because the last `gen.log` grew to
+    ~18.5 GB.
+
+7d. **Cancellation cleanup-path lifecycle audit (Phase 13 follow-up)**.
     `run9` shows that with sig `#1`/`#4`/`#5`/`#6` fixed, ctx still
     SIGSEGVs in `_PyObject_GenericGetAttrWithDict` ~60 s into the
     burst — a Python wrapper around a C++ object is being destructed
