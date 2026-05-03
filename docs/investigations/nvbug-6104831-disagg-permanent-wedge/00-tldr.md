@@ -66,8 +66,22 @@ the C++ cleanup path. Two of the seven were known from the field at
 T0. Five more emerged from investigation, each exposed by fixing the
 previous one.
 
-> The seven failure signatures and their code sites:
-> [`02-failure-signatures.md`](02-failure-signatures.md).
+| Sig | Where it lives | One-line symptom |
+|---|---|---|
+| **#1** | `CacheSender::Impl::sendResponse` (cancel-after-ready erase path) | `Broken promise` raised by the consumer's `future.get()` on the sender side |
+| **#2** | `templatedTrie.h::clearNode` / `kvCacheManager.cpp` cascade-prune walk | `cascade prune: parent did not find this node as a child` C++ assertion under sustained eviction |
+| **#3** | C++ `std::optional::value()` in the disagg gen path, surfaced via pybind | `RuntimeError: bad optional access` raised in the decode-side Python event loop *(field-only)* |
+| **#4** | `CacheTransceiver::checkGenTransferStatus(atLeastNum=1)` unconditional `future.get()` | gen worker's main event loop blocks indefinitely on a not-yet-ready future |
+| **#5** | `CacheReceiver::Impl::cancelRequest` (queued-cancel erase) | `Broken promise` raised by the consumer's `future.get()` on the receiver side |
+| **#6** | `CacheReceiver::Impl::requestSync` `!isReady` early-return + `BaseTransBufferManager::assignBufferIndex` `cv.wait` | one cancelled-after-ready transfer leaks a recv-buffer slot; the next request wedges the receiver pool forever |
+| **#7** | `CacheSender::Impl::*` (bug class with 4 manifestations) | mutex deadlock in `response()`; ctx mpi4py worker exits; Python `getattr` SIGSEGV; first-request SIGSEGV in `handleAsyncSend` |
+
+Sig `#2` is independent of the cleanup-path bug class — it's an
+eviction-driven trie invariant violation that just happens to fire
+under the same high-concurrency load.
+
+> Full per-signature root causes, fixes, regression tests, and code
+> sites: [`02-failure-signatures.md`](02-failure-signatures.md).
 
 ---
 
@@ -127,11 +141,34 @@ graph TB
     evalfix -.->|closes| L7[L7 eval-order]
     pyguards -.->|closes| L8[L8 idempotency]
 
-    classDef done fill:#cfc,stroke:#0a0
-    classDef broken fill:#fcc,stroke:#a00
+    classDef done fill:#cfc,stroke:#0a0,stroke-width:2px
+    classDef broken fill:#fcc,stroke:#a00,stroke-width:2px
+    classDef pr13056_color fill:#cce5ff,stroke:#0066cc,stroke-width:2px
+    classDef pr13495_color fill:#ffe5cc,stroke:#cc6600,stroke-width:2px
+    classDef evalfix_color fill:#d4f4d4,stroke:#0a8a0a,stroke-width:2px
+    classDef pyguards_color fill:#e8d4f4,stroke:#7030a0,stroke-width:2px
+    classDef pr13056_layer fill:#e8f1ff,stroke:#0066cc,stroke-dasharray:3 3
+    classDef pr13495_layer fill:#fff1e0,stroke:#cc6600,stroke-dasharray:3 3
+    classDef evalfix_layer fill:#e8faea,stroke:#0a8a0a,stroke-dasharray:3 3
+    classDef pyguards_layer fill:#f4e8fa,stroke:#7030a0,stroke-dasharray:3 3
+
     class done done
     class rc11 broken
+    class pr13056 pr13056_color
+    class pr13495 pr13495_color
+    class evalfix evalfix_color
+    class pyguards pyguards_color
+    class L2,L3,L4,L5 pr13056_layer
+    class L1,L6 pr13495_layer
+    class L7 evalfix_layer
+    class L8 pyguards_layer
 ```
+
+The four fix components are color-coded. Each layer node (`L1`–`L8`) is
+tinted with the lighter shade of whichever fix closes it, so the
+`closes` arrows are reinforced by colour: blue for `#13056`, orange for
+`#13495`, green for the eval-order fix, purple for the Python
+idempotency guards.
 
 Each layer needs at least one piece to close it; some pieces close
 multiple layers. The minimum closure is exactly these four pieces.
