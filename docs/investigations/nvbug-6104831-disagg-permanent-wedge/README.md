@@ -52,6 +52,7 @@ across sections that are each meant to be readable on its own:
 
 | File | When to read it |
 |---|---|
+| **[`00-tldr.md`](00-tldr.md)** | **Start here. 10-minute read.** Summarises the wedge symptom, the eight-layer root cause, the combo fix (PR `#13713`), and the empirical recovery results. Has the architecture and fix-mapping figures inline. Inspires the deeper reads if you want detail. |
 | [`01-background.md`](01-background.md) | Read first if you are new to this code. Architecture diagrams of the disagg deployment, request lifecycle walkthrough, `LlmRequestState` state machine, key files / classes. |
 | [`02-failure-signatures.md`](02-failure-signatures.md) | The seven concrete failure signatures (`#1`–`#7`): symptom, code site, root cause, fix, regression test. The "what bugs are there" view. |
 | [`03-defect-class-stack.md`](03-defect-class-stack.md) | The eight-layer `L1`–`L8` defect-class model that emerged from the investigation. Re-frames the seven signatures as the customer-visible faces of underlying invariant gaps. **This is the framework used in the four-approach comparison.** |
@@ -65,8 +66,14 @@ across sections that are each meant to be readable on its own:
 
 ## Suggested reading paths
 
-- **"I'm picking up this investigation cold and have 30 minutes."** Read this
-  README, then [`01-background.md`](01-background.md), then
+- **"I have 10 minutes."** Read [`00-tldr.md`](00-tldr.md). It
+  has the wedge symptom, the L1–L8 root cause, the combo fix
+  (PR `#13713`), and the empirical recovery results, with two
+  inline figures. Pointers to deeper reads at the end of every
+  section.
+- **"I'm picking up this investigation cold and have 30 minutes."** Read
+  [`00-tldr.md`](00-tldr.md) first, then
+  [`01-background.md`](01-background.md), then
   [`06-fix-approaches/README.md`](06-fix-approaches/README.md). You will
   understand the topology, the defect-class layering, and the fix
   trade-offs. Skim the rest as needed.
