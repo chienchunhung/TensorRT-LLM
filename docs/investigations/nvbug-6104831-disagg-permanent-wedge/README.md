@@ -42,36 +42,18 @@
   - [#12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718) — fatal engine
     detection / pod restart (mitigation for silent wedges, not a fix for the
     wedge)
-- **Status:** All six TRT-LLM signatures (`#1`, `#2`, `#4`, `#5`, `#6`)
-  have chained PRs in review. Signature `#3` is field-only and is
-  expected to disappear or change shape once `#1`, `#4`, and `#5` land
-  (a `CacheSender::Impl` bug-class manifestation is also a candidate
-  cause; see signature `#7`'s section). Signature `#7` was initially
-  classified as a NIXL-plugin `pthread_mutex_lock` deadlock in
-  Phases 10–11, then reclassified in Phase 12 as a TRT-LLM-side
-  mutex bug exposed by both NIXL and direct UCX backends. **Phase 13**
-  broadened the framing further: `run9` exposed a Python-`getattr`
-  SIGSEGV downstream of our fixes, and `run10` exposed a synchronous
-  C++ SIGSEGV in `CacheSender::Impl::handleAsyncSend` with PR `#13056`'s
-  code. **Phase 14 corrects the initial Phase 13 root-cause hypothesis**:
-  the `run10` crash is not a null `shared_ptr<LlmRequest>` already
-  present in the queue. Instrumentation in `run14` showed the pointer is
-  non-null and stable; the real first-request crash is caused by
-  unspecified C++ argument evaluation order in
-  `sendAndRemoveResponse(resp.mRequest->mRequestId, std::move(resp))`
-  after PR `#13056` changed `mRequest` from a raw pointer to a
-  `std::shared_ptr`. Materializing `reqId` before moving `resp` fixes the
-  first-request UCX SIGSEGV. A later `CONC=24` repeat exposed an
-  independent Python-side idempotency gap: the scheduler can surface the
-  same logical `DISAGG_GENERATION_INIT` request across many iterations, so
-  `prepare_resources()` and generation KV receive start must be guarded by
-  `py_request_id`. Adding per-resource-manager prepare guards and a
-  receive-start guard prevents duplicate `KVCacheManager::addSequence()`
-  / duplicate `request_and_receive_*()` side effects. With those guards
-  plus transfer tracing, the latest `CONC=24` direct-UCX run recovered at
-  idle 30 s. It still produced KV-transfer timeouts and HTTP errors during
-  the burst, but did not reproduce the first-request SIGSEGV, duplicate
-  `addSequence` assertion, Broken promise, or permanent wedge.
+- **Status:** The strongest candidate stack is now the **combo approach**:
+  PR `#13056`'s architectural lifetime/cancellation refactor + PR `#13495`'s
+  transfer-release cancellation hook + the local eval-order fix + the local
+  Python idempotency guards. On direct UCX, this stack recovered in the
+  regular 1P1D harness and then recovered across 5 same-server iterations
+  at `CONC=16` and 5 same-server iterations at `CONC=24`. Burst-time
+  `400` responses and KV-transfer timeouts still occur under stress, but
+  the permanent wedge, first-request `handleAsyncSend` SIGSEGV, ctx
+  Python-`getattr` SIGSEGV, and duplicate `addSequence` / `emplaceDone`
+  assertion have not reproduced in this combo stack. NIXL validation remains
+  required before claiming transport-complete coverage, because direct UCX
+  success does not guarantee NIXL success.
 
 ---
 
@@ -102,6 +84,118 @@ shrank. The pattern below is consistent across signatures:
   ([#13119](https://github.com/NVIDIA/TensorRT-LLM/pull/13119)) flips the
   pod or the request to "failed". The pod stays *healthy*, the request
   stays *in flight*, and the deployment stays *wedged*.
+
+## Four Approaches Compared
+
+By Phase 14, the investigation had four distinct fix stacks. They overlap,
+but they are not equivalent: each removes a different failure class, and
+the end-to-end harness results are materially different.
+
+| Approach | What it does | Local result |
+|---|---|---|
+| **A. Chained signature fixes** | Surgical fixes for signatures `#1`, `#4`, `#5`, and `#6` plus diagnostics. | Proved the individual root causes and exposed the residual sender / cleanup class. Still reached no-recovery or SIGSEGV variants under the local 1P1D UCX stress harness. |
+| **B. PR `#13056` + local patches** | Uses PR `#13056`'s broad ownership/cancellation refactor, then adds the local eval-order fix and Python generation-init idempotency guards. | Removes the deterministic first-request `handleAsyncSend` SIGSEGV and the duplicate `addSequence` assertion. Some direct-UCX runs recovered, including a `CONC=24` run, but recovery was not yet consistently clean across repeats. |
+| **C. PR `#13495` + sig `#4` + local patches** | Adds PR `#13495`'s NIXL transfer-release cancellation hook to `rc11`, plus the sig `#4` non-blocking future fix, eval-order sequencing, and Python idempotency guards. | Removes the ctx Python-`getattr` SIGSEGV and `emplaceDone` assertion seen in earlier PR `#13495` experiments, but still reached no-recovery and stale-sequence behavior (`unordered_map::at` from `add_token`) in the direct-UCX stress harness. |
+| **D. Combo: PR `#13056` + PR `#13495` + local patches** | Combines PR `#13056`'s architectural refactor with PR `#13495`'s backend transfer-release cancellation, then adds eval-order sequencing and idempotency guards. | Best result so far. Direct UCX recovered in the regular harness, then recovered 5/5 same-server iterations at `CONC=16` and 5/5 same-server iterations at `CONC=24`. Still needs NIXL validation. |
+
+### Approach A — Chained Signature Fixes
+
+This is the forensic stack developed from individual signatures:
+
+- Signature `#1`: sender-side promise is fulfilled with an exception when
+  cancellation happens after the ready signal.
+- Signature `#4`: `CacheTransceiver::checkGenTransferStatus(atLeastNum=1)`
+  skips unready futures instead of blocking on `future.get()`.
+- Signature `#5`: receiver-side queued cancellation fulfills the receiver
+  promise instead of erasing it silently.
+- Signature `#6`: receive-buffer indices are released on the `!isReady`
+  early-return path and on exception paths.
+
+This approach is valuable because each fix is small and directly tied to a
+unit-testable root cause. It is not the best current product candidate by
+itself: once those bugs are peeled away, the local harness exposes a deeper
+sender/cleanup class (`#7`) as ctx-side Python SIGSEGVs, sender lifecycle
+wedge variants, or later stale-state assertions.
+
+### Approach B — PR `#13056` Plus Eval-Order and Idempotency
+
+PR `#13056` is the broad architectural refactor. It moves the code toward
+end-to-end request ownership and more systematic cancellation handling:
+
+- `std::shared_ptr<LlmRequest>` keeps request objects alive across async
+  sender / receiver workers.
+- RAII-style recv-buffer ownership protects more receiver exit paths than
+  the targeted `#6` fix.
+- More C++ future/promise and timeout paths are handled structurally rather
+  than as one-off patches.
+
+It also introduced or exposed two gaps that must be fixed:
+
+- The call `sendAndRemoveResponse(resp.mRequest->mRequestId, std::move(resp))`
+  is unsafe once `Response::mRequest` is a `shared_ptr`, because C++ does
+  not guarantee argument evaluation order. The fix is to materialize `reqId`
+  before moving `resp`.
+- The Python scheduler may surface the same logical
+  `DISAGG_GENERATION_INIT` request for many iterations. Resource
+  preparation and KV receive start must be idempotent by `py_request_id`.
+
+After those local patches, PR `#13056` performed much better, but it was
+not yet consistently clean in the local stress harness. We saw recovered
+runs, including a direct-UCX `CONC=24` run, but also no-recovery/backlog
+patterns in earlier repeats.
+
+### Approach C — PR `#13495` Plus Sig `#4`, Eval-Order, and Idempotency
+
+PR `#13495` adds transfer-release cancellation logic around the NIXL
+transfer handle. On top of `rc11`, we also added:
+
+- the sig `#4` non-blocking future fix, because PR `#13495` does not carry
+  that fix;
+- the eval-order sequencing fix, for consistency with the PR `#13056`
+  experiments (harmless if `Response::mRequest` is still raw in this stack);
+- the Python idempotency guards for generation-init resource preparation
+  and receive start.
+
+This stack did improve the failure shape. The ctx Python-`getattr` SIGSEGV
+and duplicate `addSequence` / `emplaceDone` assertion no longer reproduced
+after adding the local patches. However, the direct-UCX stress run still
+ended in no-recovery, and the gen event loop later failed with stale
+sequence state (`unordered_map::at` from `KVCacheManager::addToken`). This
+suggests PR `#13495` alone is not enough for the broad request-lifetime /
+cleanup problem, even though it may still be critical for the NIXL path.
+
+### Approach D — Combo Stack
+
+The combo stack is:
+
+```text
+rc11
++ PR #13056 architectural lifetime/cancellation refactor
++ PR #13495 transfer-release cancellation hook
++ eval-order fix in CacheSender::Impl::handleAsyncSend
++ Python idempotency guards in _prepare_disagg_gen_init() and _recv_disagg_gen_cache()
+```
+
+This is the strongest candidate so far. Direct-UCX validation:
+
+| Test | Result |
+|---|---|
+| Regular 1P1D `CONC=16`, `BURST_DUR_S=60` | Recovered at idle 30 s. |
+| Same servers, `CONC=16`, 5 iterations | 5/5 recovered. |
+| Same servers, `CONC=24`, 5 iterations | 5/5 recovered. |
+
+The combo still produces many burst-time `400` responses and KV-transfer
+timeout logs under stress; those are serving-quality issues and may still
+need cleanup. But the key bug-repro criterion is no permanent wedge after
+the burst, and the combo is the first stack that has repeatedly satisfied
+that criterion on the direct-UCX harness.
+
+The next validation gap is transport coverage: direct UCX success does not
+guarantee NIXL success. NIXL adds its own transfer-agent state, notification
+handling, buffer registration / release behavior, and locking. Since PR
+`#13495` specifically targets NIXL transfer release, the combo must still be
+validated with the NIXL backend before it can be called complete for the
+bug reporter's original NIXL deployment shape.
 
 Throughout the report we use these signature labels, which match the
 labelling we used in the chat session that produced this investigation:
