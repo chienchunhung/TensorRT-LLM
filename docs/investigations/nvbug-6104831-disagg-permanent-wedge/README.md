@@ -36,6 +36,9 @@
   - [#13673](https://github.com/NVIDIA/TensorRT-LLM/pull/13673) — signature #6
     combined test + fix (chained on `#13640` because the `!isReady` early-return
     path is only reachable once `#13640` sends `is_ready=false`)
+  - [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) — combo
+    approach PR: PR `#13056` + PR `#13495` + eval-order fix + Python
+    idempotency guards
 - **Companion fixes in main (not in `rc11`):**
   - [#13119](https://github.com/NVIDIA/TensorRT-LLM/pull/13119) — request-level
     error propagation (cleaner failure visibility, not a fix for the wedge)
@@ -46,14 +49,16 @@
   PR `#13056`'s architectural lifetime/cancellation refactor + PR `#13495`'s
   transfer-release cancellation hook + the local eval-order fix + the local
   Python idempotency guards. On direct UCX, this stack recovered in the
-  regular 1P1D harness and then recovered across 5 same-server iterations
-  at `CONC=16` and 5 same-server iterations at `CONC=24`. Burst-time
-  `400` responses and KV-transfer timeouts still occur under stress, but
-  the permanent wedge, first-request `handleAsyncSend` SIGSEGV, ctx
-  Python-`getattr` SIGSEGV, and duplicate `addSequence` / `emplaceDone`
-  assertion have not reproduced in this combo stack. NIXL validation remains
-  required before claiming transport-complete coverage, because direct UCX
-  success does not guarantee NIXL success.
+  regular 1P1D harness, recovered across 5 same-server iterations at
+  `CONC=16`, recovered across 5 same-server iterations at `CONC=24` with
+  both 60 s and 90 s bursts, and recovered across 5 same-server iterations
+  at `CONC=32`, `BURST_DUR_S=90` after explicit stale-server cleanup. A
+  clean `CONC=64`, `BURST_DUR_S=90` run still reached no recovery after
+  180 s idle on iteration 1. Burst-time `400` responses and KV-transfer
+  timeouts still occur under stress, but the permanent wedge is now bounded
+  by load level on direct UCX rather than appearing at every tested setting.
+  NIXL validation remains required before claiming transport-complete
+  coverage, because direct UCX success does not guarantee NIXL success.
 
 ---
 
@@ -96,7 +101,7 @@ the end-to-end harness results are materially different.
 | **A. Chained signature fixes** | Surgical fixes for signatures `#1`, `#4`, `#5`, and `#6` plus diagnostics. | Proved the individual root causes and exposed the residual sender / cleanup class. Still reached no-recovery or SIGSEGV variants under the local 1P1D UCX stress harness. |
 | **B. PR `#13056` + local patches** | Uses PR `#13056`'s broad ownership/cancellation refactor, then adds the local eval-order fix and Python generation-init idempotency guards. | Removes the deterministic first-request `handleAsyncSend` SIGSEGV and the duplicate `addSequence` assertion. Some direct-UCX runs recovered, including a `CONC=24` run, but recovery was not yet consistently clean across repeats. |
 | **C. PR `#13495` + sig `#4` + local patches** | Adds PR `#13495`'s NIXL transfer-release cancellation hook to `rc11`, plus the sig `#4` non-blocking future fix, eval-order sequencing, and Python idempotency guards. | Removes the ctx Python-`getattr` SIGSEGV and `emplaceDone` assertion seen in earlier PR `#13495` experiments, but still reached no-recovery and stale-sequence behavior (`unordered_map::at` from `add_token`) in the direct-UCX stress harness. |
-| **D. Combo: PR `#13056` + PR `#13495` + local patches** | Combines PR `#13056`'s architectural refactor with PR `#13495`'s backend transfer-release cancellation, then adds eval-order sequencing and idempotency guards. | Best result so far. Direct UCX recovered in the regular harness, then recovered 5/5 same-server iterations at `CONC=16` and 5/5 same-server iterations at `CONC=24`. Still needs NIXL validation. |
+| **D. Combo / PR `#13713`: PR `#13056` + PR `#13495` + local patches** | Combines PR `#13056`'s architectural refactor with PR `#13495`'s backend transfer-release cancellation, then adds eval-order sequencing and idempotency guards. | Best result so far. Direct UCX recovered in the regular harness; recovered 5/5 same-server iterations at `CONC=16`, `CONC=24`, and clean `CONC=32` / 90 s burst; and failed clean `CONC=64` / 90 s burst with no recovery after 180 s idle. Still needs NIXL validation. |
 
 ### Approach A — Chained Signature Fixes
 
@@ -164,7 +169,7 @@ sequence state (`unordered_map::at` from `KVCacheManager::addToken`). This
 suggests PR `#13495` alone is not enough for the broad request-lifetime /
 cleanup problem, even though it may still be critical for the NIXL path.
 
-### Approach D — Combo Stack
+### Approach D — Combo Stack / PR `#13713`
 
 The combo stack is:
 
@@ -181,14 +186,25 @@ This is the strongest candidate so far. Direct-UCX validation:
 | Test | Result |
 |---|---|
 | Regular 1P1D `CONC=16`, `BURST_DUR_S=60` | Recovered at idle 30 s. |
-| Same servers, `CONC=16`, 5 iterations | 5/5 recovered. |
-| Same servers, `CONC=24`, 5 iterations | 5/5 recovered. |
+| Same servers, `CONC=16`, `BURST_DUR_S=60`, 5 iterations | 5/5 recovered. |
+| Same servers, `CONC=24`, `BURST_DUR_S=60`, 5 iterations | 5/5 recovered. |
+| Same servers, `CONC=24`, `BURST_DUR_S=90`, 5 iterations, after stale-server cleanup | 5/5 recovered. |
+| Same servers, `CONC=32`, `BURST_DUR_S=90`, 5 iterations, after stale-server cleanup | 5/5 recovered. |
+| Same servers, `CONC=64`, `BURST_DUR_S=90`, clean retry | Failed on iteration 1: `ok200=9`, `errors=64`, `total=73`; all probes through idle 180 s hit `ReadTimeout`; no recovery. |
 
 The combo still produces many burst-time `400` responses and KV-transfer
 timeout logs under stress; those are serving-quality issues and may still
 need cleanup. But the key bug-repro criterion is no permanent wedge after
 the burst, and the combo is the first stack that has repeatedly satisfied
-that criterion on the direct-UCX harness.
+that criterion on the direct-UCX harness up to `CONC=32` with a 90 s burst.
+At `CONC=64`, direct UCX still reproduces the permanent no-recovery wedge.
+
+Two run-hygiene caveats matter for interpreting the latest results. First,
+one `CONC=24`, 90 s launch failed before the burst because stale gen
+processes still held `localhost:8002`; that run is invalid as a product
+signal. Second, an earlier `CONC=32`, 90 s run failed on iteration 1, but
+the clean rerun after explicit stale-server cleanup recovered 5/5. The
+clean `CONC=64`, 90 s run still failed even after the same cleanup.
 
 The next validation gap is transport coverage: direct UCX success does not
 guarantee NIXL success. NIXL adds its own transfer-agent state, notification
@@ -1770,7 +1786,7 @@ worker exits. Two options for a follow-on Phase 14:
 Either reroute lets us capture `$rdi`, walk to the holder, and pin
 down the exact mutex (Next Steps item 7).
 
-### Phase 14 — First-request PR `#13056` + UCX SIGSEGV fixed; idempotency gap identified; latest `CONC=24` repeat recovers (T+8 days, *current*)
+### Phase 14 — First-request PR `#13056` + UCX SIGSEGV fixed; idempotency gap identified; direct-UCX recovery boundary measured (T+8 days, *current*)
 
 Phase 14 starts from the strongest Phase 13 artifact: `run10`
 crashed on the very first direct-UCX request with a top frame in
@@ -2069,11 +2085,15 @@ The Phase 14 evidence is strong enough to split the work:
    preparation and KV receive start idempotent by `py_request_id`. This
    is not specific to PR `#13056`; repeated scheduler visits should not
    re-run non-idempotent side effects.
-3. **Latest direct-UCX pause point**: after the two fixes above, the
-   latest `CONC=24` run recovered. The remaining observed failures are
-   burst-time KV-transfer timeouts / `400` errors, with evidence pointing
-   at head-of-line backlog and timeout interaction rather than a stuck
-   ctx `sendSync()` or gen `requestSync()` call.
+3. **Latest direct-UCX pause point**: after the two fixes above, clean
+   same-server UCX repeats recovered 5/5 at `CONC=24`,
+   `BURST_DUR_S=90` and 5/5 at `CONC=32`, `BURST_DUR_S=90`. A clean
+   `CONC=64`, `BURST_DUR_S=90` retry failed on iteration 1 with no
+   recovery after 180 s idle. The remaining observed failures are
+   burst-time KV-transfer timeouts / `400` errors plus a high-load
+   no-recovery boundary, with evidence pointing at head-of-line backlog
+   and timeout interaction rather than a stuck ctx `sendSync()` or gen
+   `requestSync()` call at the passing load levels.
 4. **Still open from earlier phases**: the mutex-deadlock variant of
    sig `#7` still needs an exact `$rdi` mutex-address capture in a
    configuration that reliably produces the deadlock rather than one
@@ -2781,9 +2801,12 @@ In rough priority order:
     PR `#13056`.
 
 7c. **Investigate burst-time KV-transfer timeout / backlog behaviour
-    after the eval-order and idempotency fixes.** The latest direct-UCX
-    `CONC=24` run recovered at idle 30 s, but it still produced many
-    burst-time generation/context KV-transfer timeouts and `400` errors.
+    after the eval-order and idempotency fixes.** Clean direct-UCX repeats
+    now recover 5/5 at `CONC=24`, `BURST_DUR_S=90` and 5/5 at `CONC=32`,
+    `BURST_DUR_S=90`, but a clean `CONC=64`, `BURST_DUR_S=90` retry still
+    reaches no recovery after 180 s idle on iteration 1. The passing runs
+    still produce many burst-time generation/context KV-transfer timeouts
+    and `400` errors.
     Transfer instrumentation balanced in that run (`sendSync_before_format`
     / `[transfer-send] begin` / `[transfer-send] end` /
     `sendSync_after_format` / `sendAndRemove_exit` all counted 37; gen
