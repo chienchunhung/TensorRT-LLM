@@ -217,11 +217,58 @@ NIXL-path validation now shows a sharp contrast:
 |---|---|
 | NIXL transceiver path, NIXL transfer agent using backend `UCX`, same servers, `CONC=32`, `BURST_DUR_S=90`, 5 iterations | 5/5 recovered; each burst completed with `ok200=716`, `errors=0`, `total=716`. |
 | NIXL transceiver path, NIXL transfer agent using backend `UCX`, same servers, `CONC=64`, `BURST_DUR_S=90`, 5 iterations | 5/5 recovered; bursts completed with `ok200=716`, `errors=0`, `total=716` except one iteration with `ok200=715`, `errors=0`, `total=715`. |
+| NIXL transceiver path, NIXL transfer agent using backend `UCX`, 3 ctx/gen pairs on one 8-GPU B300 node, `CONC=128`, `BURST_DUR_S=90`, 5 iterations | Running as the current local stress verdict candidate. This is a strong single-node saturation test if it passes, but it still does not cover multi-node fabric, Dynamo orchestration, or production mixed traffic. |
 
 This means the latest contrast is not "UCX hardware transport bad, NIXL
 transport good"; both NIXL runs used the UCX plugin underneath. The split is
 between TRT-LLM's direct UCX transceiver path and the NIXL transfer-agent path
 with PR `#13495`'s explicit transfer-release cancellation semantics.
+
+#### Direct-UCX cleanup / cancellation design
+
+The direct-UCX path can plausibly acquire similar cancellation semantics
+without changing UCX itself. UCX exposes `ucp_request_cancel()`, and the
+UCXX copy used by this build exposes it through `ucxx::Request::cancel()`:
+
+```text
+ucxx::Request::cancel()
+  -> ucp_request_cancel(_worker->getHandle(), _request)
+```
+
+The missing piece is not the primitive; it is TRT-LLM's lifecycle contract.
+Direct UCX currently posts a `ucxx::Request` and then blocks on
+`future.get()` until the callback fires. That means a per-request cancel flag
+cannot be observed while the direct-UCX call is waiting. By contrast, the
+NIXL path wraps the backend handle in `TransferStatus`, polls
+`wait(timeout_ms)` in bounded slices, and calls `release()` when cancellation
+is observed.
+
+The proposed short-term design is therefore:
+
+1. Add a direct-UCX `TransferStatus` wrapper around `ucxx::Request`.
+2. Implement `wait(timeout_ms)` using `isCompleted()` / callback-future
+   polling, returning `kIN_PROGRESS` on timeout.
+3. Implement `release()` by calling `ucxx::Request::cancel()`, then continue
+   progressing / waiting until the UCXX request reaches a terminal state.
+   Only after that point can TRT-LLM safely unwind and release or reuse send
+   / receive buffers.
+4. Factor the NIXL polling policy into a shared helper used by both
+   `AgentConnection::send()` and direct `UcxConnection::{send,recv}`:
+   submit transfer, bounded wait, observe `DataContext::getTransferTerminate()`,
+   release/cancel backend request, wait to terminal ownership state, then
+   throw to unwind TRT-LLM request state.
+
+This keeps backend-specific logic small: NIXL's `release()` maps to
+`releaseXferReq()`, while direct UCX's `release()` maps to
+`ucxx::Request::cancel()` plus terminal-state draining. The policy for when
+to poll, when to cancel, and when it is safe to unwind lives once.
+
+The larger architectural option is to turn direct UCX into a full
+`BaseTransferAgent` backend and route it through `AgentConnection`. That
+would remove more duplication long term, but it is materially larger and
+riskier because it has to preserve today's ZMQ bootstrap, tag scheme,
+connection caching, and recv-side behavior. The lower-risk incident fix is
+the shared `TransferStatus` / cancellable-wait contract first.
 
 Throughout the report we use these signature labels, which match the
 labelling we used in the chat session that produced this investigation:
@@ -2107,7 +2154,15 @@ The Phase 14 evidence is strong enough to split the work:
    timeout interaction, or missing direct-UCX cancellation/release semantics
    rather than a stuck ctx `sendSync()` or gen `requestSync()` call at the
    passing load levels.
-4. **Still open from earlier phases**: the mutex-deadlock variant of
+4. **Direct-UCX cancellation path is implementable in TRT-LLM scope**:
+   UCXX exposes `ucxx::Request::cancel()`, which calls UCX's
+   `ucp_request_cancel()`. The design should not add an isolated UCX-only
+   loop; it should reuse the `TransferStatus` lifecycle contract already used
+   by NIXL. Direct UCX needs a `TransferStatus` wrapper that maps `release()`
+   to `request->cancel()` plus terminal-state draining, and both NIXL and
+   direct UCX should share a common "bounded wait, observe request cancel,
+   release backend handle, drain, throw" helper.
+5. **Still open from earlier phases**: the mutex-deadlock variant of
    sig `#7` still needs an exact `$rdi` mutex-address capture in a
    configuration that reliably produces the deadlock rather than one
    of the SIGSEGV/assertion variants.
@@ -2835,6 +2890,25 @@ In rough priority order:
     ~18.5 GB. Given the NIXL+UCX-plugin success at `CONC=64`, also compare
     cancellation and transfer-handle release semantics between direct UCX and
     the NIXL transfer-agent path.
+
+7c-1. **Prototype shared cancellation semantics for direct UCX.** UCXX exposes
+      `ucxx::Request::cancel()`, backed by UCX `ucp_request_cancel()`, so a
+      TRT-LLM-scoped direct-UCX fix is feasible. Add a `TransferStatus` wrapper
+      for direct UCX requests, implement `release()` as cancel plus
+      terminal-state draining, and move the current NIXL polling / cancel
+      policy into a shared helper. The important safety invariant is:
+      request cancel is not enough by itself; TRT-LLM must keep progressing or
+      waiting until the backend request reaches a terminal ownership state
+      before send/recv buffers can be released or reused. This is a medium
+      change and should precede any larger "make direct UCX a full
+      `BaseTransferAgent` backend" refactor.
+
+7c-2. **Record the 3-pair NIXL stress verdict.** The current in-flight local
+      saturation run uses 3 ctx/gen pairs on one 8-GPU B300 node with
+      `CONC=128`, `BURST_DUR_S=90`, and 5 same-server iterations. Passing this
+      run would be the strongest local single-node verdict for the combo+NIXL
+      approach, while still leaving multi-node fabric, Dynamo orchestration,
+      and production mixed traffic as follow-up validation scopes.
 
 7d. **Cancellation cleanup-path lifecycle audit (Phase 13 follow-up)**.
     `run9` shows that with sig `#1`/`#4`/`#5`/`#6` fixed, ctx still
