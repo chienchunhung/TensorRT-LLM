@@ -74,8 +74,14 @@ Local 1P1D `trtllm-serve` long-prompt burst harness, single host:
 | Same servers, `CONC=24`, `BURST_DUR_S=60`, 5 iterations | 5/5 recovered. |
 | Same servers, `CONC=24`, `BURST_DUR_S=90`, 5 iterations, after stale-server cleanup | 5/5 recovered. |
 | Same servers, `CONC=32`, `BURST_DUR_S=90`, 5 iterations, after stale-server cleanup | 5/5 recovered. |
+| Same servers, `CONC=48`, `BURST_DUR_S=90`, 5 iterations, with diagnostic build | Failed on iteration 1: `ok200=11`, `errors=48`, `total=59`; all probes through idle 180 s hit `ReadTimeout`; no recovery. |
 | Same servers, `CONC=64`, `BURST_DUR_S=90`, clean retry | Failed on iteration 1: `ok200=9`, `errors=64`, `total=73`; all probes through idle 180 s hit `ReadTimeout`; no recovery. |
 | Same servers, `CONC=64`, `BURST_DUR_S=90`, confirmation after NIXL success | Failed on iteration 1 again: `ok200=12`, `errors=64`, `total=76`; same pattern; reproducible. |
+| Same servers, `CONC=128`, `BURST_DUR_S=90`, 5 iterations, with diagnostic build | Failed on iteration 1: `ok200=12`, `errors=100`, `total=112`; same pattern. |
+
+The direct-UCX usable boundary on this rig is therefore `CONC=32`,
+`BURST_DUR_S=90`. Above that, direct UCX wedges on the first burst and
+does not recover.
 
 ### NIXL transceiver path (NIXL transfer agent using backend `UCX`)
 
@@ -83,7 +89,13 @@ Local 1P1D `trtllm-serve` long-prompt burst harness, single host:
 |---|---|
 | Same servers, `CONC=32`, `BURST_DUR_S=90`, 5 iterations | 5/5 recovered; each burst completed with `ok200=716`, `errors=0`, `total=716`. |
 | Same servers, `CONC=64`, `BURST_DUR_S=90`, 5 iterations | 5/5 recovered; bursts completed with `ok200=716`, `errors=0`, `total=716` except one iteration with `ok200=715`, `errors=0`, `total=715`. |
-| 3 ctx/gen pairs on one 8-GPU B300 node, `CONC=128`, `BURST_DUR_S=90`, 5 iterations | Running as the current local stress verdict candidate. |
+| 3 ctx/gen pairs on one 8-GPU B300 node, `CONC=128`, `BURST_DUR_S=90`, 5 iterations | 5/5 recovered; bursts completed with `ok200=716`, `errors=0`, `total=716` (one iteration `ok200=715`). |
+| 3 ctx/gen pairs on one 8-GPU B300 node, `CONC=256`, `BURST_DUR_S=90`, 5 iterations | 5/5 recovered; bursts completed with `ok200=716`, `errors=0`, `total=716` (one iteration `ok200=715`). |
+
+The 3-pair `CONC=256` recovery is the strongest local single-node
+verdict for the combo+NIXL stack. Multi-node fabric, Dynamo
+orchestration, and production mixed traffic remain open follow-up
+validation scopes.
 
 The latest contrast is **not** "UCX hardware transport bad, NIXL
 transport good"; both NIXL runs used the UCX plugin underneath. The
@@ -91,31 +103,113 @@ split is between TRT-LLM's direct UCX transceiver path and the NIXL
 transfer-agent path with PR `#13495`'s explicit transfer-release
 cancellation semantics.
 
+### Direct-UCX saturation evidence (diagnostic build)
+
+To understand why direct UCX falls behind NIXL on the same workload, we
+built a diagnostic version of the combo with three extra signals:
+
+- `[ucx-cancel] cancel observed` warnings inside `waitUcxRequestOrCancel()`
+  whenever a per-request cancel flag flips while a direct-UCX wait is in
+  progress.
+- `[ucx-slow] op=... elapsedMs=...` warnings when any direct-UCX call
+  (`sendConnectionId`, `send`, `recv`, `recvConnect`) takes ≥ 100 ms (env
+  override `TRTLLM_UCX_SLOW_CALL_LOG_MS`).
+- `[cancel] CacheSender|CacheReceiver::cancelRequest` entry/flip/exit lines
+  promoted to `WARNING` so the cancel path is visible live.
+
+For `CONC=128`, `BURST_DUR_S=90`, the diagnostic counts were:
+
+| Marker | gen.log | ctx.log |
+|---|---:|---:|
+| `[ucx-cancel] cancel observed` | 0 | 3 |
+| `[ucx-slow] op=...` (≥100 ms) | 34 | 67 |
+| `CacheSender::cancelRequest entered` | 0 | 139 |
+| `CacheSender::cancelRequest flipped` | 0 | 3 |
+| `CacheReceiver::cancelRequest entered` | 33 | 0 |
+| `CacheReceiver::cancelRequest removedFromQueue=1` | 33 | 0 |
+| `exceeded total timeout` | 27 | 139 |
+
+For `CONC=48`, `BURST_DUR_S=90`, the same shape held (gen `[ucx-slow]=31`,
+ctx `[ucx-slow]=61`, ctx sender `entered=91 / flipped=3`, gen receiver
+`entered=31 / flipped=0 / removedFromQueue=23`, ctx `exceeded total
+timeout=91`).
+
+What this evidence says:
+
+- Individual direct-UCX calls *complete*, but they are slow under load.
+  `[ucx-slow]` durations were 3-11 s for buffers of 1-3.7 GB, i.e. on the
+  order of 300-400 MB/s effective. This is well below what UCX can sustain
+  for shared-memory / NVLink / IPC peer-to-peer on a single B300 node. The
+  bottleneck is throughput, not a stuck call.
+- The TRT-LLM cancel paths run, but almost all cancels resolve via *queue
+  removal* rather than aborting an in-flight UCX call:
+  - ctx `CacheSender::cancelRequest`: 139 entered, 3 flipped the in-flight
+    cancel flag, the rest were satisfied via `mReadyResponses` queue
+    removal (request waiting to be sent, never started).
+  - gen `CacheReceiver::cancelRequest`: 33 entered, 0 flipped, all 33 had
+    `removedFromQueue=1` (request waiting in the receiver queue, never
+    started).
+- The failure mode is *queue backpressure → deadline reaper →
+  cancellation of work that never started*, not "UCX call stuck waiting on
+  a dead peer". A scoped cancel-aware UCX wait helper has the right
+  shape, but it cannot help when no in-flight UCX call needs to be
+  cancelled.
+
+### Why direct UCX falls behind NIXL on the same workload
+
+NIXL and direct UCX use the same UCX plugin, so the wire-level transport is
+the same. The difference is the request shape used to move data:
+
+| Layer | NIXL path (`AgentConnection::send`) | Direct UCX path (`UcxConnection::send` / `recv`) |
+|---|---|---|
+| Data transfer primitive | One-sided RDMA `submitTransferRequests` (write to remote pre-registered VRAM) | Two-sided `tagSend` / `tagRecv` rendezvous |
+| Receiver participation | None per buffer; receiver consumes after a single notification | Receiver must post matching `tagRecv` per buffer |
+| Sync between sender and receiver | Single `notifySyncMessage` after the write completes | Per-buffer rendezvous handshake plus completion |
+| Per-buffer latency under load | Bounded by RDMA write throughput | Bounded by rendezvous round-trip + receiver scheduling latency |
+| Cancellation handle | `nixlAgent::releaseXferReq()` via `TransferStatus::release()` (used in `AgentConnection::send` poll-wait) | `ucxx::Request::cancel()` → `ucp_request_cancel()` available, but the wedge happens before in-flight-cancel becomes the deciding factor |
+
+The practical consequence is what we measured: under `CONC ≥ 48`, direct UCX
+spends multi-second windows in tag rendezvous per buffer, the response /
+request queues build up, the deadline reaper cancels the backlog, and
+recovery probes after the burst keep timing out because the worker queues
+do not drain in time.
+
 ---
 
-## The remaining direct-UCX `CONC=64` wedge
+## The remaining direct-UCX boundary above `CONC=32`
 
-The combo still wedges on direct UCX at `CONC=64`. This is consistent
-with the L1–L8 framing: `#13495`'s `TransferStatus::release()` is a
-NIXL-side primitive. The direct-UCX path doesn't have an equivalent
-primitive yet, even though the underlying UCX library exposes one
-(`ucp_request_cancel()` / `ucxx::Request::cancel()`). The proposed
-short-term design (from Phase 14):
+The combo still wedges on direct UCX at `CONC=48 / 64 / 128`,
+`BURST_DUR_S=90`. This is **not** primarily an L1-L8 cancellation gap;
+the diagnostic build shows the wedge is throughput saturation under
+the rendezvous protocol plus queue backpressure (see *Direct-UCX
+saturation evidence* above). The proposed short-term design from
+Phase 14 - a direct-UCX `TransferStatus::release()` wrapper around
+`ucxx::Request::cancel()` plus a shared cancel-aware wait helper - is
+still the right *cancellation shape* for direct UCX. It correctly
+matches NIXL's lifecycle contract for the cases where a cancel does
+fire mid-call. But it does **not** lift the saturation boundary. The
+diagnostic build at `CONC=128` shows that only 3 of 139 ctx-side
+cancels actually flipped the in-flight cancel flag the helper would
+observe; the rest are queue removals of requests that never started.
 
-1. Add a direct-UCX `TransferStatus` wrapper around `ucxx::Request`.
-2. Implement `wait(timeout_ms)` using `isCompleted()` /
-   callback-future polling, returning `kIN_PROGRESS` on timeout.
-3. Implement `release()` by calling `ucxx::Request::cancel()`, then
-   continue progressing / waiting until the UCXX request reaches a
-   terminal state. Only after that point can TRT-LLM safely unwind
-   and release or reuse send / receive buffers.
-4. Factor the NIXL polling policy into a shared helper used by both
-   `AgentConnection::send()` and direct `UcxConnection::{send,recv}`:
-   submit transfer, bounded wait, observe
-   `DataContext::getTransferTerminate()`, call `release()` on cancel.
+Lifting the direct-UCX boundary on this workload requires either:
+
+- **(a)** UCX rendezvous tuning (e.g. `UCX_RNDV_SCHEME=put_zcopy`,
+  `UCX_RNDV_THRESH`) plus parallel send workers
+  (`TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM`); cheap to test, may shift
+  the throughput ceiling; or
+- **(b)** replacing `tagSend`/`tagRecv` rendezvous with a one-sided RDMA
+  shape similar to NIXL's: pre-register receiver memory, use
+  `ucp_put_nbx`, deliver completion via a small notification message.
+  Larger change; either an extension of the direct-UCX path or a new
+  `BaseTransferAgent` backend that unifies with the NIXL path.
 
 This is a follow-up TRT-LLM PR scope, not a NIXL or UCX change. See
 [`../08-next-steps-and-pr-map.md`](../08-next-steps-and-pr-map.md).
+
+For the current PR cycle the decision is to ship PR `#13713` with
+direct-UCX as recovered up to `CONC=32`, `BURST_DUR_S=90` on this rig,
+and to defer further direct-UCX work.
 
 ---
 

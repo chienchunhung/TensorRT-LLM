@@ -76,25 +76,61 @@ and idempotency guards already, plus PR `#13056` + PR `#13495`'s
 architectural mechanisms. Recovery is clean on NIXL+UCX-plugin
 through `CONC=64`, the customer's transport.
 
-### 3. Add a direct-UCX `TransferStatus::release()` analog
+### 3. Lift the direct-UCX saturation boundary above `CONC=32`
 
-The combo still wedges on direct UCX at `CONC=64` because PR `#13495`'s
-`releaseXferReq()` is NIXL-specific. UCXX exposes
-`ucxx::Request::cancel()`, backed by UCX `ucp_request_cancel()`, so
-a TRT-LLM-scoped direct-UCX fix is feasible:
+The combo recovers cleanly on direct UCX through `CONC=32`,
+`BURST_DUR_S=90` and wedges above that on this single-host rig
+(`CONC=48 / 64 / 128`). The diagnostic build (see
+[`06-fix-approaches/D-combo.md`](06-fix-approaches/D-combo.md#direct-ucx-saturation-evidence-diagnostic-build))
+shows the wedge is throughput saturation plus queue backpressure: per-
+buffer `tagSend`/`tagRecv` calls take 3-11 s for 1-3.7 GB buffers
+(~300-400 MB/s effective), the deadline reaper cancels backlog, and
+recovery probes time out while queues drain. Almost all TRT-LLM
+cancels under saturation resolve via queue removal of work that never
+started (3 of 139 ctx-side cancels actually flipped the in-flight
+cancel flag at `CONC=128`).
 
-1. Add a `TransferStatus` wrapper for direct UCX requests.
-2. Implement `release()` as cancel + terminal-state draining.
-3. Move the current NIXL polling / cancel policy into a shared helper
-   used by both `AgentConnection::send()` and direct
-   `UcxConnection::{send,recv}`.
-4. The important safety invariant: request cancel is not enough by
-   itself; TRT-LLM must keep progressing or waiting until the backend
-   request reaches a terminal ownership state before send/recv buffers
-   can be released or reused.
+Two follow-up scopes lift the boundary:
 
-This is a medium change and should precede any larger "make direct UCX
-a full `BaseTransferAgent` backend" refactor.
+**3a. Cheap test: UCX rendezvous tuning + parallel send workers**
+
+- `UCX_RNDV_SCHEME=put_zcopy` (or `get_zcopy`), raise `UCX_RNDV_THRESH`,
+  ensure GPU NVLink/IPC transports are enabled.
+- Increase `TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM` (currently 1) so
+  multiple async-send worker threads can overlap sends.
+- Possibly raise `kv_transfer_timeout_ms` to absorb burst-time variance.
+
+This will not change architecture; it can lift throughput enough that
+the queue stops backing up. Cheap to test, no rebuild. Recommended as
+the first step.
+
+**3b. One-sided RDMA shape for direct UCX (matches NIXL)**
+
+If 3a plateaus, the direct-UCX path needs to replace `tagSend` /
+`tagRecv` rendezvous with a one-sided RDMA shape similar to NIXL's:
+
+1. Pre-register receiver memory (memory descriptor exchange).
+2. Use `ucp_put_nbx` for one-sided writes (already exposed by UCXX).
+3. Deliver completion via a small notification message.
+4. Add a `TransferStatus` wrapper around the UCXX request and implement
+   `release()` as `ucxx::Request::cancel()` plus terminal-state
+   draining.
+5. Factor the NIXL polling / cancel policy into a shared helper used by
+   both `AgentConnection::send()` and the new direct-UCX path.
+
+The cancellation primitive is independently useful for sub-saturation
+cancellation correctness; it is **not** by itself sufficient to lift
+the saturation boundary.
+
+The larger architectural option is to turn direct UCX into a full
+`BaseTransferAgent` backend and route it through `AgentConnection`,
+which would unify the two paths. That removes more duplication
+long-term but is materially larger and riskier.
+
+For the current PR cycle, this work is **deferred**. PR `#13713` ships
+with direct-UCX recovered up to `CONC=32`, `BURST_DUR_S=90` on this
+rig, and direct-UCX above its boundary is documented as a known
+limitation, not a regression introduced by the combo.
 
 ### 4. Multi-node / Dynamo orchestration validation
 

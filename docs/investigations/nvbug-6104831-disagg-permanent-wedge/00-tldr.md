@@ -212,18 +212,27 @@ focused unit tests for these signatures.
 ## Does it work?
 
 Yes, on the customer's transport. The combo recovers cleanly under the
-local 1P1D `trtllm-serve` long-prompt burst harness on a single host:
+local 1P1D `trtllm-serve` long-prompt burst harness on a single host
+(plus a 3 ctx/gen pair stress shape on one 8-GPU B300 node):
 
-| Transport | `CONC=16` | `CONC=24` | `CONC=32` | `CONC=64` |
-|---|---|---|---|---|
-| **NIXL + UCX plugin** *(customer transport)* | n/a | n/a | **5/5 recovered, zero burst-time errors** | **5/5 recovered, zero burst-time errors** |
-| Direct UCX | 5/5 recovered | 5/5 recovered | 5/5 recovered | wedged on iter 1 |
+| Transport | `CONC=16` | `CONC=24` | `CONC=32` | `CONC=48` | `CONC=64` | `CONC=128` (3-pair) | `CONC=256` (3-pair) |
+|---|---|---|---|---|---|---|---|
+| **NIXL + UCX plugin** *(customer transport)* | n/a | n/a | **5/5 recovered, zero burst errors** | n/a | **5/5 recovered, zero burst errors** | **5/5 recovered, zero burst errors** | **5/5 recovered, zero burst errors** |
+| Direct UCX | 5/5 recovered | 5/5 recovered | 5/5 recovered | wedged on iter 1 | wedged on iter 1 | wedged on iter 1 | n/a |
 
 The customer-reported failure shape is **fixed on NIXL+UCX-plugin
-through `CONC=64`**. NIXL is the customer's transport, so the
-reporter's deployment shape is covered by the combo. Direct UCX still
-wedges at `CONC=64`; that is a separate, narrower follow-up that needs
-a `ucxx::Request::cancel()` analog to PR #13495's `releaseXferReq()`
+through at least `CONC=256` with 3 ctx/gen pairs**. NIXL is the
+customer's transport, so the reporter's deployment shape is covered by
+the combo. Direct UCX recovers cleanly through `CONC=32` and saturates
+above that. The diagnostic build shows the direct-UCX failure at high
+load is throughput saturation plus queue backpressure (not a stuck UCX
+call): individual `tagSend`/`tagRecv` calls take 3-11 s for 1-3.7 GB
+buffers (~300-400 MB/s effective), the response/request queues build
+up, the deadline reaper cancels backlog, and recovery probes after the
+burst keep timing out. Most TRT-LLM cancels resolve via queue removal
+of work that never started rather than aborting an in-flight UCX call.
+Lifting that boundary needs either UCX rendezvous tuning + parallel
+send workers, or a one-sided RDMA shape mirroring NIXL — both deferred
 (see [`08-next-steps-and-pr-map.md`](08-next-steps-and-pr-map.md)).
 
 A few honest caveats:
