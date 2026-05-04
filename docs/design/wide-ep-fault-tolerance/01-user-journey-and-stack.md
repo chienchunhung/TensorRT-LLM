@@ -103,7 +103,7 @@ WideEP execution sits on a three-layer stack. The same workload (an AlltoAll acr
 graph TB
     subgraph "L1 — Process orchestration"
         MPI["MPI runtime<br/>(default, mpi4py)<br/>mpirun launcher,<br/>MPIPoolExecutor"]
-        Ray["Ray actors<br/>(opt-in, orchestrator_type='ray')<br/>KubeRay, placement groups"]
+        Ray["Ray actors<br/>(opt-in, orchestrator_type=ray)<br/>KubeRay, placement groups"]
     end
 
     subgraph "L2 — Control plane"
