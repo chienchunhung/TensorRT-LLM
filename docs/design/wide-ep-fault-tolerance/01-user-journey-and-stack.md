@@ -47,7 +47,7 @@ sequenceDiagram
     RankN->>RankN: HostMoeTensorSharer publishes node-local shm
     RankN->>RankN: first MoE layer call → CommunicationFactory.create_strategy()
 
-    Note over Rank0,RankN: Server is ready. Client requests arrive at rank 0 HTTP endpoint;<br/>rank 0 dispatches via MPI to all 72 workers; each iteration runs<br/>AlltoAll across all 72 ranks for every MoE layer.
+    Note over Rank0,RankN: Server is ready. Client requests arrive at rank 0 HTTP endpoint.<br/>Rank 0 dispatches via MPI to all 72 workers.<br/>Each iteration runs AlltoAll across all 72 ranks for every MoE layer.
 ```
 
 Concretely, on a 72-rank NVL72 launch:
