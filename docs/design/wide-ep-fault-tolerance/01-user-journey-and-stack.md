@@ -167,6 +167,18 @@ The actual high-throughput tensor movement during inference. **Three different l
 
 Critically: **NVLinkOneSided does not use NCCL or NVSHMEM.** It uses MNNVL fabric memory directly with custom CUDA kernels written in TRT-LLM. The completion-flag table that the AlltoAll kernel spins on is ours; the synchronization protocol is ours; the FT semantics are ours to add.
 
+### What's shared, what's not
+
+It's natural to assume MNNVL, NCCL, NVSHMEM (and **NIXL**, which is the L3 path used for disaggregated KV cache transfer rather than EP collectives) share more than they do. They share the **physical fabric** (NVLink + NVSwitch + MNNVL pages on NVL72, plus IB / RoCE for cross-rack) and the **CUDA driver substrate** (`cuMem*`, streams, contexts, GPU memory subsystem). NCCL on NVL72 will in fact choose MNNVL fabric pages as its transport when available — the same hardware that NVLinkOneSided uses directly. So in terms of where the bytes ultimately move, all four can hit the same fabric.
+
+What they *don't* share:
+
+- **API surface.** Different libraries with different programming models. You can't pass a `ncclComm_t` to NIXL, or a NIXL transfer handle to NVSHMEM.
+- **Synchronization model.** MNNVL writes raw PTX against a `completion_flags` table in symmetric memory — the kernel itself is the synchronization. NCCL has internal stream-based sync. NVSHMEM has symmetric quiet/fence primitives. NIXL has a transfer state machine with explicit `PENDING / PROCESSING / DONE / ERROR` states.
+- **Failure-reporting story.** NCCL exposes `ncclCommGetAsyncError` + `ncclCommAbort`. NIXL exposes `check_xfer_state` and surfaces `RuntimeError("NIXL transfer failed: …")` on error. NVSHMEM has limited error-reporting support on shipping versions. **MNNVL has no library-level error API — we own the kernel, and there's nothing above us to surface a failure.** This is the unique constraint that justifies the host-side AlltoAll watchdog ([§5.3](05-phase-1-immediate-survival.md#53-failure-detection--pr-12718-integration)).
+
+Net: same hardware can move bytes through any of these stacks; FT engineering for each is genuinely independent work, with very different existing primitives to build on.
+
 ### What the layers don't do
 
 A common confusion is to expect FT at every layer. The three layers cooperate but do not substitute for one another:

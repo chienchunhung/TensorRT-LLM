@@ -49,11 +49,20 @@ for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize) {
 
 **Kernel-side `check_timeout` backstop.** The 300s `trap;` stays as a worst-case defense — if the host watchdog (§5.3) fails to fire and the mask isn't set, the kernel will eventually self-abort rather than hang the GPU forever. PR 1a.8 (v1) optionally tightens this and replaces `trap;` with a host-visible flag to avoid context corruption; for MVP the existing behavior is acceptable.
 
-### NCCL fallback wiring
+### NCCL FT wiring (PR 1a.7)
 
-Verified: zero non-test uses of `ncclCommAbort`, `NCCL_ASYNC_ERROR_HANDLING`, `ncclCommFinalize`, `ncclGetLastError` in TRT-LLM. The only NCCL integration is `torch.classes.trtllm.NcclCommunicatorOp` (P2P, no error hook). Implication: the `AllGatherReduceScatter` fallback EP backend hangs the same way the NVLinkOneSided backend does today, just at a different layer.
+Verified: zero non-test uses of `ncclCommAbort`, `NCCL_ASYNC_ERROR_HANDLING`, `ncclCommFinalize`, `ncclGetLastError` in TRT-LLM. The only NCCL integration is `torch.classes.trtllm.NcclCommunicatorOp` (P2P, no error hook).
 
-PR 1a.7 wires `NCCL_ASYNC_ERROR_HANDLING=1` at communicator init, registers a watchdog that calls `ncclCommAbort` on timeout, and exposes a Python-callable `abort_and_reinit(active_ranks)` API. v1 scope.
+**Why this matters more than "the EP fallback."** It's tempting to frame PR 1a.7 as a safety net for the rarely-used `AllGatherReduceScatter` EP backend, but NCCL is in the WideEP data path even when **MNNVL is the chosen AlltoAll backend.** Specifically:
+
+- TP allreduces in non-MoE projections (LM head, embedding, output-side reductions) — NCCL via `torch.distributed` or via `NcclCommunicatorOp`.
+- PP send/recv when `pp > 1` — NCCL via `NcclCommunicatorOp`.
+- DeepSeek-V3 with `enable_attention_dp=True` reduces but does not eliminate this volume; the per-attention-layer TP allreduces go away, but output-side and (with PP) inter-stage collectives remain.
+- The `AllGatherReduceScatter` EP backend itself — only chosen when MNNVL+DeepEP are both unavailable, which is rare on production NVL72.
+
+A dead rank hangs the next NCCL collective on any of these paths just as surely as it hangs the MNNVL AlltoAll. Without `ncclCommAbort` wiring, that hang is unrecoverable — independent of whether MNNVL masking succeeds. So **PR 1a.7 is required for production WideEP regardless of which EP backend is selected**, not just as a fallback safety net. Audit 1a Day 1 corroborates this: even on the `torch.distributed` path (where PT does wire NCCL abort), PT 2.11's recovery is broken, which is why PR 2a.1 in Phase 2 drops below `torch.distributed` for the actual rebuild.
+
+PR 1a.7 wires `NCCL_ASYNC_ERROR_HANDLING=1` at communicator init, registers a watchdog that calls `ncclCommAbort` on timeout, and exposes a Python-callable `abort_and_reinit(active_ranks)` API. **v1 scope** because the dominant Phase 1 MVP failure mode is Mode B (MNNVL kernel hang) which 1a.7 doesn't fix — but landing 1a.7 in v1 closes the parallel NCCL hang that the same dead rank causes in TP / PP collectives. AllGatherReduceScatter-as-the-EP-backend gets the same wiring for free.
 
 ## 5.2 EPLB topology adaptation
 
@@ -122,6 +131,20 @@ Detection is the entry point for everything in §5.1 and §5.2. The design exten
 
 **Implication for `trtllm-llmapi-launch` deployments.** The `mgmn_leader_node`-based launcher path (used by `trtllm-bench`, `trtllm-serve` with `TLLM_SPAWN_PROXY_PROCESS=1`, and the layer-wise benchmark CI test) instantiates `RemoteMpiCommSessionClient`, whose `submit()` returns `[]`. PR #12718's `_check_mpi_futures()` therefore has no futures to inspect for those deployments and Layer 2 is silent. Layer 1 (the AlltoAll watchdog) is the **only** detection mechanism that fires there — it must not be treated as optional. Layer 1 is also strictly faster (1–5 s vs 5 s poll), so prefer it as the primary path everywhere, with Layer 2 as a redundant signal where available.
 
+### Where errors come from: producers vs consumers
+
+The detection layers above produce signals; PR #12718's `classify_error()` is the consumer of those signals. The matrix below shows, for each backend in the WideEP data path, **whether failures surface naturally today** (PR #12718 picks them up automatically) versus **which producer-side work this design adds** to surface signals on the silent paths.
+
+| Backend | Used for in WideEP | Surfaces failure today? | What this design adds |
+|:---|:---|:---|:---|
+| NCCL via `torch.distributed` | TP allreduces, output-side collectives, attention DP coords | **Yes** — PT watchdog raises Python exception | Classified by PR #12718 patterns (`"nccl error"`, `"nccl timeout"`); Audit 1a Day 1 found PT 2.11's recovery path itself broken — PR 2a.1 (Phase 2) drops below `torch.distributed` |
+| NCCL via TRT-LLM custom op | PP send/recv (`NcclCommunicatorOp`), `AllGatherReduceScatter` EP fallback | **No** — `ncclCommAbort`/`getAsyncError` not wired (zero non-test uses) | Closed by **PR 1a.7** (NCCL FT wrapper). Note that NCCL is in the WideEP data path even when MNNVL is the chosen EP backend (TP / PP collectives), so 1a.7 matters more than the "EP fallback" framing implies |
+| NIXL | Disagg KV cache transfer (production default for §1-DS) | **Yes** — `check_xfer_state == ERROR` raises `RuntimeError("NIXL transfer failed: …")` (`_agent_py.py:125`) | Already classifiable; **PR 1c.1 adds NIXL-specific regex patterns** (`"nixl transfer failed"`, `"nixl transfer entered error state"`) so the classifier reaches `severe` instead of falling through to `transient` |
+| MNNVL / NVLinkOneSided | WideEP MoE AlltoAll (NVL72 primary) | **No** — kernel spins on `completion_flags[*][peer]` silently; eventual 300s in-kernel `trap;` corrupts CUDA context | The **host-side AlltoAll watchdog (PR 1a.4)** *synthesizes* the exception — polls the host-visible flags table, raises `AlltoAllTimeoutError` at the configured deadline. Without 1a.4, MNNVL failures don't reach PR #12718 in any usable form |
+| NVSHMEM / DeepEP | Cross-node EP fallback | **Limited** — `Buffer.__del__` deadlocks on peer death; no public `mask_buffer_ptr` | Out of MVP scope; deferred indefinitely pending upstream NVSHMEM API |
+
+So **PR 1a.7 (NCCL wiring), PR 1a.4 (host watchdog), and PR 1c.1's NIXL patterns are the producer-side work** that makes PR #12718's classifier useful for WideEP. Without these, PR #12718 simply doesn't see the failures — even though it correctly classifies errors that *do* surface (CUDA, MPI worker death, signal-driven exceptions).
+
 ### Layer 1 — AlltoAll watchdog (the host-side abort hook)
 
 The kernel's existing `completion_flags[kMaxRanks][kMaxRanks]` table sits in host-visible MNNVL fabric memory. The host can read it without entering the kernel. New component:
@@ -188,11 +211,16 @@ EP_IMMEDIATE_FATAL_EXTRA = [
 EP_SEVERE_EXTRA = [
     "alltoall timeout", "nccl timeout", "deep_ep buffer barrier hang",
     "symmetric memory access violation", "rdma timeout",
+    # NIXL — disagg KV transceiver (production default). Strings drawn from
+    # tensorrt_llm/_torch/disaggregation/nixl/_agent_py.py:40,43,125
+    "nixl transfer failed",
+    "nixl transfer entered error state",
+    "nixl transfer wait timed out",
 ]
 EP_TRANSIENT_EXTRA = ["alltoall slow", "nccl retry", "ecc correctable error"]
 ```
 
-The classifier still returns the same three string literals; we add patterns, not classes.
+The classifier still returns the same three string literals; we add patterns, not classes. The NIXL additions ensure that KV-transfer failures on the disaggregated path classify as `severe` (consume per-rank budget; potential FT trigger) rather than falling through to `transient` (logged only). Producer-side, NIXL already raises these messages cleanly; the only design work is the regex patterns themselves.
 
 ### `EPGroupHealth` — the shared in-process primitive
 
