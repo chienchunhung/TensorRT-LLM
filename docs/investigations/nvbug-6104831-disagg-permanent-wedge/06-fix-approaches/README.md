@@ -2,7 +2,7 @@
 
 Four candidate fix stacks emerged from the investigation. They overlap,
 but they are not equivalent: each closes a different combination of the
-L1–L8 defect classes (see
+L1–L9 defect classes (see
 [`../03-defect-class-stack.md`](../03-defect-class-stack.md)). End-to-end
 harness results are materially different between them.
 
@@ -23,16 +23,18 @@ companion files describe each approach in detail:
 ## TL;DR
 
 **Approach D (combo) wins.** It is the first stack that closes every
-load-bearing layer (L1–L8) and recovers cleanly on both transport
-paths up through `CONC=32` on direct UCX and `CONC=64` on
-NIXL+UCX-plugin. The other approaches each leave at least one layer
-uncovered, and *any uncovered layer is sufficient to wedge the
-deployment* under the customer load shape.
+load-bearing layer (L1–L8) plus the residual memory-safety invariant
+(L9), and recovers cleanly on both transport paths up through
+`CONC=32` on direct UCX and `CONC=256` on NIXL+UCX-plugin (3 ctx/gen
+pairs). The other approaches each leave at least one layer uncovered,
+and *any uncovered layer in `L1`–`L8` is sufficient to wedge the
+deployment* under the customer load shape; only D additionally closes
+`L9` (silent buffer-pool corruption hazard on cancel/exception).
 
 That ordering — A < B < C ≪ D — is not "more code is better." It is a
 direct consequence of layer coverage, where every uncovered layer
 corresponds to a specific failure mode that was empirically observed
-in the run archives.
+in the run archives (or, for `L9`, a code-level audit gap).
 
 ---
 
@@ -53,6 +55,7 @@ layer and, where relevant, by what mechanism.
 | **L6** NIXL backend handle release on cancel | ✗ | ✗ — no NIXL backend interaction | ✓ — **only `#13495` has this**: `TransferStatus::release()` → `nixlAgent::releaseXferReq()` | ✓ via PR `#13495` |
 | **L7** eval-order regression introduced by L2 fix | n/a — L2 not closed, no regression | ✓ via local eval-order fix | ✓ via local eval-order fix (`#13439` triggers same regression) | ✓ |
 | **L8** Python scheduler idempotency | partial — only observable if other layers don't crash first | ✓ via local idempotency guards | ✓ via the same local guards | ✓ |
+| **L9** transport quiescence on unsafe exit | ✗ | ✗ | ✗ | ✓ — PR `#13728` (fail-closed poison + Python shutdown) folded directly into the combo, plus the local MLA port to `mlaCacheFormatter.cpp` |
 
 Reading this matrix tells the story:
 
@@ -74,8 +77,9 @@ Reading this matrix tells the story:
   ended in no-recovery, and the gen event loop later failed with stale
   sequence state."*
 - **D** covers every layer. It is the only stack that recovers 5/5 at
-  `CONC=16/24/32` on direct UCX and 5/5 at `CONC=32/64` on
-  NIXL+UCX-plugin.
+  `CONC=16/24/32` on direct UCX and 5/5 at `CONC=32/64/128/256` on
+  NIXL+UCX-plugin (3 ctx/gen pairs at `CONC≥128`). It is also the
+  only stack that closes `L9` (silent corruption hazard).
 
 ---
 
@@ -85,17 +89,19 @@ This is the empirical confirmation of the layer analysis. The harness
 is the long-prompt + cancellation burst from
 [`../04-reproduction.md`](../04-reproduction.md).
 
-| Approach | direct UCX `CONC=16` | direct UCX `CONC=24` | direct UCX `CONC=32` | direct UCX `CONC=64` | NIXL `CONC=32` | NIXL `CONC=64` |
-|---|---|---|---|---|---|---|
-| A — chained signature fixes | wedge after ~burst+cleanup; surfaces sig `#7` variants | wedge | wedge | wedge | wedge (NIXL `run8`) | not run |
-| B — `#13056` + eval-order + idempotency | inconsistent: some repeats recover, some wedge | inconsistent | not validated | wedge or stale-sequence | not validated | not validated |
-| C — `#13495` + sig `#4` + eval-order + idempotency | improved failure shape; still no-recovery; later `unordered_map::at` from `add_token` | wedge or stale-sequence | wedge or stale-sequence | wedge | not validated | not validated |
-| **D — combo** | **5/5 recovered (60 s + 90 s)** | **5/5 recovered (60 s + 90 s)** | **5/5 recovered (90 s)** | wedged on iteration 1 (no recovery 180 s) | **5/5 recovered, zero burst-time errors** | **5/5 recovered, zero burst-time errors** |
+| Approach | direct UCX `CONC=16` | direct UCX `CONC=24` | direct UCX `CONC=32` | direct UCX `CONC=64` | NIXL `CONC=32` | NIXL `CONC=64` | NIXL `CONC=128` (3-pair) | NIXL `CONC=256` (3-pair) |
+|---|---|---|---|---|---|---|---|---|
+| A — chained signature fixes | wedge after ~burst+cleanup; surfaces sig `#7` variants | wedge | wedge | wedge | wedge (NIXL `run8`) | not run | not run | not run |
+| B — `#13056` + eval-order + idempotency | inconsistent: some repeats recover, some wedge | inconsistent | not validated | wedge or stale-sequence | not validated | not validated | not validated | not validated |
+| C — `#13495` + sig `#4` + eval-order + idempotency | improved failure shape; still no-recovery; later `unordered_map::at` from `add_token` | wedge or stale-sequence | wedge or stale-sequence | wedge | not validated | not validated | not validated | not validated |
+| **D — combo (with `#13728` + MLA port)** | **5/5 recovered (60 s + 90 s)** | **5/5 recovered (60 s + 90 s)** | **5/5 recovered (90 s)** | wedged on iteration 1 (no recovery 180 s) | **5/5 recovered, zero burst-time errors** | **5/5 recovered, zero burst-time errors** | **5/5 recovered, zero burst-time errors (review-fix v3, `#13728` folded in)** | **5/5 recovered, zero burst-time errors** |
 
 The customer transport (NIXL + UCX plugin) is **clean on the combo
-through `CONC=64`**. The only remaining failure case is direct-UCX
-under sustained `CONC=64` stress; that requires an additional
-TRT-LLM-side fix in the direct-UCX cancellation path (see
+through `CONC=256` with three ctx/gen pairs**. The only remaining
+failure case is direct-UCX under sustained `CONC≥48` stress; that's
+throughput saturation, not a cancellation gap, and requires either
+UCX rendezvous tuning + parallel send workers or a one-sided RDMA
+shape mirroring NIXL (see
 [`../08-next-steps-and-pr-map.md`](../08-next-steps-and-pr-map.md)).
 
 ---

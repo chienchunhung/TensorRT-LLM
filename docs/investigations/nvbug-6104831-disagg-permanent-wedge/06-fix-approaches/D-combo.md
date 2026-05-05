@@ -2,9 +2,12 @@
 
 The combo combines PR `#13056`'s architectural lifetime / cancellation
 refactor with PR `#13495`'s backend transfer-release cancellation, then
-adds the eval-order sequencing fix and Python idempotency guards. **The
-strongest candidate so far** and the only stack that closes every layer
-in the `L1`–`L8` defect class stack.
+adds the eval-order sequencing fix and Python idempotency guards. PR
+`#13728`'s fail-closed memory-safety policy is folded in directly,
+plus a port of the same poison-on-NIXL-throw pattern to the MLA send
+formatter that `#13728` missed. **The strongest candidate so far**
+and the only stack that closes every layer in the `L1`–`L9` defect
+class stack.
 
 Submitted as PR [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713).
 
@@ -18,15 +21,19 @@ rc11
 + PR #13495   (transfer-release cancellation hook)
 + eval-order fix in CacheSender::Impl::handleAsyncSend
 + Python idempotency guards in _prepare_disagg_gen_init() and _recv_disagg_gen_cache()
++ PR #13728   (fail-closed on unquiesced disagg KV transfer)
++ MLA port    (poison-on-NIXL-throw + zero-copy guard in mlaCacheFormatter.cpp)
 ```
 
-For the detailed contents of each piece, see the per-approach files
-([`B-pr13056.md`](B-pr13056.md) and [`C-pr13495.md`](C-pr13495.md)) and
-the local-patch descriptions in either of them.
+For the detailed contents of the first four pieces, see the per-approach
+files ([`B-pr13056.md`](B-pr13056.md) and [`C-pr13495.md`](C-pr13495.md))
+and the local-patch descriptions in either of them. The PR `#13728`
+fold-in and the MLA port are described in the *Memory-safety hardening*
+section below.
 
 ---
 
-## What it covers (`L1`–`L8`)
+## What it covers (`L1`–`L9`)
 
 | Layer | Coverage | Where it comes from |
 |---|---|---|
@@ -39,6 +46,98 @@ the local-patch descriptions in either of them.
 | **L6** NIXL backend handle release | ✓ | `#13495`'s `TransferStatus::release()` → `nixlAgent::releaseXferReq()`. |
 | **L7** eval-order regression | ✓ | Local eval-order fix (necessary because L2 is closed). |
 | **L8** Python scheduler idempotency | ✓ | Local idempotency guards. |
+| **L9** transport quiescence on unsafe exit | ✓ | PR `#13728` covers the non-MLA send path (`cacheFormatter.cpp`) and the recv path (`dataTransceiver.cpp`); the local MLA port covers `mlaCacheFormatter.cpp`. The Python-side `_fail_closed_for_unquiesced_disagg_transfer()` drains the scheduler when an unquiesced transfer is detected. |
+
+---
+
+## Memory-safety hardening (PR `#13728` fold-in + MLA port)
+
+PR `#13713`'s original fix scope was wedge prevention: closing
+`L1`–`L8` so the customer-visible failure stops happening. Once those
+layers were closed and the combo recovered cleanly through `CONC=256`
+on NIXL, the residual `L9` invariant came into focus during code
+review: cancel and exception paths were still returning recv buffer
+slots (and, on the MLA path, send buffer slots) to the pool while the
+local NIXL agent thread or the remote peer might still be reading or
+writing into the slot's VRAM. No empirical wedge was traceable to
+`L9`; it is a silent-corruption surface, the worst kind of bug
+because it does not announce itself.
+
+PR [`#13728`](https://github.com/NVIDIA/TensorRT-LLM/pull/13728)
+introduced the fail-closed memory-safety policy that closes `L9`. The
+combo PR `#13713` folds `#13728` in directly rather than stacking it
+as a separate PR; the rationale is that exposing a known memory-
+safety hazard between two PRs in the chain would be worse than
+shipping a slightly larger combo. The fold-in adds three pieces:
+
+1. **`BufferIndexHolder::poison()`** in
+   `cpp/tensorrt_llm/batch_manager/baseTransBuffer.{h,cpp}`. Marks the
+   slot poisoned (flag `mBufferIndexFlag[idx] = 2`) and the entire
+   pool poisoned (`mConcurrenceResource.mPoisoned.store(true)`).
+   Subsequent `assignBufferIndex` calls fail closed with a `TLLM_THROW`
+   instructing the operator to restart the process. `held()` is
+   true on construction even when `mIndex == std::nullopt` so the
+   dynamic-buffer path can still poison its pool on unsafe exit.
+
+2. **`ReadySignalResult` tri-state** in
+   `cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp` and
+   `cpp/tensorrt_llm/executor/cache_transmission/agent_utils/connection.{h,cpp}`.
+   `recvReadySignalWithStatus()` returns
+   `kReady` / `kNotReady` / `kCancelled`; the recv-side
+   `requestSync()` poisons holders only on `kCancelled` and on
+   exception (where transport quiescence is unknown). `kNotReady`
+   means the peer explicitly said no data is coming, which is safe
+   to release.
+
+3. **Send-side poison-on-throw** in
+   `cpp/tensorrt_llm/batch_manager/cacheFormatter.cpp` and
+   `cpp/tensorrt_llm/batch_manager/mlaCacheFormatter.cpp`. The
+   `sendAllBuffers()` call (or the parallel send loop in MLA) is
+   wrapped in `try { ... } catch (...) { if (agentConnection != nullptr)
+   sendHolder.poison(); throw; }`. The `agentConnection != nullptr`
+   guard restricts poisoning to NIXL paths where transport quiescence
+   is unknown; direct-UCX paths fall back to the destructor's normal
+   release because direct UCX has no quiescence semantics anyway.
+
+4. **Python-side fail-closed shutdown** in
+   `tensorrt_llm/_torch/pyexecutor/py_executor.py`.
+   `_fail_closed_for_unquiesced_disagg_transfer()` clears
+   `active_requests` / `waiting_queue` / `request_accumulated` /
+   `control_requests`, sets `is_shutdown = True` *and*
+   `shutdown_event.set()` so callers parked on either signal wake up,
+   enqueues structured error responses for every in-flight request,
+   and notifies `response_cv`. It triggers when `_handle_errors`
+   detects any in-flight transfer in `is_disagg_generation_transmission_in_progress`
+   or `is_disagg_context_transmission_state` at the moment of
+   failure.
+
+PR `#13728`'s diff missed `mlaCacheFormatter.cpp` — the MLA send
+path uses the same `BufferIndexHolder sendHolder` pattern as
+`cacheFormatter.cpp` but had no try/catch + poison around its parallel
+send loop and no zero-copy guard. The PR `#13713` review-fix cleanup
+ports both to MLA (commit-pending in the combo worktree). MLA
+deployments (DeepSeek-V2/V3/R1, etc.) on NIXL therefore inherit `L9`
+coverage on the same terms as MHA models.
+
+The receiver path covers both MHA and MLA models because the cancel /
+exception poisoning happens in `dataTransceiver.cpp::CacheReceiver::Impl::requestSync`,
+above the per-model formatter dispatch.
+
+### Empirical impact of the fold-in
+
+The L9 fail-closed policy was *not exercised* in any of the
+reaffirmation runs (CONC=128 / 256 NIXL 3-pair, 5/5 PASS each). That
+is the expected outcome: with `L1`–`L8` closed, the visible wedges
+don't happen, and a clean burst should never reach an unquiesced-
+transfer path. `L9` is the rip-cord — it exists so that the *next*
+unknown bug in `L1`–`L8` cannot silently corrupt the buffer pool
+instead of being detected. Validating that the rip-cord triggers
+correctly is unit-test scope; the recv-side `kCancelled` →
+`poisonRecvHolders()` path and the send-side `agentConnection !=
+nullptr` → `sendHolder.poison()` path each have a focused C++ unit
+test, and the Python `_fail_closed_for_unquiesced_disagg_transfer()`
+has a Python-level test (porting in progress alongside the sig `#1`,
+`#4`, `#5` regression tests).
 
 ---
 
@@ -46,18 +145,22 @@ the local-patch descriptions in either of them.
 
 The customer's wedge is **a stack of independent defect classes**, each
 of which is independently sufficient to wedge the deployment. Closing
-all eight is the only way to recover under the customer load shape.
-The other approaches each leave at least one layer uncovered:
+all eight is the only way to recover under the customer load shape;
+closing the ninth is what stops the next unknown bug in `L1`–`L8`
+from corrupting the buffer pool instead of being detected. The other
+approaches each leave at least one layer uncovered:
 
-- A leaves L2, L3, L6.
-- B leaves L6 (and is partial on L1, L4).
-- C leaves L3, L4 sig `#5` half of L1.
-- D leaves nothing.
+- A leaves L2, L3, L6, L9.
+- B leaves L6, L9 (and is partial on L1, L4).
+- C leaves L3, L4, L9, sig `#5` half of L1.
+- D leaves nothing — and once PR `#13728` is folded in plus the MLA
+  port, also closes L9 across both formatter paths.
 
 For the layer-by-layer reasoning, see
 [`README.md`](README.md#coverage-matrix). The empirical confirmation
-(direct-UCX recovery at `CONC=16`/`24`/`32` and NIXL recovery at
-`CONC=32`/`64`) matches the prediction exactly.
+(direct-UCX recovery at `CONC=16`/`24`/`32`, NIXL recovery at
+`CONC=32`/`64`/`128`/`256`, plus L9 active across all paths) matches
+the prediction exactly.
 
 ---
 
@@ -85,17 +188,23 @@ does not recover.
 
 ### NIXL transceiver path (NIXL transfer agent using backend `UCX`)
 
-| Test | Result |
-|---|---|
-| Same servers, `CONC=32`, `BURST_DUR_S=90`, 5 iterations | 5/5 recovered; each burst completed with `ok200=716`, `errors=0`, `total=716`. |
-| Same servers, `CONC=64`, `BURST_DUR_S=90`, 5 iterations | 5/5 recovered; bursts completed with `ok200=716`, `errors=0`, `total=716` except one iteration with `ok200=715`, `errors=0`, `total=715`. |
-| 3 ctx/gen pairs on one 8-GPU B300 node, `CONC=128`, `BURST_DUR_S=90`, 5 iterations | 5/5 recovered; bursts completed with `ok200=716`, `errors=0`, `total=716` (one iteration `ok200=715`). |
-| 3 ctx/gen pairs on one 8-GPU B300 node, `CONC=256`, `BURST_DUR_S=90`, 5 iterations | 5/5 recovered; bursts completed with `ok200=716`, `errors=0`, `total=716` (one iteration `ok200=715`). |
+| Test | Build | Result |
+|---|---|---|
+| Same servers, `CONC=32`, `BURST_DUR_S=90`, 5 iterations | combo (pre-`#13728`) | 5/5 recovered; each burst completed with `ok200=716`, `errors=0`, `total=716`. |
+| Same servers, `CONC=64`, `BURST_DUR_S=90`, 5 iterations | combo (pre-`#13728`) | 5/5 recovered; bursts completed with `ok200=716`, `errors=0`, `total=716` except one iteration with `ok200=715`, `errors=0`, `total=715`. |
+| 3 ctx/gen pairs on one 8-GPU B300 node, `CONC=128`, `BURST_DUR_S=90`, 5 iterations | combo (pre-`#13728`) | 5/5 recovered; bursts completed with `ok200=716`, `errors=0`, `total=716` (one iteration `ok200=715`). |
+| 3 ctx/gen pairs on one 8-GPU B300 node, `CONC=256`, `BURST_DUR_S=90`, 5 iterations | combo (pre-`#13728`) | 5/5 recovered; bursts completed with `ok200=716`, `errors=0`, `total=716` (one iteration `ok200=715`). |
+| 3 ctx/gen pairs on one 8-GPU B300 node, `CONC=128`, `BURST_DUR_S=90`, 5 iterations (review-fix v3) | combo + `#13728` + MLA port + cleanup edits | **5/5 recovered, zero failure markers across all 12 worker / front / client logs (no `Broken promise`, no `bad optional access`, no `Assertion`, no `Traceback`, no `SIGSEGV`, no `Cannot cancel request`, no `exceeded total timeout`).** Bursts: 716 / 715 / 716 / 715 / 715 OK; recovery at idle 30 s on every iteration; all 7 ports return HTTP 200 post-run. |
 
-The 3-pair `CONC=256` recovery is the strongest local single-node
-verdict for the combo+NIXL stack. Multi-node fabric, Dynamo
-orchestration, and production mixed traffic remain open follow-up
-validation scopes.
+The 3-pair `CONC=256` recovery is the strongest pre-`#13728` local
+single-node verdict; the 3-pair `CONC=128` review-fix-v3 run is the
+strongest *post*-fold-in verdict and confirms that the review-fix
+edits (PR `#13728` integration, MLA port, comment / docstring /
+shutdown-event cleanups) do not regress the proven-stable non-MLA
+NIXL path. Multi-node fabric, Dynamo orchestration, and production
+mixed traffic remain open follow-up validation scopes; an MLA-model
+stress test (e.g. DeepSeek on NIXL) is a separate validation scope
+because Qwen3-0.6B does not exercise `mlaCacheFormatter.cpp`.
 
 The latest contrast is **not** "UCX hardware transport bad, NIXL
 transport good"; both NIXL runs used the UCX plugin underneath. The
@@ -243,22 +352,34 @@ Two caveats matter for interpreting the empirical data:
 
 ## Strengths
 
-- **The only stack that closes every layer in L1–L8.** This isn't
+- **The only stack that closes every layer in L1–L9.** This isn't
   rhetoric — every other stack leaves at least one layer open and
-  therefore has a predictable residual failure mode.
-- **NIXL recovery clean through `CONC=64`.** This is the customer's
-  transport. The combo is the first stack that works for the
-  reporter's actual deployment shape.
+  therefore has a predictable residual failure mode (and only D
+  closes the `L9` memory-safety hazard at all).
+- **NIXL recovery clean through `CONC=256`** with three ctx/gen pairs.
+  This is the customer's transport. The combo is the first stack that
+  works for the reporter's actual deployment shape, and the
+  review-fix-v3 reaffirmation at `CONC=128` confirms the PR `#13728`
+  fold-in does not regress that.
 - **Direct-UCX recovery clean through `CONC=32`.** The remaining
-  `CONC=64` wedge is a known gap with a clear follow-up scope.
+  `CONC=64` wedge is a known gap (throughput saturation, not
+  cancellation) with a clear follow-up scope.
+- **MHA + MLA models both covered for L9.** `#13728` covers the
+  non-MLA send path; the local MLA port covers `mlaCacheFormatter.cpp`.
+  The recv-side poison logic is above the formatter dispatch and
+  applies to both.
 - **Each piece has independent design rationale**: `#13056` has
-  detailed commit messages; `#13495` has a 512-line design doc; the
-  local patches have empirical justification (Phase 14 traces).
+  detailed commit messages; `#13495` has a 512-line design doc;
+  `#13728` has a structured fail-closed contract and tri-state
+  `ReadySignalResult`; the local patches have empirical justification
+  (Phase 14 traces for eval-order; review-time code audit for the MLA
+  port).
 
 ## Weaknesses
 
-- **Largest blast radius** of all four approaches. Combines two large
-  PRs with two local patches; the integration surface is non-trivial.
+- **Largest blast radius** of all four approaches. Combines three
+  large PRs with two local patches; the integration surface is
+  non-trivial.
 - **L1 has overlapping coverage** between `#13056`'s cancel-flag flow
   and `#13495`'s explicit `set_exception`. The combo uses
   `#13495`'s ordering, but the two mechanisms touch the same code site
@@ -267,7 +388,14 @@ Two caveats matter for interpreting the empirical data:
   `BufferIndexHolder`. Both make the same RAII change to the same
   files. Merge resolution required.
 - **Direct-UCX `CONC=64` still wedges** — the L6-equivalent for the
-  direct-UCX path isn't there yet.
+  direct-UCX path isn't there yet (separate from `L9`; that's a
+  cancellation gap, not a memory-safety gap).
+- **`L9` triggers haven't been validated under live load.** The fail-
+  closed Python path and the C++ poison hooks are unit-tested
+  individually, but the customer-shape stress harness has not yet
+  reached an unquiesced-transfer scenario in any of the runs (because
+  `L1`–`L8` are doing their job). That coverage gap is by design but
+  worth documenting.
 - **Multi-node and Dynamo orchestration not yet validated.**
 
 ---

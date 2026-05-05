@@ -14,9 +14,11 @@ server keeps accepting connections, but every request after the burst
 times out indefinitely.
 
 From a customer's perspective it looks like one bug. From the C++ KV
-cache transceiver it is **a stack of eight independent defects** in the
-request cleanup path. Any one of them is sufficient to wedge the
-deployment.
+cache transceiver it is **a stack of eight independent wedge defects
+plus one residual memory-safety gap** in the request cleanup path. Any
+one of `L1`–`L8` is sufficient to wedge the deployment; `L9` is the
+defense-in-depth invariant that closes the silent-corruption surface
+left exposed once L1–L8 prevent the visible wedges.
 
 The minimal trigger is:
 
@@ -85,12 +87,15 @@ under the same high-concurrency load.
 
 ---
 
-## Root cause: eight invariant gaps
+## Root cause: nine invariant gaps
 
-The seven signatures are the visible faces of **eight underlying
+The seven signatures are the visible faces of **nine underlying
 invariant gaps** that the rc11 transceiver doesn't enforce. We call
-them L1 through L8. Each is independently sufficient to wedge the
-deployment under the customer load shape.
+them L1 through L9. L1–L8 are wedge-prevention invariants — each is
+independently sufficient to wedge the deployment under the customer
+load shape. L9 is the residual memory-safety invariant that, even
+with L1–L8 closed, prevents silent buffer-pool corruption when a
+cancel or exception races an in-flight NIXL/UCX transfer.
 
 | Layer | What's missing | Customer-visible failure |
 |---|---|---|
@@ -102,13 +107,18 @@ deployment under the customer load shape.
 | **L6** | NIXL/UCX backend must release transfer handles on cancel | Stranded transfer handles → contention → mutex deadlock |
 | **L7** | C++ argument evaluation order must be safe with `shared_ptr` | First-request SIGSEGV in `handleAsyncSend` after L2 fix |
 | **L8** | Python scheduler must be idempotent by `py_request_id` | `KVCacheManager::addSequence` `emplaceDone` assertion |
+| **L9** | Buffer slots must not return to the pool while transport quiescence is unknown | (silent) recv buffer reused mid-transfer → KV-cache corruption / sporadic decode garbage |
 
 L1–L6 are C++ defects in the transceiver. L7 is a *regression*
 introduced by L2's fix — closing the UAF requires `shared_ptr<LlmRequest>`,
 which makes a previously-safe argument-evaluation pattern undefined
 behaviour. L8 is a Python-side scheduler defect that only becomes
 observable once L7 is removed and the system progresses far enough to
-exercise the repeated init scheduling path.
+exercise the repeated init scheduling path. L9 is a defense-in-depth
+memory-safety invariant: it never *fires* in a clean run, but on
+cancel/exception paths where TRT-LLM cannot prove the transport has
+quiesced it forces a fail-closed shutdown rather than handing pool
+VRAM back to the next request.
 
 > Code-level evidence for each layer plus the cascade map:
 > [`03-defect-class-stack.md`](03-defect-class-stack.md).
@@ -119,7 +129,7 @@ exercise the repeated init scheduling path.
 
 The fix is a single bundled stack — submitted as PR
 [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) — that
-closes all eight layers. It composes four pieces:
+closes all nine layers. It composes six pieces:
 
 ```mermaid
 graph TB
@@ -129,8 +139,10 @@ graph TB
     pr13495["PR #13495<br/>TransferStatus::release()<br/>→ nixlAgent::releaseXferReq()<br/>+ TransferSession ownership"]
     evalfix["Eval-order fix<br/>materialize reqId before std::move(resp)<br/>in handleAsyncSend"]
     pyguards["Python idempotency guards<br/>_disagg_gen_init_prepared_ids<br/>_disagg_gen_kv_recv_started_ids"]
+    pr13728["PR #13728<br/>BufferIndexHolder::poison()<br/>+ ReadySignalResult tri-state<br/>+ _fail_closed_for_unquiesced_disagg_transfer"]
+    mlaport["MLA port<br/>poison-on-NIXL-throw + zero-copy guard<br/>in mlaCacheFormatter.cpp"]
 
-    rc11 --> pr13056 --> pr13495 --> evalfix --> pyguards --> done["Combo PR #13713<br/>(fixed)"]
+    rc11 --> pr13056 --> pr13495 --> evalfix --> pyguards --> pr13728 --> mlaport --> done["Combo PR #13713<br/>(fixed)"]
 
     pr13056 -.->|closes| L2[L2 lifetime]
     pr13056 -.->|closes| L3[L3 cancel primitive]
@@ -140,6 +152,8 @@ graph TB
     pr13495 -.->|closes| L6[L6 NIXL handle release]
     evalfix -.->|closes| L7[L7 eval-order]
     pyguards -.->|closes| L8[L8 idempotency]
+    pr13728 -.->|closes for non-MLA| L9[L9 transport quiescence]
+    mlaport -.->|closes for MLA| L9
 
     classDef done fill:#cfc,stroke:#0a0,stroke-width:2px
     classDef broken fill:#fcc,stroke:#a00,stroke-width:2px
@@ -147,10 +161,13 @@ graph TB
     classDef pr13495_color fill:#ffe5cc,stroke:#cc6600,stroke-width:2px
     classDef evalfix_color fill:#d4f4d4,stroke:#0a8a0a,stroke-width:2px
     classDef pyguards_color fill:#e8d4f4,stroke:#7030a0,stroke-width:2px
+    classDef pr13728_color fill:#fce8d4,stroke:#a04020,stroke-width:2px
+    classDef mlaport_color fill:#fce8d4,stroke:#a04020,stroke-width:2px
     classDef pr13056_layer fill:#e8f1ff,stroke:#0066cc,stroke-dasharray:3 3
     classDef pr13495_layer fill:#fff1e0,stroke:#cc6600,stroke-dasharray:3 3
     classDef evalfix_layer fill:#e8faea,stroke:#0a8a0a,stroke-dasharray:3 3
     classDef pyguards_layer fill:#f4e8fa,stroke:#7030a0,stroke-dasharray:3 3
+    classDef pr13728_layer fill:#fdf0e0,stroke:#a04020,stroke-dasharray:3 3
 
     class done done
     class rc11 broken
@@ -158,22 +175,28 @@ graph TB
     class pr13495 pr13495_color
     class evalfix evalfix_color
     class pyguards pyguards_color
+    class pr13728 pr13728_color
+    class mlaport mlaport_color
     class L2,L3,L4,L5 pr13056_layer
     class L1,L6 pr13495_layer
     class L7 evalfix_layer
     class L8 pyguards_layer
+    class L9 pr13728_layer
 ```
 
-The four fix components are color-coded. Each layer node (`L1`–`L8`) is
+The six fix components are color-coded. Each layer node (`L1`–`L9`) is
 tinted with the lighter shade of whichever fix closes it, so the
 `closes` arrows are reinforced by colour: blue for `#13056`, orange for
 `#13495`, green for the eval-order fix, purple for the Python
-idempotency guards.
+idempotency guards, and brown for `#13728` + the MLA port (which
+together close `L9` across both formatter paths).
 
 Each layer needs at least one piece to close it; some pieces close
-multiple layers. The minimum closure is exactly these four pieces.
-Removing any one re-opens at least one layer, and re-opening any one
-layer is empirically sufficient to wedge the deployment.
+multiple layers. The minimum closure is exactly these six pieces.
+Removing any of the first four re-opens at least one wedge layer
+(empirically sufficient to wedge the deployment); removing `#13728`
+and / or the MLA port re-opens `L9` (silent corruption hazard, no
+visible wedge).
 
 The contributions break down as:
 
@@ -199,12 +222,26 @@ The contributions break down as:
   `_prepare_disagg_gen_init` and `_recv_disagg_gen_cache` from running
   side effects twice on the same `py_request_id` when the scheduler
   re-presents an in-progress request.
+- **PR #13728** closes L9 on the non-MLA send path and the recv path.
+  Adds `BufferIndexHolder::poison()` (marks the slot poisoned, refuses
+  to reuse without a process restart), a tri-state
+  `ReadySignalResult{kReady, kNotReady, kCancelled}` so the recv side
+  can distinguish "peer explicitly said not-ready" (safe to release)
+  from "wait was cancelled / no signal" (transport quiescence
+  unknown — must poison), and Python-side
+  `_fail_closed_for_unquiesced_disagg_transfer()` to drain the
+  scheduler and notify waiters when an unquiesced transfer is detected.
+- **MLA port** closes L9 on the MLA send path. `mlaCacheFormatter.cpp`
+  was missed by `#13728` and got the same try/catch + `sendHolder.poison()`
+  pattern plus the zero-copy disable guard during the PR `#13713`
+  review-fix cleanup.
 
 The combo also retains your chained regression tests as the
 load-bearing test scaffolding — neither PR #13056 nor PR #13495 has
-focused unit tests for these signatures.
+focused unit tests for these signatures, and the L1 / L4 / L5 sig
+tests now ship with the combo PR directly.
 
-> The full per-piece breakdown and the L1-L8 → fix mapping:
+> The full per-piece breakdown and the L1-L9 → fix mapping:
 > [`06-fix-approaches/D-combo.md`](06-fix-approaches/D-combo.md).
 
 ---
@@ -213,27 +250,39 @@ focused unit tests for these signatures.
 
 Yes, on the customer's transport. The combo recovers cleanly under the
 local 1P1D `trtllm-serve` long-prompt burst harness on a single host
-(plus a 3 ctx/gen pair stress shape on one 8-GPU B300 node):
+(plus a 3 ctx/gen pair stress shape on one 8-GPU B300 node). The
+**bold** entries below are post-PR-`#13728`-fold-in reaffirmations on
+the review-fix v3 build (current `c3e8659670` + the cleanup commits);
+the rest pre-date the fold-in but ran on the same combo without `L9`
+hardening:
 
 | Transport | `CONC=16` | `CONC=24` | `CONC=32` | `CONC=48` | `CONC=64` | `CONC=128` (3-pair) | `CONC=256` (3-pair) |
 |---|---|---|---|---|---|---|---|
-| **NIXL + UCX plugin** *(customer transport)* | n/a | n/a | **5/5 recovered, zero burst errors** | n/a | **5/5 recovered, zero burst errors** | **5/5 recovered, zero burst errors** | **5/5 recovered, zero burst errors** |
+| **NIXL + UCX plugin** *(customer transport)* | n/a | n/a | 5/5 recovered, zero burst errors | n/a | 5/5 recovered, zero burst errors | **5/5 recovered, zero burst errors (review-fix v3)** | **5/5 recovered, zero burst errors** |
 | Direct UCX | 5/5 recovered | 5/5 recovered | 5/5 recovered | wedged on iter 1 | wedged on iter 1 | wedged on iter 1 | n/a |
 
 The customer-reported failure shape is **fixed on NIXL+UCX-plugin
-through at least `CONC=256` with 3 ctx/gen pairs**. NIXL is the
-customer's transport, so the reporter's deployment shape is covered by
-the combo. Direct UCX recovers cleanly through `CONC=32` and saturates
-above that. The diagnostic build shows the direct-UCX failure at high
-load is throughput saturation plus queue backpressure (not a stuck UCX
-call): individual `tagSend`/`tagRecv` calls take 3-11 s for 1-3.7 GB
-buffers (~300-400 MB/s effective), the response/request queues build
-up, the deadline reaper cancels backlog, and recovery probes after the
-burst keep timing out. Most TRT-LLM cancels resolve via queue removal
-of work that never started rather than aborting an in-flight UCX call.
+through at least `CONC=256` with 3 ctx/gen pairs, with the L9 fail-
+closed policy active**. NIXL is the customer's transport, so the
+reporter's deployment shape is covered by the combo. Direct UCX
+recovers cleanly through `CONC=32` and saturates above that. The
+diagnostic build shows the direct-UCX failure at high load is
+throughput saturation plus queue backpressure (not a stuck UCX call):
+individual `tagSend`/`tagRecv` calls take 3-11 s for 1-3.7 GB buffers
+(~300-400 MB/s effective), the response/request queues build up, the
+deadline reaper cancels backlog, and recovery probes after the burst
+keep timing out. Most TRT-LLM cancels resolve via queue removal of
+work that never started rather than aborting an in-flight UCX call.
 Lifting that boundary needs either UCX rendezvous tuning + parallel
 send workers, or a one-sided RDMA shape mirroring NIXL — both deferred
 (see [`08-next-steps-and-pr-map.md`](08-next-steps-and-pr-map.md)).
+
+The L9 fail-closed policy was *not exercised* by any of these runs —
+no log line shows a poison or fail-closed shutdown firing. That is
+expected: L1–L8 close the visible wedges, and a clean burst should
+never reach an unquiesced-transfer path. L9 is the rip-cord for the
+case the rest of the stack misses, and validating that it triggers
+correctly is a unit-test rather than stress-test scope.
 
 A few honest caveats:
 
@@ -303,21 +352,24 @@ emergence pattern means the smallest stack was not knowable at T0.
 
 In rough priority order:
 
-1. **Land PR #13713 (combo)** on `main`. The strongest current
-   candidate.
+1. **Land PR #13713 (combo, with `#13728` folded in and MLA hardened)**
+   on `main`. The strongest current candidate.
 2. **Pin down sig `#7` Variant A's mutex address** with a live `gdb`
    capture under NIXL backend. Estimated 30–60 min of diagnostic
    work, then ~1–2 days for a surgical lock-ordering fix.
 3. **Add a direct-UCX `TransferStatus::release()` analog** using
    `ucxx::Request::cancel()` to close the residual `CONC=64`
    direct-UCX wedge.
-4. **Multi-node and Dynamo orchestration validation.**
-5. **Backport [#13119](https://github.com/NVIDIA/TensorRT-LLM/pull/13119)**
+4. **Lift the direct-UCX saturation boundary above `CONC=32`**. UCX
+   rendezvous tuning + parallel send workers first; one-sided RDMA
+   shape mirroring NIXL as a follow-up.
+5. **Multi-node and Dynamo orchestration validation.**
+6. **Backport [#13119](https://github.com/NVIDIA/TensorRT-LLM/pull/13119)**
    (request-level error propagation) to `rc11` for clean failure
    attribution on any future field hit.
-6. **Add a cancel-during-transfer integration test** to CI. The single
+7. **Add a cancel-during-transfer integration test** to CI. The single
    biggest reason this bug class went undetected until production.
-7. **Document the seven invariants** in the disaggregated-serving
+8. **Document the seven invariants** in the disaggregated-serving
    developer guide so the next contributor adding a transfer mode
    doesn't reintroduce this bug class.
 

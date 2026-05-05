@@ -1,18 +1,28 @@
-# 03 — Defect Class Stack (`L1`–`L8`)
+# 03 — Defect Class Stack (`L1`–`L9`)
 
 The seven failure signatures (`#1`–`#7`) in
 [`02-failure-signatures.md`](02-failure-signatures.md) are the customer-
 visible faces of the wedge. This file describes the *deeper* structure
-underneath them: **eight invariant gaps that the rc11 disaggregated KV
-transceiver doesn't actually enforce**, each of which is independently
-sufficient to wedge the deployment under the customer load shape.
+underneath them: **nine invariant gaps that the rc11 disaggregated KV
+transceiver doesn't actually enforce**.
 
-The `L1`–`L8` framing is what makes the four-approach comparison
+The first eight (`L1`–`L8`) are *wedge-prevention* invariants — any one
+of them, left uncovered, is independently sufficient to wedge the
+deployment under the customer load shape. The ninth (`L9`) is a
+*memory-safety* invariant: closing `L1`–`L8` prevents the visible
+wedges, but a residual class of cancel/exception paths can still leave
+NIXL/UCX transfers in flight against pool-owned receive buffers. `L9`
+forces those paths to fail closed (poison the slot, refuse to reuse
+without a process restart) instead of risking silent buffer-pool
+corruption.
+
+The `L1`–`L9` framing is what makes the four-approach comparison
 unambiguous — each candidate fix stack closes some of these layers and
 leaves others open, and every uncovered layer corresponds to a
-load-bearing failure mode that prevents recovery. The actual approach
-comparison lives in [`06-fix-approaches/README.md`](06-fix-approaches/README.md);
-this file establishes the framework that comparison uses.
+load-bearing failure mode (or, for `L9`, a defense-in-depth memory-safety
+gap) that prevents recovery. The actual approach comparison lives in
+[`06-fix-approaches/README.md`](06-fix-approaches/README.md); this file
+establishes the framework that comparison uses.
 
 ---
 
@@ -40,7 +50,7 @@ includes a mechanism that closes the invariant in L_n, or it doesn't.
 
 ---
 
-## The eight layers
+## The nine layers
 
 | # | Defect class | Code site | Why it bites in production |
 |---|---|---|---|
@@ -52,13 +62,15 @@ includes a mechanism that closes the invariant in L_n, or it doesn't.
 | **L6** | **Backend transfer-handle stranding** — NIXL/UCX transfer stays registered after TRT-LLM-side cancel | NIXL `TransferStatus` lifetime; no `releaseXferReq()` call on cancel | Stranded handles accumulate; backend lock-ordering wedge (sig `#7`'s deadlock variant) becomes more likely under contention |
 | **L7** | **Eval-order UB introduced by shared_ptr** (only after L2 is fixed) | `dataTransceiver.cpp::handleAsyncSend` line 514: `sendAndRemoveResponse(resp.mRequest->mRequestId, std::move(resp));` | Once `Response::mRequest` is `shared_ptr`, compilers may evaluate `std::move(resp)` first → reads `mRequestId` from a moved-from `shared_ptr` → SIGSEGV on first request |
 | **L8** | **Python scheduler idempotency** — `_prepare_disagg_gen_init` and `_recv_disagg_gen_cache` re-run side effects when the same `py_request_id` is rescheduled while in `DISAGG_GENERATION_INIT` | `py_executor.py::_prepare_disagg_gen_init`, `_recv_disagg_gen_cache` | `KVCacheManager::addSequence` fires `emplaceDone` assertion at `kvCacheManager.cpp:2992`; `request_and_receive_async` is started twice for the same request |
+| **L9** | **Transport quiescence on unsafe exit** — buffer slots returned to the pool while the NIXL/UCX transport may still be writing into them | `cacheFormatter.cpp::CacheFormatter::format` send loop, `mlaCacheFormatter.cpp::MLACacheFormatter::format` send loop, `dataTransceiver.cpp::CacheReceiver::Impl::requestSync` recv path; all paths where `BufferIndexHolder::~BufferIndexHolder` runs on cancel / exception with an in-flight `AgentConnection` | Closing L1–L8 prevents wedges, but the cancel/exception paths still hand pool-owned VRAM back to the next request while the peer (or the local agent thread) may still be writing into those buffers. Risk surface is silent KV-cache corruption / sporadic decode garbage that only manifests under cancel-heavy load |
 
 `L1` through `L6` are C++ defects in the transceiver. `L7` is a
 *regression* introduced by `L2`'s fix (any approach that adds
 `shared_ptr<LlmRequest>` must also add the eval-order fix). `L8` is a
 Python-side scheduler defect that becomes observable only once `L7` is
 removed and the system progresses far enough to exercise the repeated
-init scheduling path.
+init scheduling path. `L9` is the residual memory-safety invariant left
+exposed once `L1`–`L8` close the visible wedges.
 
 ---
 
@@ -90,6 +102,8 @@ graph TB
 
     L8[L8: Python scheduler<br/>idempotency] --> EMPLACE[emplaceDone<br/>assertion]
 
+    L9[L9: Transport quiescence<br/>on unsafe exit] --> CORRUPT[Silent buffer-pool<br/>reuse hazard<br/>under cancel-heavy load]
+
     SIG2[Sig #2:<br/>trie cascade prune]
     INDEPENDENT[Independent —<br/>eviction-driven, not<br/>cleanup-path]
     SIG2 -.-> INDEPENDENT
@@ -114,7 +128,16 @@ Some additional observations from the mapping:
   `kvCacheManager.cpp:2992`) that is *only observable* once L7 is
   removed. Prior to fixing L7, the worker crashed before it could ever
   hit L8.
-- **Sig `#2` (trie cascade prune) does not map to any of L1–L8.** It is
+- **L9 does not map to any single signature** because it is a
+  defense-in-depth memory-safety invariant rather than a customer-
+  observed wedge. The customer's wedge clears once L1–L8 are covered;
+  L9 closes the residual hazard that, on cancel/exception, the recv
+  buffer pool can be reused by the next request while the local agent
+  thread (or the peer) may still be writing into the previous tenant's
+  VRAM. The mitigation is to *not* return such slots to the pool —
+  poison them, log loudly, and force a process restart before the
+  pool is usable again.
+- **Sig `#2` (trie cascade prune) does not map to any of L1–L9.** It is
   an independent eviction-driven bug, fixed entirely by changing
   `templatedTrie.h::clearNode` to reset the child's `mPrevNode` before
   erasing.
@@ -245,13 +268,81 @@ Approach D includes this fix as a local patch on top of `#13056` and
 `#13495`. Approach A doesn't need it (no L2 fix). Approaches B and C
 both need it.
 
+### L9 — transport quiescence on unsafe exit
+
+Once `L1`–`L8` are closed, the recv-side path in
+`dataTransceiver.cpp::CacheReceiver::Impl::requestSync` and the send-
+side paths in `cacheFormatter.cpp::CacheFormatter::format` and
+`mlaCacheFormatter.cpp::MLACacheFormatter::format` still have cancel
+and exception edges where:
+
+1. A `BufferIndexHolder` (or a vector of them) owns a recv / send slot.
+2. The local NIXL/UCX agent thread or the remote peer may still be
+   writing to that slot's VRAM (the cancel races the in-flight
+   transfer).
+3. The natural `~BufferIndexHolder()` destructor returns the slot to
+   the pool's free list — and the next request grabs it.
+
+This is the silent-corruption surface. `L9` requires those paths to
+*poison* the slot (and therefore the entire pool) instead of releasing
+it, plus a Python-side fail-closed path that drains in-flight requests
+and forces a process restart:
+
+```cpp
+// cacheFormatter.cpp::CacheFormatter::format (and mlaCacheFormatter.cpp):
+try
+{
+    sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum,
+        preAllocSendBuffer, bufferManager, targetInfo, pickUpConnections);
+}
+catch (...)
+{
+    if (agentConnection != nullptr)
+    {
+        // NIXL path — transport quiescence is unknown on throw.
+        sendHolder.poison();
+    }
+    throw;
+}
+
+// dataTransceiver.cpp::CacheReceiver::Impl::requestSync:
+catch (...)
+{
+    if (agentConnectionManagerForAcq)
+    {
+        poisonRecvHolders();
+    }
+    llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+    llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+    throw;
+}
+```
+
+```python
+# py_executor.py::_fail_closed_for_unquiesced_disagg_transfer:
+self.active_requests.clear()
+self.waiting_queue.clear()
+self.request_accumulated.clear()
+self.control_requests.clear()
+self.is_shutdown = True
+self.shutdown_event.set()
+self._enqueue_responses(list(error_responses.items()))
+with self.response_cv:
+    self.response_cv.notify_all()
+```
+
+PR `#13728` introduced this for the non-MLA path; the MLA send loop
+was missed by `#13728` and ported separately as part of the PR `#13713`
+review-fix cleanup. The receiver path covers both MHA and MLA models
+because the cancel/exception poisoning happens above the formatter.
+
 ---
 
 ## How the layers compose into the customer wedge
 
 The customer's wedge isn't one bug; it's a stack where *any single
-uncovered layer is sufficient to reproduce a permanent wedge or
-crash under the load shape*:
+uncovered layer in `L1`–`L8` is sufficient to reproduce a permanent
+wedge or crash under the load shape*:
 
 - L4 alone wedges the gen event loop indefinitely (sig `#4`) → no
   recovery regardless of any other fix
@@ -270,7 +361,17 @@ crash under the load shape*:
 This is the structural reason "fix the bugs we know about" hasn't been
 enough: the bugs we initially knew about (`#1`, `#2`, `#3` from the
 field) didn't form a sufficient set. Each of L1–L8 is an independently
-necessary defense.
+necessary wedge defense.
+
+`L9` sits a layer above wedge prevention. Once `L1`–`L8` are covered,
+the deployment recovers cleanly — but cancel and exception paths can
+still return pool-owned VRAM to the next request while the transport
+may still be reading or writing into it. `L9` closes that residual
+hazard by failing closed (poisoning the slot, requiring a process
+restart) any time TRT-LLM cannot prove the transport has quiesced.
+This is defense-in-depth, not wedge prevention; it never *fires* in a
+clean run, but it converts an entire class of latent corruption modes
+into a loud, attributable shutdown.
 
 ---
 
@@ -286,10 +387,12 @@ necessary defense.
 | L6 | NIXL `XferReq` handles accumulate as cancelled transfers leave them registered. Eventually triggers the deadlock variant of sig `#7`. |
 | L7 | First request after `Response::mRequest` becomes `shared_ptr` SIGSEGVs deterministically in `handleAsyncSend`. Cannot serve any traffic. |
 | L8 | After the system progresses past the burst once, `KVCacheManager::addSequence` fires `emplaceDone` assertion at `kvCacheManager.cpp:2992`. Subsequent requests crash. |
+| L9 | No visible wedge, but the recv buffer pool can be reused while the previous tenant's NIXL/UCX transfer is still in flight. Symptom is silent KV-cache corruption / sporadic decode garbage that only manifests under cancel-heavy load — the worst kind of bug because it does not announce itself. |
 
-The last column in this table is exactly the residual failure mode that
+The L1–L8 entries in this table describe the residual failure mode that
 characterises each of the four candidate fix approaches A/B/C
-respectively. Approach D is the first stack that closes every layer.
+respectively. Approach D is the first stack that closes L1–L8, and
+the post-PR-`#13728` fold-in is the first stack that also closes L9.
 
 ---
 

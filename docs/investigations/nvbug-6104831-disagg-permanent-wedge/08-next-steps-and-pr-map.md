@@ -19,7 +19,8 @@ recommendation, read
 | **#5** Receiver-side `Broken promise` from queued cancel | Combined test + fix in review | (combined into fix PR) | [#13672](https://github.com/NVIDIA/TensorRT-LLM/pull/13672) | Mirror of `#1` on the receiver side. |
 | **#6** Recv-buffer index leak via `!isReady` early return | Combined test + fix in review (chained on `#13640`) | (combined into fix PR) | [#13673](https://github.com/NVIDIA/TensorRT-LLM/pull/13673) | Two-layer fix: RAII cleanup in `sendRequestInfo()` (Layer A) + explicit free in `requestSync()` `!isReady` path (Layer B). Direct cascade from the `#1` fix. |
 | **#7** `pthread_mutex_lock` wedge in `CacheSender::Impl::*` (bug class with 4 manifestations) | Variant D fixed; mutex deadlock variant still needs `gdb` capture | — (unit test deferred until exact mutex / holder identified) | Variant D fix included in [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) (combo PR) | Re-classified in Phase 12 from "NIXL plugin bug" to "TRT-LLM-side `CacheSender::Impl` mutex bug, exposed across both NIXL and direct-UCX backends". Phase 13 broadened to a 4-manifestation class. Phase 14 confirmed and fixed Variant D (eval-order). |
-| **Combo (Approach D)** | In review | (multiple) | [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) | PR `#13056` + PR `#13495` + eval-order fix + Python idempotency guards. The strongest current candidate; see [`06-fix-approaches/D-combo.md`](06-fix-approaches/D-combo.md). |
+| **L9** Transport quiescence on unsafe exit (no signature — defense-in-depth) | Folded into combo; MLA port follow-up done | — (focused unit tests being ported alongside the sig regression tests) | [#13728](https://github.com/NVIDIA/TensorRT-LLM/pull/13728) folded directly into [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) | Adds `BufferIndexHolder::poison()`, tri-state `ReadySignalResult{kReady,kNotReady,kCancelled}`, send-side `try/catch` + poison around `sendAllBuffers`, and Python `_fail_closed_for_unquiesced_disagg_transfer()`. The MLA send path was missed by `#13728` and ported to `mlaCacheFormatter.cpp` as part of the PR `#13713` review-fix cleanup (zero-copy disable + try/catch + `sendHolder.poison()`). |
+| **Combo (Approach D)** | In review | (multiple) | [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) | PR `#13056` + PR `#13495` + eval-order fix + Python idempotency guards + PR `#13728` (folded in) + MLA port. The strongest current candidate; see [`06-fix-approaches/D-combo.md`](06-fix-approaches/D-combo.md). |
 
 ### Companion fixes (already in `main`, not in `rc11`)
 
@@ -73,8 +74,10 @@ but this needs runtime confirmation.
 Land [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) on
 `main`. The combo includes the eval-order fix (Variant D of sig `#7`)
 and idempotency guards already, plus PR `#13056` + PR `#13495`'s
-architectural mechanisms. Recovery is clean on NIXL+UCX-plugin
-through `CONC=64`, the customer's transport.
+architectural mechanisms, plus PR `#13728`'s `L9` fail-closed
+memory-safety policy folded in directly with an MLA-formatter port.
+Recovery is clean on NIXL+UCX-plugin through `CONC=256` with three
+ctx/gen pairs, the customer's transport.
 
 ### 3. Lift the direct-UCX saturation boundary above `CONC=32`
 
@@ -138,6 +141,16 @@ All current results are single-host. Customer's deployment is K8s
 cluster with Dynamo Operator. Combo + NIXL needs validation in that
 shape before being declared production-ready.
 
+### 4a. MLA-model stress validation
+
+All current stress runs use Qwen3-0.6B (GQA-style attention), which
+exercises `cacheFormatter.cpp` rather than `mlaCacheFormatter.cpp`.
+The MLA `L9` port should be exercised under the customer-shape stress
+harness with a DeepSeek-class model (V2 / V3 / R1) before the combo
+is declared safe for MLA deployments. Cost is one rebuild + one
+5-iteration loop using the existing `.repro/run_validation_loop.sh`
+with `MODEL` overridden.
+
 ### 5. Backport `#13119` to `rc11`
 
 Request-level error propagation in disagg serving. Doesn't fix the
@@ -161,6 +174,20 @@ resource leak on side B" — is likely to repeat if other paths share
 the same RAII gap. Specific candidates: other `concurrence` resources
 in `BaseTransBufferManager`, request-side state in `dataTransceiver.cpp`
 helpers, formatter exit paths.
+
+This audit is **strongly motivated** by the MLA-formatter finding
+during the PR `#13713` review cycle: PR `#13728` originally fixed
+`cacheFormatter.cpp` (MHA / GQA send path) but missed the structurally
+identical `mlaCacheFormatter.cpp::format()` send loop. The MLA path
+had the same `BufferIndexHolder sendHolder` pattern with no try/catch
++ poison around `sendBufferFun`, leaving DeepSeek-style MLA models
+exposed to the same memory-safety hazard the rest of the combo
+closes. The fix was mechanical (port the same try/catch + poison
+pattern + zero-copy disable guard), but the gap existed for an entire
+PR cycle because no one auditing `#13728` cross-checked the MLA
+formatter. A short audit pass over every other RAII-protected path in
+the disagg transceiver would catch the next instance of this pattern
+before it ships.
 
 ### 8. Document the seven invariants
 
@@ -341,6 +368,7 @@ Long-prompt burst + recovery-probe script in the
 | `run9` | rc11 + our fixes + UCX | `~/disagg-investigation-archive/run9_rc11_ourfixes_ucx_segfault/` (Variant C SIGSEGV) |
 | `run10` | rc11 + PR `#13056` + UCX | `~/disagg-investigation-archive/run10_pr13056_ucx_segfault_handleAsyncSend/` (Variant D SIGSEGV) |
 | `run14`, `run14c` | PR `#13056` + UCX with eval-order instrumentation / fix | local logs in PR `#13056` worktree |
+| `run_pr13713_reviewfix_v3` | combo + PR `#13728` + MLA port + cleanup edits, NIXL 3-pair, `CONC=128`, 5 iterations | `.repro/logs/run_pr13713_reviewfix_v3_20260504_172546/` in `local/pr13056-pr13495-combo` worktree (5/5 PASS, zero failure markers across all 12 worker / front / client logs, all 7 ports return HTTP 200 post-run) |
 
 ### New unit tests
 

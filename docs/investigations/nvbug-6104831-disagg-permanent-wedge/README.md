@@ -15,7 +15,9 @@
 
 ## Status (current)
 
-The strongest candidate stack is the **combo approach** (Approach D):
+The strongest candidate stack is the **combo approach** (Approach D),
+now with the PR `#13728` fail-closed memory-safety policy folded in
+and ported to the MLA send path:
 
 ```text
 rc11
@@ -23,23 +25,29 @@ rc11
 + PR #13495   (transfer-release cancellation hook)
 + eval-order fix in CacheSender::Impl::handleAsyncSend
 + Python idempotency guards in _prepare_disagg_gen_init() and _recv_disagg_gen_cache()
++ PR #13728   (fail-closed on unquiesced disagg KV transfer)
++ MLA port    (poison-on-NIXL-throw + zero-copy guard in mlaCacheFormatter.cpp)
 ```
 
 Submitted as PR [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713).
 
 Latest local results, 1P1D `trtllm-serve` long-prompt burst harness on a
-single host:
+single 8-GPU B300 host. Bold cells are the post-PR-#13728 reaffirmations;
+the rest pre-date the fold-in:
 
-| Transport | `CONC=16` | `CONC=24` | `CONC=32` | `CONC=64` |
-|---|---|---|---|---|
-| Direct UCX | 5/5 recovered (60 s + 90 s) | 5/5 recovered (60 s + 90 s) | 5/5 recovered (90 s) | wedged (no recovery 180 s) |
-| NIXL + UCX plugin | n/a | n/a | 5/5 recovered, zero burst-time errors | 5/5 recovered, zero burst-time errors |
+| Transport | `CONC=16` | `CONC=24` | `CONC=32` | `CONC=64` | `CONC=128` (3-pair) | `CONC=256` (3-pair) |
+|---|---|---|---|---|---|---|
+| NIXL + UCX plugin | n/a | n/a | 5/5 recovered, zero burst errors | 5/5 recovered, zero burst errors | **5/5 recovered, zero burst errors (review-fix v3)** | **5/5 recovered, zero burst errors** |
+| Direct UCX | 5/5 recovered (60 s + 90 s) | 5/5 recovered (60 s + 90 s) | 5/5 recovered (90 s) | wedged (no recovery 180 s) | wedged | n/a |
 
 The customer-reported failure mode is *fixed on NIXL+UCX-plugin through
-`CONC=64`*, with the only remaining failure being on TRT-LLM's *direct UCX*
-path under sustained `CONC=64` stress. NIXL is the customer transport, so
-the reporter's deployment shape is covered by the candidate stack.
-Multi-node and full Dynamo orchestration validation are still pending.
+`CONC=256` with three ctx/gen pairs*, with the only remaining failure
+being on TRT-LLM's *direct UCX* path above `CONC=32` (throughput
+saturation, not a cancellation gap — see
+[`06-fix-approaches/D-combo.md`](06-fix-approaches/D-combo.md#direct-ucx-saturation-evidence-diagnostic-build)).
+NIXL is the customer transport, so the reporter's deployment shape is
+covered by the candidate stack. Multi-node and full Dynamo orchestration
+validation are still pending.
 
 ---
 
@@ -122,6 +130,7 @@ across sections that are each meant to be readable on its own:
 | [#13671](https://github.com/NVIDIA/TensorRT-LLM/pull/13671) | sig `#4` fix |
 | [#13672](https://github.com/NVIDIA/TensorRT-LLM/pull/13672) | sig `#5` test + fix |
 | [#13673](https://github.com/NVIDIA/TensorRT-LLM/pull/13673) | sig `#6` test + fix (chained on `#13640`) |
+| [#13728](https://github.com/NVIDIA/TensorRT-LLM/pull/13728) | fail-closed on unquiesced disagg KV transfer (folded into `#13713`) |
 
 **Combo PR**: [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) — Approach D.
 
