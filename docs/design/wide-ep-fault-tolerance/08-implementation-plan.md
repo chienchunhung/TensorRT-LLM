@@ -194,13 +194,14 @@ Phase 3 is sized at work-track granularity because scope will refine post-Phase-
 
 | Track | Scope | Rough size | Prereq |
 |:---|:---|:---|:---|
-| **3a** Latency anomaly detection | CUDA-event instrumentation, 3×-median detector, alerting hook | 2–3 weeks | Phase 2 complete |
+| **3a** Telemetry foundation + latency anomaly detection | Shared per-rank ring buffer (CUDA events + NVML signals + EPLB stats) consumed by 3a / 3e / 3f; 3×-median detector; alerting hook | 3–4 weeks | Phase 2 complete |
 | **3b** Preemptive expert migration | Reuses Phase 1 v1 weight-migration path; adds drain-state + hot-expert prioritization | 2–3 weeks | 3a, 1b.6 |
 | **3c** Elastic scaling up | Reuses Phase 2 rebuild for N → M > N; orchestrator API | 3–4 weeks | Phase 2, 2c.1 |
 | **3d** Elastic scaling down | Combines 3b drain + Phase 1 mask; orchestrator API | 2–3 weeks | 3b |
-| **3e** Predictive failure detection | Telemetry integration (NVML + per-rank history) + rule-based predictor | 3–4 weeks + telemetry infra | Telemetry infra (out of scope) |
+| **3e** Predictive failure detection | Consumes 3a telemetry + historical NVML; rule-based predictor first, ML model later | 3–4 weeks + telemetry infra | 3a, telemetry infra |
+| **3f** Straggler mitigation (forward-looking, [§7.5](07-phase-3-beyond-failover.md#75-straggler-mitigation-forward-looking)) | **Detailed design TBD.** Lightweight first cut = Option A (latency-aware routing) + Option D (tail-cutting timeout). Option C (shadow rank as performance hot-spare) lands "for free" once §6.3 is done. **Option B (speculative redundant compute) is research-grade — own design doc, ~10–14 weeks if pursued.** | A+D: ~6–7 weeks. A+D+C: ~10–13 weeks. With B: +10–14 weeks. | 3a (telemetry), §6.3 for C, settled open questions in §7.5 for B |
 
-**Total Phase 3:** ~3 months of engineering effort, but gated on production experience from Phases 1 and 2 to prioritize correctly. Not on the MVP critical path.
+**Total Phase 3:** ~3 months engineering for 3a–3e (the Phase 3 originally scoped); ~5 months if Phase 3.5 lands the lightweight straggler track (3f's A + D); 7–9 months if Option B speculative compute is added. All gated on production experience from Phases 1 and 2 to prioritize correctly. Not on the MVP critical path.
 
 ## 8.4 Timeline summary
 
