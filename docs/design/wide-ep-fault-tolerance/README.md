@@ -40,6 +40,10 @@ See [§0 Executive Summary](00-executive-summary.md) for the full headline pictu
 | [#13302](https://github.com/NVIDIA/TensorRT-LLM/pull/13302) | WideEP FT: add EPGroupHealth thread-safe rank mask | In review | §5.3, PR 1a.1 |
 | [#13404](https://github.com/NVIDIA/TensorRT-LLM/pull/13404) | WideEP FT: NVLinkOneSided kernel mask | Open | §5.1, PR 1a.2 |
 
+## Forward-looking research exploration
+
+- [Straggler speculation research](straggler-speculation-research/README.md) — sub-directory capturing the research arm of straggler mitigation (Option B in §7.5: speculative redundant compute in synchronous AlltoAll). Three docs: problem framing, literature survey + search plan, publication venue analysis. Not committed engineering work; the production track (A + D in §7.5) is independent.
+
 ## Workflow artifacts
 
 Planning materials that informed this rewrite (preserved for record-keeping):
@@ -47,6 +51,8 @@ Planning materials that informed this rewrite (preserved for record-keeping):
 - [Redesign outline](redesign-outline.md) — agreed 10-section structure before drafting
 - [Research pass items](redesign-research-pass.md) — source-verification checklist
 - [Research pass report](redesign-research-pass-report.md) — findings that anchor the rewrite
+- [Audit 1a findings](audit-1a-findings.md) — Days 1–3 empirical results (NCCL rebuild, MPI signal handlers, `cuMemUnmap` on dead-peer regions)
+- [Research pass prototypes](research-pass-prototypes/README.md) — runnable scripts that produced the audit findings
 
 ## Scope & non-goals
 
