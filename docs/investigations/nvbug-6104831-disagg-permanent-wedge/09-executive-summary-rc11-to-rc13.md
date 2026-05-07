@@ -1,15 +1,8 @@
-# 09 — Executive Summary: rc11 → rc13 Journey
+# 09 — NVBug 6104831 Executive Summary
 
-**Audience:** an engineer or technical lead who needs to understand the
-disaggregated KV-transfer cancellation/cleanup bug class (NVBug
-6104831), the proposed fix (PR
-[#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713)), why it
-regressed when applied on top of `rc13`, the short-term and long-term
-plans, and the design invariants the bug class violates.
-
-**Reading time:** 15 minutes. **Self-contained:** this file does not
-require reading any other section to follow. Optional deep-dive
-pointers are listed at the end.
+Executive summary of NVBug 6104831 and the proposed fix in PR
+[#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713). The fix
+solves the bug on `rc11` but regresses when applied on top of `rc13`.
 
 ---
 
@@ -459,23 +452,3 @@ deleting the dual-path (replacing `store_blocks_for_reuse(pin=True)`
 with `pin=False`, plus removing the supporting flag and call sites)
 is the architectural fix and retires the latent symptoms the stop-gap
 leaves open.
-
----
-
-## Optional deep-dive pointers
-
-This file is self-contained; no further reading is required. If you
-want to drill in on any one part:
-
-| Topic | File |
-|---|---|
-| 10-minute version (rc11 only) | [`00-tldr.md`](00-tldr.md) |
-| Architecture and request walkthrough | [`01-background.md`](01-background.md) |
-| The eight signatures in detail (#1–#8) | [`02-failure-signatures.md`](02-failure-signatures.md) |
-| The L1–L10 invariants with code-level evidence | [`03-defect-class-stack.md`](03-defect-class-stack.md) |
-| Reproducer | [`04-reproduction.md`](04-reproduction.md) |
-| Chronological investigation, including Phase 15 (rc13 regression) | [`05-investigation-timeline.md`](05-investigation-timeline.md) |
-| Approach D (combo) detail and empirical results | [`06-fix-approaches/D-combo.md`](06-fix-approaches/D-combo.md) |
-| Why so many bugs were latent; retrospective | [`07-architectural-reflections.md`](07-architectural-reflections.md) |
-| PR map, outstanding work, staged landing plan | [`08-next-steps-and-pr-map.md`](08-next-steps-and-pr-map.md) |
-| The architectural answer (Phase 2 delete-the-dual-path design) | [`docs/design/block-reuse-overlap-scheduler/phase2-unify-reuse-mechanisms.md`](../../design/block-reuse-overlap-scheduler/phase2-unify-reuse-mechanisms.md) |
