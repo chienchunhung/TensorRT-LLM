@@ -272,5 +272,65 @@ Open item: streaming SSE helpers must be audited so they follow the same boundar
 | Second failure during rebuild | Medium | Medium | 2a.8 | Abandon rebuild, re-mask, retry | **Medium** |
 | HostMoeTensorSharer MPI hard-bake | Medium | High | Future migration | Refactor before Ray pivot | **Medium** |
 | PP + WideEP interaction | Medium | Low | 2+ | Defer to Phase 2 | **Medium (deferred)** |
+| **Cross-team coordination (MNNVL stack, NVSHMEM API)** | Medium | Medium | 2a, §7.5 | Engage NVSHMEM / CUDA driver / fabric manager / IMEX teams early; see [§9.5](#95-cross-team-dependencies-nvidia-internal) | **Medium** — depends on external roadmaps |
 
 Bolded rows are the ones warranting active tracking during MVP execution.
+
+## 9.5 Cross-team dependencies (NVIDIA-internal)
+
+Phase 2 (PG reconstruction over MNNVL) and [§7.5](07-phase-3-beyond-failover.md#75-straggler-mitigation-forward-looking) (forward-looking straggler / resize work) depend on components owned by NVIDIA teams outside TRT-LLM. This section captures the dependency map for early engagement. Specific team names should be verified through internal channels (NV Slack, Confluence, internal owner lists) since reorg history isn't visible from the doc; the table below is the *external read* — accurate at the component level, but the team-name column should be confirmed before any formal contact.
+
+### Component ownership map (external read; verify internally)
+
+| Component | What it is | Owning org (external read) | Internal verification path |
+|:---|:---|:---|:---|
+| **NVSHMEM** | GPU OpenSHMEM library; DeepEP rides on it | NVIDIA HPC Software (sibling to NCCL, MPI integration, HPC SDK) | Internal NVSHMEM owner list; `#nvshmem` Slack equivalent |
+| **MNNVL — physical fabric** | NVLink + NVSwitch silicon | Hardware / silicon teams | Generally not on our path |
+| **MNNVL — fabric manager** | NVSwitch fabric manager daemon | NV Switch / fabric manager team (system software) | Internal NVSwitch / fabric-manager owner list |
+| **MNNVL — IMEX daemon** | `nvidia-imex` user-space daemon for cross-node fabric memory grants | System software team (sibling to fabric manager) | Internal driver / sysSW owner list |
+| **CUDA driver — fabric handle** | `cuMemCreate(... CU_MEM_HANDLE_TYPE_FABRIC ...)`, `cuMemMap`, `cuMemUnmap` for fabric memory | CUDA driver team (memory management subsystem) | Internal CUDA driver owner list |
+| **DeepEP wrappers** | Python + CUDA kernels wrapping NVSHMEM for MoE AlltoAll | **DeepSeek-AI (external; not NVIDIA)** | NVIDIA-DeepSeek collaboration channel |
+
+### Dependencies by phase
+
+**Phase 1 (MVP + v1).** No cross-team dependency. Wholly owned by TRT-LLM. We can ship on our own schedule.
+
+**Phase 2 (Restoration).** Three cross-team engagements:
+
+- **CUDA driver team** — fabric handle teardown semantics under peer death. [Audit 1a Day 3](audit-1a-findings.md) (posix-FD variant) showed `cuMemUnmap` of a dead-peer region completes in ~0.25 ms with no fault. Need explicit confirmation that the fabric-handle path matches and that future driver versions preserve the behavior. Engage when [Audit 1b](#audit-1--mnnvl--nvshmem-teardown-capability) is being planned.
+- **NVSwitch fabric manager team** — what does the fabric manager do when an MNNVL domain member disappears? Does it interfere with rank-masked AlltoAll, or with our rebuild flow? Audit 1b is partly about answering this empirically; their team's expectations should be cross-checked beforehand. Engage early.
+- **IMEX team** — does IMEX support re-exchanging memory grants among surviving members without daemon restart? Engage when planning [PR 2a.2](08-implementation-plan.md#2a--process-group-reconstruction) (MNNVL teardown + reallocate).
+
+**§7.5 (Forward-looking straggler / resize work).** Same MNNVL stack as Phase 2, plus dynamic-resize requirements (adding a rank to a live fabric domain). Higher bar than Phase 2's "rebuild after death."
+
+**DeepEP-related (deferred indefinitely).** Two-sided dependency:
+
+- **NVSHMEM team (NVIDIA)** — `mask_buffer_ptr` public API. Referenced in vLLM's RFC #27774 since 2024 but not yet shipped in public NVSHMEM. NVSHMEM team's roadmap decision.
+- **DeepEP team (DeepSeek-AI; external)** — wiring of any new NVSHMEM masking primitive into DeepEP's public API. NVIDIA-DeepSeek collaboration channel.
+
+### Engagement strategy
+
+Three tiered actions:
+
+1. **Now (independent of MVP critical path).** Identify named contacts for NVSHMEM, CUDA driver fabric memory, and IMEX / fabric manager. Open low-key technical conversations about FT requirements. Even informal awareness that TRT-LLM has a Phase 2 / §7.5 roadmap depending on their components helps those teams factor it into their own planning. No formal commitments needed at this stage; the goal is visibility.
+
+2. **Before Audit 1b (NVL72 validation).** Pre-coordinate with the NVSwitch fabric manager + IMEX teams so audit findings can be cross-checked against their expectations. Avoids a "we measured X; you say it should be Y" loop, and gives them advance notice that audit data will surface.
+
+3. **At Phase 2 design freeze.** Convert the informal contacts into named approvers / consultants on the relevant Phase 2 PRs. Particularly PR 2a.2 (MNNVL teardown + reallocate) and PR 2a.0b (NVL72 rack-fabric audit). For DeepEP-related work, no engagement makes sense until upstream NVSHMEM has signaled `mask_buffer_ptr` is on their roadmap.
+
+### Implications for our roadmap
+
+| Class of work | Owners | Our control of timing |
+|:---|:---|:---|
+| MNNVL kernel rank masking (PR 1a.2) | TRT-LLM only | **High** — we own the kernel |
+| MNNVL fabric teardown + rebuild after peer death (PR 2a.2) | CUDA driver + fabric manager + IMEX | **Low–medium** — depends on documenting / extending external behavior |
+| MNNVL dynamic resize (live add/remove rank) — §7.5 | Same as above, larger asks | **Low** — likely needs a multi-team roadmap discussion |
+| NVSHMEM rank masking via `mask_buffer_ptr` | NVSHMEM team (NVIDIA) + DeepEP (DeepSeek) | **Low** — two-sided external dependency, slow timeline historically |
+| NVSHMEM PE recovery / rejoin | NVSHMEM team | **Low** — library roadmap question |
+| NCCL FT (`ncclCommAbort` wiring on our side) | TRT-LLM team for wrapper; NCCL team for upstream | **Medium** — wrapper is ours (PR 1a.7); upstream NCCL FT is mature |
+
+Net implication:
+
+- **Anything purely in TRT-LLM source** (Phase 1, most of §5, §6.1, §6.4) — we own and ship on our schedule.
+- **Anything that touches MNNVL fabric semantics** (Phase 2, §7.5) — needs early external engagement. Worth opening conversations *now*, not when we hit the audit.
+- **Anything requiring NVSHMEM API extensions** (DeepEP FT) — soft dependency on someone else's timeline. Treat as out-of-scope until that timeline is established by upstream.
