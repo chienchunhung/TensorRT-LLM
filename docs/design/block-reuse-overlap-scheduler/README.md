@@ -47,10 +47,18 @@ The original PR #12416 explored a broader refactoring approach (extracting `_may
 
 ### Phase 2: Unify Block Reuse and Disaggregated Partial Reuse
 
-**Status:** Design complete — deprioritized
-**Priority:** P1 (when prioritized) — Code simplification and PP enablement
+**Status:** Design complete — **promoted from "deprioritised" to "load-bearing for stable disagg block reuse"** following the rc13 regression observed against PR [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713).
+**Priority:** P0 follow-up to PR `#13713` — Phase 1 stop-gap unblocks rc13 customers; Phase 2 deletes the L10 redundant-cleanup mechanism that the stop-gap is patching around.
 
-Remove the pin/unpin lifecycle from `AsyncTransferManager`. Rely on reference counting for block protection during KV transfer. Drop the `pp_size == 1` restriction. The design is documented below for future reference when this work is picked up.
+Remove the pin/unpin lifecycle from `AsyncTransferManager`. Rely on reference counting for block protection during KV transfer. Drop the `pp_size == 1` restriction.
+
+The rc13 regression empirically confirms that the dual-mechanism critique in this design doc is not just code-cleanliness — it produces a customer-visible server hang under rc13's default-on block reuse + an in-flight cancel timing window. See the
+[NVBug 6104831 investigation Phase 15](../../investigations/nvbug-6104831-disagg-permanent-wedge/05-investigation-timeline.md)
+and the
+[L10 row in the defect-class stack](../../investigations/nvbug-6104831-disagg-permanent-wedge/03-defect-class-stack.md)
+for the empirical evidence.
+
+Phase 2 closes L10 outright and additionally retires the latent symptoms the stop-gap leaves open: pin leak on cancel/timeout, PP > 1 disagg without block reuse, eviction race in the unpin → release window, and recurring regression risk on adjacent code.
 
 ### Phase 3: Partial Overlap for Immediate Block Reuse
 

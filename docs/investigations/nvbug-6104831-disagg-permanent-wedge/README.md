@@ -41,13 +41,31 @@ the rest pre-date the fold-in:
 | Direct UCX | 5/5 recovered (60 s + 90 s) | 5/5 recovered (60 s + 90 s) | 5/5 recovered (90 s) | wedged (no recovery 180 s) | wedged | n/a |
 
 The customer-reported failure mode is *fixed on NIXL+UCX-plugin through
-`CONC=256` with three ctx/gen pairs*, with the only remaining failure
-being on TRT-LLM's *direct UCX* path above `CONC=32` (throughput
+`CONC=256` with three ctx/gen pairs* on `rc11`, with the only remaining
+failure being on TRT-LLM's *direct UCX* path above `CONC=32` (throughput
 saturation, not a cancellation gap — see
 [`06-fix-approaches/D-combo.md`](06-fix-approaches/D-combo.md#direct-ucx-saturation-evidence-diagnostic-build)).
 NIXL is the customer transport, so the reporter's deployment shape is
 covered by the candidate stack. Multi-node and full Dynamo orchestration
 validation are still pending.
+
+> **rc13 caveat (sig `#8` / L10):** the same combo regresses to a
+> server hang when applied on top of `rc13`, because rc13 turns block
+> reuse on by default and that surfaces a redundant cleanup-mechanism
+> defect (the L10 layer in
+> [`03-defect-class-stack.md`](03-defect-class-stack.md)). PR
+> `#13713` must therefore land *with* a small stop-gap that always
+> calls `_terminate_request` after `end_transfer()` returns true and
+> dedupes via a `resources_freed` flag. The architectural follow-up
+> is Phase 2 of the existing
+> [block-reuse-overlap-scheduler design doc](../../design/block-reuse-overlap-scheduler/),
+> which deletes the dual-path entirely (replaces
+> `store_blocks_for_reuse(pin=True)` with `pin=False`, drops the
+> `should_store_blocks` flag and the `unpin_blocks_by_id` call).
+> Phase 15 of the timeline has the empirical evidence and the full
+> plan. See
+> [`08-next-steps-and-pr-map.md`](08-next-steps-and-pr-map.md) item 2
+> for the staged landing plan.
 
 ---
 
@@ -62,8 +80,8 @@ across sections that are each meant to be readable on its own:
 |---|---|
 | **[`00-tldr.md`](00-tldr.md)** | **Start here. 10-minute read.** Summarises the wedge symptom, the eight-layer root cause, the combo fix (PR `#13713`), and the empirical recovery results. Has the architecture and fix-mapping figures inline. Inspires the deeper reads if you want detail. |
 | [`01-background.md`](01-background.md) | Read first if you are new to this code. Architecture diagrams of the disagg deployment, request lifecycle walkthrough, `LlmRequestState` state machine, key files / classes. |
-| [`02-failure-signatures.md`](02-failure-signatures.md) | The seven concrete failure signatures (`#1`–`#7`): symptom, code site, root cause, fix, regression test. The "what bugs are there" view. |
-| [`03-defect-class-stack.md`](03-defect-class-stack.md) | The eight-layer `L1`–`L8` defect-class model that emerged from the investigation. Re-frames the seven signatures as the customer-visible faces of underlying invariant gaps. **This is the framework used in the four-approach comparison.** |
+| [`02-failure-signatures.md`](02-failure-signatures.md) | The eight concrete failure signatures (`#1`–`#8`, with `#8` being the rc13 server hang under disagg + block reuse + in-flight cancel): symptom, code site, root cause, fix, regression test. The "what bugs are there" view. |
+| [`03-defect-class-stack.md`](03-defect-class-stack.md) | The ten-layer `L1`–`L10` defect-class model that emerged from the investigation. Re-frames the eight signatures as the customer-visible faces of underlying invariant gaps. **This is the framework used in the four-approach comparison.** |
 | [`04-reproduction.md`](04-reproduction.md) | How to reproduce the wedge locally with `trtllm-serve` 1P1D, the load shape that matters, and what does *not* reproduce it. |
 | [`05-investigation-timeline.md`](05-investigation-timeline.md) | Chronological journey: Phases 0 (field report) through 14 (current). Useful for understanding *how* the bug class was discovered and why each fix exposed the next, but not required to understand the current state. |
 | [`06-fix-approaches/`](06-fix-approaches/) | The four candidate fix stacks (A, B, C, D), one file each, plus a comparison `README.md` that scores them against the `L1`–`L8` defect class stack. **The `README.md` here is the most important file in the report for picking a fix path.** |

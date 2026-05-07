@@ -63,6 +63,7 @@ includes a mechanism that closes the invariant in L_n, or it doesn't.
 | **L7** | **Eval-order UB introduced by shared_ptr** (only after L2 is fixed) | `dataTransceiver.cpp::handleAsyncSend` line 514: `sendAndRemoveResponse(resp.mRequest->mRequestId, std::move(resp));` | Once `Response::mRequest` is `shared_ptr`, compilers may evaluate `std::move(resp)` first → reads `mRequestId` from a moved-from `shared_ptr` → SIGSEGV on first request |
 | **L8** | **Python scheduler idempotency** — `_prepare_disagg_gen_init` and `_recv_disagg_gen_cache` re-run side effects when the same `py_request_id` is rescheduled while in `DISAGG_GENERATION_INIT` | `py_executor.py::_prepare_disagg_gen_init`, `_recv_disagg_gen_cache` | `KVCacheManager::addSequence` fires `emplaceDone` assertion at `kvCacheManager.cpp:2992`; `request_and_receive_async` is started twice for the same request |
 | **L9** | **Transport quiescence on unsafe exit** — buffer slots returned to the pool while the NIXL/UCX transport may still be writing into them | `cacheFormatter.cpp::CacheFormatter::format` send loop, `mlaCacheFormatter.cpp::MLACacheFormatter::format` send loop, `dataTransceiver.cpp::CacheReceiver::Impl::requestSync` recv path; all paths where `BufferIndexHolder::~BufferIndexHolder` runs on cancel / exception with an in-flight `AgentConnection` | Closing L1–L8 prevents wedges, but the cancel/exception paths still hand pool-owned VRAM back to the next request while the peer (or the local agent thread) may still be writing into those buffers. Risk surface is silent KV-cache corruption / sporadic decode garbage that only manifests under cancel-heavy load |
+| **L10** | **Redundant block-reuse cleanup mechanism on the disagg path** — partial-reuse early-termination + `_end_transfer_and_maybe_terminate` post-transfer termination form a dual-path with implicit hand-off via `should_store_blocks` | `py_executor.py::_handle_responses` (early-termination branch gated by `enable_partial_reuse_for_disagg`), `AsyncTransferManager._end_transfer_and_maybe_terminate` (post-transfer branch gated by `not should_store_blocks`); pin/unpin lifecycle in `start_transfer` / `end_transfer` | Two cleanup owners coordinate via implicit boolean state. Each owner can refuse termination under the right timing (in-transmission guard at the early site, `should_store_blocks=True` skip at the late site), and the cross-product can leave a request with no owner. Customer-visible: server hang on rc13 + block reuse + in-flight cancel. Latent additional symptoms: pin leak on cancel/timeout (gradual GPU OOM), PP > 1 disagg cannot use block reuse, eviction race in the unpin → release window (cache-hit rate degradation), recurring regression risk on adjacent code |
 
 `L1` through `L6` are C++ defects in the transceiver. `L7` is a
 *regression* introduced by `L2`'s fix (any approach that adds
@@ -70,7 +71,12 @@ includes a mechanism that closes the invariant in L_n, or it doesn't.
 Python-side scheduler defect that becomes observable only once `L7` is
 removed and the system progresses far enough to exercise the repeated
 init scheduling path. `L9` is the residual memory-safety invariant left
-exposed once `L1`–`L8` close the visible wedges.
+exposed once `L1`–`L8` close the visible wedges. `L10` is the redundant
+cleanup-mechanism layer surfaced by the rc13 regression: with block
+reuse on by default in rc13, the dual-path becomes routinely exercised
+and the implicit hand-off between the two cleanup owners breaks. See
+[`05-investigation-timeline.md`](05-investigation-timeline.md) Phase 15
+for the empirical evidence.
 
 ---
 
@@ -104,12 +110,15 @@ graph TB
 
     L9[L9: Transport quiescence<br/>on unsafe exit] --> CORRUPT[Silent buffer-pool<br/>reuse hazard<br/>under cancel-heavy load]
 
+    L10[L10: Redundant block-reuse<br/>cleanup mechanism] --> SIG8[Sig #8: rc13 server hang<br/>under disagg + block reuse<br/>+ in-flight cancel]
+    L10 -.->|latent| LATENT[Pin leak / PP=1 restriction /<br/>eviction race / regression risk]
+
     SIG2[Sig #2:<br/>trie cascade prune]
     INDEPENDENT[Independent —<br/>eviction-driven, not<br/>cleanup-path]
     SIG2 -.-> INDEPENDENT
 
     classDef sig fill:#ffe,stroke:#b80
-    class SIG1,SIG2,SIG3,SIG4,SIG5,SIG6,SIG7A,SIG7D sig
+    class SIG1,SIG2,SIG3,SIG4,SIG5,SIG6,SIG7A,SIG7D,SIG8 sig
 ```
 
 Some additional observations from the mapping:
@@ -137,8 +146,17 @@ Some additional observations from the mapping:
   VRAM. The mitigation is to *not* return such slots to the pool —
   poison them, log loudly, and force a process restart before the
   pool is usable again.
-- **Sig `#2` (trie cascade prune) does not map to any of L1–L9.** It is
-  an independent eviction-driven bug, fixed entirely by changing
+- **L10 maps to sig `#8`** (the rc13 server-hang regression) plus a
+  set of latent symptoms that the Phase 1 stop-gap does *not*
+  address: pin leak on cancel/timeout (gradual GPU OOM), PP > 1
+  disagg cannot use block reuse, an eviction race in the unpin →
+  release window (cache-hit rate degradation under memory pressure),
+  redundant double-store of blocks in the radix tree, and recurring
+  regression risk on adjacent code. The architectural answer is to
+  delete the dual-path entirely (existing design doc Phase 2 — see
+  [`docs/design/block-reuse-overlap-scheduler/phase2-unify-reuse-mechanisms.md`](../../design/block-reuse-overlap-scheduler/phase2-unify-reuse-mechanisms.md)).
+- **Sig `#2` (trie cascade prune) does not map to any of L1–L10.** It
+  is an independent eviction-driven bug, fixed entirely by changing
   `templatedTrie.h::clearNode` to reset the child's `mPrevNode` before
   erasing.
 

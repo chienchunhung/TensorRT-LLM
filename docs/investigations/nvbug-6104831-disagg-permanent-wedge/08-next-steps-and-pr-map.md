@@ -69,7 +69,7 @@ the top of `response()`'s loop body
 ([`dataTransceiver.cpp:684`](../../../cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp#L684)),
 but this needs runtime confirmation.
 
-### 2. Land the combo (Approach D) for the customer
+### 2. Land the combo (Approach D) for the customer, with the rc13 stop-gap
 
 Land [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) on
 `main`. The combo includes the eval-order fix (Variant D of sig `#7`)
@@ -78,6 +78,53 @@ architectural mechanisms, plus PR `#13728`'s `L9` fail-closed
 memory-safety policy folded in directly with an MLA-formatter port.
 Recovery is clean on NIXL+UCX-plugin through `CONC=256` with three
 ctx/gen pairs, the customer's transport.
+
+**Important: the combo regresses on rc13 without the L10 stop-gap.**
+rc13 turns on block reuse by default, which surfaces the L10 dual-path
+defect (sig `#8`). The combo must therefore land *with* a small
+stop-gap in `_end_transfer_and_maybe_terminate`:
+
+1. Remove the `if not should_store_blocks:` guard. Always call
+   `_terminate_request` after `end_transfer()` returns true.
+2. Add a `resources_freed` flag on the request's transfer metadata.
+   Set inside `_do_terminate_request` after `free_resources` runs,
+   check on entry to dedupe.
+3. Add an integration test driving disagg + block_reuse +
+   slow-transfer so `_handle_responses` runs while the request is in
+   transmission. Tag the test as "covers the dual-path that Phase 2
+   will simplify" so the test author of the Phase 2 PR knows to update
+   it after the deletion.
+
+The stop-gap is ~10 lines plus an integration test. Comment every
+new field with `# STOP-GAP: remove with Phase 2 pin-elimination work`
+so future contributors don't solidify it as the long-term contract.
+
+### 2a. Land Phase 2 of the block-reuse-overlap-scheduler design (medium-term)
+
+Follow-up PR after `#13713` lands. Implements the deletion documented
+in
+[`docs/design/block-reuse-overlap-scheduler/phase2-unify-reuse-mechanisms.md`](../../design/block-reuse-overlap-scheduler/phase2-unify-reuse-mechanisms.md):
+
+- Replace `store_blocks_for_reuse(request, pin=True)` with `pin=False`
+  in the disagg path.
+- Delete the `should_store_blocks` flag and the conditional in
+  `_end_transfer_and_maybe_terminate`.
+- Delete `block_id` from `RequestTransferMetadata`; simplify to a
+  bare counter.
+- Delete `unpin_blocks_by_id` in `end_transfer`.
+- Drop the `pp_size == 1` restriction.
+- Delete the stop-gap fields (`resources_freed`) and the dual-path
+  integration-test annotations.
+
+This closes layer **L10** outright. Strictly smaller diff than the
+stop-gap once measured by net-lines (deletes more than it adds).
+Risks are documented in the Phase 2 design doc and need explicit
+audit on rc13: (a) the "sequence alive → ref count > 0" invariant
+must hold under PR `#13728`'s fail-closed paths; (b) the scheduler's
+free-block accounting must keep treating in-transfer blocks as
+allocated under memory pressure; (c) PP > 1 enablement should be
+verified end-to-end through the long-prompt burst harness, not just
+asserted because the restriction is gone.
 
 ### 3. Lift the direct-UCX saturation boundary above `CONC=32`
 

@@ -22,6 +22,7 @@ For convenience, the signature labels at a glance:
 | **#5** | Receiver-side `Broken promise` from queued cancel | `CacheReceiver::Impl::cancelRequest()` erasing queued request without fulfilling promise | Post-`#4`-fix C++ trace logs |
 | **#6** | Recv-buffer index leak via `!isReady` early-return; subsequent receives wedge in `BaseTransBufferManager::assignBufferIndex()` | `cpp/tensorrt_llm/batch_manager/baseTransBuffer.cpp` (unbounded `cv.wait`) leaked from `CacheReceiver::Impl::requestSync()` (`!isReady` path) | Fine-grained C++ instrumentation across `sendRequestInfo()` body in `run7` |
 | **#7** | A bug class in `CacheSender::Impl::*` C++ code, observed as four manifestations: deadlock in `response()`; ctx mpi4py executor exits; Python-`getattr` SIGSEGV; first-request SIGSEGV in `handleAsyncSend` (PR `#13056` + UCX) | `cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp::CacheSender::Impl::*` | `gdb` post-mortems of `run8`, `pr13056_run1`, `rc11_ucx_run1`, `run9`, `run10`, `run14`/`run14c` |
+| **#8** | rc13 server hang under disagg + block reuse + in-flight cancel | `py_executor.py::_handle_responses` early-termination branch (gated by `enable_partial_reuse_for_disagg`) + `AsyncTransferManager._end_transfer_and_maybe_terminate` (gated by `not should_store_blocks`) — both refuse termination under the right timing, leaving the request with no cleanup owner | rc13 ablation: `CONC=128` passes with block reuse disabled, fails with block reuse enabled regardless of overlap setting |
 
 > **Read this caveat before reading anything else.** Signatures `#1`
 > through `#6` are real TRT-LLM bugs and the chained PRs land their
@@ -606,3 +607,90 @@ A, B, C are not yet individually addressed; combo D's other mechanisms
 Python idempotency guards, NIXL transport path) empirically eliminate
 or work around the remaining wedges through `CONC=64` on NIXL and
 `CONC=32` on direct UCX. Direct-UCX `CONC=64` still wedges.
+
+---
+
+## Signature #8 — rc13 server hang under disagg + block reuse + in-flight cancel
+
+**Symptom (rc13 ablation):**
+
+The combo (PR #13713 + #13728 + MLA port) recovered cleanly on rc11
+through `CONC=256` on NIXL. Applied to `rc13`, the same stack
+**hangs** the server under workloads that previously succeeded.
+`CONC=128` ablations isolate the trigger:
+
+| rc13 configuration | Outcome |
+|---|---|
+| block reuse disabled, overlap enabled | 5/5 recovered |
+| block reuse enabled, overlap disabled | wedged |
+| block reuse enabled, overlap enabled | wedged |
+
+Block reuse is the trigger; overlap is incidental. rc13 is the first
+release where block reuse + disaggregation are both default-on.
+
+**Where it lives:**
+
+Two cleanup owners coordinate via implicit boolean state:
+
+1. [`tensorrt_llm/_torch/pyexecutor/py_executor.py`](../../../tensorrt_llm/_torch/pyexecutor/py_executor.py)::`_handle_responses` early-termination branch, gated by `enable_partial_reuse_for_disagg && !is_vswa && pp_size==1`.
+2. `AsyncTransferManager._end_transfer_and_maybe_terminate`, gated by `not should_store_blocks`.
+
+PR #12816 introduced the second gate's "`should_store_blocks`
+short-circuit" justification: *"_handle_responses already
+terminated this request via the early-termination path."* PR #12816
+*also* added an `is_disagg_context_transmission_state` guard at the
+first site that defers termination during in-flight transmission.
+The combination is contradictory: when block reuse is on AND the
+request is in-flight at `_handle_responses` time, both sites refuse,
+and termination never happens.
+
+**Root cause:**
+
+This is layer **L10** in the defect-class stack — the redundant
+block-reuse cleanup mechanism on the disagg path. With block reuse
+enabled, two cleanup owners (the early-termination optimisation and
+the post-transfer termination) compete to handle the same request,
+each with its own refusal condition. The cross-product of refusal
+conditions has at least one cell where neither owner accepts, and
+that cell is exactly the in-flight cancel under block reuse case
+that rc13's defaults exercise routinely.
+
+PR #13713 didn't introduce this defect; the dual-path pre-exists.
+But PR #13713's `_can_terminate_request_now` deferral interacts with
+the dual-path in the failure-producing way, so applying #13713 to
+rc13 surfaces it as a customer-visible hang.
+
+**Fix (short-term stop-gap):**
+
+Two parts in `_end_transfer_and_maybe_terminate`:
+
+1. Remove the `if not should_store_blocks:` guard. Always call
+   `_terminate_request` after `end_transfer()` returns true.
+2. Make `_do_terminate_request` idempotent via a `resources_freed`
+   flag on the request's transfer metadata. Set it inside
+   `_do_terminate_request` after `free_resources` runs; check on
+   entry to dedupe against the (rare) case where
+   `_handle_responses` did take the early-termination path.
+
+**Fix (medium-term, architectural — the right answer):**
+
+Land Phase 2 of the existing
+[block-reuse-overlap-scheduler design doc](../../design/block-reuse-overlap-scheduler/phase2-unify-reuse-mechanisms.md):
+delete the dual-path entirely. Replace
+`store_blocks_for_reuse(request, pin=True)` with `pin=False`, drop
+the `should_store_blocks` flag and the `unpin_blocks_by_id` call,
+rely on reference counting (sequence stays alive during transfer →
+ref count > 0 → blocks not evictable) for protection. This also
+deletes the latent symptoms the stop-gap leaves open: pin leak on
+cancel/timeout, PP > 1 disagg without block reuse, eviction race in
+the unpin → release window, and recurring regression risk on
+adjacent code.
+
+**Status:** Stop-gap planned to land with PR #13713 to unblock the
+rc13 customer; Phase 2 follow-up to land separately after #13713
+stabilises. See Phase 15 of
+[`05-investigation-timeline.md`](05-investigation-timeline.md) for
+the empirical evidence and the full plan.
+
+**PRs:** TBD. Stop-gap is small (~10 lines + integration test);
+Phase 2 is documented in the design doc but not yet implemented.

@@ -496,6 +496,130 @@ follow-up.
 
 ---
 
+## Phase 15 — rc13 regression: block reuse exposes the L10 dual-path (T+10 days, *current*)
+
+After the combo (PR #13713 + the PR #13728 fold + MLA port) recovered
+cleanly on rc11 through `CONC=256` on NIXL with three ctx/gen pairs,
+the same stack regressed when applied on top of `rc13`: the server
+**hangs** on scenarios that succeeded on `rc11`. The differentiating
+factor is rc13 enabling block reuse by default.
+
+### Ablation evidence
+
+| rc13 configuration | `CONC=128` outcome |
+|---|---|
+| block reuse disabled, overlap enabled | 5/5 recovered |
+| block reuse enabled, overlap disabled | wedged |
+| block reuse enabled, overlap enabled | wedged |
+
+Block reuse is the trigger. Overlap scheduler is incidental.
+
+### Root cause: L10 (redundant block-reuse cleanup mechanism)
+
+The relevant code site:
+
+```python
+def _can_terminate_request_now(self, request: LlmRequest) -> bool:
+    if request.is_disagg_context_transmission_state:
+        logger.warning(
+            f"Deferring termination for request {request.py_request_id} "
+            "because context KV transfer is still in progress")
+        return False
+
+    if self.async_transfer_manager.end_transfer(request):
+        # When should_store_blocks is True, _handle_responses already
+        # terminated this request via the early-termination path
+        # (enable_partial_reuse_for_disagg branch). Skip the redundant
+        # termination to avoid double free_resources calls.
+        if not self.async_transfer_manager.should_store_blocks:
+            self._terminate_request(request)
+```
+
+This is a logical contradiction:
+
+- The first guard (PR #13713, post-fold) defers termination during
+  in-flight transmission — preventing UAF on the C++ side.
+- The skip on `should_store_blocks=True` (PR #12816) was justified by
+  "_handle_responses already terminated via the early-termination path."
+- But PR #12816 *itself* also added the `is_disagg_context_transmission_state`
+  guard in `_handle_responses`, which means the early-termination
+  path **does not run** for in-flight requests.
+
+When block reuse is on AND the request is in-flight when `_handle_responses`
+runs, **both paths skip and termination never happens.** The request
+stays in `active_requests`, KV blocks stay pinned, and the server
+eventually hangs.
+
+This is layer **L10** — the redundant block-reuse cleanup mechanism
+on the disagg path, where two cleanup owners coordinate via implicit
+boolean state.
+
+### Two competing fix proposals
+
+A separate AI-assisted plan ("Disagg KV Cleanup With Block Reuse")
+proposed adding more state to safely encode the dual-path:
+`termination_requested` / `resources_freed` metadata, eventually a
+`KVReuseLease` RAII type, and ultimately a unified
+`DisaggRequestCleanupSession` coordinator owning the multi-axis
+lifecycle.
+
+The existing design doc Phase 2 of
+[`docs/design/block-reuse-overlap-scheduler/`](../../design/block-reuse-overlap-scheduler/)
+proposed *deleting* the dual-path: replace
+`store_blocks_for_reuse(request, pin=True)` with `pin=False`, drop
+the `should_store_blocks` flag and the `unpin_blocks_by_id` call, and
+rely on reference counting (sequence stays alive during transfer →
+ref count > 0 → blocks not evictable) for protection.
+
+The two plans address the same symptom from opposite directions:
+add coordination vs delete the redundancy. Phase 2 is the cleaner
+direction because the rc13 regression is exactly the bug it predicted
+months ago, the deletion is structurally smaller than the
+coordination, and the proposed plan's eventual lease/session
+abstractions become unnecessary once the redundant mechanism is gone.
+
+### Plan: stop-gap + Phase 2
+
+**Short-term** (lands with PR #13713 to unblock rc13):
+
+1. Remove the `if not should_store_blocks:` guard in
+   `_end_transfer_and_maybe_terminate`. Always call `_terminate_request`
+   after `end_transfer()` returns true.
+2. Add a `resources_freed` boolean on the request's transfer metadata.
+   Set it inside `_do_terminate_request` after `free_resources` runs.
+   Check it on entry to make `_terminate_request` idempotent.
+3. Add an integration test that drives the disagg + block_reuse +
+   slow-transfer path so `_handle_responses` runs while the request
+   is in transmission. Tag the test as covering the dual-path that
+   Phase 2 will later simplify.
+
+**Medium-term** (separate PR after #13713 lands):
+
+Land Phase 2 of the existing design doc:
+
+- `store_blocks_for_reuse(request, pin=False)` in the disagg path.
+- Delete the `should_store_blocks` flag and the conditional in
+  `_end_transfer_and_maybe_terminate`.
+- Delete `block_id` from `RequestTransferMetadata`, simplify to a
+  bare counter.
+- Delete `unpin_blocks_by_id` in `end_transfer`.
+- Drop the `pp_size == 1` restriction (lifts a pre-existing
+  customer constraint).
+
+The integration test from the short-term step survives Phase 2's
+simplification (same observable behaviour, simpler implementation).
+
+### What L10 means latent
+
+The Phase 1 stop-gap closes the specific rc13 hang but leaves several
+latent symptoms documented in the L10 row of
+[`03-defect-class-stack.md`](03-defect-class-stack.md): pin leak on
+cancel/timeout, PP > 1 disagg without block reuse, eviction race in
+the unpin → release window, redundant double-store, ongoing
+regression risk on adjacent code. Phase 2 closes all of them.
+
+---
+
 ## What this timeline shows
 
 Six rounds of "find bug → fix bug → find next bug" took ~8 days of

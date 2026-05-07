@@ -2,8 +2,75 @@
 
 | | |
 |---|---|
-| **Depends on** | Phase 1 ([PR #12416](https://github.com/NVIDIA/TensorRT-LLM/pull/12416)) |
-| **Status** | Design only |
+| **Depends on** | Phase 1 ([PR #12816](https://github.com/NVIDIA/TensorRT-LLM/pull/12816), merged) |
+| **Status** | Design complete — **promoted from "deprioritised" to "load-bearing for stable disagg block reuse" by the rc13 regression empirically observed against PR #13713**. See [Empirical confirmation: the rc13 regression](#empirical-confirmation-the-rc13-regression) below. |
+
+## Empirical confirmation: the rc13 regression
+
+When this Phase 2 was first written, the dual-mechanism critique was a
+code-cleanliness argument plus a "permanent pin leak risk on
+cancellation/timeout" hazard that was hard to demonstrate empirically.
+That changed in rc13.
+
+`rc13` turned block reuse on by default for disaggregated serving. The
+combo fix from
+[NVBug 6104831](../../investigations/nvbug-6104831-disagg-permanent-wedge/)
+(PR
+[#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) +
+[#13728](https://github.com/NVIDIA/TensorRT-LLM/pull/13728) fold + MLA
+port), which recovered cleanly on rc11 through `CONC=256` on NIXL,
+**regressed to a server hang on rc13** under the same load. The rc13
+ablations isolate the trigger:
+
+| rc13 configuration | `CONC=128` outcome |
+|---|---|
+| block reuse disabled, overlap enabled | 5/5 recovered |
+| block reuse enabled, overlap disabled | wedged |
+| block reuse enabled, overlap enabled | wedged |
+
+Block reuse is the trigger, not overlap.
+
+Root cause: with block reuse on AND a request in flight at
+`_handle_responses` time, two cleanup owners (the partial-reuse
+early-termination branch in `_handle_responses`, and the
+post-transfer termination in `_end_transfer_and_maybe_terminate`)
+each refuse termination under the right timing. The early-termination
+branch defers because of the `is_disagg_context_transmission_state`
+guard PR #12816 added; the post-transfer branch skips because of the
+`if not should_store_blocks` guard PR #12816 also added. Termination
+never happens; the request stays in `active_requests`; KV blocks stay
+pinned; the server hangs.
+
+The investigation report names this layer **L10 — redundant
+block-reuse cleanup mechanism on the disagg path**. See the
+investigation's
+[Phase 15 timeline entry](../../investigations/nvbug-6104831-disagg-permanent-wedge/05-investigation-timeline.md)
+and the
+[L10 row in the defect-class stack](../../investigations/nvbug-6104831-disagg-permanent-wedge/03-defect-class-stack.md).
+
+This is exactly the dual-mechanism the original Phase 2 doc proposed
+to delete. Phase 1's minimal fix (PR #12816) added in-transmission
+guards to prevent double-termination, but those guards interact with
+the existing `should_store_blocks` short-circuit to produce the
+rc13-failing cell.
+
+The short-term fix (planned to land alongside PR #13713) adds an
+idempotency flag (`resources_freed`) and removes the
+`should_store_blocks` short-circuit, so termination always runs once.
+That stop-gap closes the specific rc13 hang but leaves several latent
+symptoms documented in the L10 row of the defect-class stack: pin leak
+on cancel/timeout, PP > 1 disagg cannot use block reuse, eviction
+race in the unpin → release window, redundant double-store of blocks
+in the radix tree, and recurring regression risk on adjacent code.
+
+**Phase 2 — this design — closes all of those symptoms in one go**
+because removing pinning eliminates the dual-path entirely. There is
+no second cleanup owner; there is no `should_store_blocks` flag; the
+`_end_transfer_and_maybe_terminate` site is the only termination
+owner; the cross-product collapses to a single state.
+
+Status promotion: this is no longer P1 deprioritised work; it is a
+prerequisite for stable disagg block reuse on rc13 and beyond.
 
 ## Problem
 
