@@ -1,18 +1,21 @@
 # 09 — Executive Summary: rc11 → rc13 Journey
 
-**Target audience:** an engineer or technical lead who needs to understand
-what was wrong in rc11, how PR #13713 fixed it, why it regressed on rc13,
-and what the short-term and long-term plans are. **Reading time:** 15 minutes.
+**Audience:** an engineer or technical lead who needs to understand the
+disaggregated KV-transfer cancellation/cleanup bug class (NVBug
+6104831), the proposed fix (PR
+[#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713)), why it
+regressed when applied on top of `rc13`, the short-term and long-term
+plans, and the design invariants the bug class violates.
 
-For deeper depth on any one part, every section ends with a pointer to the
-relevant detail file. The 10-minute version is in
-[`00-tldr.md`](00-tldr.md); this file extends it with the rc13 chapter.
+**Reading time:** 15 minutes. **Self-contained:** this file does not
+require reading any other section to follow. Optional deep-dive
+pointers are listed at the end.
 
 ---
 
-## (1) The original rc11 wedge
+## 1. The original rc11 wedge
 
-### What the customer saw
+### Customer-visible symptom
 
 A `trtllm-serve` disaggregated 1P1D deployment running rc11 served the
 first burst of long-prompt requests, then **stopped responding
@@ -32,17 +35,14 @@ long prompts (~8K tokens)
 
 Drop any one and the wedge typically does not reproduce. Most
 production workloads were missing one or more of these and never hit
-it. The customer's deployment hit all of them.
+it; the customer's deployment hit all of them simultaneously.
 
 ### What was actually broken
 
 From the outside, one bug. Inside the C++ KV-cache transceiver, **a
-stack of nine independent defects** in the request cleanup path. Any
-one of them was sufficient to wedge the deployment under the load
-shape; closing eight of nine still leaves the deployment exposed to
-silent corruption under cancel-heavy load.
-
-The investigation uncovered seven concrete failure signatures:
+stack of nine independent defects** in the request cancellation /
+cleanup path. The investigation uncovered seven concrete failure
+signatures in rc11:
 
 | Sig | Where it lives | Customer-visible symptom |
 |---|---|---|
@@ -50,71 +50,122 @@ The investigation uncovered seven concrete failure signatures:
 | `#2` | `templatedTrie.h::clearNode` cascade-prune walk | `cascade prune: parent did not find this node as a child` C++ assertion under sustained eviction |
 | `#3` | `std::optional::value()` in disagg gen path | `RuntimeError: bad optional access` raised in decode-side Python event loop *(field-only)* |
 | `#4` | `cacheTransceiver.cpp::checkGenTransferStatus(atLeastNum=1)` | gen worker's main event loop blocks indefinitely on a not-yet-ready future |
-| `#5` | `CacheReceiver::Impl::cancelRequest` (queued-cancel erase) | `Broken promise` raised by the consumer's `future.get()` on the receiver side |
+| `#5` | `CacheReceiver::Impl::cancelRequest` (queued-cancel erase) | `Broken promise` raised on the receiver side |
 | `#6` | `CacheReceiver::Impl::requestSync` `!isReady` early-return + `BaseTransBufferManager::assignBufferIndex` `cv.wait` | one cancelled-after-ready transfer leaks a recv-buffer slot; the next request wedges the receiver pool forever |
 | `#7` | `CacheSender::Impl::*` (bug class with 4 manifestations) | mutex deadlock; ctx mpi4py worker exits; Python `getattr` SIGSEGV; first-request SIGSEGV in `handleAsyncSend` |
 
 These seven signatures were the visible faces of nine underlying
-**invariant gaps** the rc11 transceiver didn't enforce — labelled L1
-through L9 in the defect-class stack:
+**invariant gaps** the rc11 transceiver did not enforce. The full set
+of invariants is enumerated in section 2; for now the load-bearing
+property is:
 
-```mermaid
-graph TB
-    subgraph "L1-L9 defect class stack (what rc11 doesn't enforce)"
-        L1["L1 — Cancellation bookkeeping<br/>promise erased without set_value/set_exception"]
-        L2["L2 — Request lifetime<br/>raw LlmRequest* outliving Python termination"]
-        L3["L3 — In-process cancellation primitive<br/>cancelRequest can't interrupt in-flight workers"]
-        L4["L4 — Receiver-future blocking<br/>unconditional future.get() on unready future"]
-        L5["L5 — Recv-buffer slot leak<br/>RAII pairing missing on non-happy exit paths"]
-        L6["L6 — Backend transfer-handle stranding<br/>NIXL/UCX handles registered after TRT-LLM-side cancel"]
-        L7["L7 — Eval-order UB introduced by L2 fix<br/>only matters once shared_ptr lands"]
-        L8["L8 — Python scheduler idempotency<br/>repeat init scheduling of in-progress requests"]
-        L9["L9 — Transport quiescence on unsafe exit<br/>buffer pool reused while peer may still write"]
-    end
+> **Any uncovered invariant is independently sufficient to wedge the
+> deployment under the customer load shape.** Closing eight of nine
+> still leaves the wedge.
 
-    L1 --> SIGS["Surfaces as: 7 distinct customer-visible signatures"]
-    L2 --> SIGS
-    L3 --> SIGS
-    L4 --> SIGS
-    L5 --> SIGS
-    L6 --> SIGS
-    L7 --> SIGS
-    L8 --> SIGS
-    L9 -.->|"latent corruption hazard,<br/>not a wedge symptom"| SIGS
-
-    classDef layer fill:#fff3e0,stroke:#e65100
-    classDef sig fill:#ffebee,stroke:#c62828
-    class L1,L2,L3,L4,L5,L6,L7,L8,L9 layer
-    class SIGS sig
-```
-
-The crucial property: **any uncovered layer in L1–L8 is independently
-sufficient to wedge the deployment.** Fixing six of eight still leaves
-the wedge. That's why "land one PR that closes one bug" doesn't work
-for this class — a candidate fix has to cover the whole layer set.
-
-> Detail: [`02-failure-signatures.md`](02-failure-signatures.md),
-> [`03-defect-class-stack.md`](03-defect-class-stack.md).
+That is why "land one PR that closes one bug" doesn't work for this
+class — a candidate fix has to cover the whole invariant set.
 
 ---
 
-## (2) How PR #13713 solved it on rc11
+## 2. The invariants for correct request cancellation and cleanup
 
-### The fix is a combo
+A request that gets cancelled or times out mid-flight in the
+disaggregated KV-cache transfer path passes through a set of cleanup
+paths. Each cleanup path must respect the following ten invariants for
+the system to remain correct, recover-able, and memory-safe. The
+NVBug 6104831 bug class is the cumulative result of every one of
+these being unenforced or partially enforced in rc11.
 
-PR [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) is the
-first stack that closes every load-bearing layer (L1–L8) plus the
-residual memory-safety invariant (L9). It composes four pieces:
+The invariants group into four categories:
+
+### 2.1 Lifetime invariants — what stays alive while transfers are in flight
+
+| # | Invariant | Why it matters |
+|---|---|---|
+| **L2** | **Request-object lifetime.** A `LlmRequest` object must remain alive across all C++ async operations that hold a reference to it. Python termination must not free the request out from under C++ async workers. | rc11 stored raw `LlmRequest*` in `mSenderFutures`, `mRequesterFutures`, `mReadyResponses`, `mRequestsQueue`. Python's `_terminate_request` could free the underlying object while C++ async paths still dereferenced it. Forensically observed as `mRequestId == 0x5555555555555555` (glibc free-fill pattern). |
+| **L7** | **Argument-evaluation safety.** Code combining read-and-move on a moved-from-able type (`f(x->field, std::move(x))`) must materialize the read before the move. | A regression introduced *only* once L2 is fixed. Once `Response::mRequest` becomes `shared_ptr<LlmRequest>`, `sendAndRemoveResponse(resp.mRequest->mRequestId, std::move(resp))` becomes argument-evaluation-order unsafe. Causes a deterministic first-request SIGSEGV. |
+| **L9** | **Transport quiescence on unsafe exit.** A buffer slot may not be returned to the pool while the transport may still be writing to it. Cancel/exception paths cannot prove peer quiescence; they must *poison* the slot rather than release it. | NIXL/UCX one-sided RMA can land a peer write after TRT-LLM has issued a cancel and the slot has been reassigned. Latent corruption hazard, not a wedge symptom. Closed by `BufferIndexHolder::poison()` and a fail-closed Python policy when quiescence is unknown. |
+
+### 2.2 Resource invariants — every acquired resource must release on every exit
+
+| # | Invariant | Why it matters |
+|---|---|---|
+| **L5** | **RAII pool slots.** Every `assignBufferIndex` must pair with `freeBufferIndex` on every exit path, including exception paths. Manual acquire/release pairing is forbidden in cleanup-sensitive code. | rc11's `requestSync` had at least three exit paths (success, `!isReady` early return, exception); only the success path released. One leaked recv-buffer slot wedged the next receive forever on the unbounded `cv.wait` (the customer-visible sig #6 wedge). |
+| **L6** | **Backend transport release on cancel.** A cancellation reaching the transport boundary must release the backend transfer handle, not just unset TRT-LLM-side bookkeeping. | NIXL `nixlXferReqH` handles stay registered after TRT-LLM-side cancel unless `nixlAgent::releaseXferReq()` is called explicitly. Stranded handles accumulate under contention and contribute to sig #7 deadlocks. |
+
+### 2.3 Synchronization invariants — what no thread waits forever on
+
+| # | Invariant | Why it matters |
+|---|---|---|
+| **L1** | **Promise fulfillment.** Every `std::promise` associated with a request's transfer must be fulfilled exactly once before destruction — `set_value` on success, `set_exception` on cancel/error/timeout. No promise may be destroyed unfulfilled. | rc11's `CacheSender::Impl::sendResponse` cancel-after-ready erase path and `CacheReceiver::Impl::cancelRequest` queued-cancel erase path both destroyed promises without fulfilling them. The consumer's `future.get()` then threw raw `std::future_error: Broken promise` with no per-request attribution. |
+| **L3** | **In-process cancellation primitive.** A cancellation request issued from any layer must be observable by every in-flight worker that holds the request. Workers blocked on `cv.wait`, polling on transport recv, or waiting on `future.get()` must all be interruptible. | rc11's `cancelRequest` returned `false` and logged "Cannot cancel request" on the in-flight path. Cancelled requests piled up in worker queues; `Cannot cancel request` log noise accumulated; sig #7 deadlock variants became more likely under contention. |
+| **L4** | **Non-blocking poll.** Status-check entry points called from the executor's main event loop must be non-blocking. They may not call `future.get()` on a future that has not been observed ready; they must `wait_for(0)` and skip unready entries. | rc11's `checkGenTransferStatus(atLeastNum=1)` selected entries from `mRequesterFutures` by insertion order and called `future.get()` unconditionally. A single stuck transfer self-blocked the gen event loop indefinitely (the customer-visible sig #4 wedge). |
+
+### 2.4 Coordination invariants — exactly one owner, no implicit handoffs
+
+| # | Invariant | Why it matters |
+|---|---|---|
+| **L8** | **Scheduler idempotency.** Operations triggered by request scheduling (resource preparation, async receive start) must be idempotent by `py_request_id`. The scheduler may re-present the same logical request across iterations; non-idempotent side effects on those visits are bugs. | The Python scheduler can revisit the same `DISAGG_GENERATION_INIT` request across iterations while it waits for KV transfer to complete. rc11 ran `KVCacheManager::addSequence` and `request_and_receive_async` on every visit, producing the `emplaceDone` assertion at `kvCacheManager.cpp:2992` and double-queuing receive futures. |
+| **L10** | **Single cleanup owner.** Each request must have exactly one cleanup owner across its lifecycle. No two code paths may concurrently attempt termination + `free_resources` for the same request, and no request may be left without a designated cleanup owner. Implicit boolean state machines that coordinate handoff between cleanup owners are forbidden. | The rc13 regression. Block reuse on the disagg path uses a "partial-reuse early termination" optimisation in `_handle_responses`; regular termination happens in `_end_transfer_and_maybe_terminate`. The two owners coordinate via the implicit `should_store_blocks` boolean, with refusal conditions that can both fire at once (in-flight + block-reuse-on), leaving the request with no cleanup owner. Server hangs. |
+
+### Visualising the invariant set
 
 ```mermaid
 graph TB
-    rc11["rc11 baseline<br/>(broken — wedges under customer load)"]:::broken
+    subgraph "Lifetime — what stays alive"
+        L2["L2 — Request-object lifetime<br/>(shared_ptr&lt;LlmRequest&gt; through transceiver)"]
+        L7["L7 — Argument-evaluation safety<br/>(materialize read before move)"]
+        L9["L9 — Transport quiescence<br/>(poison slot when quiescence unknown)"]
+    end
+    subgraph "Resource — every acquire releases"
+        L5["L5 — RAII pool slots<br/>(BufferIndexHolder)"]
+        L6["L6 — Backend transport release<br/>(nixlAgent::releaseXferReq)"]
+    end
+    subgraph "Synchronization — no thread waits forever"
+        L1["L1 — Promise fulfillment<br/>(set_value or set_exception, exactly once)"]
+        L3["L3 — In-process cancel primitive<br/>(per-request cancel-flag, plumbed through waits)"]
+        L4["L4 — Non-blocking poll<br/>(wait_for(0) before future.get())"]
+    end
+    subgraph "Coordination — one owner, no implicit handoff"
+        L8["L8 — Scheduler idempotency<br/>(by py_request_id)"]
+        L10["L10 — Single cleanup owner<br/>(no two cleanup paths race)"]
+    end
+
+    classDef lifetime fill:#fff3e0,stroke:#e65100
+    classDef resource fill:#e8f5e9,stroke:#1b5e20
+    classDef sync fill:#e3f2fd,stroke:#0d47a1
+    classDef coord fill:#fce4ec,stroke:#880e4f
+    class L2,L7,L9 lifetime
+    class L5,L6 resource
+    class L1,L3,L4 sync
+    class L8,L10 coord
+```
+
+The four categories form an architectural hierarchy: lifetime
+invariants govern who is alive, resource invariants govern what is
+held, synchronization invariants govern who is waiting, and
+coordination invariants govern who is responsible. A complete
+cancellation/cleanup contract requires all four enforced
+simultaneously.
+
+---
+
+## 3. How PR #13713 solved the rc11 wedge
+
+PR [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) is the
+first stack that closes nine of the ten invariants (L1–L9). It
+composes four pieces:
+
+```mermaid
+graph TB
+    rc11["rc11 baseline<br/>(broken: 9 invariants violated)"]:::broken
 
     pr13056["PR #13056<br/>shared_ptr&lt;LlmRequest&gt; lifetime<br/>+ per-request cancel-flag<br/>+ kv_transfer_timeout_ms enforcement<br/>+ BufferIndexHolder RAII"]:::pr13056
     pr13495["PR #13495<br/>TransferStatus::release()<br/>→ nixlAgent::releaseXferReq()<br/>+ TransferSession ownership"]:::pr13495
     evalfix["Eval-order fix<br/>materialize reqId before std::move(resp)<br/>in handleAsyncSend"]:::evalfix
     pyguards["Python idempotency guards<br/>_disagg_gen_init_prepared_ids<br/>_disagg_gen_kv_recv_started_ids"]:::pyguards
-    pr13728["PR #13728 (folded in)<br/>Fail-closed on unquiesced<br/>BufferIndexHolder::poison()"]:::pr13728
+    pr13728["PR #13728 (folded in)<br/>BufferIndexHolder::poison()<br/>+ fail-closed Python policy"]:::pr13728
 
     rc11 --> pr13056 --> pr13495 --> evalfix --> pyguards --> pr13728 --> done["PR #13713 combo<br/>(rc11 wedge fixed)"]:::done
 
@@ -134,39 +185,38 @@ graph TB
     classDef broken fill:#fcc,stroke:#a00,stroke-width:2px
 ```
 
-Each layer has at least one mechanism closing it. Removing any piece
-re-opens at least one layer.
+Each invariant has at least one mechanism enforcing it. Removing any
+piece re-violates at least one invariant.
 
-### Empirical recovery on rc11
-
-Local 1P1D `trtllm-serve` long-prompt burst harness, single 8-GPU B300 host:
+**Empirical recovery on rc11** (local 1P1D `trtllm-serve` long-prompt
+burst harness, single 8-GPU B300 host):
 
 | Transport | `CONC=16` | `CONC=24` | `CONC=32` | `CONC=64` | `CONC=128` (3-pair) | `CONC=256` (3-pair) |
 |---|---|---|---|---|---|---|
 | **NIXL + UCX plugin** *(customer transport)* | n/a | n/a | **5/5 recovered** | **5/5 recovered** | **5/5 recovered** | **5/5 recovered** |
 | Direct UCX | 5/5 recovered | 5/5 recovered | 5/5 recovered | wedged at saturation | wedged at saturation | n/a |
 
-The customer-reported failure mode is **fully fixed** on the customer's
-transport (NIXL+UCX-plugin) through `CONC=256` with three ctx/gen
-pairs. The only remaining failure is on the direct-UCX path above
-`CONC=32`, and that is throughput saturation rather than a
-cancellation defect (it's a separate scope: `ucxx::Request::cancel()`
-+ rendezvous tuning).
+The customer-reported failure mode is **fully fixed** on the
+customer's NIXL transport through `CONC=256` with three ctx/gen pairs.
+The remaining direct-UCX wedge above `CONC=32` is throughput
+saturation (a separate scope: `ucxx::Request::cancel()` + rendezvous
+tuning), not a cancellation defect.
 
-> Detail:
-> [`06-fix-approaches/D-combo.md`](06-fix-approaches/D-combo.md),
-> [`00-tldr.md`](00-tldr.md).
+**L10 was never enforced in rc11** — but on rc11 the dual-path it
+would govern was rarely exercised because disagg block reuse defaulted
+off. PR #13713 inherited L10's gap; the regression below is what
+forces it onto the agenda.
 
 ---
 
-## (3) The rc13 regression: block reuse breaks the fix
+## 4. The rc13 regression: block reuse breaks the fix
 
 ### What changed between rc11 and rc13
 
 `rc13` enabled **disagg block reuse by default**. Block reuse (prefix
-caching) is a performance feature that stores blocks in a radix tree so
-they can be reused across requests with shared prefixes. In rc11 it
-was opt-in for disaggregated serving; in rc13 it's on by default.
+caching) stores blocks in a radix tree so they can be reused across
+requests with shared prefixes. In rc11 this was opt-in for
+disaggregated serving; in rc13 it is on by default.
 
 ### The same combo regresses on rc13
 
@@ -182,67 +232,52 @@ validated on rc11 through `CONC=256`. Applied on top of rc13, it
 
 **Block reuse is the trigger.** Overlap is incidental.
 
-### Why block reuse makes it regress: L10
+### Why block reuse exposes L10
 
 Block reuse on the disagg path uses a separate cleanup mechanism on
-top of the regular termination flow:
+top of the regular termination flow, creating two cleanup owners:
 
 ```mermaid
 flowchart TB
-    subgraph "Two cleanup paths exist when block reuse is enabled"
-        START(["Request finishes, KV transfer in progress"]) --> EARLY{"_handle_responses<br/>partial-reuse branch<br/>(early-termination)"}
-        START --> LATE{"_end_transfer_and_maybe_terminate<br/>(post-transfer)"}
+    START(["Request finishes, KV transfer in progress"]) --> EARLY{"_handle_responses<br/>partial-reuse branch<br/>(early-termination owner)"}
+    START --> LATE{"_end_transfer_and_maybe_terminate<br/>(post-transfer owner)"}
 
-        EARLY -->|"is_disagg_context_transmission_state == True<br/>→ DEFER<br/>(PR #12816 + PR #13713 guard)"| EARLY_DEFER["No termination here"]
-        EARLY -->|"transmission state == False<br/>→ terminate"| EARLY_TERM["Termination via early path"]
+    EARLY -->|"is_disagg_context_transmission_state == True<br/>→ DEFER<br/>(PR #12816 + PR #13713 guard)"| EARLY_DEFER["No termination here"]:::skip
+    EARLY -->|"transmission state == False<br/>→ terminate"| EARLY_TERM["Termination via early path"]:::ok
 
-        LATE -->|"should_store_blocks == True<br/>→ SKIP<br/>(PR #12816 short-circuit:<br/>'_handle_responses already terminated')"| LATE_SKIP["No termination here"]
-        LATE -->|"should_store_blocks == False<br/>→ terminate"| LATE_TERM["Termination via late path"]
-    end
+    LATE -->|"should_store_blocks == True<br/>→ SKIP<br/>(PR #12816 short-circuit:<br/>'_handle_responses already terminated')"| LATE_SKIP["No termination here"]:::skip
+    LATE -->|"should_store_blocks == False<br/>→ terminate"| LATE_TERM["Termination via late path"]:::ok
 
-    EARLY_DEFER --> BUG["BUG (rc13 hang):<br/>Both paths refuse<br/>→ termination never happens<br/>→ KV blocks pinned<br/>→ server hangs"]:::bug
+    EARLY_DEFER --> BUG["L10 invariant violated:<br/>both owners refused;<br/>no cleanup owner remains<br/>→ KV blocks pinned forever<br/>→ server hangs"]:::bug
     LATE_SKIP --> BUG
 
+    classDef skip fill:#fff4e8,stroke:#d97706
+    classDef ok fill:#d4f4d4,stroke:#0a8a0a
     classDef bug fill:#fcc,stroke:#a00,stroke-width:2px
 ```
 
-The contradiction: PR #12816's `should_store_blocks` short-circuit was
-justified by *"_handle_responses already terminated this request via
-the early-termination path."* But PR #12816 *also* added the
-`is_disagg_context_transmission_state` guard at the early site, which
-prevents the early-termination path from running for in-flight
+The contradiction: PR #12816's `should_store_blocks` short-circuit on
+the late path was justified by *"_handle_responses already terminated
+this request via the early-termination path."* But PR #12816 *also*
+added the `is_disagg_context_transmission_state` guard at the early
+path, which prevents early termination from running for in-flight
 requests. So when block reuse is enabled AND the request is in-flight
-when `_handle_responses` runs:
+when `_handle_responses` runs, both owners refuse, termination never
+happens, KV blocks stay pinned, and the server hangs.
 
-- Early path skips because the request is in transmission.
-- Late path skips because `should_store_blocks` says "already done."
+This violates **L10** — the single-cleanup-owner invariant. Two
+cleanup owners coordinate via implicit boolean state, and the
+cross-product has a cell where neither accepts ownership.
 
-Termination never happens. The request stays in `active_requests`, KV
-blocks stay pinned, the server eventually hangs.
-
-This is **layer L10 — redundant block-reuse cleanup mechanism on the
-disagg path** in the defect-class stack. It surfaces as **sig #8**
-(rc13 server hang under disagg + block reuse + in-flight cancel).
-
-PR #13713 didn't introduce L10. The dual-path pre-existed rc11. It was
-*latent* on rc11 because:
-
-1. Block reuse defaulted to off on disagg; the dual-path was rarely exercised.
-2. PR #12816 fixed the visible double-termination case it was tested for.
-3. The specific failure-producing cell (in-flight + block reuse on) was not in the test matrix.
-
-PR #13713's `is_disagg_context_transmission_state` guard *interacts*
+PR #13713 did not introduce L10; the dual-path pre-existed rc11 and
+was latent because rc11's disagg block reuse defaulted off. PR
+#13713's `is_disagg_context_transmission_state` guard *interacts*
 with the dual-path in the failure-producing way; rc13's default-on
-block reuse makes the cell routinely hit. Result: regression.
-
-> Detail:
-> [`05-investigation-timeline.md`](05-investigation-timeline.md) Phase 15,
-> [`02-failure-signatures.md`](02-failure-signatures.md) sig #8,
-> [`03-defect-class-stack.md`](03-defect-class-stack.md) L10.
+block reuse makes the failure-producing cell the routine case.
 
 ---
 
-## (4) Short-term plan: the L10 stop-gap unblocks rc13
+## 5. Short-term plan: the L10 stop-gap unblocks rc13
 
 ### The fix
 
@@ -253,12 +288,11 @@ Two parts in `_end_transfer_and_maybe_terminate`:
 2. **Make `_do_terminate_request` idempotent** via a `resources_freed`
    flag on the request's transfer metadata. Set it inside
    `_do_terminate_request` after `free_resources` runs; check on entry
-   to dedupe against the (rare) case where `_handle_responses` did
-   take the early-termination path.
+   to dedupe against the rare case where `_handle_responses` did take
+   the early-termination path.
 
-Plus an integration test driving disagg + block_reuse + slow-transfer
-so `_handle_responses` runs while the request is in transmission. Tag
-the test as covering the dual-path that Phase 2 will simplify.
+Plus an integration test driving disagg + block reuse + slow-transfer
+so `_handle_responses` runs while the request is in transmission.
 
 ### What it covers
 
@@ -273,14 +307,14 @@ The Phase 1 stop-gap leaves several latent L10 symptoms open:
 
 ```mermaid
 graph TB
-    L10["L10 — redundant block-reuse cleanup mechanism"]:::layer
+    L10["L10 invariant gap<br/>(redundant cleanup mechanism)"]:::layer
     STOPGAP["Phase 1 stop-gap (this week)"]:::stopgap
     REMAIN["Latent symptoms NOT closed by stop-gap"]:::latent
 
     L10 --> STOPGAP
     L10 --> REMAIN
 
-    STOPGAP --> SIG8["✓ Sig #8: rc13 server hang<br/>(closed)"]
+    STOPGAP --> SIG8["✓ rc13 server hang<br/>(closed)"]
     REMAIN --> PIN["Pin leak on cancel/timeout<br/>→ gradual GPU OOM in long deployments"]
     REMAIN --> PP["PP > 1 disagg cannot use block reuse<br/>(should_store_blocks gated on pp_size==1)"]
     REMAIN --> RACE["Eviction race in unpin → release window<br/>→ cache-hit rate degradation"]
@@ -293,47 +327,39 @@ graph TB
     classDef latent fill:#ffe5cc,stroke:#cc6600,stroke-width:2px
 ```
 
-The stop-gap is **load-bearing for unblocking the customer this week**.
-It is **not** the architectural fix. Mark every new field with a
+The stop-gap is **load-bearing for unblocking the customer** but is
+**not** the architectural fix to L10. Mark every new field with a
 `# STOP-GAP: remove with Phase 2 pin-elimination work` comment so
-future contributors don't solidify it as the long-term contract.
-
-> Detail:
-> [`08-next-steps-and-pr-map.md`](08-next-steps-and-pr-map.md) item 2.
+future contributors do not solidify it as the long-term contract.
 
 ---
 
-## (5) Mid-term: design doc Phase 2 deletes the dual-path
+## 6. Mid-term: delete the dual-path entirely (the L10 architectural fix)
 
 ### The architectural answer
 
-Phase 2 of the existing
-[block-reuse-overlap-scheduler design doc](../../design/block-reuse-overlap-scheduler/phase2-unify-reuse-mechanisms.md)
-proposes deleting the dual-path entirely:
-
-- Replace `store_blocks_for_reuse(request, pin=True)` with `pin=False`
-  in the disagg path.
-- Delete the `should_store_blocks` flag and the conditional in
-  `_end_transfer_and_maybe_terminate`.
-- Delete `block_id` from `RequestTransferMetadata`; simplify to a
-  bare counter.
-- Delete `unpin_blocks_by_id` in `end_transfer`.
-- Drop the `pp_size == 1` restriction on disagg block reuse.
+The medium-term fix replaces `store_blocks_for_reuse(request,
+pin=True)` with `pin=False` on the disagg path, deletes the
+`should_store_blocks` flag and the conditional in
+`_end_transfer_and_maybe_terminate`, deletes `block_id` from
+`RequestTransferMetadata`, deletes `unpin_blocks_by_id` in
+`end_transfer`, and drops the `pp_size == 1` restriction.
 
 The safety argument is that *reference counting already provides
-equivalent protection*: the sequence stays alive during transfer →
-ref count > 0 → blocks not evictable. Pinning is redundant.
+equivalent protection* for in-transfer blocks: the sequence stays
+alive during transfer → ref count > 0 → blocks not evictable.
+Pinning is redundant.
 
 ### Add coordination vs delete redundancy
 
-There were two competing fix proposals for L10:
+Two competing fix proposals existed for L10:
 
 ```mermaid
 graph LR
-    L10["L10 — dual-path cleanup mechanism"]:::layer
+    L10["L10 invariant gap"]:::layer
 
-    L10 --> ADD["Proposed plan:<br/>ADD coordination<br/>(KVReuseLease + cleanup session)"]:::add
-    L10 --> DELETE["Design doc Phase 2:<br/>DELETE the dual-path<br/>(replace pin=True with pin=False)"]:::delete
+    L10 --> ADD["Add coordination<br/>(KVReuseLease + cleanup session)"]:::add
+    L10 --> DELETE["Delete the dual-path<br/>(replace pin=True with pin=False)"]:::delete
 
     ADD --> ADD_RESULT["More mechanism<br/>(lease object + session<br/>+ resources_freed metadata<br/>+ termination_requested<br/>+ block-reuse-aware invariants)"]
     DELETE --> DELETE_RESULT["Less mechanism<br/>(no should_store_blocks flag<br/>+ no unpin call<br/>+ no block_id field<br/>+ smaller RequestTransferMetadata<br/>+ pp_size==1 restriction lifted)"]
@@ -348,32 +374,32 @@ graph LR
     classDef goodreview fill:#cfc,stroke:#0a0
 ```
 
-Phase 2 is the strictly cleaner direction:
+Deletion is the strictly cleaner direction:
 
-| Aspect | Add coordination | Delete redundancy (Phase 2) |
+| Aspect | Add coordination | Delete redundancy |
 |---|---|---|
 | **Lines net change** | + several hundred (lease class, session coordinator, invariant assertions) | net **negative** (deletes flag, deletes unpin, simplifies metadata) |
 | **L10 closure** | Patches symptoms; dual-path remains | Closes outright; dual-path is gone |
 | **Latent symptoms** | All remain (pin leak, PP > 1, eviction race) | All retired |
-| **PP > 1 enablement** | No | Yes — restriction can be dropped |
+| **PP > 1 enablement** | No | Yes |
 | **Future regression risk** | High — every PR touching cleanup paths must consider the dual-path cross-product | Low — single owner, single contract |
 | **Maintenance cost** | Recurring (`resources_freed` must be threaded through every new path) | One-time deletion, then zero |
 
-### Risks of Phase 2
+### Risks of the deletion path
 
-Phase 2 is medium-risk, high-payoff. Three things to verify:
+Three things to verify before landing:
 
 1. **The "sequence alive → ref count > 0" invariant must hold under
-   PR #13728's fail-closed paths.** If `_fail_closed_for_unquiesced_disagg_transfer`
-   can free a sequence with an outstanding transfer, ref-count protection
-   evaporates. Audit before landing.
+   the fail-closed paths.** If `_fail_closed_for_unquiesced_disagg_transfer`
+   can free a sequence with an outstanding transfer, the ref-count
+   protection that replaces pinning evaporates. Audit before landing.
 2. **Scheduler's free-block accounting under memory pressure.** With
    `pin=False`, the scheduler must keep treating in-transfer blocks as
-   "allocated" so memory pressure doesn't force eviction of blocks the
-   transfer is reading.
-3. **PP > 1 disagg end-to-end.** The doc says lifting the restriction is
-   safe; verify with the long-prompt burst harness across PP > 1 before
-   declaring it.
+   "allocated" so memory pressure does not force eviction of blocks
+   the transfer is reading.
+3. **PP > 1 disagg end-to-end.** Lifting the `pp_size == 1`
+   restriction is asserted-safe in the design; verify with the
+   long-prompt burst harness across PP > 1 before declaring it.
 
 ### The staged plan
 
@@ -386,7 +412,7 @@ graph LR
     NOW --> STEP1["1. PR #13713 + L10 stop-gap<br/>(unblocks rc13 customer)"]:::step
     STEP1 --> STEP2["2. Integration test<br/>for the dual-path scenario<br/>(locks in CI coverage)"]:::step
     STEP2 --> THEN
-    THEN --> STEP3["3. Design doc Phase 2 PR<br/>(delete pinning,<br/>delete should_store_blocks,<br/>lift PP=1 restriction)"]:::step
+    THEN --> STEP3["3. Architectural fix<br/>(delete pinning,<br/>delete should_store_blocks,<br/>lift PP=1 restriction)"]:::step
     STEP3 --> LATER
     LATER --> STEP4["4. Cleanup: remove<br/>resources_freed flag<br/>+ stop-gap comments"]:::step
 
@@ -408,40 +434,45 @@ Each step has a falsifiable success criterion:
 
 The customer is unblocked at every step.
 
-> Detail:
-> [`docs/design/block-reuse-overlap-scheduler/phase2-unify-reuse-mechanisms.md`](../../design/block-reuse-overlap-scheduler/phase2-unify-reuse-mechanisms.md),
-> [`08-next-steps-and-pr-map.md`](08-next-steps-and-pr-map.md) item 2a.
-
 ---
 
 ## One-paragraph recap
 
-The original rc11 wedge was nine independent invariant gaps in the
-disagg KV transceiver, surfacing as seven distinct customer-visible
-symptoms. PR #13713 closes all nine — combining PR #13056's
-architectural lifetime/cancellation refactor, PR #13495's NIXL backend
-release hook, an eval-order fix, Python idempotency guards, and PR
-#13728's fail-closed memory-safety policy — and recovers cleanly on
-rc11 through `CONC=256` on the customer's NIXL transport. Applying the
-same combo to rc13 regresses because rc13 enables block reuse by
-default, which surfaces a tenth latent layer (L10): a redundant
-cleanup mechanism whose dual-path can leave a request with no
-termination owner. The Phase 1 stop-gap (~10 lines) closes the
-specific rc13 hang and lets PR #13713 land; the design doc's Phase 2
-(~negative net lines) deletes the dual-path entirely as the long-term
-architectural fix and retires the latent symptoms the stop-gap leaves
-open.
+The rc11 wedge was **nine independent invariant gaps** in the disagg
+KV-transfer cancellation/cleanup path, surfacing as seven distinct
+customer-visible symptoms. The invariants group into four categories:
+**lifetime** (object/eval-order/transport-quiescence), **resource**
+(RAII pool slots, backend-handle release on cancel),
+**synchronization** (promise fulfillment, cancellation primitive,
+non-blocking poll), and **coordination** (scheduler idempotency,
+single cleanup owner). PR #13713 — combining PR #13056's lifetime +
+cancellation refactor, PR #13495's NIXL release hook, an eval-order
+fix, Python idempotency guards, and PR #13728's fail-closed
+memory-safety policy — closes nine of the ten invariants and recovers
+cleanly on rc11 through `CONC=256` on the customer's NIXL transport.
+Applying the same combo to rc13 regresses because rc13 enables block
+reuse by default, which surfaces the tenth invariant gap (single
+cleanup owner): a redundant cleanup mechanism whose dual-path can
+leave a request with no termination owner. The Phase 1 stop-gap
+(~10 lines) closes the specific rc13 hang and lets PR #13713 land;
+deleting the dual-path (replacing `store_blocks_for_reuse(pin=True)`
+with `pin=False`, plus removing the supporting flag and call sites)
+is the architectural fix and retires the latent symptoms the stop-gap
+leaves open.
 
 ---
 
-## Pointers for deeper reading
+## Optional deep-dive pointers
+
+This file is self-contained; no further reading is required. If you
+want to drill in on any one part:
 
 | Topic | File |
 |---|---|
-| 10-minute version of (1) and (2) | [`00-tldr.md`](00-tldr.md) |
+| 10-minute version (rc11 only) | [`00-tldr.md`](00-tldr.md) |
 | Architecture and request walkthrough | [`01-background.md`](01-background.md) |
-| The seven (now eight) signatures in detail | [`02-failure-signatures.md`](02-failure-signatures.md) |
-| The L1–L10 defect-class framework | [`03-defect-class-stack.md`](03-defect-class-stack.md) |
+| The eight signatures in detail (#1–#8) | [`02-failure-signatures.md`](02-failure-signatures.md) |
+| The L1–L10 invariants with code-level evidence | [`03-defect-class-stack.md`](03-defect-class-stack.md) |
 | Reproducer | [`04-reproduction.md`](04-reproduction.md) |
 | Chronological investigation, including Phase 15 (rc13 regression) | [`05-investigation-timeline.md`](05-investigation-timeline.md) |
 | Approach D (combo) detail and empirical results | [`06-fix-approaches/D-combo.md`](06-fix-approaches/D-combo.md) |
