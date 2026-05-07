@@ -26,7 +26,7 @@ This section breaks the design into named PRs. Phase 1 PRs are detailed (they're
 | **1a.4** | `AlltoAllWatchdog` host thread | MVP | `_torch/modules/fused_moe/alltoall_watchdog.py` (new) | S | 1a.1 |
 | **1a.5** | NVLinkTwoSided kernel mask | v1 | `cpp/tensorrt_llm/kernels/fusedMoeCommKernels.cu`, `thop/moeCommOp.cpp` | M | 1a.2 pattern |
 | **1a.6** | NVLinkTwoSided Python binding | v1 | `_torch/modules/fused_moe/communication/nvlink_two_sided.py`, `nvlink_two_sided_flashinfer.py` | S | 1a.5 |
-| **1a.7** | NCCL FT wrapper + AllGatherReduceScatter mask wiring | v1 | NCCL communicator wrapper in `cpp/tensorrt_llm/`, `_torch/modules/fused_moe/communication/allgather_reducescatter.py` | **M** | 1a.1 |
+| **1a.7** | NCCL FT wrapper (`ncclCommAbort` + async error handling) | **MVP** | NCCL communicator wrapper in `cpp/tensorrt_llm/`, `_torch/modules/fused_moe/communication/allgather_reducescatter.py`, `NcclCommunicatorOp` | **M** | 1a.1 |
 | **1a.8** | Tighten kernel `check_timeout` + replace `trap;` with host-visible flag | v1 | `moeAlltoAllKernels.cu` | M | 1a.2 |
 
 **Status (April 2026):**
@@ -37,7 +37,7 @@ This section breaks the design into named PRs. Phase 1 PRs are detailed (they're
 
 - **1a.2** is the critical-path kernel work. Three sub-tasks inside it: (a) `kMaxRanks` 64 → 128; (b) add `active_rank_mask_lo, active_rank_mask_hi` to both `DispatchKernelPointers` and `CombineKernelPointers`; (c) guard both release-write and polling loops in dispatch (~lines 537–584) and combine (~lines 1190–1217). Performance gate: < 0.1 % overhead when all ranks active.
 
-- **1a.7** resizes S → M because NCCL FT wiring is net-new in TRT-LLM (zero prior uses of `ncclCommAbort`). Before this PR lands, `AllGatherReduceScatter` fallback is not a mask-capable path.
+- **1a.7 is MVP, not v1.** NCCL is in the WideEP data path even when MNNVL is the chosen AlltoAll backend (TP allreduces in non-MoE projections, PP send/recv via `NcclCommunicatorOp`, `AllGatherReduceScatter` if MNNVL+DeepEP unavailable). Without the wiring, a dead rank hangs the next NCCL collective — and per [Audit 1a Day 1](../wide-ep-fault-tolerance/audit-1a-findings.md), PT 2.11's default async-error-handling SIGABRTs *all* survivors at the watchdog timeout. So without 1a.7, the MVP exit criterion "throughput ≈ (N-1)/N of baseline" cannot be demonstrated end-to-end. Scope: wire `NCCL_ASYNC_ERROR_HANDLING=1` at every `ncclCommInitRank`, add a watchdog thread polling `ncclCommGetAsyncError`, expose a `abort_and_reinit(active_ranks)` API for survivors to build a fresh comm excluding the dead rank, propagate aborted-comm exceptions into PR #12718's classifier. **Pure TRT-LLM-side wiring of existing NCCL primitives — zero NCCL-side changes required.** The harder Phase 2 problem (rebuild that doesn't depend on PT 2.11's broken `dist.shrink_group`) is PR 2a.1, not 1a.7.
 
 - **1a.8** is optional for MVP but valuable — tightens the 300s backstop and replaces `trap;` (which corrupts the CUDA context) with a host-visible flag write, letting the host recover rather than requiring process restart.
 
@@ -107,6 +107,9 @@ gantt
     section CUDA track
     1a.2 NVLinkOneSided kernel mask (in flight, PR #13404) :crit, active, a3, 2026-04-22, 21d
     1a.3 NVLinkOneSided binding                 :a4, after a3, 5d
+
+    section NCCL track
+    1a.7 NCCL FT wrapper (commAbort + async err) :a7nccl, after a1, 10d
 
     section EPLB track
     1b.1-3 EPLB slot-remap + wire               :a5, 2026-05-01, 14d
@@ -209,13 +212,13 @@ Phase totals account for parallelism: multiple PRs in the same sub-phase run con
 
 | Phase | PRs | Calendar time | Depends on | Deliverable |
 |:---|:---|:---|:---|:---|
-| **Phase 1 MVP (v0)** | 1a.1–1a.4, 1b.1–1b.3, 1c.1–1c.4, 1d.0–1d.5 (13 PRs) | **6–7 weeks** with 2–3 engineers + AI coding assistance | Kernel access; PR #12718 rebased | Single-failure survival on NVLinkOneSided; <10s recovery; no weight movement at recovery time |
+| **Phase 1 MVP (v0)** | 1a.1–1a.4 + 1a.7, 1b.1–1b.3, 1c.1–1c.4, 1d.0–1d.5 (14 PRs) | **~7 weeks** with 2–3 engineers + AI coding assistance | Kernel access; PR #12718 rebased | Single-failure survival on NVLinkOneSided; <10s recovery; no weight movement at recovery time; survivors don't die as collateral on TP/PP NCCL collectives |
 | **Phase 1 v1** | 1a.5–1a.8, 1b.4–1b.7, 1c.5–1c.6, 1d.6–1d.7 (12 PRs) | **6–9 weeks after MVP** | MVP landed | All NVLink backends, full EPLB reconfigure with weight migration, multi-failure consensus, production polish |
 | **Phase 1-DS** | DS.1–DS.6 (6 PRs) | **3–4 weeks, parallelizable with v1** | MVP landed | Disagg serving FT with cross-pool coordination |
 | **Phase 2: Restoration** | 2a.0a/0b, 2a.1–2a.8, 2b.1–2b.4, 2c.1–2c.3 (17 items) | **10–14 weeks** | Phase 1 v1 complete; 2a.0a sizes the work, 2a.0b gates ship | Full N-rank restoration via PG rebuild + shadow EP ranks |
 | **Phase 3: Beyond failover** | 3a–3e tracks (not per-PR sized) | **~3 months** | Phase 2 complete + telemetry infra | Prevention, elastic scale, predictive |
 
-**Total PRs:** ~47 across Phases 1 + 2 (plus Phase 3 rough tracks). MVP alone is 13 PRs.
+**Total PRs:** ~47 across Phases 1 + 2 (plus Phase 3 rough tracks). MVP alone is 14 PRs.
 
 **Full program:** 7–10 months (with AI assistance), 10–14 months (without).
 

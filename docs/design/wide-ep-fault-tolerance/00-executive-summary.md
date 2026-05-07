@@ -50,8 +50,8 @@ Ray remains an open future-migration question, gated on a named perf-characteriz
 
 | Phase | Target | Status |
 |:---|:---|:---|
-| Phase 1 MVP | 6–7 weeks (AI coding-agent assisted) — 13 PRs | 1a.1 (PR #13302) and 1a.2 (PR #13404) in flight |
-| Phase 1 v1 | +6–9 weeks after MVP — 12 PRs | Includes NVLinkTwoSided, NCCL FT wiring, full EPLB reconfigure with weight migration, multi-failure consensus |
+| Phase 1 MVP | ~7 weeks (AI coding-agent assisted) — 14 PRs | 1a.1 (PR #13302) and 1a.2 (PR #13404) in flight |
+| Phase 1 v1 | +6–9 weeks after MVP — 11 PRs | Includes NVLinkTwoSided, full EPLB reconfigure with weight migration, multi-failure consensus, kernel-side `check_timeout` tightening |
 | Phase 1-DS (disagg) | 3–4 weeks, parallelizable with v1 — 6 PRs | After MVP lands |
 | Phase 2 (Restoration) | 10–14 weeks — 16 PRs (sizes provisional pending Audit 1) | After Phase 1 v1 + MNNVL/NVSHMEM audit |
 | Phase 3 (Beyond failover) | ~3 months — work-track sized | After Phase 2 |
