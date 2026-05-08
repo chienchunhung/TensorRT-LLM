@@ -91,9 +91,11 @@ NCCL has `ncclCommAbort(comm)` — call it on a hung communicator and the surviv
 
 ### NVSHMEM — no clean rebuild on shipping versions
 
-**Status: deferred indefinitely; tied to DeepEP scope.**
+**Status: deferred indefinitely; tied to DeepEP scope. Verified by a May 2026 API survey.**
 
-NVSHMEM symmetric memory rebuild after peer death is not well-supported on shipping versions. NVSHMEM 3.x has begun adding fault-tolerance hooks, but the coverage falls far short of NCCL's. DeepEP additionally has a known deadlock — `Buffer.__del__` calls `intranode::barrier`, which hangs if peers are dead. The TRT-LLM Python wrappers acknowledge this explicitly:
+The current shipping NVSHMEM (3.6.5, docs updated 2026-03-20) exposes only collective `nvshmem_finalize` and a job-wide `nvshmem_global_exit` abort; all team-construction calls (`nvshmem_team_destroy`, `nvshmem_team_split_strided`, `nvshmem_team_split_2d`, `nvshmemx_team_init`) are collective over the parent team. **No API admits a surviving subset of PEs to tear down and rebuild the symmetric heap and teams without participation from the dead PEs.** No FT-tagged release notes across the 3.x line (3.0 through 3.6.5); no FT-tagged GitHub issues; no NVIDIA roadmap statements about peer-death recovery in any visible thread. The OpenSHMEM 1.6 parent spec (Nov 2024) is similarly silent on FT primitives — so even if NVIDIA wanted to add them, there's no upstream standard to align with.
+
+DeepEP additionally has a known deadlock — `Buffer.__del__` calls `intranode::barrier`, which hangs if peers are dead. The TRT-LLM Python wrappers acknowledge this explicitly:
 
 - `tensorrt_llm/_torch/modules/fused_moe/communication/deep_ep.py:86`
 - `tensorrt_llm/_torch/modules/fused_moe/communication/deep_ep_low_latency.py:103`
@@ -101,7 +103,7 @@ NVSHMEM symmetric memory rebuild after peer death is not well-supported on shipp
 
 **Mitigation (existing):** the Python wrappers structure cleanup so the destructor doesn't run during the failure window. This is fragile but works for Phase 1 (no PG rebuild) — DeepEP buffers are masked rather than destroyed.
 
-**Phase 2:** since DeepEP is deferred indefinitely, Phase 2 does not need to rebuild NVSHMEM symmetric memory. If DeepEP support comes in (post-`mask_buffer_ptr`), the NVSHMEM rebuild design becomes its own work track; today it's out of scope.
+**Phase 2:** since DeepEP is deferred indefinitely, Phase 2 does not need to rebuild NVSHMEM symmetric memory. If DeepEP support comes in (post-public-`mask_buffer_ptr`), the NVSHMEM rebuild design becomes its own work track; today it's out of scope. The May 2026 survey can be re-run if NVSHMEM 4.x or a future 3.x point release adds resilience primitives.
 
 ### MPI — blocked without ULFM
 
