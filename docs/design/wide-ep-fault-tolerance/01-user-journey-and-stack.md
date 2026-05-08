@@ -213,19 +213,23 @@ When a GPU fails in a WideEP group, the impact is full-cluster:
 2. Or, depending on what killed rank 37, MPI's signal handler at `mpiUtils.cpp:199–210` calls `MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE)`, which immediately kills every other rank. One variant additionally `kill(getppid(), SIGKILL)`.
 3. The `HangDetector` fires only after **300 seconds** (5 minutes) and shuts down the entire executor.
 4. All 71 healthy GPUs are wasted during the hang; all in-flight requests are lost.
-5. Full restart takes **2–3 minutes** (re-load weights, warmup, NCCL init).
+5. Full restart cost is deployment-dependent:
+   - **~3–5 min** if the model checkpoint is already on local NVMe and caches are hot (weight reload + NCCL init + MNNVL fabric setup + warmup).
+   - **~5–15 min** if shards must be fetched from cluster shared storage with cold caches.
+   - **15+ min, occasionally 30+ min** if the 681 GB checkpoint has to be re-downloaded from registry or object store. Cluster network bandwidth (typically 10 Gbps ≈ 1.25 GB/s aggregate per node) is the bottleneck; retries on flaky storage push this much higher.
+   - The 681 GB DS-V3 footprint dominates restart cost; smaller MoEs scale down proportionally.
 
-**Total downtime: 7–8 minutes per GPU failure.** [§3](03-failure-modes-and-gaps.md) names these two failure modes (signal-handler abort + kernel hang) explicitly and walks through their gap structure.
+**Total downtime: 8–20+ minutes per GPU failure** (5 min hang detection + 3–15+ min restart). Worst cases can stretch past 30 minutes when checkpoint download is on the critical path or registry retries compound. [§3](03-failure-modes-and-gaps.md) names these two failure modes (signal-handler abort + kernel hang) explicitly and walks through their gap structure.
 
 ### Goodput impact at scale
 
-For a 72-GPU deployment serving ~3500 tokens/sec:
+For a 72-GPU deployment serving ~3500 tokens/sec, using a typical-case ~12 min per failure event (caches warm, model on cluster shared storage):
 
-| Failure frequency | Downtime per event | Daily goodput loss |
-|:---|:---|:---|
-| 1 / 3 days | 8 min | ~0.2 % |
-| 1 / day | 8 min | ~0.6 % |
-| 3 / day | 8 min | ~1.7 % |
+| Failure frequency | Downtime per event | Daily goodput loss (typical) | Daily goodput loss (worst case, 20+ min/event) |
+|:---|:---|:---|:---|
+| 1 / 3 days | ~12 min | ~0.3 % | ~0.5 % |
+| 1 / day | ~12 min | ~0.8 % | ~1.4 % |
+| 3 / day | ~12 min each | ~2.5 % | ~4.2 % |
 
 Sustained even at the low-frequency end, this is a real production headwind. Customer SLAs that promise availability within a 9s budget become difficult to honor.
 

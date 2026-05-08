@@ -6,7 +6,7 @@
 
 ## The problem
 
-WideEP — distributing MoE experts across 32–72+ GPUs for DeepSeek-V3/R1 class models — has no fault tolerance in TRT-LLM today. A single GPU failure in a 72-rank EP group on NVL72 causes **7–8 minutes of full downtime** because (a) the AlltoAll kernel has no abort hook and spins for 300s on the dead peer's `completion_flags` slot, or (b) the MPI signal handler at `mpiUtils.cpp:195–215` calls `MPI_Abort(MPI_COMM_WORLD)` which kills every other rank. With 72 GPUs at 2–5 % AFR, MTBF is 3–7 days — daily downtime is not far off.
+WideEP — distributing MoE experts across 32–72+ GPUs for DeepSeek-V3/R1 class models — has no fault tolerance in TRT-LLM today. A single GPU failure in a 72-rank EP group on NVL72 causes **8–20+ minutes of full downtime** because (a) the AlltoAll kernel has no abort hook and spins for 300s on the dead peer's `completion_flags` slot, or (b) the MPI signal handler at `mpiUtils.cpp:195–215` calls `MPI_Abort(MPI_COMM_WORLD)` which kills every other rank. The 5-minute hang detection then forces a full restart, which costs another 3–15+ minutes depending on whether the 681 GB checkpoint is on local NVMe, on cluster shared storage, or has to be re-downloaded. With 72 GPUs at 2–5 % AFR, MTBF is 3–7 days — daily downtime is not far off.
 
 Competitors have shipped: SGLang's Elastic EP (March 2026, ~6.5s recovery), vLLM's RFC #27774 (active). TRT-LLM has nothing.
 
