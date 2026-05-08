@@ -49,6 +49,8 @@ for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize) {
 
 **Kernel-side `check_timeout` backstop.** The 300s `trap;` stays as a worst-case defense — if the host watchdog (§5.3) fails to fire and the mask isn't set, the kernel will eventually self-abort rather than hang the GPU forever. PR 1a.8 (v1) optionally tightens this and replaces `trap;` with a host-visible flag to avoid context corruption; for MVP the existing behavior is acceptable.
 
+**Industry precedent for the softer-than-`trap;` direction.** vLLM's in-flight FT work ([PR #38534](https://github.com/vllm-project/vllm/pull/38534)) uses a 100s static kernel-side timeout in DeepEP / NIXL-EP that **auto-masks** the failed rank rather than aborting — surviving ranks continue without hanging, no context corruption. This is exactly the direction PR 1a.8 proposes for our MNNVL kernel: replace `trap;` with a host-visible flag so the host can recover rather than requiring process restart. vLLM's 100s timeout is on a different backend (DeepEP / NIXL-EP, not MNNVL) and is library-side rather than kernel-side custom code, but the architectural shape — soft timeout + auto-mask + host-recoverable — validates the PR 1a.8 design choice.
+
 ### NCCL FT wiring (PR 1a.7)
 
 Verified: zero non-test uses of `ncclCommAbort`, `NCCL_ASYNC_ERROR_HANDLING`, `ncclCommFinalize`, `ncclGetLastError` in TRT-LLM. The only NCCL integration is `torch.classes.trtllm.NcclCommunicatorOp` (P2P, no error hook).

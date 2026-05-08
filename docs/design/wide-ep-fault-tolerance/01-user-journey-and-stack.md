@@ -169,7 +169,7 @@ Critically: **NVLinkOneSided does not use NCCL or NVSHMEM.** It uses MNNVL fabri
 
 ### What's shared, what's not
 
-It's natural to assume MNNVL, NCCL, NVSHMEM (and **NIXL**, which is the L3 path used for disaggregated KV cache transfer rather than EP collectives) share more than they do. They share the **physical fabric** (NVLink + NVSwitch + MNNVL pages on NVL72, plus IB / RoCE for cross-rack) and the **CUDA driver substrate** (`cuMem*`, streams, contexts, GPU memory subsystem). NCCL on NVL72 will in fact choose MNNVL fabric pages as its transport when available — the same hardware that NVLinkOneSided uses directly. So in terms of where the bytes ultimately move, all four can hit the same fabric.
+It's natural to assume MNNVL, NCCL, NVSHMEM (and **NIXL**, which TRT-LLM uses as the L3 path for disaggregated KV cache transfer; vLLM additionally uses a "NIXL-EP" variant as an EP-level data plane with `activeRanks`-style masking — see vLLM PR #38534) share more than they do. They share the **physical fabric** (NVLink + NVSwitch + MNNVL pages on NVL72, plus IB / RoCE for cross-rack) and the **CUDA driver substrate** (`cuMem*`, streams, contexts, GPU memory subsystem). NCCL on NVL72 will in fact choose MNNVL fabric pages as its transport when available — the same hardware that NVLinkOneSided uses directly. So in terms of where the bytes ultimately move, all four can hit the same fabric.
 
 What they *don't* share:
 
@@ -235,12 +235,18 @@ Sustained even at the low-frequency end, this is a real production headwind. Cus
 
 ### Competitive pressure
 
-| Framework | FT status (April 2026) |
+| Framework | FT status (May 2026) |
 |:---|:---|
-| **SGLang Elastic EP** | Shipped March 2026. ~6.5s recovery, tolerates up to 50 % rank loss. Built on Mooncake EP's `activeRanks` API. |
-| **vLLM RFC #27774** | Active. Plans DeepEP `mask_buffer_ptr` integration + EPLB-driven elastic scale. |
+| **SGLang Elastic EP** | Shipped March 2026. ~6.5s recovery, tolerates up to 50 % rank loss. Built on Mooncake EP's `activeRanks` API. A more sophisticated three-plane FT framework (data / control / decision plane) is proposed in an [RFC on a personal fork](https://github.com/gaidandawang-afk/sglang/issues/1) — not yet on the official `sgl-project/sglang`. |
+| **vLLM** | Three-PR FT framework in flight (Ray + internal LB only): [#34833](https://github.com/vllm-project/vllm/pull/34833) (fault reporting via ZMQ sentinels), [#38534](https://github.com/vllm-project/vllm/pull/38534) (pause-on-error using DeepEP / NIXL-EP "FT-enabled backends" with 100s static kernel timeout), [#40468](https://github.com/vllm-project/vllm/pull/40468) (cleanup + retry: NCCL `commAbort`, DP cpu_group rebuild, prefix-cache-driven retry without replacement rank — operates at N-1 indefinitely). Earlier RFC [#27774](https://github.com/vllm-project/vllm/issues/27774) is the published framing; PRs above are the implementation. |
 | **Ray 2.55 DP-group FT** | Shipped. Coarse — restarts whole DP groups, not per-rank. |
-| **TRT-LLM** | **Nothing.** Single GPU failure → 7–8 min downtime, no in-place recovery. |
+| **TRT-LLM** | **Nothing.** Single GPU failure → 8–20+ min downtime, no in-place recovery. |
+
+Three observations from the May 2026 survey:
+
+- **Convergent architecture.** vLLM and SGLang are converging on the same three-phase rollout (report → pause → cleanup/retry) and the same HTTP+ZMQ control surface (`GET /fault_tolerance/status`, `POST /fault_tolerance/apply`). Same data-plane backend choice (Mooncake-EP, NIXL-EP). Worth aligning our `check_health()` (PR 1d.2) and replacement-rank API (PR 2c.1) so deployments using vLLM/SGLang FT tooling can extend to TRT-LLM.
+- **Both target Ray, not MPI.** vLLM #34833 explicitly: "Elastic EP currently supports only Ray + internal LB." SGLang RFC also Ray-based. Strengthens the long-term Ray-pivot argument; doesn't change our MPI-for-MVP decision (see [§3.3](03-failure-modes-and-gaps.md#33-why-not-just-pivot-to-ray)).
+- **vLLM operates at N-1 indefinitely.** No Phase-2-equivalent (no replacement-rank rebuild). Our Phase 2 is differentiated work, not table stakes.
 
 [§2](02-stack-comparison-and-positioning.md) compares the stacks at the layer level (not just the FT capabilities) and identifies what TRT-LLM's stack uniquely enables.
 

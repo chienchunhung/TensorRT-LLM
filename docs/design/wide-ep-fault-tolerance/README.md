@@ -44,6 +44,22 @@ See [§0 Executive Summary](00-executive-summary.md) for the full headline pictu
 
 - [Straggler speculation research](straggler-speculation-research/README.md) — sub-directory capturing the research arm of straggler mitigation (Option B in §7.5: speculative redundant compute in synchronous AlltoAll). Three docs: problem framing, literature survey + search plan, publication venue analysis. Not committed engineering work; the production track (A + D in §7.5) is independent.
 
+## Related FT work in vLLM and SGLang
+
+External fault-tolerance work in adjacent inference frameworks. Surveyed May 2026; see [§1.3](01-user-journey-and-stack.md#13-why-fault-tolerance-now) and [§3.3](03-failure-modes-and-gaps.md#33-why-not-just-pivot-to-ray) for how this informs our framing.
+
+| Reference | What it is | Status |
+|:---|:---|:---|
+| [vLLM PR #34833](https://github.com/vllm-project/vllm/pull/34833) | Fault-reporting framework — ZMQ-based sentinels, HTTP `GET /fault_tolerance/status`, ZMQ PUB on `vllm_fault` topic | In flight; targets Ray + internal LB only |
+| [vLLM PR #38534](https://github.com/vllm-project/vllm/pull/38534) | Pause-on-error workflow — DeepEP / NIXL-EP "FT-enabled backends" with active-rank-mask and 100s static kernel timeout; HTTP `POST /fault_tolerance/apply` | In flight; builds on #34833 |
+| [vLLM PR #40468](https://github.com/vllm-project/vllm/pull/40468) | Cleanup + retry — non-blocking NCCL `commAbort`, DP cpu_group rebuild, in-flight requests preempted to waiting queue, prefix-cache-driven retry without replacement rank (operates at N-1 indefinitely) | In flight; reviewers flagged bugs |
+| [SGLang FT RFC (gaidandawang-afk fork)](https://github.com/gaidandawang-afk/sglang/issues/1) | Three-plane framework proposal: data plane (Mooncake-EP / NIXL-EP), control plane (SGLang FT Framework with ZMQ sentinels), decision plane (serving framework). Same `/fault_tolerance/status` + `/fault_tolerance/apply` API as vLLM | RFC on a personal fork; not yet on the official sgl-project/sglang |
+
+Three observations from the survey shape framing in this design:
+- **Convergent architecture** — vLLM and SGLang are converging on the same three-phase rollout (report → pause → cleanup/retry) and the same HTTP+ZMQ control surface. Worth aligning our `check_health()` (PR 1d.2) and replacement-rank API (PR 2c.1) so deployments using vLLM/SGLang FT tooling can extend to TRT-LLM.
+- **Both target Ray, not MPI** — strengthens the long-term Ray-pivot argument; doesn't change our MPI-for-MVP decision.
+- **vLLM's kernel-side mask is 100s auto-mask, not 300s `trap;`** — validates PR 1a.8's direction (replace `trap;` with host-visible flag).
+
 ## Workflow artifacts
 
 Planning materials that informed this rewrite (preserved for record-keeping):

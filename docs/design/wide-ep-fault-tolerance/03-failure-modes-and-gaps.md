@@ -212,6 +212,8 @@ The MPI-path FT-enabling work (§5.4) is the compensating investment. Net effect
 
 We treat the pivot as a **deferred architectural question**, not an MVP decision. The design keeps the Ray path open — nothing in the proposed MPI-path work prevents a later migration, and the kernel-level changes (Mode B work) port directly to Ray.
 
+**Industry signal (May 2026 survey):** Both vLLM and SGLang's in-flight FT work targets Ray, not MPI. vLLM PR #34833 explicitly states "Elastic EP currently supports only Ray + internal LB," deferring MPI. SGLang's [FT RFC](https://github.com/gaidandawang-afk/sglang/issues/1) is also Ray-based. Beyond the orchestrator choice, both converge on the same data-plane (Mooncake-EP / NIXL-EP with `activeRanks`-style masking), the same control-plane API surface (`/fault_tolerance/status` + `/fault_tolerance/apply`), and the same three-phase rollout (report → pause → cleanup-and-retry). This **strengthens the long-term Ray-pivot argument**: the broader inference-serving ecosystem is converging on Ray for FT, and a TRT-LLM that stays MPI-only for FT becomes increasingly out of step. **It does not change the MVP decision** — the three preconditions above still hold, particularly the Ray-path WideEP perf characterization gap. But it sharpens the question: when the audits and refactors land, the pivot conversation will face additional pressure from ecosystem alignment, not just the technical merits of either path.
+
 ## 3.4 Summary: gap × failure-mode matrix
 
 | Gap | Layer | Mode A | Mode B | Addressed in |
