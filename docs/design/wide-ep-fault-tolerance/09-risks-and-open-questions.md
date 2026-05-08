@@ -107,7 +107,31 @@ Not a blocker for MVP — NVLinkOneSided is the primary target. Feature flag ([P
 
 **Severity × Probability:** High × Medium | **Phase:** 2a | **Residual:** **Medium** — novel work; execution risk realizes in Phase 2, not MVP
 
-Per-layer cleanup paths can deadlock on dead peers. DeepEP's `Buffer.__del__` calls `intranode::barrier`; NCCL abort cleanup is best-effort; MPI `MPI_Comm_split` is collective. Mitigated by coordinated teardown (all survivors agree before any starts), explicit `destroy()` sequencing on DeepEP, `MPI_ERRORS_RETURN` on MPI, and opportunistic ULFM. The MNNVL audit above (Audit 1) covers the MNNVL-specific variant.
+Per-layer cleanup paths can deadlock on dead peers. DeepEP's `Buffer.__del__` calls `intranode::barrier`; NCCL abort cleanup is best-effort; MPI `MPI_Comm_split` is collective. Mitigated by coordinated teardown (all survivors agree before any starts), explicit `destroy()` sequencing on DeepEP, `MPI_ERRORS_RETURN` on MPI, and opportunistic ULFM. The MNNVL audit above (Audit 1) covers the MNNVL-specific variant. The next three risks call out the largest sub-concerns folded into this one separately, since they have distinct external owners and distinct mitigation paths.
+
+### Risk — NVSwitch fabric manager behavior under mid-collective rank death
+
+**Severity × Probability:** High × Medium | **Phase:** 2a | **Residual:** **Medium** — gated on cross-team engagement and Audit 1b outcome
+
+When an MNNVL domain member disappears, the NVSwitch fabric manager's reaction is unspecified from outside the fabric-manager team. Possible behaviors: cleanly invalidate routes (good); retry communication with the dead rank indefinitely (bad — can mark survivors' fabric mappings as suspect); suspend the whole domain temporarily (worst). Whichever it does, it directly affects whether mid-flight `cuMemUnmap` on dead-peer regions completes cleanly and whether survivors can re-allocate fabric memory in a smaller-N topology.
+
+**Mitigation:** named cross-team dependency in [§9.5](#95-cross-team-dependencies-nvidia-internal); engage NVSwitch fabric manager team before Audit 1b runs so audit findings can be cross-checked against their expectations. Audit 1b empirically characterizes the behavior on NVL72.
+
+### Risk — IMEX dynamic re-grant support
+
+**Severity × Probability:** High × Medium | **Phase:** 2a, 2b | **Residual:** **Medium** — fundamentally changes Phase 2 sub-second feasibility if the answer is "no"
+
+For MNNVL on NVL72, fabric memory grants are managed by the `nvidia-imex` daemon. Phase 2 needs IMEX to support: (a) invalidating the dead rank's grants when it dies, (b) issuing new grants to the replacement rank when it joins, both *without* restarting the daemon. **We don't control whether IMEX supports dynamic re-grant.** If IMEX requires a daemon restart, Phase 2 on MNNVL gets multi-second-class even with a pre-staged shadow rank, because daemon restart adds orchestration coordination cost.
+
+**Mitigation:** named cross-team dependency in [§9.5](#95-cross-team-dependencies-nvidia-internal); engage IMEX team before PR 2a.2 starts to either confirm dynamic re-grant works or scope the daemon-restart workaround. If "no" answer: fall back to MX P2P RDMA path (~2 s) as the primary recovery mode and accept that shadow + GMS sub-second is gated on IMEX roadmap.
+
+### Risk — MPI rank-add architecture undefined
+
+**Severity × Probability:** Medium × Medium | **Phase:** 2c | **Residual:** **Medium** — architectural decision pending PR 2c.2 design
+
+Default `mpirun` doesn't natively support adding a rank to a running job. `MPI_Comm_spawn` exists but is complex to wire. The current [§6.2](06-phase-2-full-restoration.md#62-pg-reconstruction) design states "the replacement joins via the FT subcomm + a new sub-communicator that excludes the dead rank, and operates over that sub-comm thereafter," but the *actual mechanism* is undefined: does the replacement become an MPI peer (via `MPI_Comm_spawn`, complex), or bypass MPI entirely (start as non-MPI process, join NCCL + MNNVL groups via FT subcomm bootstrap, never enter `COMM_WORLD`)?
+
+**Mitigation:** explicit open design question for PR 2c.2 (Join protocol for new rank entering EP group). Both options are viable; the choice has follow-on implications for how the replacement coordinates with surviving ranks (which collectives go through MPI vs which go directly through NCCL/MNNVL). Settle before PR 2c.2 design freeze.
 
 ### Risk — Failure broadcast consensus (false positives)
 
@@ -273,6 +297,9 @@ Open item: streaming SSE helpers must be audited so they follow the same boundar
 | HostMoeTensorSharer MPI hard-bake | Medium | High | Future migration | Refactor before Ray pivot | **Medium** |
 | PP + WideEP interaction | Medium | Low | 2+ | Defer to Phase 2 | **Medium (deferred)** |
 | **Cross-team coordination (MNNVL stack, NVSHMEM API)** | Medium | Medium | 2a, §7.5 | Engage NVSHMEM / CUDA driver / fabric manager / IMEX teams early; see [§9.5](#95-cross-team-dependencies-nvidia-internal) | **Medium** — depends on external roadmaps |
+| **NVSwitch fabric manager behavior under rank death** | High | Medium | 2a | Cross-team engagement (§9.5); Audit 1b empirical characterization | **Medium** — pending audit + external |
+| **IMEX dynamic re-grant support** | High | Medium | 2a, 2b | Cross-team engagement (§9.5); MX P2P RDMA fallback if IMEX answer is "no" | **Medium** — fundamentally changes sub-second feasibility |
+| **MPI rank-add architecture undefined** | Medium | Medium | 2c | Settle in PR 2c.2 design (Comm_spawn vs bypass MPI) | **Medium** — architectural decision pending |
 
 Bolded rows are the ones warranting active tracking during MVP execution.
 
