@@ -52,11 +52,20 @@ graph TB
 
 The collective rebuild is *participation, not failover*. Surviving ranks call the same teardown + init APIs they would for any communicator-lifecycle event; they don't restart anything they own.
 
-## 6.2 PG reconstruction per backend
+## 6.2 PG reconstruction
 
-Process-group reconstruction is the hardest distributed-systems problem in this design, and it varies meaningfully across the four communicator/memory layers WideEP touches. Each has its own teardown semantics, its own deadlock hazards, and its own maturity. We address them per-layer.
+Process-group reconstruction is the hardest distributed-systems problem in this design. Two distinct concerns sit under this header and the design has to address both:
 
-### NCCL — feasible with modern primitives
+- **Data-plane rebuild per EP backend** ([§6.2.1](#621-data-plane-rebuild-per-ep-backend)) — the actual L3 communicator that carries MoE AlltoAll bytes. Three different libraries (NCCL, MNNVL, NVSHMEM) with three different rebuild stories.
+- **Control-plane prerequisites for any rebuild** ([§6.2.2](#622-control-plane-prerequisites-for-any-rebuild)) — the L1/L2 channel (MPI by default; `torch.distributed` on Ray) that *coordinates* the rebuild. Survivors agree on the new topology, exchange a new `ncclUniqueId`, signal "rebuild ready" to the replacement, and resume serving — all over this channel. If it's poisoned by the dead member, the data-plane rebuild can't proceed even when the data-plane libraries cooperate.
+
+Both have to work for Phase 2 to succeed. The first three sub-sections below are L3 data-plane backends; the fourth is L1/L2 control-plane survival. They're not interchangeable.
+
+### 6.2.1 Data-plane rebuild per EP backend
+
+Three L3 backends, each with different rebuild semantics. None of these is interchangeable with the others — each has to be addressed in its own sub-PR within Phase 2.
+
+#### NCCL — feasible with modern primitives
 
 **Status: well-understood; the custom-shim approach is natural for MPI path and future-proof for Ray path.**
 
@@ -72,7 +81,7 @@ NCCL has `ncclCommAbort(comm)` — call it on a hung communicator and the surviv
 
 **Caveat:** historical NCCL versions had bugs (memory leaks, zombie threads) on repeated abort+reinit. Modern (NCCL 2.20+) is stable enough for production, but we should set up regression coverage that exercises the abort path.
 
-### MNNVL — needs an audit before sizing
+#### MNNVL — needs an audit before sizing
 
 **Status: empirical answer not yet confirmed; named risk in [§9](09-risks-and-open-questions.md).**
 
@@ -89,7 +98,7 @@ NCCL has `ncclCommAbort(comm)` — call it on a hung communicator and the surviv
 
 **Best guess (subject to audit):** ~100 ms for teardown + reallocate is plausible based on `cuMemRelease`/`cuMemMap` cost in healthy paths. Cross-process unmap of a dead-process region is the unknown.
 
-### NVSHMEM — no clean rebuild on shipping versions
+#### NVSHMEM — no clean rebuild on shipping versions
 
 **Status: deferred indefinitely; tied to DeepEP scope. Verified by a May 2026 API survey.**
 
@@ -105,7 +114,11 @@ DeepEP additionally has a known deadlock — `Buffer.__del__` calls `intranode::
 
 **Phase 2:** since DeepEP is deferred indefinitely, Phase 2 does not need to rebuild NVSHMEM symmetric memory. If DeepEP support comes in (post-public-`mask_buffer_ptr`), the NVSHMEM rebuild design becomes its own work track; today it's out of scope. The May 2026 survey can be re-run if NVSHMEM 4.x or a future 3.x point release adds resilience primitives.
 
-### MPI — blocked without ULFM
+### 6.2.2 Control-plane prerequisites for any rebuild
+
+Even when the data-plane libraries (NCCL, MNNVL, NVSHMEM) cooperate, the rebuild has to be *coordinated* — survivors must agree on the dead-rank set, exchange a new `ncclUniqueId`, signal "rebuild ready" to the replacement, and synchronize "rebuild complete, resume serving." On the MPI default path that coordination runs over MPI; on a future Ray deployment it would run over `torch.distributed`. Either way, **if the control-plane communicator is poisoned by the dead member, the data-plane rebuild stalls waiting on broken control-plane primitives.** This subsection covers that survival concern.
+
+#### MPI — blocked without ULFM
 
 **Status: structural problem; mitigation via FT subcomm + ULFM where available.**
 
@@ -121,15 +134,15 @@ Restarting `MPI.COMM_WORLD` with a dead participant is not feasible on stock MPI
 
 **This is the cleanest argument for the long-term Ray pivot** ([§3.3](03-failure-modes-and-gaps.md#33-why-not-just-pivot-to-ray)): on the Ray path with `torch.distributed`, Phase 2 communicator rebuild is a documented + tested PyTorch operation. On the MPI path, we're working around `MPI.COMM_WORLD`'s structural limitation. The MPI workaround is sufficient for MVP single-failure; multi-failure on MPI is harder and likely needs ULFM or an architectural change.
 
-### Per-backend summary
+### 6.2.3 Combined summary (data plane + control plane)
 
-| Backend | Rebuild story | Phase 2 readiness |
-|:---|:---|:---|
-| NCCL (custom ops) | `ncclCommAbort` + `ncclCommInitRank` | Wiring needed (PR 1a.7) — MVP-adjacent |
-| NCCL (`torch.distributed`) | `destroy_process_group` + `init_process_group` | Inherited from PyTorch — works on Ray path |
-| MNNVL (NVLinkOneSided/TwoSided) | Teardown + reallocate + handle re-exchange | **Audit needed** — sizes Phase 2 work |
-| NVSHMEM (DeepEP) | No clean story; destructor deadlock | Deferred indefinitely with DeepEP |
-| MPI `COMM_WORLD` | ULFM if available; FT-subcomm workaround otherwise | Single-failure on MPI path; Ray path is cleaner long-term |
+| Layer | Component | Rebuild / survival story | Phase 2 readiness |
+|:---|:---|:---|:---|
+| **L3 data plane** | NCCL (custom ops) | `ncclCommAbort` + `ncclCommInitRank` | Wiring needed (PR 1a.7 in MVP); rebuild shim is PR 2a.1 |
+| **L3 data plane** | NCCL (`torch.distributed`) | `destroy_process_group` + `init_process_group` | Inherited from PyTorch — works on Ray path; PT 2.11 `shrink_group(SHRINK_ABORT)` itself broken (Audit 1a Day 1) |
+| **L3 data plane** | MNNVL (NVLinkOneSided/TwoSided) | Teardown + reallocate + handle re-exchange | **Audit needed** — sizes Phase 2 work |
+| **L3 data plane** | NVSHMEM (DeepEP) | No clean story on shipping versions; destructor deadlock | Deferred indefinitely with DeepEP |
+| **L1/L2 control plane** | MPI `COMM_WORLD` | ULFM if available; FT-subcomm workaround otherwise | Single-failure on MPI path; Ray path is cleaner long-term |
 
 ## 6.3 Shadow rank + GMS roles
 
