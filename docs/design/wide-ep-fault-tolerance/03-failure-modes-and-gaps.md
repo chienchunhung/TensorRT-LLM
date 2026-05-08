@@ -87,6 +87,45 @@ graph LR
 
 **Design consequence.** Both modes must be closed. Ray fixes Mode A structurally but not Mode B. MPI-path signal-handler replacement fixes Mode A but not Mode B. Only kernel-level masking with a host-side abort path fixes Mode B. **The two fixes are complementary, not alternatives.** [§5](05-phase-1-immediate-survival.md) addresses Mode B (§5.1 kernel masking) *and* Mode A (§5.4 signal handler replacement on the MPI path).
 
+### What causes each mode, and which is more significant
+
+It's worth surfacing the actual failure-cause distribution for each mode, plus an inversion that affects the design ordering.
+
+**Mode A causes.** The dying rank's process catches a signal that the OS delivers and the MPI handler intercepts. Common sources:
+
+- CUDA illegal memory access / illegal address → SIGSEGV via the CUDA runtime's host-side stub.
+- Out-of-memory kill (OOM-killer or cgroup memory limit) → SIGKILL or SIGTERM.
+- Uncaught Python exception escaping `worker_main` → SIGABRT via Python's default handler.
+- Severe NVIDIA XID errors that surface as fatal CUDA errors → eventually crash the process.
+- Hardware faults that surface through the OS (PCIe link errors, host-side ECC).
+- Explicit `MPI.COMM_WORLD.Abort(N)` from application code (rare, but does happen in some test paths).
+
+**Mode B causes.** The dying rank's *process* is up enough that no signal-handler chain fires, but its *forward progress* on writing to peers' `completion_flags` has stopped. Three buckets:
+
+| Bucket | Mechanism | Examples |
+|:---|:---|:---|
+| **Hardware / fabric** | The GPU is alive but its peer-write path is broken | NVLink lane degradation past retry threshold; NVSwitch fabric port fault on NVL72; ECC-uncorrectable in the `completion_flags` region of fabric memory; XID errors that mark a context unstable but don't kill the process; PCIe link errors intra-node; MNNVL fabric grant revocation by IMEX or fabric manager without killing the process |
+| **Driver / kernel** | The CUDA driver itself stalls; process is up but the GPU isn't making progress | NVIDIA user-space driver hang (a known class of failure); kernel stuck in queue waiting on driver service; CUDA stream where a launch never completes; thermal throttling severe enough to look like a hang at the per-AlltoAll timescale |
+| **Application** | The CPU-side process is alive but the forward thread isn't posting work | Python deadlock or GIL pathology; forward thread blocked on something the watchdog doesn't see (file I/O, lock contention); kernel completed but the next iteration's kernel never gets launched |
+
+The common property of all Mode B causes: from the AlltoAll kernel's perspective — which is what spins on `completion_flags` — the difference between "process dead but holding signal" and "process alive but stalled" doesn't matter. Either way the flag never gets written.
+
+**By raw frequency, Mode A dominates today.** Most production failures eventually surface as OS signals (CUDA errors, OOMs, uncaught exceptions, severe XIDs). The MPI signal handler at `mpiUtils.cpp:195–215` catches all of them and fires `MPI_Abort`. So "rank died, MPI propagated, cluster went down" describes the majority of incidents in current production deployments.
+
+**By difficulty, Mode B is harder.** Mode A is loud — the dying rank actively signals its death. The fix (PR 1d.0 in [§5.4](05-phase-1-immediate-survival.md#54-mpi-path-ft-enabling-work)) is to *suppress* that signaling so survivors aren't dragged down. Mode B is silent — no signal, no exception, no notification. It requires the explicit kernel-level host watchdog (PR 1a.4) plus the MNNVL kernel masking (PR 1a.2). That's net-new infrastructure, not a fix to existing infrastructure.
+
+**The post-1d.0 inversion.** Once PR 1d.0 lands and replaces `MPI_Abort` with `_exit(N)`, **every Mode A failure looks like Mode B from the survivors' perspective**. The dying rank exits cleanly without telling anyone; survivors see exactly the same thing they'd see if a fabric port had silently failed. The detection burden shifts entirely to the watchdog.
+
+| Phase of deployment | Most common failure shape from survivors' POV | Implication |
+|:---|:---|:---|
+| **Today (no FT)** | Mode A (signal handler propagates abort) → cluster down | `MPI_Abort` is "doing its job" — signaling the failure, just at the cost of the whole cluster |
+| **Post-1d.0 (`_exit(N)` instead of `MPI_Abort`)** | Effectively all failures look like Mode B from survivors' POV | Watchdog (1a.4) must catch every failure, since Mode A's signal propagation has been deliberately suppressed |
+| **Post-1d.0 + 1a.4 + 1c.3** | Detected as silent peer death within ~5 s; broadcast via FT subcomm; mask + `reconfigure_mask_only` | The dying rank's class of failure matters less; the survivor-side detection is uniform |
+
+This is why the design treats Mode B work as the more architecturally important even though Mode A is more frequent in raw failure counts. Mode B's machinery is what survives the *transition* — the period between 1d.0 landing (which suppresses Mode A's propagation) and 1a.4 + 1c.3 catching the resulting silent peer.
+
+The MVP's engineering effort distribution reflects this: 1d.0 (Mode A fix) is one S-sized PR; the Mode B machinery is three of the four MVP tracks (1a kernel + 1c detection + parts of 1d). The work-heaviness ratio is Mode B-heavy because significance is what justifies the engineering budget, not raw frequency.
+
 ## 3.2 Gap analysis by layer
 
 For each layer of the stack (L1 / L2 / L3 / EPLB / Detection), what's missing today, mapped to which failure mode it enables or blocks. All findings anchored against current source per the research pass.
