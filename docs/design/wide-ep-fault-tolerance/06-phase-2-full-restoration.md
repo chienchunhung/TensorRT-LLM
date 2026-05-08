@@ -58,15 +58,19 @@ Process-group reconstruction is the hardest distributed-systems problem in this 
 
 ### NCCL — feasible with modern primitives
 
-**Status: well-understood; gated on PR 1a.7 wiring.**
+**Status: well-understood; the custom-shim approach is natural for MPI path and future-proof for Ray path.**
 
-NCCL has `ncclCommAbort(comm)` — call it on a hung communicator and the surviving ranks can build a fresh one with a new `ncclUniqueId`. Surviving CUDA contexts and GPU memory are preserved; only the comm object is replaced. PyTorch's `destroy_process_group()` + `init_process_group()` is the production-tested implementation of this pattern.
+NCCL has `ncclCommAbort(comm)` — call it on a hung communicator and the surviving ranks can build a fresh one with a new `ncclUniqueId`. Surviving CUDA contexts and GPU memory are preserved; only the comm object is replaced.
 
-**TRT-LLM-specific gap:** zero non-test uses of `ncclCommAbort` / `NCCL_ASYNC_ERROR_HANDLING` in the custom NCCL ops (`NcclCommunicatorOp`). PyTorch's `torch.distributed` path inherits the wiring; TRT-LLM's custom path does not. PR 1a.7 closes this for v1.
+**Why we build directly on NCCL primitives, not on `torch.distributed.shrink_group`.** TRT-LLM's NCCL is reached through three different code paths in production — `NcclCommunicatorOp` for PP, the `AllGatherReduceScatter` EP fallback, and TP collective ops — **none of which go through `torch.distributed`** on the MPI default path. They each manage their own `ncclComm_t` directly. So PR 2a.1 builds on `ncclCommAbort` + `ncclCommInitRank` because that's the layer where the comm objects actually live; "drop below `torch.distributed`" isn't quite the right framing because we were never above `torch.distributed` to begin with on the MPI MVP path.
+
+**The same shim is the right answer on a future Ray path too.** Audit 1a Day 1 verified that PT 2.11's `dist.shrink_group(ranks_to_exclude=…, shrink_flags=SHRINK_ABORT)` hangs > 60 s after peer death (with `ASYNC=0`) or causes survivors to SIGABRT (with `ASYNC=1`). The "obvious" upstream recovery primitive doesn't work in our shipping PyTorch version. So even on a Ray-based future deployment where collectives go through `torch.distributed`, we'd still need the same custom NCCL-primitive shim — `dist.shrink_group(SHRINK_ABORT)` isn't a viable alternative. PR 2a.1 is therefore not a workaround for upstream brokenness but the natural design either way.
+
+**TRT-LLM-specific gap:** zero non-test uses of `ncclCommAbort` / `NCCL_ASYNC_ERROR_HANDLING` in TRT-LLM's custom NCCL ops. The primitives are available in NCCL ≥ 2.13; we just don't call them today. PR 1a.7 closes this for MVP (since NCCL is in the data path for TP/PP regardless of EP backend); PR 2a.1 builds on top for the full rebuild.
 
 **Phase 2 mechanism:** survivors + replacement call `ncclCommAbort` on the old comm, exchange a new `ncclUniqueId` over the FT subcomm, every participant calls `ncclCommInitRank` into the new comm. Target: ~100 ms in normal cases.
 
-**Caveat:** historical NCCL versions had bugs (memory leaks, zombie threads) on repeated abort+reinit. Modern (PyTorch 2.5+, NCCL 2.20+) is stable enough for production, but we should set up regression coverage that exercises the abort path.
+**Caveat:** historical NCCL versions had bugs (memory leaks, zombie threads) on repeated abort+reinit. Modern (NCCL 2.20+) is stable enough for production, but we should set up regression coverage that exercises the abort path.
 
 ### MNNVL — needs an audit before sizing
 
