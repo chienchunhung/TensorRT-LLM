@@ -247,3 +247,281 @@ The overlap scheduler (`_executor_loop_overlap`) uses a `previous_batch` staging
 4. No special handling needed — this is the same as a fresh executor start
 
 For pipeline parallel (`_executor_loop_pp`), the shadow must coordinate across PP ranks during activation. All shadow workers for a PP group must activate simultaneously — the health check should be coordinated via the existing process group.
+
+---
+
+## Restart-After-Death Failover (Cold Standby)
+
+Everything above describes **shadow failover** — a *pre-warmed standby process* that holds weights via GMS-RO and is promoted to RW on primary death. That model targets sub-5-second activation but requires:
+
+- A second worker process running idle alongside the primary
+- The §07 tiered compile cache to stay inside the activation budget
+- Substantial new executor-layer state machinery (the diagram and code earlier in this section)
+
+There is a **simpler failover model** that PR #13926's `LoadFormat.GMS` already enables end-to-end with **no new TRT-LLM code**: rather than keeping a hot standby running, accept that the worker dies and let an external supervisor restart it. The replacement worker is a *fresh process* that connects to the *surviving GMS daemon* and zero-copy materializes the already-committed weights. No prior worker state survives — only the daemon's pool does.
+
+This pattern is operationally what most TRT-LLM users will reach for first because it composes with the same supervisor primitives they already use (systemd, K8s Deployments, Dynamo replica scheduling). It does not require sleep/wake, does not require the shadow lifecycle state machine, and works on `main` today.
+
+### Failover Modes Compared
+
+| Property | Shadow failover (§06 above) | Restart-after-death (this section) | Cold from scratch |
+|----------|------------------------------|------------------------------------|-------------------|
+| **Standby cost** | One running process per shadow, ~0 GPU bytes for weights (mapped RO), full host RAM footprint | Zero processes between failures | Zero |
+| **Activation latency target** | <5 s (with tiered compile cache) | ~5–45 s (depends on warmup cache state) | Full S2 cold-start: 75–390 s |
+| **What survives across failure** | Weights in GMS pool; shadow process itself (alive, idle) | Weights in GMS pool only | Nothing |
+| **Per-failure recovery work** | RO→RW upgrade + KV alloc + warmup-from-cache | Fresh process boot + GMS RO connect + KV alloc + warmup | Full disk load + KV alloc + warmup |
+| **Needs sleep/wake** | Yes (for KV cache on standby) | No | No |
+| **Needs §07 compile cache** | Required to hit <5 s | Optional (just reduces post-restart warmup) | Same as today |
+| **Needs new executor state machine** | Yes — see "Shadow Worker Lifecycle" above | No | No |
+| **Status of code** | Designed only, not built | **Working in PR #13926 today, given daemon orchestration** | Always available |
+
+For most production deployments, **restart-after-death is the right starting point.** Shadow failover is a latency optimization on top — useful when the 5–45 s restart gap is intolerable (e.g., per-request SLO-bound chat workloads), unnecessary otherwise.
+
+### Mechanics
+
+What happens when the primary dies, step by step:
+
+```
+t0   Primary worker A is serving traffic.
+     A holds an RW session against the GMS daemon (per-GPU, per-tag).
+     Daemon has committed weights in its pool.
+     RO peers (if any) hold mappings into that pool.
+
+t1   Primary A dies (segfault, OOM-kill, scheduler eviction, …).
+     A's process terminates. Its CUDA context is reclaimed by the driver.
+     A's KV cache (if it was using virtual_memory_scope) is gone with the process.
+     The GMS daemon, being a separate process, is unaffected.
+
+t2   GMS daemon observes the writer socket close.
+     ⚠️ The daemon's behavior here is load-bearing for this pattern:
+        (a) commit-survives-writer: pool stays committed for new RO clients.   ← we need this
+        (b) commit-tied-to-writer:  daemon revokes commit on writer disconnect. ← breaks failover
+     This is the single most important upstream question to confirm.
+
+t3   External supervisor (systemd, K8s, Dynamo, …) observes A is gone
+     and starts replacement worker B with the same model, same socket path,
+     and same tag. B is configured with --load-format=gms --gms-mode=auto.
+
+t4   B's GMSBackend.connect() opens the socket, requests RW_OR_RO.
+     Daemon sees the existing commit, grants RO.
+     B's model_loader.py takes the RO branch (model_loader.py:543–553):
+       - post_load_weights() wires aliases
+       - materialize_module_from_gms() zero-copy maps weights from the
+         daemon's pool into B's parameter buffers.
+     Weight materialize cost: ~100 ms (no disk I/O, no per-instance copy).
+
+t5   B allocates its own KV cache (per-process), runs warmup, registers
+     with the router, begins serving.
+```
+
+The total budget for `t1`→`t5` is:
+
+| Phase | Cost |
+|-------|------|
+| Supervisor detects death and restarts | 1–5 s (orchestrator-dependent) |
+| Process boot (Python init, MPI, CUDA context) | 1–3 s |
+| GMS connect + RO materialize | ~0.1–0.5 s |
+| KV cache allocation | ~1–3 s |
+| Warmup (cold compile cache) | ~16–43 s (v3 baseline) |
+| Warmup (warm compile cache via §07) | ~0.5–2 s |
+| **Total without §07** | ~20–55 s |
+| **Total with §07** | ~5–10 s |
+
+So restart-after-death plus the §07 tiered compile cache gives a ~5–10 s failover budget without ever running a shadow worker. That is the **realistic near-term target** for self-managed TRT-LLM+GMS deployments.
+
+### Gaps Today
+
+Sorting by who owns the fix:
+
+#### Owned by TRT-LLM
+
+| Gap | Severity | Where |
+|-----|----------|-------|
+| `GMSBackend.connect()` returns False on socket failure but does not retry. A fast supervisor restart can race the daemon's socket reset. | Medium | `_torch/memory/gpu_memory_backend.py`: add bounded retry with exponential backoff (~15 LOC). |
+| `connect()` collapses "daemon down" and "daemon up but no commit" into one boolean. Replacement workers can't distinguish "I should wait" from "I should give up and reload." | Low–medium | Surface granted lock type / error code distinctly. |
+| Destructor ordering in `PyTorchModelEngine.__del__` (review issue #1 on PR #13926) becomes more important: a crashed worker that doesn't fully evict can leave stale per-tag registry entries that confuse the next worker. | Medium | Reverse destructor order; expose deterministic shutdown. |
+| No daemon-liveness watchdog inside the worker. If the daemon dies while RO workers are mapped, the workers hold dangling pointers with no clean error. | Medium–low | Background liveness probe; SIGTERM the worker on daemon loss. Out of scope for #13926. |
+| No integration with `LLM.sleep/wake` (#14052). See "Composition with sleep/wake" below. | None for this pattern | n/a |
+
+#### Owned by `gpu_memory_service` upstream (ai-dynamo/dynamo)
+
+| Gap | Severity |
+|-----|----------|
+| Daemon must retain commit when the RW writer's socket disconnects (no explicit `evict` call). **Load-bearing assumption — confirm before claiming failover works.** | Critical |
+| Orphan-rescue: if the writer dies between allocation and `finalize_write`, a replacement should be able to either complete the orphan commit or reclaim the reservation cleanly. | Medium |
+| Configurable TTL/eviction for committed pools with no RO peers, to bound the "writer died, nobody noticed" case. | Low |
+
+#### Owned by orchestration
+
+| Gap | Severity |
+|-----|----------|
+| **Daemon must be a node-level service, not a worker subprocess.** Otherwise it dies with the worker and the whole pattern collapses. | Critical |
+| Worker restart must use the **same** socket path and tag. A fresh path means a fresh pool (full reload). | Critical |
+| Supervisor must distinguish "worker died, daemon healthy" from "daemon died, all workers need restart." Otherwise cascade-restart. | Medium |
+| Compile cache persistence across worker restarts (disk-backed today). | Medium (gates the <10 s target) |
+
+### Composition with Sleep/Wake (#13918, #14052)
+
+`LLM.sleep([tags])` from PR #14052 operates on TRT-LLM's `_torch.virtual_memory` tag manager. It releases physical CUDA pages via `cuMemUnmap` for any allocations registered with the given tag inside a `virtual_memory_scope` block.
+
+`LoadFormat.GMS` weights are **not** registered with the `virtual_memory` tag manager. They live in the GMS daemon's pool, mapped into the worker process via `gms_use_mem_pool(tag, device)`. As a result, `LLM.sleep(["weights"])` on a GMS-RO worker is a silent no-op — the tag manager finds nothing to release.
+
+This **does not affect** restart-after-death failover, which doesn't involve sleep/wake at any step. It **does affect** the shadow failover design (§06 above), where the shadow worker would ideally sleep its KV cache between failures while keeping weights mapped. The KV-cache half works today; the weight half does not need to.
+
+Three implementation tiers for closing the weight-side composition (only relevant for shadow failover, online weight update, and similar advanced flows — not needed for restart-after-death):
+
+| Tier | Approach | Effort | Value |
+|------|----------|--------|-------|
+| **A. Block and document** | `validate_gms_sleep_compat`: reject `sleep_config.restore_modes` keys that map to `MODEL_WEIGHTS_*` when `load_format == GMS`. Surfaces the silent-no-op as a loud `ValueError`. | ~20 LOC in `llm_args.py` | Eliminates the footgun. No actual sleep capability for GMS weights. |
+| **B. Heavy reconnect bridge** | `GMSBackend.release/materialize` does full session evict + reconnect + re-materialize. Slow (~1 s round-trip) and racy under concurrent peers. | ~150 LOC | Works but rarely worth using. |
+| **C. True bridge** | Upstream GMS adds `park()`/`unpark()` primitives. TRT-LLM's `virtual_memory` tag manager grows a delegate so `release_with_tag` routes through the backend. | ~50 LOC TRT-LLM + upstream feature | Real cheap sleep/wake on GMS weights. Long pole is upstream. |
+
+**Recommendation for PR #13926:** add Tier A. Defer B/C until shadow failover work is staffed. Track as a §14 open question.
+
+### Self-Managed Deployment Recipe (No Dynamo)
+
+Concrete steps for a TRT-LLM user who wants `LoadFormat.GMS` + restart-after-death failover without running Dynamo.
+
+#### Prerequisites
+
+- `gpu_memory_service` installed (from source — no PyPI yet; tracked as GMS-6 in §14).
+  ```bash
+  git clone https://github.com/ai-dynamo/dynamo
+  pip install ./dynamo/lib/gpu_memory_service
+  ```
+- TRT-LLM built with PR #13926's `LoadFormat.GMS` support.
+- A model checkpoint accessible to at least the first worker.
+- Local filesystem (tmpfs, ext4) for the GMS Unix sockets — **not NFS**.
+
+#### Step 1: Run the GMS daemon as a node-level service
+
+Pick a socket path convention. One daemon per GPU is the simplest model. For 8 GPUs you'd run 8 daemons; for a single GPU one daemon.
+
+**systemd unit example** (`/etc/systemd/system/gms-daemon@.service`):
+
+```ini
+[Unit]
+Description=GPU Memory Service daemon for GPU %i
+After=network.target
+
+[Service]
+Type=simple
+User=trtllm
+Environment="CUDA_VISIBLE_DEVICES=%i"
+ExecStart=/usr/local/bin/gpu-memory-service-daemon \
+    --socket /var/run/gms/gms-%i.sock \
+    --device 0
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable per-GPU instances:
+
+```bash
+sudo mkdir -p /var/run/gms
+sudo chown trtllm:trtllm /var/run/gms
+sudo systemctl enable --now gms-daemon@0.service gms-daemon@1.service  # etc.
+```
+
+**Kubernetes alternative:** run the daemon as a sidecar container in the same pod as `trtllm-serve`, OR as a DaemonSet that runs once per node. Sidecar is simpler (no cross-pod socket mounting); DaemonSet is more efficient when many workers share one daemon.
+
+#### Step 2: Start the first worker (the writer)
+
+```bash
+trtllm-serve <model_repo> \
+    --backend pytorch \
+    --load-format gms \
+    --gms-socket-path /var/run/gms/gms-0.sock \
+    --gms-mode rw \
+    --gms-tag weights \
+    --port 8000
+```
+
+Or equivalently via `--config` YAML:
+
+```yaml
+load_format: GMS
+gms_config:
+  socket_path: /var/run/gms/gms-0.sock
+  mode: rw
+  tag: weights
+```
+
+This worker loads from disk and commits to the GMS pool. Expect normal cold-start latency (~75–306 s depending on storage tier) for this *first* boot. The cost is paid once per daemon lifetime, not per worker death.
+
+#### Step 3: Configure the supervisor for restart
+
+For systemd, wrap `trtllm-serve` in its own unit with `Restart=on-failure`:
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/trtllm-serve <model> \
+    --load-format gms \
+    --gms-socket-path /var/run/gms/gms-0.sock \
+    --gms-mode auto \
+    --gms-tag weights \
+    --port 8000
+Restart=on-failure
+RestartSec=5s
+# Don't restart trtllm-serve if the GMS daemon is down — handle that explicitly
+ConditionPathExists=/var/run/gms/gms-0.sock
+```
+
+Note `--gms-mode=auto` on this unit, not `rw`. After the first boot has committed, every subsequent boot (failover restart) goes through the RO branch and zero-copy maps from the surviving daemon.
+
+For Kubernetes, the equivalent is a `Deployment` with `restartPolicy: Always` and a liveness probe against `/health`. Use a `readinessProbe` to keep the worker out of the service load-balancer until it has finished GMS materialize + KV alloc + warmup.
+
+#### Step 4: Verify the failover path
+
+```bash
+# 1. Confirm initial RW commit happened
+curl -fsS http://localhost:8000/health
+
+# 2. Kill the worker (simulating death)
+sudo systemctl kill trtllm-serve.service --signal=SIGKILL
+
+# 3. systemd restarts it within RestartSec. Wait for ready:
+until curl -fsS http://localhost:8000/health; do sleep 1; done
+
+# 4. Check the worker's log for "LoadFormat.GMS (RO): materialized weights"
+journalctl -u trtllm-serve.service | grep -E "GMS (RW|RO)"
+```
+
+The second-boot log should show `LoadFormat.GMS (RO): materialized weights` rather than the cold-load checkpoint-read banner. If you instead see another RW commit, the daemon did not retain commit across the writer's death — that's the load-bearing upstream issue from "Gaps Today" above.
+
+#### Step 5: Multi-model and multi-tag deployments
+
+A single GMS daemon supports multiple tags. To run two different models on the same GPU:
+
+```bash
+# Model A's worker
+trtllm-serve <model-a> ... --gms-tag model-a-weights
+
+# Model B's worker
+trtllm-serve <model-b> ... --gms-tag model-b-weights
+```
+
+Tag uniqueness is the user's responsibility — there is no daemon-side content fingerprint. Reusing the same tag for two different model weights will produce undefined behavior; the second worker will RO-map whatever bytes the first committed, regardless of model identity.
+
+#### Caveats and known limits
+
+- **Single-rank only today.** Multi-rank GMS (TP > 1, PP > 1) requires per-rank daemons and coordinated commit across ranks. Not in PR #13926.
+- **Daemon survival is the user's job.** Never auto-restart the daemon with the worker (e.g., do not use a `Restart=always` policy that bounces both together). The daemon's lifetime must be a strict superset of the worker's.
+- **No automatic daemon health watchdog in the worker.** If the daemon dies while a worker is RO-mapped, the worker holds dangling GPU pointers. The recommended response is to SIGTERM the worker so the supervisor restarts it (it will block at `GMSBackend.connect()` until the daemon comes back).
+- **Compile cache is separate from GMS.** Disk-backed compile cache works as it does today, but a fresh worker process re-pays the cold compile cost unless §07's tiered compile cache lands. Plan for ~16–43 s of warmup per restart until then.
+- **No sleep/wake support for weights.** See "Composition with Sleep/Wake" above. The validator from Tier A will reject the combination at config-load time.
+
+### Open Questions
+
+Tracked as candidate items for §14:
+
+- **GMS-7 (upstream):** Confirm and document daemon commit semantics on writer disconnect (`commit-survives-writer` vs `commit-tied-to-writer`).
+- **GMS-8 (upstream):** Orphan-commit rescue API (writer died mid-commit).
+- **GMS-9 (upstream):** Configurable commit TTL with no RO peers.
+- **TRTLLM-T1 (TRT-LLM):** Bounded retry in `GMSBackend.connect()` for fast restart cycles.
+- **TRTLLM-T2 (TRT-LLM):** Tier-A validator: reject `sleep_config` restore modes targeting MX/GMS-managed weight tags.
+- **TRTLLM-T3 (TRT-LLM):** Background daemon liveness watchdog.
+- **DEPLOY-1 (documentation):** Promote the recipe above into a TRT-LLM deployment guide once §07 lands.
