@@ -82,6 +82,30 @@ After both 1a and 1b land: empirical answer to "MNNVL rebuild on the NVL72 fabri
 
 **Pre-requisites that make the audit possible:** Ray-path CI needs EP ≥ 32 tests first. Today largest is TP = 4 (research pass report). So the audit itself is 1–2 weeks *after* Ray-path test coverage is built out.
 
+### Audit 3 — NIXL-EP evaluation as data-plane backend
+
+**Severity × Probability:** Medium × Medium | **Phase:** v1 (post-MVP integration if outcome positive) | **Residual risk:** Medium (outcome shapes v1 priority order)
+
+**Why it's named.** The NIXL team has built **NIXL-EP**, an EP-backend variant of NIXL (the same library TRT-LLM already uses as the disagg KV-cache L3 path), and has asked TRT-LLM to evaluate it. vLLM PR [#38534](https://github.com/vllm-project/vllm/pull/38534) is already shipping with NIXL-EP listed as one of the two "FT-enabled backends" (alongside DeepEP). If NIXL-EP carries cleaner FT primitives than NVSHMEM/DeepEP, integrating it as an additional AlltoAll backend would let us close the "DeepEP FT deferred indefinitely" gap without waiting on NVSHMEM `mask_buffer_ptr`.
+
+**Why it's not MVP.** NVLinkOneSided is the primary AlltoAll backend for NVL72, kernel mask is already in flight as PR #13404, and we have full kernel ownership. NIXL-EP is therefore a *coverage broadening* item, not a survival item — it belongs in v1 alongside NVLinkTwoSided (PR 1a.5–1a.6) and the kernel `check_timeout` hardening (PR 1a.8), not on the MVP critical path.
+
+**Scope.** ~2 weeks, one engineer, runnable in parallel with MVP (no critical-path dependency):
+
+| Step | Work | Output |
+|:---|:---|:---|
+| E1 | Technical-fit assessment — does NIXL-EP's API surface fit into TRT-LLM's `CommunicationFactory` strategy abstraction? What changes would PR 1a.7's NCCL FT wrapper pattern look like for NIXL-EP? | Integration sketch + binding scope estimate |
+| E2 | FT primitive validation — confirm NIXL-EP exposes the `activeRanks`-style masking + abort that vLLM PR #38534 relies on, on a version we can link against. | Empirical FT primitive coverage table |
+| E3 | Perf comparison vs NVLinkOneSided on a ≥ 4-GPU node — bandwidth, latency, kernel launch overhead, steady-state regression. | Quantitative comparison |
+| E4 | Maturity assessment — production deployments, version stability, NVIDIA-internal support story. | Risk register entry |
+| E5 | Write-up + go/no-go recommendation — integrate as v1 backend, defer, or decline. | Decision document |
+
+**Integration scope if E5 is positive.** Two new PRs in Phase 1 v1: **1a.9** (NIXL-EP communication strategy + factory registration) and **1a.10** (NIXL-EP rank-masking + FT primitive integration). Sizes M + M; both depend on PR 1a.1 (EPGroupHealth) and the NIXL-EP version selected in E2.
+
+**Strategic value if E5 is positive.** Backend priority order becomes: 1) NVLinkOneSided (primary, NVL72), 2) NVLinkTwoSided (NVLink without MNNVL), 3) NIXL-EP (mask-capable, no NVSHMEM dependency), 4) AllGatherReduceScatter (NCCL fallback), 5) DeepEP / DeepEPLowLatency (deferred). This collapses the deferred-indefinitely status of DeepEP into a *demoted-to-low-priority* status — coverage broadens without us waiting on NVSHMEM's `mask_buffer_ptr` roadmap.
+
+**Strategic value if E5 is negative.** Bounded cost (~2 engineer-weeks), no MVP impact, audit report still informs whether vLLM's NIXL-EP choice transfers to our stack.
+
 ## 9.2 Technical risks
 
 ### Risk — NVLink kernel modification complexity
@@ -94,6 +118,14 @@ The kernel mask change touches performance-critical CUDA synchronization. Potent
 - Correctness tests before performance tests.
 - < 0.1 % steady-state overhead gate with all ranks active.
 - Kernel source already reviewed; `kMaxRanks` bump is single-line; mask plumbing is additive.
+
+### Risk — NIXL-EP integration timing
+
+**Severity × Probability:** Medium × Medium | **Phase:** v1 | **Residual:** **Medium** — gated on Audit 3 outcome
+
+The NIXL team has built NIXL-EP and vLLM already uses it as an FT-enabled backend (PR #38534). For TRT-LLM, the open question is whether NIXL-EP fits cleanly into `CommunicationFactory` and whether its FT primitives (`activeRanks`-style masking + abort) are mature enough to integrate as a v1 backend. Two failure modes: (a) **integration is harder than estimated** — version skew, API mismatch, or perf regression vs NVLinkOneSided pushes the two new PRs (1a.9, 1a.10) past v1's window; (b) **deferring too long lets vLLM's NIXL-EP stack become the de-facto standard before we ship** — a coverage gap that's harder to close later.
+
+**Mitigation:** Audit 3 ([§9.1](#audit-3--nixl-ep-evaluation-as-data-plane-backend)) is a bounded 2-week parallel evaluation that produces a go/no-go for v1. If go, the two integration PRs slot into Phase 1 v1 alongside 1a.5–1a.6. If no-go, no schedule impact — MVP and v1 ship unchanged. Either way, NIXL-EP doesn't gate MVP.
 
 ### Risk — DeepEP backend limitations
 
@@ -279,6 +311,7 @@ Open item: streaming SSE helpers must be audited so they follow the same boundar
 |:---|:---|:---|:---|:---|:---|
 | MNNVL/NVSHMEM audit outcome | High | Medium | 2a | Audit 1 | **Medium** — gates Phase 2 sizing |
 | Ray-path perf uncharacterized | Medium | High | Future migration | Audit 2 | **Medium–High** — covered when Audit 2 runs |
+| **NIXL-EP integration timing** | Medium | Medium | v1 | Audit 3 (bounded 2-week parallel evaluation); go/no-go decides v1 PRs 1a.9, 1a.10 | **Medium** — outcome shapes v1 priority order |
 | Ray + disagg + NIXL unsupported | Medium | High | Phase 1-DS / future | Close gap upstream; ship on MPI first | **Medium** — hard gap, closes with upstream fix |
 | NVLink kernel modification | High | Medium | 1a | PR 1a.2 minimal change; correctness-first | **Low** |
 | DeepEP limitations | Medium | High | 1a | NVLink primary; DeepEP deferred | **High (accepted)** |

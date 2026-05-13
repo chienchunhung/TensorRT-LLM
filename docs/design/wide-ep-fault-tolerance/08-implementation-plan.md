@@ -28,6 +28,8 @@ This section breaks the design into named PRs. Phase 1 PRs are detailed (they're
 | **1a.6** | NVLinkTwoSided Python binding | v1 | `_torch/modules/fused_moe/communication/nvlink_two_sided.py`, `nvlink_two_sided_flashinfer.py` | S | 1a.5 |
 | **1a.7** | NCCL FT wrapper (`ncclCommAbort` + async error handling) | **MVP** | NCCL communicator wrapper in `cpp/tensorrt_llm/`, `_torch/modules/fused_moe/communication/allgather_reducescatter.py`, `NcclCommunicatorOp` | **M** | 1a.1 |
 | **1a.8** | Tighten kernel `check_timeout` + replace `trap;` with host-visible flag | v1 | `moeAlltoAllKernels.cu` | M | 1a.2 |
+| **1a.9** | NIXL-EP communication strategy + factory registration | v1 (conditional on Audit 3) | `_torch/modules/fused_moe/communication/nixl_ep.py` (new), `communication_factory.py` | M | 1a.1, Audit 3 positive |
+| **1a.10** | NIXL-EP rank-masking + FT primitive integration | v1 (conditional on Audit 3) | `_torch/modules/fused_moe/communication/nixl_ep.py` | M | 1a.9 |
 
 **Status (April 2026):**
 - **1a.1 is in flight as PR #13302** — reviewed and refined based on reviewer feedback.
@@ -40,6 +42,8 @@ This section breaks the design into named PRs. Phase 1 PRs are detailed (they're
 - **1a.7 is MVP, not v1.** NCCL is in the WideEP data path even when MNNVL is the chosen AlltoAll backend (TP allreduces in non-MoE projections, PP send/recv via `NcclCommunicatorOp`, `AllGatherReduceScatter` if MNNVL+DeepEP unavailable). Without the wiring, a dead rank hangs the next NCCL collective — and per [Audit 1a Day 1](../wide-ep-fault-tolerance/audit-1a-findings.md), PT 2.11's default async-error-handling SIGABRTs *all* survivors at the watchdog timeout. So without 1a.7, the MVP exit criterion "throughput ≈ (N-1)/N of baseline" cannot be demonstrated end-to-end. Scope: wire `NCCL_ASYNC_ERROR_HANDLING=1` at every `ncclCommInitRank`, add a watchdog thread polling `ncclCommGetAsyncError`, expose a `abort_and_reinit(active_ranks)` API for survivors to build a fresh comm excluding the dead rank, propagate aborted-comm exceptions into PR #12718's classifier. **Pure TRT-LLM-side wiring of existing NCCL primitives — zero NCCL-side changes required.** The harder Phase 2 problem (rebuild that doesn't depend on PT 2.11's broken `dist.shrink_group`) is PR 2a.1, not 1a.7.
 
 - **1a.8** is optional for MVP but valuable — tightens the 300s backstop and replaces `trap;` (which corrupts the CUDA context) with a host-visible flag write, letting the host recover rather than requiring process restart.
+
+- **1a.9 / 1a.10 are conditional on Audit 3** ([§9.1](09-risks-and-open-questions.md#audit-3--nixl-ep-evaluation-as-data-plane-backend)). The NIXL team has built NIXL-EP, and vLLM PR #38534 already uses it as an FT-enabled backend. A bounded 2-week parallel evaluation track (E1–E5 in Audit 3) decides whether NIXL-EP slots into v1 as priority 3 between NVLinkTwoSided and AllGatherReduceScatter, or is declined. The evaluation runs in parallel with MVP and has no critical-path impact. If the outcome is positive, these two PRs ship in v1 and integrate NIXL-EP's `activeRanks`-style masking + abort with `EPGroupHealth` and the failure-broadcast path.
 
 ### 1b — EPLB topology adaptation
 
@@ -213,7 +217,7 @@ Phase totals account for parallelism: multiple PRs in the same sub-phase run con
 | Phase | PRs | Calendar time | Depends on | Deliverable |
 |:---|:---|:---|:---|:---|
 | **Phase 1 MVP (v0)** | 1a.1–1a.4 + 1a.7, 1b.1–1b.3, 1c.1–1c.4, 1d.0–1d.5 (14 PRs) | **~7 weeks** with 2–3 engineers + AI coding assistance | Kernel access; PR #12718 rebased | Single-failure survival on NVLinkOneSided; <10s recovery; no weight movement at recovery time; survivors don't die as collateral on TP/PP NCCL collectives |
-| **Phase 1 v1** | 1a.5–1a.8, 1b.4–1b.7, 1c.5–1c.6, 1d.6–1d.7 (12 PRs) | **6–9 weeks after MVP** | MVP landed | All NVLink backends, full EPLB reconfigure with weight migration, multi-failure consensus, production polish |
+| **Phase 1 v1** | 1a.5–1a.8 (+ 1a.9–1a.10 conditional on Audit 3), 1b.4–1b.7, 1c.5–1c.6, 1d.6–1d.7 (12 PRs, up to 14 with NIXL-EP) | **6–9 weeks after MVP** | MVP landed | All NVLink backends, full EPLB reconfigure with weight migration, multi-failure consensus, production polish; optional NIXL-EP backend integration |
 | **Phase 1-DS** | DS.1–DS.6 (6 PRs) | **3–4 weeks, parallelizable with v1** | MVP landed | Disagg serving FT with cross-pool coordination |
 | **Phase 2: Restoration** | 2a.0a/0b, 2a.1–2a.8, 2b.1–2b.4, 2c.1–2c.3 (17 items) | **10–14 weeks** | Phase 1 v1 complete; 2a.0a sizes the work, 2a.0b gates ship | Full N-rank restoration via PG rebuild + shadow EP ranks |
 | **Phase 3: Beyond failover** | 3a–3e tracks (not per-PR sized) | **~3 months** | Phase 2 complete + telemetry infra | Prevention, elastic scale, predictive |
