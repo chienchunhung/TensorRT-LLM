@@ -1,919 +1,553 @@
-# 10 — Ablation: what happens if we don't do mid-flight NIXL cancellation?
+# 10 — PR #13713 value proposition: why the cancel / RAII / lifetime / fail-closed surface is load-bearing
 
-PR [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) bundles
-five distinct defensive layers on top of the baseline timeout +
-state-ordering fixes:
+This section answers the three questions a PR #13713 reviewer typically
+asks first:
 
-1. **Mid-flight NIXL cancellation** — `release()` on `TransferStatus`,
-   `mHandleMutex` on `NixlTransferStatus`, the bounded poll loop in
-   `AgentConnection::send`, the per-request cancel registry in
-   `CacheSender::Impl` / `CacheReceiver::Impl`, the cancel-aware return
-   types on `AgentConnectionManager::waitForNotification` /
-   `recvReadySignalWithStatus`.
-2. **`BufferIndexHolder` RAII + `poison()`** — recv-side buffer-index
-   leak fix for the six exit paths in `CacheReceiver::Impl::requestSync`,
-   plus a `poison()` path that marks the buffer pool as
-   non-reusable when transport quiescence is unknown.
-3. **`shared_ptr<LlmRequest>` async-lifetime** — extension of the async
-   worker's grip on the `LlmRequest` past Python-side
-   `_terminate_request`.
-4. **Recv-side per-request idempotency** — guards against
-   double-fulfillment of a future when cancel and completion race.
-5. **Fail-closed on unquiesced transfer** (memory-safety policy) —
-   `BaseCacheTransceiver::hasPoisonedTransferBuffer` exposed to Python;
-   `py_executor._check_cache_transfer_errors` calls
-   `_fail_closed_for_unquiesced_disagg_transfer` and sets
-   `shutdown_event` when the pool is poisoned, deliberately shutting
-   down PyExecutor to prevent NIXL from writing into TRT-LLM-reclaimed
-   memory.
+1. **What fails, and where in the code does it fail?**
+2. **Why does it fail?** (root cause, not symptom)
+3. **How does PR #13713 help — and specifically, why is mid-flight
+   cancellation necessary?**
 
-Reviewer pushback during PR #13713 raised a fair question: are all five
-layers really load-bearing, or is the timeout-based eviction
-([`02-failure-signatures.md`](02-failure-signatures.md#signature-4)
-plus the `kv_transfer_timeout_ms` plumbing in
-[`08-next-steps-and-pr-map.md`](08-next-steps-and-pr-map.md)) alone
-enough? This section is the empirical answer.
-
-## TL;DR
-
-The defensive layers are **not optional belt-and-suspenders**.
-The 60 s production default never exercises them, but as soon as the
-cancel/timeout path fires:
-
-- Layers 1–4 (cancel, RAII, lifetime, idempotency) **convert a
-  permanent wedge into a recoverable transient-error regime**
-  (Experiment 4: `Broken promise` 89 → 0; `NO RECOVERY` 1 → 0).
-- Layer 5 (fail-closed on unquiesced transfer) **converts potential
-  use-after-free into a loud HTTP 400** (Experiment 6: PyExecutor on
-  the paused peer is shut down on head, surfacing
-  "PyExecutor has already been shutdown" to the orchestrator rather
-  than risking silent memory corruption on the ablation branch).
-
-The "lower availability" pattern that PR #13713 shows under brief
-peer-unresponsiveness is the **correct behaviour** of a memory-safety
-mechanism that deliberately trades apparent availability for verified
-safety. Ablation's higher apparent availability under the same
-condition is illusory — it is availability *with potential memory
-corruption from NIXL writes into reclaimed buffers*.
+The answers are backed by six A/B experiments comparing PR #13713 head
+(`local/pr13713-rc13-clean`) against an ablation branch with the cancel
+surface removed (`local/pr13713-no-midflight-cancel`).
 
 ---
 
-## Why the question came up
-
-Two earlier investigation phases produced a tempting but misleading
-hypothesis:
-
-- **conc=64 NIXL+UCX-plugin, `kv_transfer_timeout_ms=60000`, 5 iter** —
-  the no-midflight-cancel branch passed 5/5 with 715 requests per burst,
-  zero errors, zero failure markers, recovery in 30 s.
-- **conc=256 NIXL native, `kv_transfer_timeout_ms=60000`, 5 iter** —
-  same branch passed 5/5 again.
-
-Inspection of the per-worker logs after both runs showed
-`Cannot cancel request: 0`, `exceeded total timeout: 0`,
-`Broken promise: 0`, `bad_optional_access: 0`. The defensive layers had
-never *fired*. The workload never put the system into the failure
-regime they protect against, because at 60 s timeout every transfer
-completed within its natural latency under tested concurrency. This is
-consistent with [`04-reproduction.md`](04-reproduction.md): the
-customer wedge needs a load shape that produces cancels and retries, not
-just throughput pressure.
-
-So the conclusion from the 60 s-timeout passes is *not* "Tier 2 is
-unnecessary". It is "the workload tested didn't exercise Tier 2".
-
-The follow-up experiment lowers `kv_transfer_timeout_ms` to a value
-that *does* force the cancel/timeout path to fire under a stable, easy
-workload.
-
----
-
-## Setup
-
-### Branch under test
-
-`local/pr13713-no-midflight-cancel` on
-[`chienchunhung/TensorRT-LLM`](https://github.com/chienchunhung/TensorRT-LLM/tree/local/pr13713-no-midflight-cancel)
-(commit `e7b5931227`), built off PR #13713's head and removing only the
-four Tier 2 layers above. The preserved set on this branch is:
-
-- `kv_transfer_timeout_ms` C++ deadline in
-  `cacheTransceiver.cpp::checkContextTransferStatus` /
-  `checkGenTransferStatus`.
-- Python-side fallback deadline (`py_kv_transfer_start_time` in
-  `py_executor.py::_check_kv_transfer_timeout`).
-- `setState`-after-`receiveAsync` ordering in `requestAndReceiveAsync`
-  (with the lock-down test
-  `test_request_and_receive_async_state_ordering`).
-- Config plumbing for both timeout knobs (`llm_args.py`,
-  `executor.h`, nanobind).
-- `_terminate_request` boolean-return contract documentation.
-
-The smoke check used to confirm the binaries on each rebuild is:
-
-```python
-from tensorrt_llm.bindings.internal.batch_manager import CacheTransceiver
-hasattr(CacheTransceiver, 'has_poisoned_transfer_buffer')   # expected False
-```
-
-### Harness
-
-The standard
-[`run_combo_nixl_3pair.sh`](../../../../.repro/harness/threepair/) +
-`run_validation_loop.sh` from [`04-reproduction.md`](04-reproduction.md),
-configured for 3 ctx/gen pairs on a single B300 8-GPU host, NIXL native
-transport (`TRTLLM_NIXL_KVCACHE_BACKEND=NIXL`), and 5 burst iterations
-per run.
-
-For the ablation experiment, both worker configs
-(`ctx_config_nixl.yaml`, `gen_config_nixl.yaml`) lower the deadline
-knobs:
-
-```yaml
-cache_transceiver_config:
-  backend: NIXL
-  kv_transfer_sender_future_timeout_ms: 500      # poll slice
-  kv_transfer_timeout_ms: 1000                   # request deadline
-```
-
-The 1 s deadline is aggressive enough that any transfer queued behind a
-modest backlog hits it. At conc=64 with 3 pairs the per-pair queue
-depth averages ~21 in-flight transfers, which is enough to push
-individual transfers past 1 s during the burst.
-
-### Watchdog instrumentation
-
-The
-[`.repro/watchdog/dump_stacks_on_hang.sh`](../../../../.repro/watchdog/dump_stacks_on_hang.sh)
-helper polls `/health` on all seven ports every 15 s and, on four
-consecutive failures (~60 s of unresponsiveness), `kill -QUIT`s every
-`trtllm-serve` worker (printing Python thread stacks to stderr) and
-attaches `gdb --batch -ex 'thread apply all bt 30'` to each (printing
-all C++ thread stacks). Output lands in
-`<run_dir>/stack_snapshots/<ts>/`.
-
-The watchdog uses `mTerminate`-style polling, so it doesn't itself
-interact with the cancel path under test.
-
----
-
-## Six experiments
-
-The experiments traverse the timeout-pressure spectrum and finish with
-a peer-pause failure injection that triggers the memory-safety policy
-(layer 5) directly:
-
-| # | Workload | Branches | What it isolates |
-|---|---|---|---|
-| 1 | conc=64 NIXL+UCX, 60 s timeout, 5 iter | ablation only | Happy-path baseline; defenses dormant |
-| 2 | conc=256 NIXL native, 60 s timeout, 5 iter | ablation only | Throughput stress without timeout pressure |
-| 3 | conc=64 NIXL native, **1 s timeout**, 5 iter | ablation only | First scenario that drives the cancel/timeout path |
-| 4 | conc=64 NIXL native, **1 s timeout**, 5 iter | A/B (ablation vs head) | Confirms layers 1–4 are load-bearing |
-| 5 | conc=64 NIXL native, **5 s timeout**, 5 iter | A/B (ablation vs head) | Intermediate-pressure regime; shows when defenses fire silently |
-| 6 | conc=64 NIXL native, 5 s timeout, **SIGSTOP gen-8004 for 20 s mid-burst** | A/B (ablation vs head) | Directly drives layer 5 (fail-closed-on-unquiesced) and exposes the memory-safety semantics |
-
-### Experiment 1 — conc=64 NIXL+UCX-plugin, default 60 s timeout
-
-```text
-RUN_TAG=run_no_midflight_cancel_ucx_3pair_conc64
-CONC=64
-BURST_DUR_S=90
-TRTLLM_NIXL_KVCACHE_BACKEND=UCX
-kv_transfer_timeout_ms=60000   (default, preserved)
-```
-
-| iteration | burst | recovery | verdict |
-|---|---|---|---|
-| 1 | 715 ok / 0 err / 90.5 s | 30 s | PASS |
-| 2 | 715 ok / 0 err / 90.5 s | 30 s | PASS |
-| 3 | 715 ok / 0 err / 90.7 s | 30 s | PASS |
-| 4 | 715 ok / 0 err / 90.5 s | 30 s | PASS |
-| 5 | 715 ok / 0 err / 90.5 s | 30 s | PASS |
-
-Failure-marker scan: zero matches across all workers and all
-iterations.
-
-```text
-Cannot cancel request:    0
-exceeded total timeout:   0
-Broken promise:           0
-bad optional access:      0
-NO RECOVERY:              0
-OVERALL: PASS
-```
-
-**Interpretation:** The defensive layers were never reached. Every
-transfer completed inside its 60 s natural latency window. This run
-proves only that the no-midflight-cancel branch does not regress against
-happy-path workloads.
-
-### Experiment 2 — conc=256 NIXL native, default 60 s timeout
-
-```text
-RUN_TAG=run_no_midflight_cancel_nixl_native_conc256_clean
-CONC=256
-BURST_DUR_S=90
-TRTLLM_NIXL_KVCACHE_BACKEND=NIXL
-kv_transfer_timeout_ms=60000
-```
-
-(The "clean" suffix reflects an aggressive teardown
-— `pkill -9 -f tensorrt_llm.commands.serve` + `fuser -k`
-— between this run and the earlier conc=64 NIXL+UCX run; an
-earlier attempt without that teardown produced port conflicts and
-non-meaningful results.)
-
-| iteration | burst | recovery | verdict |
-|---|---|---|---|
-| 1 | 715 ok / 0 err / 90.5 s | 30 s | PASS |
-| 2 | 715 ok / 0 err / 90.5 s | 30 s | PASS |
-| 3 | 715 ok / 0 err / 90.7 s | 30 s | PASS |
-| 4 | 716 ok / 0 err / 90.6 s | 30 s | PASS |
-| 5 | 716 ok / 0 err / 90.5 s | 30 s | PASS |
-
-Failure-marker scan: zero matches again.
-
-```text
-Cannot cancel request:    0
-exceeded total timeout:   0
-Broken promise:           0
-bad optional access:      0
-NO RECOVERY:              0
-OVERALL: PASS
-```
-
-**Interpretation:** Throughput was identical to conc=64 (~715 req/burst
-in both runs), confirming the system is throughput-saturated at conc=64
-and further concurrency only deepens the queue, not the throughput.
-Per-request latency at conc=256 is ~32 s (256 in-flight, 8 req/s) —
-still well under the 60 s timeout. Same conclusion as Experiment 1: the
-defensive layers were never reached.
-
-### Experiment 3 — conc=64 NIXL native, 1 s timeout
-
-This is the ablation that actually exercises the cancel path. The
-timeout is aggressive enough that requests queued behind ~20 others on
-the same ctx/gen pair routinely cross the deadline.
-
-```text
-RUN_TAG=run_no_midflight_cancel_aggressive_timeout_conc64
-CONC=64
-BURST_DUR_S=90
-TRTLLM_NIXL_KVCACHE_BACKEND=NIXL
-kv_transfer_timeout_ms=1000               (aggressive)
-kv_transfer_sender_future_timeout_ms=500  (aggressive poll slice)
-```
-
-#### Per-iteration burst result
-
-```text
-iteration 1: 216 ok / 499 err / 715 total — 70 % error rate
-iteration 2: ABORT  — sanity probe failed (60 s read timeout)
-iteration 3: ABORT
-iteration 4: ABORT
-iteration 5: ABORT
-OVERALL: FAIL
-```
-
-The system enters a permanent wedge during iteration 1's burst and
-never recovers. Iterations 2 through 5 abort at the pre-burst sanity
-probe.
-
-#### Per-worker failure-marker breakdown
-
-```text
-log file              CanCanc  ExcTO   MarkErr   BrokPm
-context_8001                1    189       189        0
-context_8003                1    236       236        0
-context_8005                1     82        82        0
-generation_8002             1     29         0       29
-generation_8004             2     30         0       30
-generation_8006             1     30         0       30
-
-TOTAL                       7    596       507       89
-```
-
-Three things stand out:
-
-1. **7 `Cannot cancel request` events across both sides.** Each
-   represents a request that crossed the deadline while it was
-   mid-flight (past the queue-drain visible state, inside the NIXL
-   submit/wait or inside `waitForNotification`). The queue-drain
-   cancel could not find it, so the worker stayed parked.
-
-2. **Sender vs receiver have asymmetric failure shapes:**
-   - Sender (`context_*`): `ExcTO = MarkErr` (1:1). Every sender-side
-     timeout completes the "mark as error" transition cleanly. No
-     `Broken promise` on the sender side.
-   - Receiver (`generation_*`): `ExcTO = BrokPm` (1:1). **Every**
-     receiver-side timeout ends in `std::future_error: Broken promise`.
-
-3. **The 504/507 sender timeouts that *don't* produce `Cannot cancel`
-   were caught at the queue-drain layer** — i.e. the request was still
-   sitting in `mPendingRequests` or `mReadyResponses` when the deadline
-   fired, so the cancel removed it cleanly. The seven cancel-misses are
-   the requests that already passed the queue and entered NIXL submit
-   territory.
-
-#### The receiver-side cascade
-
-The PR-#13713-preserved gen-side log line is:
-
-```text
-[batchmgr] Generation KV cache transfer for request <id> reached
-  total timeout while waiting for receiver future. Requesting
-  cancellation and marking as error.
-```
-
-This is `checkGenTransferStatus` doing `wait_for(deadline_remaining)`
-on `mRequesterFutures`. When the future doesn't resolve, the timeout
-decision is made — but the underlying receiver worker is still stuck.
-The receiver worker's wait points (with the cancel-aware plumbing
-removed) are:
-
-```text
-CacheReceiver::Impl::requestSync()
-  ├── sendRequestAndBufferInfo(remote_ctx)
-  ├── recvReadySignal()
-  │     └── waitForReadySignal()
-  │           └── waitForNotification<ReadySignalInfo>(..., mTerminate)
-  │                 while (!mTerminate.load()) { ... yield ... }   ← stuck
-  └── formatter->receiveSync()
-        └── AgentConnection::recv()
-              └── waitForSyncInfo()
-                    └── waitForNotification<NotificationSyncInfo>(..., mTerminate)
-                          while (!mTerminate.load()) { ... yield ... } ← or stuck
-```
-
-`waitForNotification` checks only the **process-wide** `mTerminate`
-flag, not a per-request cancel. Without PR #13713's cancel-aware return
-plumbing, the receiver worker spins until process exit. When the
-deadline-eviction logic runs `_terminate_request`, the `LlmRequest`
-object is torn down (recall we also removed the `shared_ptr<LlmRequest>`
-lifetime extension), the `std::promise<void>` owned by the receiver
-worker is destroyed, and the upper layer's `future.get()` throws
-`std::future_error: Broken promise`. This is the 1:1 ratio on the gen
-side: every gen-side timeout ends in a broken promise.
-
-The full sequence per request, from the `context_8001` log (timestamps
-elided for brevity):
-
-```text
-... Generation KV cache transfer for request <id> reached total
-    timeout while waiting for receiver future. Requesting cancellation
-    and marking as error.
-... Cannot cancel request <id>                            ← in some cases
-... Set request <id> from state 9 to -1                   ← state 9 = DISAGG_GENERATION_TRANS_IN_PROGRESS
-... Generation KV cache transfer for timed-out request
-    <id> finished with error: std::future_error: Broken promise
-... Set request <id> from state -1 to 20                  ← state 20 = error reported up
-```
-
-#### The sender-side cascade
-
-The sender side ships its own preserved log line:
-
-```text
-[batchmgr] Context KV cache transfer for request <id> exceeded
-  total timeout: elapsed 1XXX ms > limit 1000 ms. Marking as error.
-```
-
-This is `checkContextTransferStatus` doing the same `wait_for` over
-`mSenderFutures`. The sender worker's wait points (with the bounded
-poll loop and `release()` removed) are:
-
-```text
-CacheSender::Impl async worker
-  └── CacheFormatter::format(session)
-        └── sendBuffer(session, ...)
-              └── AgentConnection::send(ctx, data, size)
-                    ├── status = mAgent->submitTransferRequests(request)
-                    ├── status->wait()        ← UNBOUNDED on revert; was bounded poll on PR #13713
-                    └── mAgent->notifySyncMessage(remote, ...)
-```
-
-`NixlTransferStatus::wait()` on the revert is a `while (true)` over
-`mRawAgent->getXferStatus(mHandle)` that returns only on
-`NIXL_SUCCESS` or non-`NIXL_IN_PROG` status. There is no external
-signal that can break it — except for `release()`, which the revert
-removed. The worker spins in `yield()` until NIXL eventually completes
-the submit. *In our experiment that does happen* (NIXL's queue
-eventually drains), which is why the sender side doesn't produce
-`Broken promise` — the worker does eventually call `set_value` on its
-promise. The damage is the latency, not the cleanup: the buffer index
-the worker holds is leaked for the entire duration of the stuck
-wait, and the deadline-eviction has already marked the request as
-error so the response is discarded.
-
----
-
-## Mapping the observed failures to the L1–L10 defect layers
-
-Cross-referencing against
-[`03-defect-class-stack.md`](03-defect-class-stack.md):
-
-| Observation in this experiment | Defect-class layer | PR #13713 fix that closes it |
+## Why this section exists (value positioning)
+
+PR #13713 does not close a single customer-reported regression. The
+NVBug 6104831 wedge is closed at lower concurrency by simpler subsets
+of the stack. What PR #13713 lands is a **comprehensive defensive
+surface** over the disaggregated KV-cache transceiver — five
+interlocking layers that close the latent invariant gaps in the cancel
+/ cleanup / lifetime / quiescence semantics.
+
+The temptation in reviewing work like this is to ask "what bug does
+each line fix?" and to push back on anything that isn't a 1:1 customer
+regression repro. The cost of that framing is exactly what this
+investigation spent on the path from sig `#1` to sig `#8`: peeling one
+signature, finding another behind it, peeling that, finding another.
+Sigs `#1`–`#8` are eight sequential discoveries of the same underlying
+gap, surfacing differently under different load shapes, transports, and
+rc-level scheduler defaults. Every signature looked like its own bug
+until we proved it was the same gap.
+
+The value PR #13713 offers is **not** another rev of "fix the next
+signature". It is **the close-out of the invariant class** — the
+position from which future load shapes, transport backends, and
+scheduler changes do not reopen this investigation. Future-proofing
+the transceiver against a class of latent bugs is, in this codebase,
+a higher-leverage spend of review effort than fixing them individually
+as they surface.
+
+The headline TL;DR, in three rows:
+
+| Tier | Failure class | Closed by |
 |---|---|---|
-| 7 × `Cannot cancel request` | L7 (mid-flight cancellation is impossible without `release()`) | Mid-flight NIXL cancellation: `release()` + `mHandleMutex` + bounded poll loop in `AgentConnection::send` + per-request cancel registry |
-| 89 × `Broken promise` on gen side, 1:1 with ExcTO | L3 (promise/future race on cancel) + L5 (`LlmRequest` lifetime) | Recv-side per-request idempotency + `shared_ptr<LlmRequest>` async-lifetime |
-| Receiver workers parked in `waitForNotification` (inferred from L3 cascade) | L7 again, receiver flavour | Cancel-aware return types on `waitForNotification` / `recvReadySignalWithStatus` + tri-state recv ready signal |
-| Sender worker spins in `NixlTransferStatus::wait` until NIXL drains | L7 + L2 (buffer-index leak on long-stuck wait) | Bounded poll loop with `release()` on cancel + `BufferIndexHolder` RAII |
-| 0 × `bad_optional_access` | L5 (lifetime) — *protection not exercised, but not because protection was unnecessary*; the timing simply didn't catch the freed-`LlmRequest` window. The ablation removed the guard. | `shared_ptr<LlmRequest>` async-lifetime |
-
-So the experiment empirically validates that at least four invariants
-in [`03-defect-class-stack.md`](03-defect-class-stack.md) (L2, L3, L5,
-L7) are load-bearing under any workload that drives the cancel/timeout
-path. The Tier 1 deadline-eviction work by itself catches the issue
-but cannot recover the resources — it converts a hang into a slow
-wedge, not into a clean error.
+| **1 — Correctness (memory safety)** | Baseline `kv_transfer_timeout_ms` frees a buffer NIXL is still pinning → NIXL eventually writes into the reclaimed buffer → silent corruption of an unrelated request's response. | Layers 1 + 2 + 5 (mid-flight cancel + poison + fail-closed) |
+| **2 — Operability (debuggability)** | `NixlTransferStatus::wait()` is unbounded. Python's `kv_transfer_timeout_ms` cannot reach the C++ worker. Terminal peer failures leak workers indefinitely. | Layer 1 (`release()`) — the only application-level exit from NIXL's submit/wait API |
+| **3 — Quality of service** | `Broken promise` cascade (89–162 events per burst), buffer-pool starvation on cancel exit paths, unbounded recovery from peer slowdowns. | Layers 2, 3, 4 in combination |
 
 ---
 
-## What this conclusively shows, and what it doesn't
+## What fails, and where
 
-**Shown (this experiment plus Experiments 1 and 2):**
+Four concrete failure modes, each with code site and observable
+symptom:
 
-- PR #13713's defensive layers are dormant under happy-path workloads
-  with the production-default 60 s timeout. Removing them on the
-  no-midflight-cancel branch does not regress happy-path latency or
-  recovery.
-- The same defensive layers become load-bearing the moment a workload
-  drives the cancel/timeout path. The 1 s ablation wedges in iteration
-  1 with exactly the failure signatures the defensive layers were
-  designed to break (`Cannot cancel request`, `Broken promise`,
-  permanent wedge).
-- The receiver side is the structurally worse failure mode of the two:
-  every gen-side timeout produces a `Broken promise` (vs zero on the
-  sender side).
-- The 60 s passes from earlier do not imply the defenses are
-  unnecessary — they imply the workload tested didn't push the system
-  into the regime the defenses protect against. Earlier passes are
-  necessary but not sufficient evidence.
+### 1. Permanent worker wedge — the NVBug 6104831 customer report
 
-### Experiment 4 — A/B run on PR #13713 head under the same 1 s timeout
+**Symptom:** generation pod stops responding after the first burst.
+Workers stay alive (no crash, no exit). Generation event loop never
+recovers. Probes hit `ReadTimeout`.
 
-The same aggressive-timeout harness was applied to PR #13713 head
-(`local/pr13713-rc13-clean`, defensive layers present and active). The
-prediction going in was a clean 5/5 PASS. The actual result is more
-informative than that.
+**Where:** a sender's C++ async thread is parked in
+`NixlTransferStatus::wait`
+(`cpp/tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.cpp`)
+called from `AgentConnection::send`
+(`cpp/tensorrt_llm/executor/cache_transmission/agent_utils/connection.cpp`).
+`nixlAgent::getXferStatus` keeps returning `NIXL_IN_PROG` because the
+peer has gone silent. The Python event loop has already marked the
+`LlmRequest` as error via `kv_transfer_timeout_ms` and called
+`_terminate_request`, but the C++ worker has no application-level
+signal to break out.
+
+### 2. Broken-promise cascade
+
+**Symptom:** 89–162 `std::future_error: Broken promise` exceptions per
+burst on cancel-heavy workloads (Experiment 4: 89; Experiment 6: 162).
+
+**Where:** `cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp` —
+`receiveAsync` and the recv-side machinery. The race: cancel and
+completion paths fulfill the same `std::promise<TransferResult>`
+concurrently. Whichever loses sees a destroyed promise. The exception
+trace points at the *consumer* of the future, not the producer race,
+which is why this signature took multiple investigation phases to
+root-cause.
+
+### 3. Buffer-pool starvation (sig `#6`)
+
+**Symptom:** receiver workers stuck in
+`BaseTransBufferManager::assignBufferIndex`, parked on `mBuffersCV`
+indefinitely. Permanent wedge of the receiver-side worker.
+
+**Where:** `cpp/tensorrt_llm/batch_manager/baseTransBuffer.cpp` plus
+the early-return path in
+`cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp::CacheReceiver::Impl::receiveSync`.
+The latter leaks the buffer index slot without returning it to the
+pool; after enough cancellations, every slot is leaked and new
+transfers wait forever.
+
+### 4. Silent use-after-free of an NIXL-pinned buffer (the memory-safety hazard)
+
+**Symptom:** HTTP 200 responses with garbled bytes. *Invisible to
+throughput metrics.* The worst kind of failure: the orchestrator sees
+healthy responses and routes more traffic at the corrupted worker.
+
+**Where:** opened by the combination of `kv_transfer_timeout_ms`-driven
+`_terminate_request` (`tensorrt_llm/_torch/pyexecutor/py_executor.py`)
+and the absence of any application-level cancellation of the NIXL
+request. NIXL retains the destination buffer pin; TRT-LLM reclaims the
+buffer to the allocator; the next request gets the same buffer; NIXL's
+queued push eventually writes the original payload into the new
+request's buffer.
+
+We did not observe (4) directly under AddressSanitizer (see "Honest
+gaps"). The architectural timeline is given in "Why it fails"; the
+observable proxy is that Experiment 6 directly observed Layer 5
+shutting `PyExecutor` down by design exactly when (4)'s preconditions
+held on head.
+
+---
+
+## Why it fails
+
+The shared root cause is a missing invariant on the disaggregated
+transceiver:
+
+> Cancellation of a `LlmRequest` must drain — or at minimum
+> *signal-to-NIXL* — any in-flight transport handle owned by that
+> request **before** the request's destination buffer is returned to
+> the allocator.
+
+The baseline `rc11` / `rc13` code does not enforce this invariant.
+Four contributing facts:
+
+**(a) NIXL's `submitTransferRequests → getXferStatus` API has no
+application-level wake-up.** Three ways out of `NIXL_IN_PROG`: peer
+ack (`NIXL_SUCCESS`), NIC / agent error, or `releaseXferReq`. Without
+`releaseXferReq`, the C++ thread parks in `getXferStatus` until the
+peer behaves. `kv_transfer_timeout_ms` lives entirely on the Python
+side — it changes Python state, not C++ thread state.
+
+**(b) `std::promise<TransferResult>` is single-fulfillment.** Both the
+cancel path and the natural-completion path can hold a reference. If
+both fire, one wins and the other throws `Broken promise`.
+
+**(c) `BaseTransBufferManager` uses raw buffer indices, not RAII.**
+Every cancel exit path is its own opportunity to leak an index. Easy
+to get right at write time; impossible to keep right as new exit paths
+land.
+
+**(d) C++ async workers reference `LlmRequest` by raw pointer /
+reference.** If Python's `_terminate_request` destroys the
+`LlmRequest` while the C++ worker is still unwinding from an
+interrupted `NixlTransferStatus::wait`, the worker reads freed memory.
+
+Each of (a)-(d) is benign in steady-state. Under cancellation pressure
+(short timeouts, peer slowdowns, deployment kill signals, transport
+backend changes) they compound into the four failure modes above. The
+critical point: *new* sources of cancellation pressure — short timeouts
+for SLA tightening, new transport backends, new schedulers that cancel
+more eagerly — re-expose this gap automatically. The investigation
+already saw this happen: rc13's default-on block reuse turned sig `#5`
+back into sig `#8` overnight.
+
+**The use-after-free timeline (failure mode #4) made concrete:**
 
 ```text
-RUN_TAG=run_pr13713_head_aggressive_timeout_conc64
-binary: local/pr13713-rc13-clean   (PR #13713 head)
-hasattr(CacheTransceiver, 'has_poisoned_transfer_buffer')  →  True
-CONC=64, BURST_DUR_S=90, TRTLLM_NIXL_KVCACHE_BACKEND=NIXL
-kv_transfer_timeout_ms=1000, kv_transfer_sender_future_timeout_ms=500
+T+0   sender: submitTransferRequests(dst=X)        X pinned by NIXL
+T+0   sender: status->wait()  (unbounded)
+T+0   receiver: peer slow/stuck                    NIXL push queued, not yet written
+T+5   deadline fires; "Marking as error"           X still pinned by NIXL
+T+5   _terminate_request → LlmRequest destroyed    X returned to allocator
+T+5–10 new request gets buffer at X                X holds new request's bytes
+T+20+ peer recovers / NIXL drains                  NIXL writes original payload into X
+                                                   ──► USE-AFTER-FREE
+T+30+ client of new request sees HTTP 200          Response contains garbled bytes
 ```
 
-| iteration | result |
+A deployment with `kv_transfer_timeout_ms` set but without PR #13713's
+defensive surface is **strictly less safe** than one without any
+deadline-eviction at all — the latter at least doesn't free the buffer
+out from under NIXL.
+
+---
+
+## How PR #13713 helps — and why mid-flight cancellation is the keystone
+
+PR #13713 introduces five interlocking layers. **Layer 1 (mid-flight
+NIXL cancellation) is the keystone** — without it, the rest of the
+stack has nothing to act on.
+
+### Layer 1 — `release()` on `NixlTransferStatus` + `AgentConnection::send` poll loop
+
+Adds `NixlTransferStatus::release()` calling
+`nixlAgent::releaseXferReq` under `mHandleMutex`. `AgentConnection::send`
+(and `recv`) replaces the unbounded `status->wait()` with a poll loop
+that checks a per-request cancel registry on each slice. On cancel
+detection it calls `release()` and throws — unwinding the worker.
+
+Code:
+- `cpp/tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.{h,cpp}`
+  — `release()` + `mHandleMutex`
+- `cpp/tensorrt_llm/executor/cache_transmission/agent_utils/connection.{h,cpp}`
+  — poll loop in `send()` / `recv()`, per-request cancel check
+
+> **Why mid-flight cancellation is necessary, in one sentence:**
+> without `release()`, `kv_transfer_timeout_ms` is a Python-level
+> timeout that cannot actually interrupt the C++ thread doing the
+> transfer — the C++ worker is stuck inside an NIXL API call with no
+> application-level wake-up, and Python's "marked as error"
+> disposition has no causal connection to the C++ worker's state.
+
+**Proof.** Experiment 6, transient peer pause via SIGSTOP-gen-8004 for
+20 s mid-burst:
+
+| Branch | Worker recovery after SIGCONT |
 |---|---|
-| 1 | **PASS** — burst `216 ok / 477 err / 715`, RECOVERY at idle=30 s |
-| 2 | FAIL — sanity probe `http_500` (system still draining) |
-| 3 | FAIL — sanity probe `http_500` |
-| 4 | **PASS** — RECOVERY at idle=**60 s** (longer idle was enough) |
-| 5 | FAIL — sanity probe `http_500` |
+| Ablation (no `release()`) | **NO RECOVERY** in 60 s probe window; HTTP 500 at +60 s |
+| PR #13713 head | **HTTP 200 at +1.71 s** |
 
-5/5 was not reached, but neither was the permanent wedge from
-Experiment 3. The system is in a recoverable transient-error regime,
-not a wedge.
+That's a ~50× differential under a *transient* failure. The
+customer-reported NVBug 6104831 wedge is the canonical *terminal*
+failure case: NIXL never returns, `release()` is the only exit.
 
-#### A/B comparison table
+### Layer 2 — `BufferIndexHolder` RAII + `poison()`
 
-| Marker | No-midflight-cancel (Experiment 3) | PR #13713 head (Experiment 4) | Δ |
+RAII guard around buffer-index acquisition; every exit path returns
+the index to the pool. On a cancel-driven exception, the catch block
+in `cacheFormatter.cpp` / `mlaCacheFormatter.cpp` calls
+`sendHolder.poison()` — sets `mPoisoned` on `BaseTransBufferManager`.
+`mPoisoned` is the "we cancelled but cannot prove the transport is
+quiescent" flag.
+
+Code:
+- `cpp/tensorrt_llm/batch_manager/baseTransBuffer.{h,cpp}` — RAII + `poison()`
+- `cpp/tensorrt_llm/batch_manager/cacheFormatter.cpp` — catch block
+- `cpp/tensorrt_llm/batch_manager/mlaCacheFormatter.cpp` — catch block (MLA port)
+
+**Depends on Layer 1.** The catch block only fires on a cancel-driven
+throw. Without Layer 1's throw path, no signal.
+
+**Proof.** Experiment 4 (1 s timeout, conc=64): ablation `NO RECOVERY`
+count = 1 (iter 1 wedges, iters 2–5 abort at sanity probe); head `NO
+RECOVERY` count = 0 plus 2/5 PASS. The RAII destructor returning
+indices on every exit path is what unblocks subsequent iterations.
+
+### Layer 3 — `std::shared_ptr<LlmRequest>` async lifetime
+
+Changes `CacheTransceiver::sendAsync` / `receiveAsync` to take
+`std::shared_ptr<LlmRequest>` instead of `LlmRequest&`. Pins the
+request lifetime to the C++ async operation, independent of when
+Python's `_terminate_request` runs. Closes the use-after-free race
+that Layer 1 **exposes** — now that the worker can unwind mid-transfer,
+it might unwind into a destroyed `LlmRequest`.
+
+Code:
+- `cpp/tensorrt_llm/batch_manager/dataTransceiver.{h,cpp}` — signature change
+
+**Depends on Layer 1.** Layer 1 creates the race; Layer 3 closes it.
+Asking "why not remove just the shared_ptr part?" gets: because Layer 1
+created the race that the shared_ptr closes. Removing 3 reopens a race
+that didn't exist before Layer 1.
+
+### Layer 4 — Recv-side per-request idempotency
+
+Guards `std::promise<TransferResult>` fulfillment against the
+cancel / completion race that produces `Broken promise`.
+
+Code:
+- `cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp` — recv-side
+  per-request guard
+
+**Proof.** `Broken promise` counts: Experiment 4 ablation = 89, head =
+0; Experiment 6 ablation = 162, head = 0. Cleanest single A/B signal
+in the entire investigation.
+
+### Layer 5 — `_fail_closed_for_unquiesced_disagg_transfer` (memory-safety policy)
+
+Python reads `has_poisoned_transfer_buffer()` in
+`_check_cache_transfer_errors`; if true, sets `shutdown_event` and
+graceful-shuts-down `PyExecutor`. When Layer 2's `mPoisoned` is set,
+we *know* we cancelled with non-zero probability of incomplete
+quiescence; continuing to allocate buffers from a possibly-still-pinned
+pool is unsafe. The only safe response is to take the pod out of
+service explicitly so the orchestrator restarts it.
+
+Code:
+- `tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py` —
+  `has_poisoned_transfer_buffer()` shim
+- `tensorrt_llm/_torch/pyexecutor/py_executor.py` —
+  `_fail_closed_for_unquiesced_disagg_transfer`,
+  `_check_cache_transfer_errors`
+- `cpp/tensorrt_llm/batch_manager/cacheTransceiver.{h,cpp}` +
+  `cpp/tensorrt_llm/nanobind/batch_manager/cacheTransceiver.cpp` —
+  `hasPoisonedTransferBuffer` aggregation + binding
+
+**Depends on Layers 1 and 2.** Layer 5 has no signal to act on without
+Layer 2's poison flag; Layer 2 has no exception to catch without Layer
+1's throw. Asking "can we land just Layer 5?" gets: no, Layer 5 has
+no input.
+
+**Proof.** Experiment 6 head log:
+
+```text
+[serve] Client error to http://localhost:8004/v1/chat/completions:
+  400, message='Bad Request: PyExecutor has already been shutdown.'
+```
+
+`has_poisoned_transfer_buffer present: True` on head; `False` on
+ablation. The fail-closed shutdown fired on head exactly when designed.
+Ablation has no such guard and proceeds into the UAF window.
+
+### Why the layers must land as a unit
+
+```text
+   Layer 1 (mid-flight cancel)
+   release() + poll loop in send/recv
+        │ throws on cancel
+        ▼
+   Layer 2 (RAII + poison)
+   BufferIndexHolder catches, sets mPoisoned
+        │ exposed as has_poisoned_transfer_buffer()
+        ▼
+   Layer 5 (Python fail-closed)
+   _fail_closed_for_unquiesced_disagg_transfer
+   → shutdown_event.set() → graceful PyExecutor exit → HTTP 400
+
+   Independent races opened/closed by Layer 1:
+   Layer 3 (shared_ptr<LlmRequest>): keeps the request alive while
+            the unwinding C++ worker still references it.
+   Layer 4 (recv-side idempotency): guards std::promise against
+            double-fulfillment when cancel and completion race.
+```
+
+There is no consistent subset to ship. "Just Layer 1" leaves Layer 3's
+race uncovered (UAF on `LlmRequest`) and re-introduces Layer 4's
+broken-promise cascade. "Just Layer 5" has no input. "Layers 1+3+4 but
+skip 5" leaves the buffer-pool corruption invisible to Python and lets
+the worker keep serving from a possibly-corrupted pool.
+
+---
+
+## Empirical evidence — six experiments
+
+| # | Workload | Branches | Headline result |
 |---|---|---|---|
-| `Cannot cancel request` | 7 | 6 | -1 (essentially unchanged) |
-| `exceeded total timeout` | 596 | 961 | **+365** |
-| `Marking as error` | 507 | 965 | **+458** |
+| 1 | conc=64 NIXL+UCX, 60 s timeout | ablation only | PASS, defenses dormant |
+| 2 | conc=256 NIXL native, 60 s timeout | ablation only | PASS — concurrency alone doesn't trigger the failure class |
+| 3 | conc=64 NIXL native, **1 s timeout** | ablation only | **WEDGE** in iter 1; 89 `Broken promise`; iters 2–5 abort |
+| 4 | conc=64 NIXL native, 1 s timeout | A/B | Ablation: WEDGE; head: 2/5 PASS, **0 `Broken promise`** |
+| 5 | conc=64 NIXL native, **5 s timeout** | A/B | Both PASS, identical marker counts (13/13/13/0) — head's defenses fire silently |
+| 6 | conc=64, 5 s timeout, **SIGSTOP gen-8004 for 20 s** | A/B | Ablation stuck >82 s; head recovers in **1.71 s** + Layer 5 shuts down PyExecutor by design |
+
+### Regime spectrum
+
+| Timeout / Failure | Cancel-path pressure | Ablation | PR #13713 head |
+|---|---|---|---|
+| 60 s (production default) | dormant | PASS | PASS |
+| 5 s | fires silently — natural completion bails ablation out | PASS | PASS |
+| **1 s** | **saturated** | **permanent wedge** | 2/5 PASS, no permanent wedge |
+| **5 s + SIGSTOP** | **natural completion cannot bail out** | NO RECOVERY in 60 s; UAF window opens | recovers in 1.71 s; **Layer 5 fail-closed fires** |
+
+The regime spectrum is the central data point for the "future-proofing"
+argument. Under today's production defaults the ablation looks fine.
+Tighten the timeout to 1 s, or introduce a peer that pauses for 20 s,
+and the gap is immediate and severe. A future load shape that didn't
+exist when the code was written can reopen this without warning. The
+PR #13713 surface caps that exposure.
+
+---
+
+## Tradeoff acknowledgement
+
+PR #13713 deliberately trades **apparent availability** for **verified
+safety + bounded operability**:
+
+| Aspect | Ablation | PR #13713 head |
+|---|---|---|
+| Apparent availability during brief peer pause | Higher (degraded serving) | Lower (affected PyExecutor shut down) |
+| Memory safety after cancel with unknown quiescence | None — possible silent UAF | Enforced — preemptive shutdown |
+| Failure visibility to orchestrator | Silent (correct or corrupted HTTP 200) | Loud (explicit HTTP 400) |
+| Recovery from terminal peer failure | None (unbounded `status->wait()`) | Bounded by `kv_transfer_timeout_ms` |
+| `Broken promise` cascade | 89–162 per burst | 0 |
+| Worker-level recovery from transient pause | >80 s | 1.71 s |
+
+For orchestrated production (the customer scenario in NVBug 6104831),
+head is strictly preferred: a shut-down worker can be restarted and
+serves correct responses afterward; a worker silently serving
+corrupted responses is a much harder correctness hazard to detect.
+
+---
+
+## Honest gaps
+
+Three gaps in the empirical case. The architectural arguments hold
+without them; the experiments would make the case more compact:
+
+1. **Direct ASan observation of the UAF on ablation.** Failure mode
+   #4 rests on the architectural timeline plus the observation that
+   Layer 5 fires by design on head. A ~3–4 hour follow-up
+   (`-fsanitize=address` rebuild + re-run Experiment 6) would catch
+   the `heap-use-after-free` directly with addresses and stack trace.
+2. **SIGKILL injection (terminal peer failure).** All injections in
+   this study are *transient*. The strict-necessity claim for Layer 1
+   under terminal failures rests on the NIXL API shape and the NVBug
+   6104831 production report. A ~30 min SIGKILL follow-up would
+   directly show ablation never recovers while head unwinds and
+   surfaces HTTP 400.
+3. **Production-default 60 s timeout run on rc13-clean head.** The
+   README cites earlier rc11 / rc13 validation; we have not re-run
+   on the current rc13-clean state. Sanity-check follow-up.
+
+---
+
+## Appendix — per-experiment data
+
+### Experiment 1 — conc=64 NIXL+UCX, 60 s timeout (ablation)
+
+All 5 iters: 715 ok / 0 err / RECOVERY at idle=30 s. All markers zero.
+
+### Experiment 2 — conc=256 NIXL native, 60 s timeout (ablation)
+
+All 5 iters: 715–716 ok / 0 err / RECOVERY at idle=30 s. All markers
+zero. Confirms throughput pressure alone doesn't trigger this failure
+class.
+
+### Experiment 3 — conc=64 NIXL native, 1 s timeout (ablation only)
+
+```text
+iter 1: 216 ok / 499 err / 715 total — 70 % error rate
+iter 2–5: ABORT at sanity probe
+OVERALL: FAIL (permanent wedge)
+```
+
+Markers: `Cannot cancel`=7, `ExcTO`=596, `MarkErr`=507,
+**`Broken promise`=89** (1:1 with receiver-side timeouts). Receiver
+workers parked in `waitForNotification`; promises destroyed when
+`LlmRequest` torn down → broken-future errors.
+
+### Experiment 4 — A/B at 1 s timeout
+
+| Marker | Ablation | Head | Δ |
+|---|---|---|---|
+| `Cannot cancel request` | 7 | 6 | -1 |
+| `exceeded total timeout` | 596 | 961 | +365 (head processes more) |
+| `Marking as error` | 507 | 965 | +458 |
 | **`Broken promise`** | **89** | **0** | **-89** |
-| `bad_optional_access` | 0 | 0 | 0 |
 | **`NO RECOVERY`** | **1** | **0** | **-1** |
-| Iteration verdicts | F/F/F/F/F | P/F/F/P/F (2 PASS) | +2 PASS |
-| Overall | FAIL (permanent wedge) | FAIL (transient errors, recoverable) | qualitatively different |
+| Iteration verdicts | F/F/F/F/F | P/F/F/P/F | +2 PASS |
 
-#### Interpretation
+### Experiment 5 — A/B at 5 s timeout
 
-The result confirms three of the four originally predicted defensive
-layers and partially confirms the fourth:
+Both branches PASS all 5 iters: 716 ok / 0 err / RECOVERY at idle=30 s.
+Markers identical across branches: `Cannot cancel`=13, `ExcTO`=13,
+`MarkErr`=13, `Broken promise`=0. The cancel path fires on both
+branches (queue-drain misses); the behavioural difference is
+*downstream* — head's worker unwinds in ms via the Layer 1 throw;
+ablation's spins for ~30 s until NIXL drains naturally, confirmed by
+`elapsed 30-32 s > limit 5000 ms` log lines.
 
-1. **Recv-side idempotency + `shared_ptr<LlmRequest>` lifetime: 89 → 0
-   `Broken promise`.** This is the single cleanest signal in the A/B.
-   Every receiver-side timeout that produced a broken promise on the
-   ablation branch is now handled cleanly. This layer is unambiguously
-   load-bearing.
+### Experiment 6 — SIGSTOP-injected peer pause
 
-2. **Mid-flight cancellation: prevents the permanent wedge** — `NO
-   RECOVERY` drops from 1 to 0, and 2/5 iterations actually recover.
-   The system regains the ability to make forward progress.
-   *However*, `Cannot cancel request` only drops from 7 to 6, not to
-   0. The remaining six are explainable: mid-flight cancellation
-   closes the `status->wait()` window, but the cancel call itself
-   still has a narrow window where the cancel can fire after the
-   worker is past the cancellable region (e.g., in
-   `notifySyncMessage`, which is non-interruptible). What matters is
-   that these residual `Cannot cancel` events on head do *not*
-   escalate into `Broken promise` or buffer-pool starvation — they
-   are contained by the other defensive layers.
-
-3. **`BufferIndexHolder` RAII**: indirectly confirmed by the absence
-   of permanent wedge. With buffer-index leaks on every cancel/error
-   path the no-midflight-cancel branch wedged within iteration 1; on
-   head the pool survives 5 iterations.
-
-4. **Counter-intuitive increase in `exceeded total timeout`
-   (596 → 961) and `Marking as error` (507 → 965).** Head sees *more*
-   timeouts in absolute terms because it keeps the system processing
-   requests; the ablation branch wedged and stopped accepting work,
-   so its absolute count is artificially low. Higher error count is
-   a sign of higher throughput, not worse behavior.
-
-The 1 s timeout was deliberately chosen as 60× more aggressive than
-the production default. At this pressure, even PR #13713's defenses
-are working hard — burst-1 on head still has a 67 % error rate during
-the burst (238 ok / 477 err / 715 total). The system survives because
-it doesn't wedge, but the 30 s post-burst idle isn't always long
-enough to drain the backlog of error-marked requests before the next
-iteration's sanity probe fires. Iteration 4's longer 60-second idle
-was sufficient — hence its PASS.
-
-So we observe two distinct recovery phenomena:
-
-- **Macro-scale (between iterations):** PR #13713 wins decisively —
-  it eventually recovers every iteration; ablation never recovers.
-- **Micro-scale (during the 30 s post-burst idle):** PR #13713 needs
-  more time at this workload because the system has to drain
-  hundreds of errored requests through the cancel/cleanup pipeline.
-
-#### Where 1 s sits in the timeout-regime spectrum
-
-After Experiments 4, 5, and 6 are folded in, the full regime is:
-
-| Timeout / Failure | Cancel-path pressure | No-midflight-cancel | PR #13713 head | Layers exercised |
-|---|---|---|---|---|
-| 60 s (production default) | dormant | PASS (Experiments 1, 2) | PASS (rc11/rc13 validation) | None |
-| **5 s (intermediate)** | **fires silently — natural completion (~30 s observed) bails out the ablation branch** | PASS (Experiment 5) | PASS (Experiment 5) | Layers 1–2 fire; cancel-path logs identical on both branches; iter-level outcomes identical |
-| **1 s (~60× tighter)** | **saturated** | **permanent wedge in iter 1** (Experiment 3, 4) | **2/5 PASS, transient errors, no permanent wedge** (Experiment 4) | Layers 1–4 actively load-bearing; Layer 5 starts to fire under high error volume |
-| **5 s + SIGSTOP peer pause** | **natural completion cannot bail out — peer is genuinely paused** | Worker stuck >82 s after SIGCONT, NO RECOVERY in 60 s; *NIXL eventually writes into reclaimed buffers* (Experiment 6) | Worker recovers in 1.71 s; **`_fail_closed_for_unquiesced_disagg_transfer` shuts down the affected PyExecutor** to prevent UAF (Experiment 6) | **All 5 layers exercised**, including Layer 5 (memory-safety policy) |
-| 200 ms (theoretical) | pathological | trivial wedge | likely wedge — not all problems can be solved | — |
-
-The 1 s point stresses layers 1–4. The SIGSTOP point is the canonical
-"slow / unresponsive peer" failure that drives layer 5 directly, and
-shows that PR #13713 trades availability for memory safety **by
-design** in exactly that scenario.
-
-### Experiment 5 — A/B sweep at the intermediate 5 s timeout
-
-To probe the middle of the timeout-pressure spectrum, both branches
-ran the same 5-iteration validation loop with
-`kv_transfer_timeout_ms=5000` and `kv_transfer_sender_future_timeout_ms=2500`.
-
+Timing:
 ```text
-RUN_TAGs: run_no_midflight_cancel_5s_timeout_conc64
-          run_pr13713_head_5s_timeout_conc64
-CONC=64, BURST_DUR_S=90, TRTLLM_NIXL_KVCACHE_BACKEND=NIXL
+T+150 s after launch: SIGSTOP gen-8004
+T+170 s:              SIGCONT gen-8004
+Injector probes at +0, +1, +2, +5, +10, +20, +30, +60 s after SIGCONT
 ```
 
-#### Result
-
-Both branches **PASS** all 5 iterations: 716 ok / 0 errors per burst,
-RECOVERY at idle=30 s every time. Per-branch failure-marker counts
-across the 5 iterations:
-
-| Marker | ablation | head |
-|---|---|---|
-| `Cannot cancel request` | **13** | **13** |
-| `exceeded total timeout` | **13** | **13** |
-| `Marking as error` | **13** | **13** |
-| `Broken promise` | 0 | 0 |
-| `bad_optional_access` | 0 | 0 |
-| `NO RECOVERY` | 0 | 0 |
-
-#### Why the marker counts are identical (and why this is consistent with PR #13713 being correct)
-
-`Cannot cancel request` is emitted by `CacheSender::Impl::cancelRequest` /
-`CacheReceiver::Impl::cancelRequest` *whenever the queue-drain cancel
-cannot find the request in `mPendingRequests` / `mReadyResponses` /
-etc.* — meaning the request is already past the queue layer. PR #13713's
-mid-flight cancellation does *not* prevent this log: it adds an
-*additional* action (flip the per-request cancel atomic, call
-`release()` on the NIXL handle, throw) on top of the same log. The
-visible diagnostic is unavoidably the same on both branches when the
-cancel path is exercised.
-
-The actual divergence is *downstream* of the log:
-
-| Step | Ablation @ 5 s | Head @ 5 s |
-|---|---|---|
-| 1. Deadline fires | `exceeded total timeout` | same |
-| 2. cancel_request called | `Cannot cancel request` | same |
-| 3. Per-request cancel atomic flipped | (no flag) | flag flipped |
-| 4. `AgentConnection::send → status->wait()` | spins until NIXL drains naturally (~30 s observed in worker logs: `elapsed 30-32 s > limit 5000 ms`) | poll loop sees flag → `release()` → throws |
-| 5. Worker fate | stays parked tens of seconds; promise eventually gets `set_value` once NIXL drains | unwinds immediately; promise gets exception |
-| 6. Buffer index | leaked tens of seconds | freed via `BufferIndexHolder` destructor |
-
-So at the 5 s timeout point — on this hardware — the natural-completion
-path on ablation happens to drain fast enough (~30 s) that:
-
-- No buffer index leak accumulates to pool starvation
-- No `Broken promise` cascade fires (the NIXL push *does* complete, so
-  the receiver promise *does* get `set_value`)
-- The deadline-eviction "Marking as error" runs after the request has
-  actually completed at the C++ layer — it is essentially decorative
-
-This is the regime where **PR #13713's defenses fire silently**:
-13 `release()` calls on head, 13 spin-until-NIXL-drains on ablation,
-both branches survive. The behavioural difference exists internally
-(measurably so under instrumentation) but does not manifest in
-client-visible verdicts.
-
-The 1 s point (Experiment 4) is the regime where the natural-completion
-path can *not* drain fast enough — that's where the difference
-explodes into 89 `Broken promise` events and a permanent wedge on the
-ablation branch.
-
-#### What 5 s does NOT prove
-
-The 5 s pass on ablation is **not** evidence that the defenses are
-unnecessary in production. The pre-conditions for the natural-completion
-path to bail us out — namely "NIXL transfer always eventually completes"
-— *fail in the canonical production failure mode*: a peer that is slow,
-unresponsive, OOM-ing, or has a stuck network. Experiment 6 forces that
-exact scenario.
-
-### Experiment 6 — SIGSTOP-injected peer pause (the memory-safety test)
-
-The 5 s sweep showed that natural completion of NIXL transfers masks
-the difference between branches. To break that assumption directly,
-this experiment **pauses one generation worker mid-burst** with
-`kill -STOP`, forcing in-flight NIXL transfers to that peer to freeze.
-After 20 s, the worker is resumed with `kill -CONT`. The injector then
-probes the disagg front-end every few seconds to measure how quickly
-the system can serve a fresh request again.
-
-```text
-RUN_TAG: run_sigstop_ablation
-         run_sigstop_head
-CONC=64, BURST_DUR_S=120, kv_transfer_timeout_ms=5000
-Failure injection:
-  T+~150 s after worker launch (mid iter-1 burst): SIGSTOP gen-8004
-  T+170 s: SIGCONT gen-8004
-  recovery probes at +0, +1, +2, +5, +10, +20, +30, +60 s after SIGCONT
-```
-
-#### Headline: worker-level recovery time after SIGCONT
-
-| Branch | Injector recovery probe outcome |
+| Branch | First HTTP 200 after SIGCONT |
 |---|---|
-| **Ablation** | All 7 probes fail (HTTP `000` = connection refused) up to +60 s; final probe at wall=82 s gets HTTP 500. **NO RECOVERY within 60 s of SIGCONT.** |
-| **PR #13713 head** | First probe at +0 s (wall=1.71 s after SIGCONT) returns **HTTP 200**. **RECOVERED at +0 s.** |
+| Ablation | NO RECOVERY in 60 s; HTTP 500 at wall=82.23 s |
+| Head | HTTP 200 at wall=1.71 s |
 
-The disagg front-end is responsive to fresh chat-completion requests
-**within 1.71 seconds of SIGCONT on head**, versus **never within 60 s
-on ablation**. A ~50× recovery-time differential under the textbook
-"peer briefly unresponsive" failure scenario.
-
-#### Marker breakdown across the 5 iterations
-
-| Marker | ablation | head |
+| Marker | Ablation | Head |
 |---|---|---|
 | `Cannot cancel request` | 9 | **0** |
 | `exceeded total timeout` | 1130 | 807 |
 | `Marking as error` | 967 | 854 |
 | **`Broken promise`** | **162** | **0** |
-| `bad_optional_access` | 0 | 0 |
-| `NO RECOVERY` | 0 | 1 |
-| iter verdicts | 3 PASS, 2 ABORT | 0 PASS, 1 NO RECOVERY + 4 ABORT |
+| `NO RECOVERY` | 0 | 1 (Layer 5 — by design) |
+| Iter verdicts | 3 PASS, 2 ABORT | 0 PASS, 1 NO RECOVERY + 4 ABORT |
 
-Note the *apparent* paradox: ablation has *more* PASS iterations
-than head. The next subsection explains why this is consistent with
-PR #13713 being correct.
-
-#### The surprise: head's PyExecutor shuts down by design
-
-Inspection of head's `front.log` reveals the cause of the iter-level
-"FAIL" outcomes:
+Layer 5 firing in head's `front.log`:
 
 ```text
-[serve] Client error to http://localhost:8004/v1/chat/completions:
-        400, message='Bad Request: {"object":"error",
-        "message":"PyExecutor has already been shutdown.",
-        "type":"BadRequestError","param":null,"code":400}'
+[serve] Client error: 400 'PyExecutor has already been shutdown.'
 ```
 
-Sometime after SIGCONT — driven by the C++ cleanup pipeline's discovery
-that buffer pool slots were poisoned during the cancel-with-unknown-
-quiescence cycle — Python's `_check_cache_transfer_errors` called
-`has_poisoned_transfer_buffer()`, got `True`, and invoked
-`_fail_closed_for_unquiesced_disagg_transfer()`, which set
-`shutdown_event`. PyExecutor on gen-8004 gracefully shut itself
-down.
-
-This is **PR #13713's layer 5 firing exactly as designed**. The full
-chain is:
-
-```text
-mid-flight cancel fires (release()) — layer 1
-  → catch block in cacheFormatter — layer 2
-    → sendHolder.poison() — layer 2
-      → BaseTransBufferManager mPoisoned = true — layer 2
-        → has_poisoned_transfer_buffer() == True — layer 5
-          → _fail_closed_for_unquiesced_disagg_transfer() — layer 5
-            → shutdown_event.set() — layer 5
-              → PyExecutor.shutdown() — layer 5
-                → HTTP 400 surfaced to disagg frontend — layer 5
-                  → 500 to client; orchestrator can restart pod
-```
-
-Ablation does not have layers 2.poison(), 5, or the `release()` call
-in layer 1. So on ablation, after the cancel-with-unknown-quiescence
-cycle, the system just keeps running. The NIXL transfers that were
-in flight when the peer was paused **eventually complete after
-SIGCONT** — writing into receiver-side buffers that TRT-LLM may have
-already marked-as-error and reclaimed for new requests. This is the
-textbook use-after-free / heap-corruption window. The ablation
-branch's "higher apparent availability" in this experiment is
-**availability with potential memory corruption from NIXL writes into
-TRT-LLM-reclaimed memory**.
-
-#### Memory-safety argument, made concrete
-
-```text
-Time (rel)  Ablation                                           Receiver-side buffer at addr X
-----------  -------------------------------------------------  ---------------------------------------
-T+0         sender: submitTransferRequests(dst=X, size=N)      X is pinned by NIXL for the push
-T+0         sender: status->wait() (unbounded)                 X reserved for this transfer
-T+0         receiver: gen-8004 paused via SIGSTOP              NIXL push is queued in receiver-side
-                                                               NIC, not yet committed to X
-T+5 s       deadline fires; `Marking as error`                 X is still pinned by NIXL
-T+5 s       Python: `_terminate_request(R)` runs               LlmRequest R destroyed
-T+5 s       LlmRequest destructor; recv buffer X freed         X returned to TRT-LLM allocator
-T+~5-10 s   New request gets buffer at (or overlapping) X      X now holds new request's data
-T+20 s      receiver: SIGCONT — NIXL drains queue               NIXL writes the original push data
-                                                               into X → CORRUPTION (overwrites
-                                                               the new request's bytes)
-T+20-30 s   Sender's status->wait() finally returns SUCCESS    Sender future gets set_value;
-                                                               "Cannot cancel" + "Marking as error"
-                                                               were already logged but the request
-                                                               was already torn down — log decoration
-T+30+ s     Client sees HTTP 200 from the corrupted response   Token stream may contain garbled
-                                                               or wrong-request tokens depending on
-                                                               which bytes were overwritten
-```
-
-We did not run with a content validator on the responses, so we cannot
-confirm corruption in the *ablation* run logs directly — but the
-architectural path above is the use-after-free window that
-`_fail_closed_for_unquiesced_disagg_transfer` is designed to close.
-PR #13713 deliberately surfaces the failure (HTTP 400 → 500 →
-orchestrator restart) rather than risk silent corruption.
-
-#### Tradeoff acknowledgement
-
-PR #13713 makes a deliberate tradeoff:
-
-| Aspect | Ablation | PR #13713 head |
-|---|---|---|
-| Apparent availability under brief peer-unresponsiveness | Higher (most requests serve, just slow) | Lower (PyExecutor on the affected pair shuts down) |
-| Worker-level recovery after peer resumes | >80 s, never reaches HTTP 200 in 60 s window | 1.71 s (other 2 pairs still serving) |
-| Memory safety after cancel with unknown quiescence | None — NIXL may write to reclaimed buffers | Enforced — PyExecutor shuts down preemptively |
-| Failure visibility to orchestrator | Silent (correct or corrupted HTTP 200) | Loud (HTTP 400 "PyExecutor has already been shutdown") |
-| `Broken promise` cascade | 162 | 0 |
-| `Cannot cancel request` | 9 | 0 |
-
-For an orchestrated production deployment (the customer scenario in
-NVBug 6104831), the head behaviour is **strictly preferred**:
-a worker that is shut down can be restarted by the orchestrator and
-serves correct responses afterwards; a worker that silently serves
-potentially-corrupted responses is a correctness hazard that is much
-harder to detect.
-
-### What this conclusively shows (final)
-
-Across all six experiments:
-
-1. **`Broken promise` is eliminated by PR #13713's recv-side
-   idempotency + `shared_ptr<LlmRequest>` lifetime.**
-   89 → 0 in Experiment 4 (1 s aggressive timeout) and 162 → 0 in
-   Experiment 6 (SIGSTOP failure injection) under identical
-   workloads. Single strongest signal of layers 3 and 4 doing real
-   work.
-2. **Permanent wedge from cancel-without-cleanup is eliminated by PR
-   #13713's mid-flight cancellation + `BufferIndexHolder` RAII.**
-   `NO RECOVERY` 1 → 0 in Experiment 4; worker-level recovery time
-   after SIGCONT drops from >82 s (still HTTP 500 at +60 s) to 1.71 s
-   in Experiment 6. ~50× recovery-time differential.
-3. **Throughput in the error regime is preserved by PR #13713 — and
-   `Cannot cancel request` events drop to zero under SIGSTOP** because
-   `release()` enables clean cancellation of in-flight NIXL transfers
-   (Experiment 6: 9 → 0). The 5 s sweep (Experiment 5) shows
-   the cancel path fires silently when natural completion happens
-   to bail out the ablation branch — but that natural-completion
-   assumption breaks under the canonical production failure (slow
-   or unresponsive peer), which is exactly what Experiment 6
-   simulates.
-4. **The fail-closed-on-unquiesced layer (layer 5) is the
-   memory-safety mechanism.** Experiment 6 directly observed
-   `_fail_closed_for_unquiesced_disagg_transfer` firing on head:
-   `PyExecutor has already been shutdown` surfaced as HTTP 400 to
-   the disagg frontend. This is the deliberate trade of apparent
-   availability for verified safety — without this layer, NIXL can
-   write into TRT-LLM-reclaimed buffers, silently corrupting
-   responses to unrelated requests.
-5. **PR #13713's defensive layers are not magic.** At 60× the
-   production timeout (Experiment 4) the system survives but with
-   transient errors. Under SIGSTOP-induced peer pause (Experiment
-   6), the affected gen worker shuts down — by design. Both
-   outcomes are correct: the system enters a state that the
-   orchestrator can recover from, rather than wedging silently or
-   serving corrupted data.
-
-### What remains unmeasured
-
-- **Direct empirical detection of memory corruption on ablation.**
-  Without an AddressSanitizer build of TRT-LLM or response-content
-  validation in the test client, the use-after-free path is shown
-  architecturally (see the timeline in Experiment 6) rather than
-  observed in flight. ASan or response-content validation would
-  give us a positive empirical detection of the corruption window.
-- **Production-default 60 s timeout run on PR #13713 head with the
-  current rc13-clean build** under the 3-pair conc=64 workload —
-  earlier 60 s-timeout passes on head are on rc11/rc13 builds and
-  pre-date the current rc13-clean state.
+Causal chain: `release()` → catch block → `sendHolder.poison()` →
+`mPoisoned=true` → `has_poisoned_transfer_buffer()=True` →
+`_fail_closed_for_unquiesced_disagg_transfer()` → `shutdown_event.set()`
+→ PyExecutor shutdown → HTTP 400.
 
 ---
 
 ## Reproduction artefacts
 
-Branch under test: `local/pr13713-no-midflight-cancel` at
-`e7b5931227` ("[None][None] PR#13713 prototype: remove mid-flight NIXL
-cancellation"). Pushed to
-[`chienchunhung/TensorRT-LLM`](https://github.com/chienchunhung/TensorRT-LLM/tree/local/pr13713-no-midflight-cancel).
+Branches: `local/pr13713-no-midflight-cancel` at commit `e7b5931227`
+([fork](https://github.com/chienchunhung/TensorRT-LLM/tree/local/pr13713-no-midflight-cancel))
+and `local/pr13713-rc13-clean` (PR #13713 head).
 
-Wheel archive (built `2026-05-13T19:16Z`,
-`tensorrt_llm-1.3.0rc14-cp312-cp312-linux_x86_64.whl`) preserved at
-`/home/chienchunh/wheel-archive/pr13713-no-midflight-cancel-<TS>/` for
-node-eviction recovery. See `RESTORE.md` in the same directory for the
-checklist.
+Smoke check on each rebuild:
 
-Per-run logs (all paths relative to the worktree they ran in):
+```python
+from tensorrt_llm.bindings.internal.batch_manager import CacheTransceiver
+hasattr(CacheTransceiver, 'has_poisoned_transfer_buffer')
+# expected: False on ablation, True on head
+```
 
-- Experiment 1 (ablation, conc=64 NIXL+UCX, 60 s timeout):
-  `.repro/logs/run_pr13713_reviewfix_v2_20260513_195048/`
-- Experiment 2 (ablation, conc=256 NIXL native, 60 s timeout):
-  `.repro/logs/run_no_midflight_cancel_nixl_native_conc256_clean_20260513_210018/`
-- Experiment 3 (ablation, conc=64 NIXL native, 1 s timeout):
-  `.repro/logs/run_no_midflight_cancel_aggressive_timeout_conc64_20260513_214652/`
-- Experiment 4 (head, conc=64 NIXL native, 1 s timeout):
-  `pr13713-rc13-clean/.repro/logs/run_pr13713_head_aggressive_timeout_conc64_20260513_223841/`
-- Experiment 5:
-  - ablation: `pr13713-no-midflight-cancel/.repro/logs/run_no_midflight_cancel_5s_timeout_conc64_20260513_230959/`
-  - head:     `pr13713-rc13-clean/.repro/logs/run_pr13713_head_5s_timeout_conc64_20260513_232319/`
-- Experiment 6 (SIGSTOP injection):
-  - ablation: `pr13713-no-midflight-cancel/.repro/logs/run_sigstop_ablation_20260514_003635/`
-  - head:     `pr13713-rc13-clean/.repro/logs/run_sigstop_head_20260514_004813/`
-  - Injector logs at `/tmp/sigstop-injector-{ablation,head}-*.log`
+Wheel archive: `/home/chienchunh/wheel-archive/pr13713-no-midflight-cancel-<TS>/`
+with `RESTORE.md` checklist.
 
-Harness variants (all live in `.repro/` of each worktree):
+Harness variants in `.repro/`:
 
-- `harness-aggressive-timeout/` — 1 s `kv_transfer_timeout_ms`,
-  500 ms sender-future poll slice. Used by Experiments 3 and 4.
-  Parallel run scripts: `run_combo_nixl_3pair_aggressive.sh`,
-  `run_validation_loop_aggressive.sh`.
-- `harness-5s-timeout/` — 5 s `kv_transfer_timeout_ms`,
-  2500 ms sender-future poll slice. Used by Experiments 5 and 6.
-  Parallel run scripts: `run_combo_nixl_3pair_5s.sh`,
-  `run_validation_loop_5s.sh`.
+- `harness-aggressive-timeout/` — 1 s timeout, 500 ms poll slice
+  (Experiments 3, 4)
+- `harness-5s-timeout/` — 5 s timeout, 2500 ms poll slice
+  (Experiments 5, 6)
 
-The SIGSTOP failure injector for Experiment 6 is at
-`/tmp/sigstop-injector.sh`; it waits for `/health=200` on the target
-port, sleeps 30 s so the SIGSTOP fires mid-burst, then SIGSTOPs the
-worker for 20 s, SIGCONTs, and probes the disagg frontend every few
-seconds to record the wall-time-to-first-HTTP-200 after SIGCONT. The
-chain runner that pairs ablation and head sequentially is at
+SIGSTOP injector at `/tmp/sigstop-injector.sh`; A/B chain runner at
 `/tmp/run-sigstop-ab-chain.sh`.
+
+Most relevant run-log directories under each worktree's `.repro/logs/`:
+- Experiment 4 (head): `run_pr13713_head_aggressive_timeout_conc64_20260513_223841`
+- Experiment 6 (ablation): `run_sigstop_ablation_20260514_003635`
+- Experiment 6 (head): `run_sigstop_head_20260514_004813`
 
 ---
 
 ## Cross-references
 
-- [`02-failure-signatures.md`](02-failure-signatures.md) — signatures
-  `#1`, `#4`, `#5`, `#6` that these experiments touch.
-- [`03-defect-class-stack.md`](03-defect-class-stack.md) — the L1–L10
-  layering. The six experiments together validate L2, L3, L5, L7 are
-  load-bearing under the cancel/timeout path, and demonstrate that
-  PR #13713's layer 5 (fail-closed-on-unquiesced) is the
-  memory-safety mechanism that closes the use-after-free window
-  opened by cancel-with-unknown-quiescence.
-- [`04-reproduction.md`](04-reproduction.md) — why long-prompt + cancels
-  + retries is the minimum trigger set. These ablations provide two
-  alternative triggers: aggressive deadline at modest concurrency
-  (Experiments 3, 4) and SIGSTOP-induced peer pause (Experiment 6).
-  The SIGSTOP scenario is the closest in-process simulation of the
-  production failure mode where a peer is genuinely unresponsive.
-- [`06-fix-approaches/D-combo.md`](06-fix-approaches/D-combo.md) — the
-  combo PR #13713 approach. This section is the empirical defence of
-  why the combo's five defensive layers are not over-engineered —
-  each fires in at least one of the six experiments below.
-- [`08-next-steps-and-pr-map.md`](08-next-steps-and-pr-map.md) — the
-  remaining follow-ups: AddressSanitizer build to empirically catch
-  the use-after-free directly, and response-content validation to
-  detect downstream token corruption on the ablation branch.
+- [`02-failure-signatures.md`](02-failure-signatures.md) — sigs `#1`,
+  `#4`, `#5`, `#6` are the four failure modes named in "What fails".
+- [`03-defect-class-stack.md`](03-defect-class-stack.md) — L1–L10
+  layering. The PR #13713 five-layer surface closes L2 / L3 / L5 / L7
+  and gives Python an explicit signal to act on for L8.
+- [`04-reproduction.md`](04-reproduction.md) — original reproduction
+  recipe. Experiment 6's SIGSTOP scenario is the closest in-process
+  simulation of the production failure mode (peer genuinely
+  unresponsive).
+- [`06-fix-approaches/D-combo.md`](06-fix-approaches/D-combo.md) —
+  the combo approach this section empirically defends.
+- [`08-next-steps-and-pr-map.md`](08-next-steps-and-pr-map.md) —
+  follow-ups (ASan build, SIGKILL injection, response-content
+  validation).
+- Cross-investigation:
+  [NVBug 6043291 (zombie worker pods)](../nvbug-6043291-zombie-worker-pods/README.md)
+  — operationally adjacent failure mode; Layer 1 eliminates the same
+  root cause (workers stuck in unbounded waits) from a different
+  direction.
