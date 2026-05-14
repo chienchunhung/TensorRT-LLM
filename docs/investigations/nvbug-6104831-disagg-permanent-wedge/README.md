@@ -88,6 +88,7 @@ across sections that are each meant to be readable on its own:
 | [`06-fix-approaches/`](06-fix-approaches/) | The four candidate fix stacks (A, B, C, D), one file each, plus a comparison `README.md` that scores them against the `L1`–`L8` defect class stack. **The `README.md` here is the most important file in the report for picking a fix path.** |
 | [`07-architectural-reflections.md`](07-architectural-reflections.md) | Why so many bugs were latent until now; the seven invariants the transceiver doesn't enforce; what we would do differently in retrospect. Reader-orientation for the long-term remediation conversation. |
 | [`08-next-steps-and-pr-map.md`](08-next-steps-and-pr-map.md) | The chained PRs in flight, companion fixes, deadline-enforcement effort estimate, and outstanding work. Operational view for landing fixes. |
+| [`10-ablation-no-midflight-cancel.md`](10-ablation-no-midflight-cancel.md) | **Empirical ablation of PR `#13713`'s five defensive layers, with A/B comparisons and a memory-safety failure injection.** Six experiments traverse the timeout-pressure spectrum and finish with a SIGSTOP peer pause. Headline results: (i) at 1 s `kv_transfer_timeout_ms`, ablation wedges with **89 × `Broken promise`** and NO RECOVERY while head recovers (0 broken promises, 0 wedge); (ii) under SIGSTOP-induced peer pause, head's worker is responsive within **1.71 s after SIGCONT** vs ablation **never recovering within 60 s**; (iii) the SIGSTOP run also empirically triggered PR #13713's **layer 5 (`_fail_closed_for_unquiesced_disagg_transfer`)** — PyExecutor on the affected pair gracefully shuts down to prevent NIXL from writing into TRT-LLM-reclaimed buffers. The "lower availability" on head under brief peer-unresponsiveness is the **correct behaviour of a memory-safety mechanism**; ablation's higher apparent availability is availability *with potential use-after-free corruption*. |
 
 ---
 
@@ -129,6 +130,19 @@ across sections that are each meant to be readable on its own:
   [`05-investigation-timeline.md`](05-investigation-timeline.md) end-to-end,
   then the "What We Would Do Differently" section in
   [`07-architectural-reflections.md`](07-architectural-reflections.md).
+- **"A reviewer asked whether PR `#13713`'s mid-flight cancellation,
+  RAII, lifetime, idempotency, and fail-closed-on-unquiesced layers are
+  really necessary on top of the deadline-eviction work."** Read
+  [`10-ablation-no-midflight-cancel.md`](10-ablation-no-midflight-cancel.md).
+  Six experiments traverse the timeout-pressure spectrum and finish
+  with a SIGSTOP-induced peer pause that directly triggers the
+  memory-safety policy. Headline evidence: at 1 s `kv_transfer_timeout_ms`,
+  ablation wedges with 89 × `Broken promise` while head recovers with 0;
+  under SIGSTOP, head recovers in 1.71 s vs ablation never within 60 s,
+  and the run empirically triggers PR #13713's
+  `_fail_closed_for_unquiesced_disagg_transfer` — PyExecutor on the
+  affected pair shuts down to prevent NIXL from writing into
+  TRT-LLM-reclaimed buffers.
 
 ---
 
