@@ -132,6 +132,8 @@ gantt
 
 Three critical-path items: **1a.2** (kernel mask, in flight), **1c.3** (MPI FT subcomm, net-new), **1d.4** (harness, net-new). Each gates end-to-end demonstration of one capability; they can't be parallelized away.
 
+**MVP de-risking via end-to-end prototype.** Running parallel with the production PR tracks is a bounded **3–5 day end-to-end prototype** on a 4 or 8-GPU node that validates the integration seams between tracks (kernel mask ↔ EPLB ↔ watchdog ↔ broadcast ↔ engine hook) ahead of the production PRs. The prototype reuses PR 1a.1 (`EPGroupHealth`, PR #13302) and PR 1d.0 (signal-handler replacement) as-is; everything else is stubbed down to the minimum that exercises the seam. See [MVP prototype plan](mvp-prototype-plan.md) for the vertical-slice component table, hardware options, IMEX setup (for GB200/GB300 trays), and kill-and-survive test recipe. The prototype produces a per-event timing baseline that PR 1d.4 reuses as the harness's reference; it does **not** replace any production PR or substitute for Audit 1b.
+
 ## 8.2 Phase 2 PR breakdown
 
 **Scope:** Full N-rank restoration via process-group reconstruction + replacement rank (optionally accelerated by MX-GMS shadow + GMS zero-copy).

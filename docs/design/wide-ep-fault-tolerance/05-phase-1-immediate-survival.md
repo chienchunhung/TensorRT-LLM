@@ -404,6 +404,14 @@ Recovering specific in-flight requests (replay from last emitted token) is an or
 | **Latency** | Marginally increased; surviving ranks pick up slightly more expert computation. EPLB replication quality unchanged for MVP (slot remap only, no replica restructuring). |
 | **Correctness** | Fully preserved — every expert is reachable on at least one surviving rank under the MVP precondition. |
 
+### MVP de-risking — end-to-end prototype
+
+The 14 MVP PRs ship as four parallel tracks; their integration *seams* (who calls `mark_failed`, when the kernel re-reads the mask, how the iteration-boundary hook drives `reconfigure_mask_only`, how the watchdog interacts with the survivors' next NCCL collective) only become visible end-to-end. A bounded **3–5 day end-to-end prototype** on a 4 or 8-GPU node validates those seams ahead of the production PRs, using stubbed-down versions of every track except 1a.1 (`EPGroupHealth`, reused from PR #13302 as-is) and 1d.0 (signal-handler replacement, also reused as-is).
+
+See [MVP prototype plan](mvp-prototype-plan.md) for the full plan: vertical-slice component table, hardware options (DGX/HGX B200/B300/H100 vs. GB200/GB300 NVL72 tray; IMEX setup steps for the latter), kill-and-survive test recipe (`os.kill(rank_pid, SIGKILL)` + per-event timeline + assertions), what the prototype validates (MVP integration seams, Mode A fix, detection latency) vs. what it doesn't (rack-fabric-specific behavior — Audit 1b's domain), and exit criteria.
+
+The prototype is throwaway scaffolding; the production PRs still need to land with full test coverage. The prototype's value is integration-risk reduction and a per-event timing baseline that PR 1d.4 reuses.
+
 ## 5.6 Phase 1 v1 — what's added
 
 For completeness, items deferred from MVP to v1:
