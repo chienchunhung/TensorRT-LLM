@@ -126,6 +126,108 @@ allocated under memory pressure; (c) PP > 1 enablement should be
 verified end-to-end through the long-prompt burst harness, not just
 asserted because the restriction is gone.
 
+### 2b. Improve in-flight cancellation + poison feature ([TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721))
+
+**Status:** Planned follow-up after PR `#13713` lands. The in-flight
+cancellation + poison feature ships in `#13713` **disabled by default**
+because the current pool-wide poison + Layer 5 fail-closed shape is
+operationally too aggressive: one cancel that races NIXL mid-flight
+poisons the entire pool, forcing a PyExecutor shutdown and pod restart.
+
+**Trigger empirical evidence:** the 2026-05-13 production incident
+(Qwen3-Coder-480B disagg shadow deployment) showed this firing at
+production-default 60 s timeout under natural transient backpressure
+(decode worker briefly slow → both ctx and gen pools poisoned → 3
+container restarts in 10 min → NVCF instance recycle, ~25 min total
+outage). The §10 ablation experiments give the controlled-experiment
+counterpart (1 s timeout, SIGSTOP injection).
+
+**Goal:** convert the design from pool-wide poison + immediate
+fail-closed → per-slot poison + deferred un-poison, so that:
+
+1. Memory safety is preserved (no UAF on KV blocks while NIXL still
+   holds the transfer handle).
+2. Blast radius is minimized — freeze only the specific slot(s)
+   previously occupied by cancelled requests, un-freeze when the
+   network backend reports terminal status (`SUCCESS` / `FAILURE`) or
+   an application-level deadline expires.
+3. PyExecutor shutdown is reserved for genuine pool exhaustion (every
+   slot poisoned), not for individual cancel-mid-flight events.
+
+**Design directions (from PR `#13713` review thread discussions with
+Patrice / Iman / team):**
+
+- **Per-slot poison.** Drop `resource.mPoisoned.store(true)` in
+  `BaseTransBufferManager::poisonBufferIndex`; keep only the per-slot
+  `mBufferIndexFlag[i] = 2`. Drop the pool-wide gate in
+  `assignBufferIndex`. The existing search loop already skips slots
+  with `flag != 0`, so per-slot poison "just works" with the current
+  selection code.
+- **Re-target Layer 5.** `has_poisoned_transfer_buffer()` becomes
+  "pool fully exhausted (no clean slots remain)" rather than "any slot
+  poisoned". Python's `_check_cache_transfer_errors` fail-closed branch
+  triggers only when no more transfers can be served at all.
+- **Deferred un-poison via NIXL status polling.** Background tracker
+  (one per pool, idle most of the time) holds `(NixlTransferStatus,
+  slot_id, shared_ptr<LlmRequest>, deadline)` tuples and polls each
+  entry's `getXferStatus`. On terminal status: `releaseXferReq`, reset
+  `mBufferIndexFlag[slot] = 0`. On deadline expiry: leave the per-slot
+  flag at 2 permanently. Drain rate becomes bounded by *terminal
+  failure rate*, not cancel rate.
+- **NIXL completion callback (long-term, requires NIXL API change).**
+  If/when NIXL exposes `registerOnComplete(handle, cb)`, replace the
+  polling thread with callbacks. UCX (NIXL's typical backend) already
+  has completion callbacks, so the architectural distance is small.
+  Email thread with NIXL team is open; no API commitment yet.
+- **Progress-based vs time-based cancellation (further long-term,
+  requires NIXL API change).** The current `kvTransferTimeoutMs`
+  cancels both healthy-but-slow and truly-stuck transfers identically.
+  A "no NIXL progress for X seconds" criterion would distinguish them,
+  but requires NIXL exposing a progress signal.
+
+**Estimated scope (TRT-LLM side, no NIXL changes required for the
+immediate work):**
+
+- C++: ~50–200 lines.
+  - `cpp/tensorrt_llm/batch_manager/baseTransBuffer.{h,cpp}`:
+    per-slot vs pool-wide poison semantics, new
+    `isPoolExhausted()` query.
+  - `cpp/tensorrt_llm/batch_manager/cacheFormatter.cpp` and
+    `mlaCacheFormatter.cpp`: catch blocks register with tracker
+    instead of poisoning directly.
+  - `cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp::requestSync`:
+    same on the recv path.
+  - New `PendingQuiescenceTracker` class (background thread + polling
+    loop). Lifetime management for shared_ptr<LlmRequest> + NIXL handle.
+- Python: ~1 line. Layer 5's check switches from
+  `has_poisoned_transfer_buffer()` → `is_transfer_pool_exhausted()`
+  (new binding).
+- Tests: ablation harness on top of §10's existing reproducers
+  (1 s timeout + SIGSTOP). Verify the 2026-05-13 incident scenario
+  no longer cascades.
+
+**Risks / open questions:**
+
+1. **Correctness of `getXferStatus` for terminally-failed peers.**
+   If NIXL stays in `IN_PROG` forever for a dead peer, the tracker
+   relies on the application-level deadline to escalate to permanent
+   per-slot poison. Worth a short empirical study on NIXL's status
+   transition behavior under SIGSTOP/SIGKILL scenarios before
+   committing to the polling design.
+2. **Background thread lifetime.** Tracker holds NIXL handles and
+   `shared_ptr<LlmRequest>`; process shutdown needs to drain it
+   cleanly. Doable but adds code.
+3. **Drain rate under sustained terminal failures.** Per-slot poison
+   monotonically reduces pool capacity until process restart. For
+   typical configs (8-16 slots) and infrequent terminal failures the
+   pool effectively never exhausts; for pathological loads it
+   eventually does. Acceptable for the immediate fix; long-term
+   answer is the NIXL callback API.
+
+**Design doc:** outline placed at
+[`docs/design/disagg-inflight-cancel-poison/README.md`](../../design/disagg-inflight-cancel-poison/README.md);
+fill in when work begins.
+
 ### 3. Lift the direct-UCX saturation boundary above `CONC=32`
 
 The combo recovers cleanly on direct UCX through `CONC=32`,
