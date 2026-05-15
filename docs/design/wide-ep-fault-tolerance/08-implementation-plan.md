@@ -34,6 +34,7 @@ This section breaks the design into named PRs. Phase 1 PRs are detailed (they're
 **Status (April 2026):**
 - **1a.1 is in flight as PR #13302** — reviewed and refined based on reviewer feedback.
 - **1a.2 is in flight as PR #13404** — NVLinkOneSided kernel mask.
+- **1d.0 is in flight as PR #14160** — MPI signal handler replacement, gated on the `TLLM_FAULT_TOLERANCE_MODE` env var (proper `LLMArgs` field deferred to PR 1d.1).
 
 **Per-PR notes:**
 
@@ -119,7 +120,7 @@ gantt
     1b.1-3 EPLB slot-remap + wire               :a5, 2026-05-01, 14d
 
     section MPI-path track
-    1d.0 Signal handler replacement             :a0, 2026-05-01, 3d
+    1d.0 Signal handler replacement (in flight, PR #14160) :done, a0, 2026-05-01, 3d
     1c.3 MPI FT subcomm + thread                :crit, ac3, 2026-05-01, 21d
 
     section Integration

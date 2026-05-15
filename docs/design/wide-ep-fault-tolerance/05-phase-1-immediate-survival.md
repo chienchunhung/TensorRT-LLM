@@ -282,7 +282,7 @@ The Mode A fix. The reviewer correctly observed that today's MPI signal handlers
 
 ### Signal handler replacement
 
-Source: `cpp/tensorrt_llm/runtime/utils/mpiUtils.cpp:195–215`. Replace the two existing handlers with a non-propagating variant when `enable_wide_ep_fault_tolerance=True`:
+In flight as PR #14160 (PR 1d.0). Source: `cpp/tensorrt_llm/runtime/utils/mpiUtils.cpp:195–215`. Replace the two existing handlers with a non-propagating variant when `enable_wide_ep_fault_tolerance=True` (the MVP gate is the `TLLM_FAULT_TOLERANCE_MODE` env var; the user-facing `LLMArgs` field lands in PR 1d.1):
 
 ```cpp
 // New: non-propagating handler (FT-mode)

@@ -39,6 +39,7 @@ See [§0 Executive Summary](00-executive-summary.md) for the full headline pictu
 |:---|:---|:---|:---|
 | [#13302](https://github.com/NVIDIA/TensorRT-LLM/pull/13302) | WideEP FT: add EPGroupHealth thread-safe rank mask | In review | §5.3, PR 1a.1 |
 | [#13404](https://github.com/NVIDIA/TensorRT-LLM/pull/13404) | WideEP FT: NVLinkOneSided kernel mask | Open | §5.1, PR 1a.2 |
+| [#14160](https://github.com/NVIDIA/TensorRT-LLM/pull/14160) | WideEP FT: add MPI signal handler replacement (1d.0) | Open | §5.4, PR 1d.0 |
 
 ## Forward-looking research exploration
 

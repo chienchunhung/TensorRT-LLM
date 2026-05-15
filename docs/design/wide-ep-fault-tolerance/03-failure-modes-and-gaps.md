@@ -112,9 +112,9 @@ The common property of all Mode B causes: from the AlltoAll kernel's perspective
 
 **By raw frequency, Mode A dominates today.** Most production failures eventually surface as OS signals (CUDA errors, OOMs, uncaught exceptions, severe XIDs). The MPI signal handler at `mpiUtils.cpp:195–215` catches all of them and fires `MPI_Abort`. So "rank died, MPI propagated, cluster went down" describes the majority of incidents in current production deployments.
 
-**By difficulty, Mode B is harder.** Mode A is loud — the dying rank actively signals its death. The fix (PR 1d.0 in [§5.4](05-phase-1-immediate-survival.md#54-mpi-path-ft-enabling-work)) is to *suppress* that signaling so survivors aren't dragged down. Mode B is silent — no signal, no exception, no notification. It requires the explicit kernel-level host watchdog (PR 1a.4) plus the MNNVL kernel masking (PR 1a.2). That's net-new infrastructure, not a fix to existing infrastructure.
+**By difficulty, Mode B is harder.** Mode A is loud — the dying rank actively signals its death. The fix (PR 1d.0, in flight as PR #14160; see [§5.4](05-phase-1-immediate-survival.md#54-mpi-path-ft-enabling-work)) is to *suppress* that signaling so survivors aren't dragged down. Mode B is silent — no signal, no exception, no notification. It requires the explicit kernel-level host watchdog (PR 1a.4) plus the MNNVL kernel masking (PR 1a.2, in flight as PR #13404). That's net-new infrastructure, not a fix to existing infrastructure.
 
-**The post-1d.0 inversion.** Once PR 1d.0 lands and replaces `MPI_Abort` with `_exit(N)`, **every Mode A failure looks like Mode B from the survivors' perspective**. The dying rank exits cleanly without telling anyone; survivors see exactly the same thing they'd see if a fabric port had silently failed. The detection burden shifts entirely to the watchdog.
+**The post-1d.0 inversion.** Once PR 1d.0 (PR #14160) lands and replaces `MPI_Abort` with `_exit(N)`, **every Mode A failure looks like Mode B from the survivors' perspective**. The dying rank exits cleanly without telling anyone; survivors see exactly the same thing they'd see if a fabric port had silently failed. The detection burden shifts entirely to the watchdog.
 
 | Phase of deployment | Most common failure shape from survivors' POV | Implication |
 |:---|:---|:---|
