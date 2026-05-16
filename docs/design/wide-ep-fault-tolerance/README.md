@@ -40,10 +40,11 @@ See [§0 Executive Summary](00-executive-summary.md) for the full headline pictu
 | [#13302](https://github.com/NVIDIA/TensorRT-LLM/pull/13302) | WideEP FT: add EPGroupHealth thread-safe rank mask | In review | §5.3, PR 1a.1 |
 | [#13404](https://github.com/NVIDIA/TensorRT-LLM/pull/13404) | WideEP FT: NVLinkOneSided kernel mask | Open | §5.1, PR 1a.2 |
 | [#14160](https://github.com/NVIDIA/TensorRT-LLM/pull/14160) | WideEP FT: add MPI signal handler replacement (1d.0) | Open | §5.4, PR 1d.0 |
+| [#14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198) | WideEP FT: scaffold MVP end-to-end prototype | Draft (DO NOT SUBMIT — preview only) | [mvp-prototype-plan.md](mvp-prototype-plan.md) |
 
 ## MVP de-risking — end-to-end prototype
 
-Before all 14 MVP PRs land, a **3–5 day end-to-end prototype** on a 4 or 8-GPU node validates the integration seams between tracks (kernel mask ↔ EPLB ↔ watchdog ↔ broadcast ↔ engine hook) ahead of the production PRs. See [MVP prototype plan](mvp-prototype-plan.md) for the full plan, including hardware options (HGX/DGX B200/B300/H100 vs. GB200/GB300 NVL72 tray), IMEX setup steps for GB200/GB300, the kill-and-survive test recipe, and exit criteria. The prototype reuses PR #13302 (`EPGroupHealth`) and PR 1d.0 (signal-handler replacement) as-is; everything else is stubbed.
+Before all 14 MVP PRs land, a **3–5 day end-to-end prototype** on a 4 or 8-GPU node validates the integration seams between tracks (kernel mask ↔ EPLB ↔ watchdog ↔ broadcast ↔ engine hook) ahead of the production PRs. See [MVP prototype plan](mvp-prototype-plan.md) for the full plan, including hardware options (HGX/DGX B200/B300/H100 vs. GB200/GB300 NVL72 tray), IMEX setup steps for GB200/GB300, the kill-and-survive test recipe, and exit criteria. The prototype reuses PR #13302 (`EPGroupHealth`) and PR #14160 (1d.0 signal-handler replacement) as-is; everything else is stubbed. Scaffolding is shipped as preview-only draft **[PR #14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198)** (`prototypes/wide_ep_ft_mvp/`); the directory is discarded once the production PRs land.
 
 ## Forward-looking research exploration
 

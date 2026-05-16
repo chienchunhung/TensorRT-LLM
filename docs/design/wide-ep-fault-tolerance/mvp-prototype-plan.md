@@ -2,7 +2,7 @@
 
 [< Back to Overview](README.md)
 
-**Status:** Draft v1 • **Owner:** WideEP FT track • **Last updated:** 2026-05-15
+**Status:** Draft v1 — scaffolding shipped as preview draft [PR #14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198) on branch `WideEP-FT/mvp-prototype` (DO NOT SUBMIT; not for merge). • **Owner:** WideEP FT track • **Last updated:** 2026-05-15
 
 ## 1. Why this exists
 
@@ -142,6 +142,8 @@ Two ordering constraints:
 
 1. **PR 1d.0 (MPI signal-handler replacement) must land before the prototype.** Without it, the SIGKILL'd rank's signal handler aborts every other rank — the prototype can't survive a single kill. 1d.0 is the smallest PR in MVP and is already started; finishing it first costs little and unblocks both the prototype and the rest of the MVP.
 2. **PR #13302 (`EPGroupHealth`) ideally lands before the prototype**, since the prototype reuses it directly. If #13302 is still in review when the prototype starts, the prototype can carry a private copy and rebase to the merged version at the end.
+
+**Current status (2026-05-15):** [PR #13302 (1a.1)](https://github.com/NVIDIA/TensorRT-LLM/pull/13302) and [PR #14160 (1d.0)](https://github.com/NVIDIA/TensorRT-LLM/pull/14160) are both in review, not yet merged, so the prototype branch (`WideEP-FT/mvp-prototype`, [draft PR #14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198)) carries private cherry-picks of both. When either lands on `main`, rebase this branch onto the new main — git will treat the cherry-picked commit as already-applied and drop it cleanly. The kernel-side 1a.2 + 1a.3 work is deferred; see [`prototypes/wide_ep_ft_mvp/kernel/README.md`](https://github.com/chienchunhung/TensorRT-LLM/blob/WideEP-FT/mvp-prototype/prototypes/wide_ep_ft_mvp/kernel/README.md) on the prototype branch for the two integration paths (cherry-pick PR #13404 vs. inline minimal stub).
 
 Beyond those two, the prototype runs **in parallel with PR 1a.2 (kernel mask), PR 1c.3 (MPI FT subcomm), and PR 1d.4 (fault-injection harness)**. The prototype's stub versions of those components are different code from the production PRs, so the two streams of work don't block each other. The prototype's findings feed back into all three PR designs.
 
