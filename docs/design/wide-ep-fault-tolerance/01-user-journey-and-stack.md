@@ -93,7 +93,10 @@ Concretely, on a 72-rank NVL72 launch:
 | **Disaggregated serving (MPI)** | Separate prefill / decode pools, KV cache transferred via NIXL / UCX / MPI transceiver, `trtllm-serve` proxy routes between pools | Production-supported |
 | **Disaggregated + Ray (non-NIXL)** | Ray-managed pools with UCX/MPI transceiver | Supported; covered by `examples/test_ray.py::test_ray_disaggregated_serving` |
 | **Disaggregated + Ray + NIXL** | Ray-managed pools with NIXL transceiver | **Not supported today** — explicit waive at `tests/integration/defs/disaggregated/test_disaggregated.py:597` |
+| **Aggregated B200 NVL8 + IB** | 8-GPU B200 nodes networked by InfiniBand; AlltoAll via DeepEP (`DeepEPLowLatency` NVFP4 is the measured-best variant), no MNNVL rack fabric | Perf work in flight (May 2026, Peiheng Hu); FT story = Phase 1-IB, gated on Audit 3 NIXL-EP outcome or a DeepEP-side mitigation. See [§8.2 Phase 1-IB](08-implementation-plan.md#phase-1-ib--heterogeneous-topology-coverage-deepep-or-nixl-ep-track) |
 | **Standard EP (≤ 8 GPUs)** | Single-node, `ep_size ≤ 8`, no MNNVL | Out of scope for this design; existing process-restart handling is adequate |
+
+**Note on topology symmetry.** Even on NVL72, the fabric is not perfectly BW-symmetric: intra-tray pairs share direct NVLink, cross-tray pairs route through NVSwitch chips (multi-hop), and EPLB workload skew on top creates *effective* per-rank-pair asymmetry even when the *physical* fabric is uniform. B200 NVL8 + IB just makes the asymmetry larger and more measurable (18× peak-BW gap NVL vs IB per Peiheng's deck). Heterogeneous-topology behavior is a property of every WideEP deployment, with different magnitude across rows above. [§7.5](07-phase-3-beyond-failover.md#75-straggler-mitigation-forward-looking) and the [straggler-speculation research arm](straggler-speculation-research/README.md) frame this generally rather than NVL72-specifically.
 
 ## 1.2 The stack at each layer
 

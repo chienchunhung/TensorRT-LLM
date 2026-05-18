@@ -129,11 +129,13 @@ The NIXL team has built NIXL-EP and vLLM already uses it as an FT-enabled backen
 
 ### Risk — DeepEP backend limitations
 
-**Severity × Probability:** Medium × High | **Phase:** 1a | **Residual:** **High (accepted)** — deferred indefinitely pending public `mask_buffer_ptr`
+**Severity × Probability:** Medium × High | **Phase:** 1a (MVP), Phase 1-IB | **Residual:** **Medium–High** — was "deferred indefinitely accepted"; downgraded to "deferred conditional on heterogeneous-topology deployment timeline" after B200+IB perf work surfaced
 
 DeepEP only supports specific EP sizes ({2,4,8} intra-node, {16,32,...,128} inter-node); post-failure EP=71 isn't supported. The `mask_buffer_ptr` parameter referenced in vLLM's RFC #27774 is not in DeepEP's public API.
 
-Not a blocker for MVP — NVLinkOneSided is the primary target. Feature flag ([PR 1d.1](08-implementation-plan.md)) warns if DeepEP is the selected backend when FT is enabled.
+**Not a blocker for MVP.** NVLinkOneSided is the primary target on NVL72; feature flag ([PR 1d.1](08-implementation-plan.md)) warns if DeepEP is the selected backend when FT is enabled.
+
+**Becomes a blocker for [Phase 1-IB](08-implementation-plan.md#phase-1-ib--heterogeneous-topology-coverage-deepep-or-nixl-ep-track)** (B200 NVL8 + IB and other non-NVL72 heterogeneous-topology deployments), where DeepEP — specifically `DeepEPLowLatency` NVFP4 — is the *primary* backend, not a fallback. Two mitigation paths once Phase 1-IB activates: (a) the **IB.1 interim** — host-side static kernel timeout (vLLM PR #38534's "FT-enabled backend" 100s pattern; softer than `trap;`, doesn't require NVSHMEM-side changes), or (b) the **IB.2 path** — substitute NIXL-EP for DeepEP via Audit 3 outcome ([§9.1 Audit 3](#audit-3--nixl-ep-evaluation-as-data-plane-backend)). The IB.2 path is preferred when Audit 3 outcome is positive; IB.1 is the fallback when it isn't.
 
 ### Risk — Process-group reconstruction deadlocks
 

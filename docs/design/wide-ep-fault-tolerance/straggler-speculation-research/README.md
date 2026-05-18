@@ -1,14 +1,14 @@
-# Straggler Speculation — Research Exploration
+# Variability-Aware Scheduling — Research Exploration
 
 [↑ Up to WideEP FT](../README.md)
 
 **Status:** Forward-looking research exploration. Not committed engineering work.
-**Connects to:** [§7.5 Straggler mitigation (forward-looking)](../07-phase-3-beyond-failover.md#75-straggler-mitigation-forward-looking) in the parent design.
-**Created:** 2026-05-05.
+**Connects to:** [§7.5 Straggler mitigation](../07-phase-3-beyond-failover.md#75-straggler-mitigation-forward-looking) + [Unified variability framing](../07-phase-3-beyond-failover.md#unified-variability-framing--connection-to-71-73-and-the-research-arm) in the parent design.
+**Created:** 2026-05-05. **Scope broadened:** 2026-05-18 — from "speculative compute in synchronous AlltoAll" to "variability-aware scheduling in heterogeneous-topology WideEP serving" after Peiheng Hu's May 2026 B200+IB perf work surfaced that heterogeneous topology is a property of every WideEP deployment (not just B200+IB) and that FT is one *input* to the controller, not a separate axis.
 
 ## What's here
 
-This sub-directory captures the *research arm* of straggler mitigation — the speculative-execution direction that may merit a publication in addition to its production value. The parent design ([§7.5](../07-phase-3-beyond-failover.md#75-straggler-mitigation-forward-looking)) sketches four options (A latency-aware routing, B speculative redundant compute, C shadow rank as performance hot-spare, D tail-cutting timeout) at radar level. **Option B is the research-grade piece**: speculation in synchronous AlltoAll inference is genuinely under-explored in the literature.
+This sub-directory captures the *research arm* of variability-aware scheduling — the joint placement + speculative-execution direction that may merit a publication in addition to its production value. The parent design ([§7.5](../07-phase-3-beyond-failover.md#75-straggler-mitigation-forward-looking)) sketches four options (A latency-aware routing, B speculative redundant compute, C shadow rank as performance hot-spare, D tail-cutting timeout) at radar level. **Option B is the research-grade piece**: kernel-level first-wins combine semantics in synchronous AlltoAll inference is genuinely under-explored in the literature. The broader framing positions B as one technique within a joint formulation that also includes topology-aware placement (Q4 in the problem statement) and unified variability-source handling (Q6), with auto-scaling as a temporal extension for a possible follow-on paper (Q5).
 
 These three documents are the work product needed *before* committing engineering investment in Option B:
 

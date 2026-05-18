@@ -198,6 +198,29 @@ Sequencing benefit: running 2a.0a first means rack time is targeted validation, 
 
 **Caveat:** Ray + disagg + NIXL is unsupported today (per research pass report — `test_disaggregated.py:597`). If Phase 1-DS ships on Ray, this gap is a prerequisite. On MPI, no such gap.
 
+### Phase 1-IB — Heterogeneous-topology coverage (DeepEP or NIXL-EP track)
+
+**Status:** Conditional parallel track, similar in shape to Phase 1-DS but gated on (a) customer demand for B200 NVL8 + IB deployments reaching production, and (b) Audit 3 (NIXL-EP) outcome or a DeepEP-side mitigation landing. **Not committed engineering capacity yet** — listed so the gap is visible.
+
+**Why it exists.** Peiheng Hu's May 2026 perf work on B200 NVL8 + IB (see [§1.1](01-user-journey-and-stack.md#other-deployment-models-summary)) confirms WideEP on B200+IB is viable with `DeepEPLowLatency` NVFP4 as the AlltoAll backend. The FT story for that deployment **cannot use `NVLinkOneSided` kernel masking** (PR 1a.2) — there's no MNNVL fabric in the path. Instead, FT primitives must layer on top of either DeepEP (blocked on NVSHMEM `mask_buffer_ptr`) or NIXL-EP (gated on Audit 3 outcome).
+
+The setting is broader than B200+IB alone — every WideEP deployment exhibits *some* topology asymmetry (intra-tray NVLink vs cross-tray NVSwitch on NVL72; cross-rack vs intra-rack on multi-rack; NVLink vs IB on B200 NVL8). B200+IB is the most extreme calibration point we have, but the FT primitives this track adds (DeepEP / NIXL-EP rank masking, EPLB topology-aware placement integration) apply to any non-NVL72 deployment.
+
+**Scope (conditional, ~4–6 PRs):** Phase 1 primitives (`EPGroupHealth`, watchdog, signal-handler fix, broadcast) apply **unchanged**. EPLB `reconfigure_mask_only` applies unchanged (slot pointer rewrite, no weight migration — so the "dynamic EPLB too slow on IB" finding in Peiheng's slide 9 does *not* block this MVP-equivalent recovery). New work concentrates on the backend-specific rank-masking primitive:
+
+| PR | Title | Scope | Target | Size | Deps |
+|:---|:---|:---|:---|:---|:---|
+| **IB.1** | DeepEP rank-mask interim — host-side static kernel timeout (vLLM #38534 pattern, ~100 s) | IB (interim) | `_torch/modules/fused_moe/communication/deep_ep.py`, `deep_ep_low_latency.py` | M | Phase 1 MVP |
+| **IB.2** | NIXL-EP backend (alternative path, if Audit 3 positive) | IB | covered by PRs 1a.9–1a.10 (see [§9.1 Audit 3](09-risks-and-open-questions.md#audit-3--nixl-ep-evaluation-as-data-plane-backend)) | M+M | Audit 3 positive |
+| **IB.3** | DeepEP `Buffer` lifecycle hardening (explicit `destroy()` ordering for FT) | IB | `_torch/modules/fused_moe/communication/deep_ep.py` | S | IB.1 |
+| **IB.4** | B200 NVL8 + IB fault-injection harness | IB | `tests/integration/defs/fault_tolerance/test_b200_ib_ft.py` | M | IB.1 or IB.2 |
+| **IB.5** | Phase 1-IB documentation + deployment guide | IB | `examples/wide_ep/README.md` extension | S | IB.4 |
+| **IB.6** | Topology-aware EPLB integration (sync with Peiheng/Dongxu's roadmap) | IB | `moe_load_balancer.py` | M | IB.1; coordination |
+
+**Two backend paths.** Either IB.1 (DeepEP interim with 100s static kernel timeout, matching vLLM PR #38534's "FT-enabled backend" pattern — softer than `trap;`, doesn't require NVSHMEM `mask_buffer_ptr`, doesn't bound recovery latency well) **or** IB.2 (NIXL-EP, contingent on Audit 3 positive outcome — gets `activeRanks`-style masking with a strict recovery bound). Both paths share IB.3–IB.6.
+
+**Calendar:** ~4 weeks if IB.1 path; ~6 weeks if IB.2 path (includes Audit 3 + integration). Runs after Phase 1 MVP and in parallel with v1 / Phase 1-DS. Not a blocker for either.
+
 ## 8.3 Phase 3 rough plan
 
 Phase 3 is sized at work-track granularity because scope will refine post-Phase-2.

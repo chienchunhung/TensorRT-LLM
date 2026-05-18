@@ -149,6 +149,27 @@ Two reasons. (1) Detailed design needs to settle the open questions above before
 
 [§8.3](08-implementation-plan.md#83-phase-3-rough-plan) lists straggler mitigation as a Phase 3.5 follow-on track without per-PR sizing.
 
+### Unified variability framing — connection to §7.1, §7.3, and the research arm
+
+§7.1 (latency anomaly detection), §7.3 (elastic scaling), and this §7.5 (straggler mitigation) are different responses to the *same* underlying observation: per-rank execution-time variability. The variability has multiple causes that all manifest the same way at the AlltoAll barrier:
+
+| Cause | Section that responds | Response timescale |
+|:---|:---|:---|
+| **Workload-induced load imbalance** (MoE expert skew) | EPLB rebalance (production) | sub-iteration to seconds |
+| **Topology asymmetry** (intra-tray NVLink vs cross-tray NVSwitch on NVL72; NVLink vs IB on B200 NVL8 — see [§1.1 note on topology symmetry](01-user-journey-and-stack.md#other-deployment-models-summary)) | Topology-aware EPLB placement (forward-looking, coordinated with Peiheng/Dongxu) | minutes to hours |
+| **Hardware degradation / soft failures** (thermal, ECC, NVLink lane, DVFS) | §7.1 latency anomaly + §7.2 preemptive migration | seconds to minutes |
+| **Full rank failure** (Phase 1 recovery) | §5 rank masking + EPLB slot remap | < 10 s |
+| **FT recovery transient state** (right after a rank dies and before Phase 2 restoration) | §6 rebuild + §6.3 shadow rank | < 1 s to minutes |
+| **Software jitter** (GC, OS scheduling, contention) | none (or D's tail-cutting timeout) | µs to ms |
+
+All collapse to the same observable: **elevated per-rank execution time at the AlltoAll barrier**. The Phase 3 control loop is the unification — a shared observation pipeline (§7.1 telemetry foundation) feeding three response timescales:
+
+- **Within-iteration:** speculative redundant compute (§7.5 Option B), latency-aware routing (Option A), tail-cutting timeout (Option D).
+- **Cross-iteration (seconds–minutes):** preemptive expert migration (§7.2), latency-aware EPLB rebalance.
+- **Cross-iteration (minutes–hours):** elastic scaling up / down (§7.3), topology-aware placement.
+
+**The research arm** ([straggler-speculation-research/](straggler-speculation-research/README.md)) frames the joint formulation — placement + within-iteration scheduling + (optionally) cross-iteration capacity adaptation as a coordinated control loop over the unified variability signal. FT is not a separate axis; it's one of the inputs to the same controller. Auto-scaling (§7.3) is a temporal extension of the same controller, not a separate technique. This framing is what makes the research story stronger than "speculative compute in synchronous AlltoAll" alone — it generalizes the contribution to a setting (heterogeneous-topology WideEP, multi-source variability) that prior work in classical batch speculation does not cover.
+
 ## Phase 3 vs Phase 2 vs Phase 1
 
 | | Phase 1 | Phase 2 | Phase 3 |
