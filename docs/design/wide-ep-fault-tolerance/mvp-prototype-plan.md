@@ -2,7 +2,7 @@
 
 [< Back to Overview](README.md)
 
-**Status:** Draft v1 — scaffolding shipped as preview draft [PR #14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198) on branch `WideEP-FT/mvp-prototype` (DO NOT SUBMIT; not for merge). • **Owner:** WideEP FT track • **Last updated:** 2026-05-15
+**Status:** Draft v1 — scaffolding shipped as preview draft [PR #14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198) on branch `WideEP-FT/mvp-prototype` (DO NOT SUBMIT; not for merge). First runs in progress; findings collected in [mvp-prototype-findings.md](mvp-prototype-findings.md). • **Owner:** WideEP FT track • **Last updated:** 2026-05-18
 
 ## 1. Why this exists
 
@@ -179,7 +179,7 @@ The prototype is "done" when:
 1. **Single-rank kill survives.** SIGKILL on rank K leaves the other N-1 ranks serving; total wall-clock from kill to first new request completed at N-1 is < 10 s.
 2. **All four seam-stressing kill points converge to the same final state.** Dispatch / combine / routing / EPLB-stride kills all produce a consistent recovery.
 3. **The per-event timeline JSON is logged for every run.** This becomes the MVP regression baseline.
-4. **The findings are written up.** A short report (~1 page) covering: what worked, what surprised, which seam contracts changed during prototyping, which production PRs need design adjustments based on prototype findings. Lives alongside [audit-1a-findings.md](audit-1a-findings.md).
+4. **The findings are written up.** A short report covering: what worked, what surprised, which seam contracts changed during prototyping, which production PRs need design adjustments based on prototype findings. Lives at [mvp-prototype-findings.md](mvp-prototype-findings.md) alongside [audit-1a-findings.md](audit-1a-findings.md); each finding routes to the specific production PR that should incorporate it.
 
 ## 8. Open questions for the prototype to answer
 
