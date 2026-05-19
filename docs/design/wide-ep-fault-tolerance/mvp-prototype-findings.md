@@ -2,7 +2,7 @@
 
 [< Back to Overview](README.md) • [Prototype plan](mvp-prototype-plan.md) • [Audit 1a findings](audit-1a-findings.md)
 
-**Status:** Living document — updated as the prototype runs. • **Owner:** WideEP FT track • **Last updated:** 2026-05-18
+**Status:** Living document — updated as the prototype runs. • **Owner:** WideEP FT track • **Last updated:** 2026-05-19
 
 This file collects the seam-contract issues, performance surprises, and integration-risk discoveries surfaced by running the throwaway scaffolding at `prototypes/wide_ep_ft_mvp/` on the [`WideEP-FT/mvp-prototype`](https://github.com/chienchunhung/TensorRT-LLM/tree/WideEP-FT/mvp-prototype) branch (preview draft [PR #14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198)).
 
@@ -50,12 +50,95 @@ This is exactly the [audit-1a Day 2 F4 finding](audit-1a-findings.md#day-2--mpi-
 
 ---
 
+## F3. Detection is parallel, not serial — broadcast is consensus backup, not primary spreading
+
+**Surfaced during:** first successful Level A run, 2026-05-19. Raw event distribution from [`prototypes/wide_ep_ft_mvp/results/np4-iter40.json`](https://github.com/chienchunhung/TensorRT-LLM/blob/WideEP-FT/mvp-prototype/prototypes/wide_ep_ft_mvp/results/np4-iter40.json):
+
+| Event | Rank 0 | Rank 1 | Rank 3 |
+|---|---|---|---|
+| `watchdog_marked_failed(peer=2)` | t=88624.804 | t=88624.806 | t=88624.804 |
+| `broadcast_received(peer=2)` | — | — | — |
+
+**All three survivors detected the dead peer independently within 2 ms.** Zero `broadcast_received` events fired because by the time the MPI broadcast arrived on any survivor, that survivor's local watchdog had already called `mark_failed` (which is idempotent), so the recv-side `mark_failed` returned `False` and the broadcast-received callback was correctly skipped.
+
+**Why it matters.** The implicit assumption "rank A detects, broadcasts to B/C/D, they apply" is *not* the actual data path. The actual data path is "every rank's local zero-collective watchdog detects independently; the broadcast is a consensus backup for the small skew window where one rank's watchdog is slower than another's." This matches the production [§5.3 design](05-phase-1-immediate-survival.md#layer-1--alltoall-watchdog-the-host-side-abort-hook) (Layer 1 = primary, scale-independent), but is worth flagging explicitly so reviewers and operators don't model the system as broadcast-driven.
+
+**Implication for production PRs.**
+
+- **[PR 1c.3](08-implementation-plan.md#phase-1-pr-breakdown) (MPI FT subcomm).** The broadcast must continue to exist — there is still a ~ms skew window where one survivor has detected and another hasn't, and during that window the AlltoAll kernel could race. But the broadcast's *latency budget* is relaxed: it doesn't need to be on the critical path. Production can prefer slower-but-more-reliable primitives (e.g. a barrier+broadcast at iteration boundaries, per [PR 1c.5](08-implementation-plan.md#phase-1-pr-breakdown)) without affecting recovery time.
+- **[PR 1c.4](08-implementation-plan.md#phase-1-pr-breakdown) (model engine hook).** The `EPGroupHealth.generation` check at iteration boundary picks up *any* survivor's local mark_failed; the broadcast is only needed to handle the case where rank A's hook ran *before* its watchdog fired but *after* peer's watchdog fired. The broadcast handles this case but is not on the critical path for the common case where every survivor's watchdog has already fired by the next iteration boundary.
+
+**Driver fix.** The driver's `t_mark_failed_propagated` measurement initially required a `broadcast_received` event on every survivor; updated to count "ranks whose local `mark_failed` succeeded (via either watchdog or broadcast)" so the parallel-detection case is correctly measured.
+
+---
+
+## F4. Detection latency dominates the recovery budget; relationship is linear
+
+**Surfaced during:** OQ4 watchdog-timeout sweep, 2026-05-19. Identical workload (4 ranks, kill at iter 40, 400 iters total), varying `--watchdog-timeout-sec`:
+
+| Watchdog timeout | Total recovery (t_first_new_request_completed) | Budget verdict |
+|---|---|---|
+| 1 s | 1.10 s | ✓ PASS |
+| 2 s | 2.10 s | ✓ PASS |
+| **5 s (default)** | **5.11 s** | **✓ PASS (default)** |
+| 10 s | 10.13 s | ✗ **FAIL** |
+
+`recovery ≈ watchdog_timeout + 100 ms`. The 100 ms tail is one poll interval (50 ms in this run) + iteration boundary delay + reconfigure (~10 µs).
+
+**Why it matters.** The watchdog timeout is the *only* meaningful tuning knob for recovery latency. Everything else (broadcast, EPLB reconfigure, iteration boundary) is in the noise.
+
+**Implication for production PRs.**
+
+- **[PR 1a.4](08-implementation-plan.md#phase-1-pr-breakdown) default value.** 5 s default is well-chosen — fits the 10 s recovery budget with ~50% headroom for everything else (NCCL surfaces, model engine drain, first new request latency).
+- **[PR 1d.1](08-implementation-plan.md#phase-1-pr-breakdown) (LLMArgs).** The watchdog timeout **must** be exposed as a tunable config field (not buried as a constant). Deployments with stricter latency SLAs (e.g. < 5 s recovery) should be able to dial it down to 1-2 s at the cost of higher false-positive risk on noisy systems.
+
+**Open sub-questions.**
+
+- **False-positive floor.** At what timeout does spurious detection become a problem in production? The single-node prototype has near-zero noise; the 72-rank NVL72 case may show natural completion-flag pauses (load imbalance, EPLB stride, GC pauses) that fire a 1 s watchdog spuriously. Validation belongs to [Audit 1b](09-risks-and-open-questions.md#audit-1b--rack-fabric-validation-pending-nvl72-access).
+- **Poll-interval scaling.** Default 100 ms poll wastes ~99% of CPU samples; this prototype uses 50 ms with no measurable cost, but at 72 ranks × 1 watchdog thread/rank the steady-state cost may matter. Worth profiling in PR 1a.4 to find the right default.
+
+---
+
+## F5. Recovery time is scale-independent across 4 vs 8 ranks (validates §5 claim)
+
+**Surfaced during:** Level A end-to-end runs at `--np 4` and `--np 8`, 2026-05-19. Identical kill timing (iter 40) and identical detection config (5 s timeout, 100 ms poll), measured wall-clock from kill to first new request completed at N−1:
+
+| `--np` | `t_kill` | `t_watchdog_fires` | `t_propagated` | `t_reconfigure_done` | **Total recovery** |
+|---|---|---|---|---|---|
+| 4 | 2.056 s | 7.108 s | 7.110 s | 7.120 s | **7.168 s** |
+| 8 | 2.056 s | 7.109 s | 7.111 s | 7.121 s | **7.168 s** |
+
+**Identical to within 1 ms across every measured event.** Doubling the EP size adds zero recovery latency.
+
+**Why it matters.** The plan [§5 "What this prototype validates"](mvp-prototype-plan.md#5-what-the-prototype-validates--does-not-validate) claims "Order-of-magnitude on the < 10 s recovery target. Detection dominates the budget, and detection is scale-independent." This is now empirically confirmed at small N; the claim's extrapolation to 72 ranks is justified by the same property (every rank's local watchdog is independent — there's nothing in the design that scales with N).
+
+**Caveats.** The prototype does not exercise:
+
+- The 72×72 completion-flag table itself (`kMaxRanks` 64→128 register-pressure question is still pending for [PR 1a.2](08-implementation-plan.md#phase-1-pr-breakdown)).
+- The MPI broadcast at scale (would scale ~O(N) but is off the critical path per F3).
+- The EPLB reconfigure at 58 layers vs the prototype's 2 layers (~30× more work, but the prototype's per-layer cost is ~6 µs so 58 layers ≈ 350 µs, still well in the noise).
+
+These three pending items are [Audit 1b](09-risks-and-open-questions.md#audit-1b--rack-fabric-validation-pending-nvl72-access) territory; the prototype's "scale-independent" claim is robust within its scope.
+
+---
+
+## OQ2. Iteration-boundary semantics — answered
+
+The plan asked: "Where exactly does the model engine check `EPGroupHealth.generation` — top of iteration before any kernel launches, or after fwd setup? The latter risks launching one more iteration's kernels with the old mask."
+
+**Empirical answer from Level A runs.** The iteration-boundary hook fires within `t_iteration_boundary - t_mark_failed_propagated = 7-8 ms` of detection, well below the `iter_sleep_sec = 50 ms` cadence. Even an iteration-boundary check placed "wrong" (after fwd setup instead of before) would add at most one `iter_sleep_sec` of stale-mask exposure — ~50 ms in the prototype, likely 100-500 ms in production depending on token batch sizes.
+
+**Implication.** The "where in the iteration to check" question becomes a near-noise design choice compared to the 5 s detection budget. Production [PR 1c.4](08-implementation-plan.md#phase-1-pr-breakdown) can prioritize *cleanest integration point* over *earliest possible check point*; the cost difference is small.
+
+---
+
 ## Pending findings
 
-The Level A smoke run is incomplete (driver timed out before writing the JSON timeline; F2 was the symptom). After patching F2's prototype mitigation, the following are still pending:
+Successfully closed: **F1, F2, F3, F4, F5, OQ2, OQ4.**
 
-- [ ] Successful end-to-end Level A run: full per-event timeline (`t_kill` → `t_first_new_request_completed`) for `--np 4` and `--np 8`.
-- [ ] Watchdog vs. NCCL collective ordering (Open Question 1 from [mvp-prototype-plan.md §8](mvp-prototype-plan.md#8-open-questions-for-the-prototype-to-answer)).
-- [ ] Iteration-boundary semantics (Open Question 2): does the engine check `EPGroupHealth.generation` before or after fwd setup?
-- [ ] Detection latency reality check (Open Question 4): is the 5 s default watchdog timeout right for this hardware?
-- [ ] Seam-stressing kill points (during dispatch / combine / routing / EPLB-stride) — blocked on the kernel-side 1a.2/1a.3 integration; see [`prototypes/wide_ep_ft_mvp/kernel/README.md`](https://github.com/chienchunhung/TensorRT-LLM/blob/WideEP-FT/mvp-prototype/prototypes/wide_ep_ft_mvp/kernel/README.md).
+Still pending:
+
+- [ ] **OQ1: Watchdog vs. NCCL collective ordering.** Not validated empirically — requires adding `torch.distributed` (NCCL backend) initialization + a real allreduce to the worker, plus GPU contexts. Significant new work. *Quick a-priori analysis:* the watchdog should fire first because NCCL's async-error scan interval is typically ≥ 1 s while the watchdog is bounded by `timeout + poll_interval`. Validated empirically once we have a kernel-stub integration (currently blocked alongside the kernel-side 1a.2/1a.3 work).
+- [ ] **Seam-stressing kill points** (during dispatch / combine / routing / EPLB-stride) — blocked on the kernel-side 1a.2/1a.3 integration; see [`prototypes/wide_ep_ft_mvp/kernel/README.md`](https://github.com/chienchunhung/TensorRT-LLM/blob/WideEP-FT/mvp-prototype/prototypes/wide_ep_ft_mvp/kernel/README.md).
+- [ ] **False-positive floor characterization** (F4 sub-question) — needs NVL72 noisy-workload data; deferred to Audit 1b.
+- [ ] **Failure-during-recovery stress case** (multi-failure ordering) — out of MVP scope per PR 1c.6.
