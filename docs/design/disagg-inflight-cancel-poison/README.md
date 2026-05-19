@@ -304,14 +304,18 @@ PR #13713 lands
 
 ## Detailed design documents
 
-To be authored when each phase begins:
-
-- `phase0-stress-test-suite.md` — productionize §10 harness; per-test
-  pass criteria; CI integration.
-- `phase1-deferred-un-poison.md` — tracker class design, lifetime /
-  threading model, deadline policy, NIXL status polling cadence.
-- `phase2-multi-slot-config.md` — `CacheTransceiverConfig` surface,
-  default recommendation with VRAM measurements, Layer 5 re-target.
+- [`phase0-stress-test-suite.md`](phase0-stress-test-suite.md) —
+  **READY** — disaggregated cancellation stress-test suite (two
+  2-hour marathon tests covering the V1+C++ and V2+Python mainstream
+  configs at 3P3D, parametrized YAML configs, threaded harness,
+  pass-criteria definition, file layout, implementation-handover
+  spec). Targets [TRTLLM-12648](https://jirasw.nvidia.com/browse/TRTLLM-12648).
+- `phase1-deferred-un-poison.md` — to be authored — tracker class
+  design, lifetime / threading model, deadline policy, NIXL status
+  polling cadence.
+- `phase2-multi-slot-config.md` — to be authored — `CacheTransceiverConfig`
+  surface, default recommendation with VRAM measurements, Layer 5
+  re-target.
 - (Optional) `phase3-nixl-callback.md` — interface ask for the NIXL
   team if/when Phase 3 is prioritized.
 - (Optional) `phase4-progress-based-cancel.md` — interface ask for
