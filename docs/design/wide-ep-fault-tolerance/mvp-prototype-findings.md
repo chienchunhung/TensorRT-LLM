@@ -142,3 +142,32 @@ Still pending:
 - [ ] **Seam-stressing kill points** (during dispatch / combine / routing / EPLB-stride) — blocked on the kernel-side 1a.2/1a.3 integration; see [`prototypes/wide_ep_ft_mvp/kernel/README.md`](https://github.com/chienchunhung/TensorRT-LLM/blob/WideEP-FT/mvp-prototype/prototypes/wide_ep_ft_mvp/kernel/README.md).
 - [ ] **False-positive floor characterization** (F4 sub-question) — needs NVL72 noisy-workload data; deferred to Audit 1b.
 - [ ] **Failure-during-recovery stress case** (multi-failure ordering) — out of MVP scope per PR 1c.6.
+
+---
+
+## Status: paused (2026-05-19)
+
+The prototype's primary mandate ([§1 of the plan](mvp-prototype-plan.md#1-why-this-exists)) is empirically discharged: the MVP integration story works, the < 10 s recovery target is achievable in principle (5.11 s with default config), and the seam contracts are correct. Six findings + two open questions closed; the remaining four pending items all hit diminishing returns vs. continuing work on the production PRs that they unblock.
+
+[Draft PR #14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198) is left in `Draft (DO NOT SUBMIT)` state. The branch `WideEP-FT/mvp-prototype` continues to carry private cherry-picks of PR #13302 (1a.1) and PR #14160 (1d.0) plus the throwaway scaffolding under `prototypes/wide_ep_ft_mvp/`; if either parent PR lands on `main` while the prototype is paused, rebasing this branch will drop the cherry-pick as already-applied with no manual intervention.
+
+### When to resume
+
+Resume the prototype when *any* of the following events unblock a pending item:
+
+| Trigger | Unblocks | Action |
+|---|---|---|
+| **[PR 1a.2](08-implementation-plan.md#phase-1-pr-breakdown) (#13404, NVLinkOneSided kernel mask) lands or reaches stable review state** | Seam-stressing kill points (dispatch / combine / routing / EPLB-stride) + OQ1 (NCCL ordering, which becomes free once the kernel is in the loop) | Cherry-pick #13404 onto `WideEP-FT/mvp-prototype` per Path A in [`kernel/README.md`](https://github.com/chienchunhung/TensorRT-LLM/blob/WideEP-FT/mvp-prototype/prototypes/wide_ep_ft_mvp/kernel/README.md); replace the pseudo-AlltoAll loop in `kill_and_survive_worker.py` with the real kernel; rerun with `--kill-during {dispatch,combine,routing,eplb-stride}` variants. |
+| **[PR 1a.4](08-implementation-plan.md#phase-1-pr-breakdown) (AlltoAllWatchdog production) lands** | Validates that the production watchdog reproduces the prototype's F3/F4/F5 numbers under real MNNVL fabric memory (not POSIX shm). | Swap `stubs/alltoall_watchdog.py` for the production watchdog in the worker; rerun Level A; diff timeline against the regression baseline JSONs already committed under `prototypes/wide_ep_ft_mvp/results/`. |
+| **[PR 1c.3](08-implementation-plan.md#phase-1-pr-breakdown) (MPI FT subcomm) lands** | Lets the prototype use the production FT subcomm instead of the `Isend/Irecv` stub on `COMM_WORLD`. Also exposes `MpiFtSubcomm.world_is_poisoned()` which the prototype's F2 mitigation can be tightened against. | Swap `stubs/mpi_ft_subcomm.py` for the production component; rerun Level A; document any new propagation-time delta vs. F3 baseline. |
+| **NVL72 access becomes available** | False-positive floor characterization (F4 sub-question) + the actually-72-rank scale validation that F5 cannot extrapolate to with certainty. | Coordinate with [Audit 1b](09-risks-and-open-questions.md#audit-1b--rack-fabric-validation-pending-nvl72-access); prototype runs as written should port to NVL72 once IMEX is configured per [mvp-prototype-plan.md §3](mvp-prototype-plan.md#3-hardware). |
+| **PR 1d.4 (fault-injection harness) starts** | The prototype's `kill_and_survive_driver.py` becomes the reference implementation for the production harness; timeline JSONs become the regression baseline. | Hand off `scripts/kill_and_survive_driver.py` + `results/*.json` to PR 1d.4 author; archive the prototype dir per [mvp-prototype-plan.md §9](mvp-prototype-plan.md#9-after-the-prototype). |
+
+### How to resume (mechanical steps)
+
+1. `cd /home/scratch.chienchunh_coreai/dev/TensorRT-LLM-mvp-prototype` (or recreate the worktree from `WideEP-FT/mvp-prototype`).
+2. `git fetch fork && git rebase fork/WideEP-FT/mvp-prototype` — picks up any cherry-pick drops if a parent PR landed.
+3. `git fetch upstream && git rebase upstream/main` — picks up upstream churn.
+4. Apply the trigger-specific action above.
+5. Rerun the Level A baseline (`--np 4 --kill-at-iteration 40`) and diff the resulting `np4-iter40.json` against the regression baseline; verify F3/F4/F5 still hold before adding new variants.
+6. Append the new findings to this file as F6+, following the F1-F5 template.
