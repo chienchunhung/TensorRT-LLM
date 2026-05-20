@@ -29,8 +29,10 @@ returning 200 on `/v1/models`, so naive liveness probes never notice.
 
 The two prior zombie-worker / disagg-wedge fixes ([PR #12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718),
 [PR #13119](https://github.com/NVIDIA/TensorRT-LLM/pull/13119)) **do not close
-this case**, both because of merge timing and because of design scope. The bug
-sits in the seam between "fatal engine error" (covered by #12718) and
+this case**. Both are now on `main` (the customer's image predates them, but
+re-running on current `main` still wedges — see `fix-plan.md` §V1 for the
+verified primitives and the three reasons they miss this bug). The bug sits
+in the seam between "fatal engine error" (covered by #12718) and
 "per-request error" (covered by #13119): the executor thread dies *between
 iterations*, which neither layer owns.
 
@@ -86,7 +88,7 @@ scheduler "pays" is `context_remaining - reusable` — i.e., the post-reuse
 
 ### The Append-Side Cost (Python `_prepare_tp_inputs`)
 
-`tensorrt_llm/_torch/pyexecutor/model_engine.py:2671-2673` (current `main`):
+`tensorrt_llm/_torch/pyexecutor/model_engine.py:2667-2670` (current `main`):
 
 ```python
 total_num_tokens = len(position_ids)
@@ -115,28 +117,42 @@ of the chunk, so the absolute overshoot grows.
 
 ### Why the Mismatch Bricks the Server (Not Just the Batch)
 
-The actual failure flow:
+The actual failure flow (line numbers verified against current `main`; see
+`fix-plan.md` §V2 for the full 8-step trace):
 
 ```
-1. model_engine.py:2672  AssertionError: total_num_tokens > max_num_tokens
-                         (raised inside the forward step)
-2. forward-step try/except catches it
-                         => log "Encountered an error in forward function"
-                         => sample_state = None
-3. py_executor.py:1600   assert sample_state is not None, "Sampling failed"
-                         (NOT inside the forward-step try/except)
-                         => AssertionError escapes _event_loop_wrapper
-4. Thread-3 dies.        No code revives it; no _fatal_error is set;
-                         no in-flight GenerationResult is completed.
-5. /v1/chat/completions  awaits a future that nobody owns -> permanent hang
-   /v1/models            still returns 200 (static handler, no executor call)
+1. model_engine.py:2668     AssertionError: total_num_tokens > max_num_tokens
+                            (raised inside the forward step)
+2. forward-step try/except  catches it; logs "Encountered an error in forward
+   (py_executor.py:3411)    function"; calls _handle_errors(error_msg,
+                            requests=None) which fails EVERY active request
+                            with the error message and enqueues responses;
+                            returns sample_state = None
+3. py_executor.py:1491      assert sample_state is not None, "Sampling failed"
+   or :2444                 (NOT inside the forward-step try/except)
+                            => AssertionError escapes the loop body
+4. _event_loop_wrapper      catches Exception, logs, re-raises; finally:
+   (py_executor.py:652)     calls _executor_loop_cleanup which sets
+                            PyExecutor.is_shutdown=True. Thread dies.
+5. await_response_thread    (a separate ManagedThread) drains the queued
+                            error responses; in-flight HTTP requests
+                            receive a 5xx with the assertion message.
+6. /v1/chat/completions     submitted AFTER step 4: enqueue_requests accepts
+                            blindly (no liveness check); the dead event loop
+                            never picks them up; _await_single_response has
+                            no is_shutdown short-circuit => permanent hang.
+7. /health                  still returns 200, because LLM._check_health
+                            reads Executor.doing_shutdown (False) not
+                            PyExecutor.is_shutdown (True).
+   /v1/models               still returns 200 (no health check at all).
 ```
 
-Step 3 is the crucial gap. The forward-step exception handler set
-`sample_state = None` but did not break the loop or fail the in-flight
-batch. The `assert sample_state is not None` was added as a defensive
-guard, but it is itself a fatal assertion outside the try/except — turning
-a recoverable per-batch error into a thread death.
+The crucial gap is steps 3–4: the bare `assert sample_state is not None`
+sits outside the forward-step try/except, so a recoverable per-batch error
+becomes a thread death. The in-flight batch is delivered correctly via the
+existing per-request error channel (step 5) — what makes this a customer-
+visible wedge is steps 6–7: every subsequent request hangs, and both
+public liveness probes continue to report healthy.
 
 ---
 
@@ -150,31 +166,52 @@ a recoverable per-batch error into a thread death.
 | [#12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718) | Fatal error detection + zombie-worker prevention | 2026-04-27 | " | " |
 
 Both protections merged **after** the binary the customer reproduced on.
+Both are now on current `main`; the design-gap reasoning below applies
+unchanged to a fresh rebuild — see `fix-plan.md` §V1 for the verified
+primitive names and call sites.
 
 ### Design gaps (even if applied)
 
-1. **Wrong probe surface.** #12718 wires `SIGINT` into `/health`. The reporter
-   probed `/v1/models`, which is a static handler that never reaches executor
-   health. Even with #12718 active, `/v1/models` would still report 200.
-2. **Thread death short-circuits the fatal-error path.** #12718's
-   `_fatal_error` + `ErrorBudget` mechanism assumes the executor loop survives
-   long enough for the next `/health` poll to drain the error queue. Here the
-   loop thread dies between iterations, so no later code sets `_fatal_error`
-   and no health probe ever sees an error.
-3. **Classification would not trip.** An `AssertionError` from
-   `_prepare_tp_inputs` is not CUDA-corruption, not OOM, not NCCL. Per
-   #12718's three-tier model, it lands in "transient: ~10 occurrences before
-   crash." First-occurrence prep-time assertions are not currently classified
-   as immediate-fatal, even though they are deterministic and won't self-heal.
+The root architectural fact is **(2) below — the executor-loop thread is
+not wrapped by #12718's machinery, so its death is invisible to every
+downstream observer.** (1), (3), and (4) are downstream consequences of
+that gap. (1) is additionally an independent observability hole.
+
+1. **Wrong probe surface.** OpenAI handlers wire `signal.raise_signal(SIGINT)`
+   into the `CppExecutorError` path (`openai_server.py:1160, 1257, 1456,
+   1695`). `/v1/models` is a static handler that never reaches executor
+   health. `/health` *does* consult `LLM._check_health()` — but that method
+   reads `Executor.doing_shutdown` (only flipped by an explicit
+   `Executor.shutdown()` call), not `PyExecutor.is_shutdown` (which *is*
+   flipped on thread death by `_executor_loop_cleanup`). So both `/health`
+   and `/v1/models` continue to report 200 after the wedge.
+2. **Thread death short-circuits the fatal-error path.** #12718's primitives
+   on `main` are `_error_queue` + `_handle_background_error` +
+   `ManagedThread` (`executor/executor.py:259`, `llmapi/utils.py:311-358`).
+   `ManagedThread.run()` catches task exceptions and puts them on
+   `_error_queue`. But the `PyExecutor` event loop is started as a **plain**
+   `threading.Thread` (`py_executor.py:698-700`), not a `ManagedThread`.
+   When `_event_loop_wrapper` re-raises, the exception is lost to the
+   thread's default handler; nothing reaches `_error_queue`, so
+   `_handle_background_error` never classifies it and the SIGINT
+   self-terminate path never fires.
+3. **Classification would not trip.** Even if the exception did reach
+   `_handle_background_error`, the escaping type is `AssertionError`, not
+   `CppExecutorError`. The HTTP handlers' `signal.raise_signal(SIGINT)`
+   self-terminate is gated on `except CppExecutorError` — an
+   `AssertionError` walks past it.
 4. **#13119 is disagg-scoped and also assumes a live loop.** Its primitives
    (`GenerationResultBase.error`, `OpenAIHttpClient` body preservation,
    disagg-id regeneration) all need the executor to call back into the
-   request's `GenerationResult` to set the error. With the executor thread
-   dead, no callback ever runs.
+   request's `GenerationResult` to set the error. The in-flight batch *does*
+   get a callback today via `_handle_errors` (see the failure-flow box
+   above), but every subsequent request hangs because there is no live loop
+   to enqueue the next batch.
 
 In one sentence: **the prior work fixed the engine-death and request-error
 layers; this bug lives in the gap "the executor thread itself dies between
-iterations."**
+iterations, and #12718's classification machinery does not observe it
+because the thread is not a `ManagedThread`."**
 
 ---
 
@@ -208,12 +245,16 @@ On current `upstream/main`, the corresponding region of `prepare_resources`
 [PR #13029](https://github.com/NVIDIA/TensorRT-LLM/pull/13029), and there is
 no `remaining_budget` accumulator at that call site. The semantically
 equivalent budget math now lives in
-`tensorrt_llm/_torch/pyexecutor/scheduler/scheduler.py` (`_reuse_adjusted_compute`,
-used at L465/505/577/706/750/812) and in `scheduler_v2.py` (L453+).
+`tensorrt_llm/_torch/pyexecutor/scheduler/scheduler.py` (`_reuse_adjusted_compute`
+defined at L321, used at **9** call sites: L441, L472, L545, L676, L677,
+L720, L734, L746, L779 — the refactor since the original investigation
+added more) and in `scheduler_v2.py` (L451-467).
 
 Additionally, the reporter runs **V1 = C++ MicroBatchScheduler**, not the
 Python scheduler. PR #12806's fix is Python-only. Even if it had landed on
-`main`, it would not have closed the customer's failure path on the C++ side.
+`main`, it would not have closed the customer's failure path on the C++ side
+(`cpp/tensorrt_llm/batch_manager/microBatchScheduler.cpp`; see `fix-plan.md`
+§V3 for the three accumulator sites that need the same correction).
 
 ---
 
@@ -221,13 +262,15 @@ Python scheduler. PR #12806's fix is Python-only. Even if it had landed on
 
 | File | Surface | Issue |
 |---|---|---|
-| `cpp/.../MicroBatchScheduler` (C++ V1) | `reuse_adjusted_compute(chunk_size, reusable, context_remaining)` | Admission accounting does not pre-subtract non-first-chunk context costs |
-| `tensorrt_llm/_torch/pyexecutor/scheduler/scheduler.py` | `_reuse_adjusted_compute` callers (L465/505/577/706/750/812) | Same invariant must be audited after #13029 / #13095 refactor |
-| `tensorrt_llm/_torch/pyexecutor/scheduler/scheduler_v2.py:453+` | V2 budget path | Independent code path; needs the same audit |
-| `tensorrt_llm/_torch/pyexecutor/model_engine.py:2671-2673` | `_prepare_tp_inputs` defensive assertion | Crashes the forward step on accounting mismatch instead of failing the offending request |
-| `tensorrt_llm/_torch/pyexecutor/py_executor.py:1600,2599` | `assert sample_state is not None, "Sampling failed"` | Bare assertion outside the forward-step try/except — kills the event-loop thread |
-| `tensorrt_llm/_torch/pyexecutor/py_executor.py:669` | `_event_loop_wrapper` top-level | No `except BaseException` walking `active_requests` to complete each `GenerationResult` with the captured exception |
-| `tensorrt_llm/serve/openai_server.py` (`/v1/models` handler) | Liveness surface | Returns 200 without consulting executor health |
+| `cpp/tensorrt_llm/batch_manager/microBatchScheduler.cpp` (C++ V1) | `reuse_adjusted_compute(chunkSize, reusable, contextRemaining)` at L33-44; accumulator sites at L66-68, L358-378/L385-386, L459-461 | Admission accounting does not pre-subtract non-first-chunk context costs (see `fix-plan.md` §V3) |
+| `tensorrt_llm/_torch/pyexecutor/scheduler/scheduler.py` | `_reuse_adjusted_compute` callers (9 sites: L441, L472, L545, L676, L677, L720, L734, L746, L779) | Same invariant must be audited after #13029 / #13095 refactor |
+| `tensorrt_llm/_torch/pyexecutor/scheduler/scheduler_v2.py:451-467` | V2 budget path (`remaining_budget`) | Independent code path; needs the same audit |
+| `tensorrt_llm/_torch/pyexecutor/model_engine.py:2667-2670` | `_prepare_tp_inputs` defensive assertion | Crashes the forward step on accounting mismatch instead of failing the offending request |
+| `tensorrt_llm/_torch/pyexecutor/py_executor.py:1491, 2444` | `assert sample_state is not None, "Sampling failed"` | Bare assertion outside the forward-step try/except — kills the event-loop thread |
+| `tensorrt_llm/_torch/pyexecutor/py_executor.py:652` | `_event_loop_wrapper` top-level | Catches `Exception` not `BaseException`; does not walk in-flight queues; does not route exception into `_error_queue` so PR #12718's classification path never observes the death |
+| `tensorrt_llm/_torch/pyexecutor/py_executor.py:698-700` | Event loop thread construction | Plain `threading.Thread`, not `ManagedThread` — root cause of (2) above |
+| `tensorrt_llm/llmapi/llm.py:990` | `LLM._check_health()` | Reads `Executor.doing_shutdown` (only set by explicit shutdown), not `PyExecutor.is_shutdown` (set on thread death) |
+| `tensorrt_llm/serve/openai_server.py:767` (`/v1/models` handler) | Liveness surface | Returns 200 without consulting executor health |
 
 ---
 
@@ -258,12 +301,15 @@ Target this exact failure mode but are not on `main`:
 - [#12658](https://github.com/NVIDIA/TensorRT-LLM/pull/12658) — Open draft
   with Python-side pre-validation, stale since 2026-04-01.
 
-Hardening adjacent to this gap:
+Hardening adjacent to this gap (both now merged on `main`):
 
 - [#12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718) — Fatal error
-  detection / zombie worker prevention. Owns the **engine-death** failure
-  shape; does not handle the **executor-thread-dies-between-iterations**
-  shape this bug exhibits. See
+  detection / zombie worker prevention. Primitives landed on `main` are
+  `_error_queue` + `_handle_background_error` + `ManagedThread` +
+  `signal.raise_signal(SIGINT)` on `CppExecutorError` (see `fix-plan.md`
+  §V1). Owns the **engine-death** failure shape but does not catch this
+  bug because the `PyExecutor` event loop is a plain `threading.Thread`,
+  not a `ManagedThread`. See
   [`../nvbug-6043291-zombie-worker-pods/`](../nvbug-6043291-zombie-worker-pods/).
 - [#13119](https://github.com/NVIDIA/TensorRT-LLM/pull/13119) — Real error
   propagation to disagg server. Owns the **per-request** failure shape;
@@ -273,30 +319,40 @@ Hardening adjacent to this gap:
 
 ## Fix Plan
 
-Detailed in [`fix-plan.md`](fix-plan.md). High-level:
+Detailed in [`fix-plan.md`](fix-plan.md), with verified-state findings in
+§V1 (PR #12718 primitives on `main`), §V2 (response-delivery semantics on
+thread death), and §V3 (exact C++ patch sites). High-level:
 
 1. **Substantive (admission accounting):** port PR #12806's "pre-subtract
    non-first-chunk context costs" semantic to the C++ V1 MicroBatchScheduler
+   (Track A1, three patch sites in `microBatchScheduler.cpp` named in §V3)
    and audit the Python `_reuse_adjusted_compute` callers introduced by the
-   #13029 / #13095 refactor.
-2. **Hardening (thread death → real client error):** wrap
-   `_event_loop_wrapper` with a top-level handler that sets `_fatal_error`
-   **and** walks `active_requests` / `waiting_queue` / `executor_request_queue`
-   completing each `GenerationResult` with the captured exception. Promote
-   prep-time assertions like `total_num_tokens > max_num_tokens` to a
-   per-batch recoverable error so a single offending batch fails the
-   responsible requests instead of bricking the loop.
-3. **Liveness surface:** make `/v1/models` (or any other public "alive"
-   surface) consult `check_health()`, or document `/health` as the only
-   valid liveness probe.
+   #13029 / #13095 refactor (Track A2).
+2. **Hardening (thread death → real client error):**
+   - **B1:** remove the two bare `assert sample_state is not None`
+     statements — the proximate cause of the wedge. This single edit closes
+     the customer's exact reproduction.
+   - **B2:** wrap `_event_loop_wrapper` so its exception is routed into
+     `_error_queue` (folding this failure mode into PR #12718's existing
+     classification path) and the in-flight queues are drained with the
+     captured exception.
+   - **B3:** promote prep-time assertions like
+     `total_num_tokens > max_num_tokens` to a typed `BatchAdmissionError`
+     so a single offending batch fails just the responsible requests
+     (today's `_handle_errors(requests=None)` fails *all* active requests,
+     not just the offending batch).
+3. **Liveness surface (B4):** fix `LLM._check_health()` to observe
+   `PyExecutor._fatal_error` (added in B2), and make `/v1/models` consult
+   `_check_health()` mirroring `/health`.
 
 ---
 
 ## Cross-References
 
 - [`../nvbug-6043291-zombie-worker-pods/`](../nvbug-6043291-zombie-worker-pods/)
-  — Prior investigation; closest sibling. Defines the
-  `_fatal_error` / `check_health()` / `ErrorBudget` machinery this bug bypasses.
+  — Prior investigation; closest sibling. Defines the `_error_queue` /
+  `_handle_background_error` / `ManagedThread` / `CppExecutorError → SIGINT`
+  machinery (PR #12718) this bug bypasses (see `fix-plan.md` §V1 for why).
 - [`../nvbug-6104831-disagg-permanent-wedge/`](../nvbug-6104831-disagg-permanent-wedge/)
   — Symptom-class cousin. Different root cause (disagg KV-transceiver
   cancellation vs. agg admission accounting) but identical failure shape:
