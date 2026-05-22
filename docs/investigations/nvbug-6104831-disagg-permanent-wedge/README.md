@@ -31,6 +31,38 @@ rc11
 
 Submitted as PR [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713).
 
+> **Default-OFF after merge with `upstream/main`.** The cancellation +
+> poison + fail-closed surface, plus the Python-side timeout
+> enforcement and the deferred-cleanup machinery that depends on it,
+> are now gated behind a single opt-in environment variable
+> `TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL`. Default unset → pre-PR
+> baseline behaviour for every gated point; customers hitting NVBug
+> 6104831 opt in explicitly.
+>
+> The orthogonal lifetime / idempotency / RAII / eval-order fixes
+> (sigs `#1`, `#5`, `#6`, `#7` and the always-on portion of `#4`)
+> remain unconditional because they close baseline races that exist
+> regardless of mid-flight cancellation.
+>
+> Why default-OFF, not default-ON: the deferred-cleanup logic in
+> particular ("don't free Python resources while C++ transfer status
+> is still in progress") is a per-rank decision in the V1 + C++
+> transceiver path, which has no consensus story across TP, PP, or
+> EP. Per-rank deferral conflicts with the consistency invariants
+> those parallelism strategies depend on (TP allgather rank-batch
+> divergence, PP termination retry, MTP scheduler state). The V2 +
+> Python transceiver already enforces consensus via
+> `_consensus_outcome` (CANCELLED/FAILED on any rank → global,
+> COMPLETED only when all ranks agree); the V1 + C++ path does not.
+> Architecturally correct deferred cleanup needs to be designed
+> *with* the consensus story, not retrofitted on top of a per-rank
+> decision. See
+> [`10-ablation-no-midflight-cancel.md`](10-ablation-no-midflight-cancel.md#why-we-ship-default-off)
+> for the empirical CI evidence (RC-1 MTP / RC-2 TP allgather / RC-3
+> PP) and
+> [the follow-up design doc](../../design/disagg-inflight-cancel-poison/README.md)
+> for the architectural rethink.
+
 Latest local results, 1P1D `trtllm-serve` long-prompt burst harness on a
 single 8-GPU B300 host. Bold cells are the post-PR-#13728 reaffirmations;
 the rest pre-date the fold-in:

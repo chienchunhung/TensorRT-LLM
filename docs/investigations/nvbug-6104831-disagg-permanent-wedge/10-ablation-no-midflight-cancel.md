@@ -392,6 +392,110 @@ corrupted responses is a much harder correctness hazard to detect.
 
 ---
 
+## Why we ship default-OFF
+
+The empirical case above defends the layers' correctness *as a unit*.
+It does not, on its own, defend defaulting them ON for every
+deployment. After merging the candidate stack with `upstream/main`,
+three CI failures surfaced that point to a deeper architectural gap:
+**none of the new layers were designed with a consensus story across
+the parallelism strategies the executor supports** (TP, PP, EP). The
+five layers all make per-rank decisions about cancellation and
+deferred cleanup. The V1 + C++ transceiver path the layers extend has
+no consensus mechanism; once each rank decides independently, the
+ranks split-brain on which requests are still scheduled and which
+have been freed.
+
+### Three CI failures, one root cause
+
+| RC | Test | Surface | Per-rank decision that diverges |
+|---|---|---|---|
+| **RC-1** | `TestQwen3_5_35B_A3B.test_bf16_mtp[mtp_on]` | MTP scheduler vs `_can_terminate_request_now` | Deferred request stays in `active_requests`, but MTP speculative state is partially torn down. Next forward step's `_prepare_inputs` returns `None` instead of `(inputs, gather_ids)`. `mtp_off` variant passes — isolates MTP path as trigger. |
+| **RC-2** | `TestDeepSeekV3Lite.test_auto_dtype_with_helix[pp1dp2cp2 / pp2tp1cp2]` | TP / CP allgather | `checkContextTransferStatus` deadline check fires at slightly different wall-clock times per rank. Rank 0 includes a request in its batch; rank 1 excludes it. Different batches → one rank enters `tp_cp_allgather`, the other doesn't → MPI collective blocks indefinitely → 300 s hang detector. |
+| **RC-3** | `TestDisagg.test_asymmetric_executor[llama-4proc-mpi_kvcache-90]` | PP termination handler | `DisaggPPTerminationHandler` callback was changed to `_do_terminate_request_if_safe`, which defers on in-transmission requests but has no retry path wired up for the PP case. KV blocks pinned indefinitely → pool exhaustion → CUDA illegal memory access on the next scheduling attempt. |
+
+All three are the same defect class: **the deferred-cleanup logic
+treats "is this request in transmission?" as a per-rank query and
+acts unilaterally on the answer.** A rank that answers "yes, defer"
+and a rank that answers "no, terminate" diverge on the next
+iteration's batch and on whether the request's KV blocks have been
+returned to the pool — neither of which is a per-rank property in TP,
+PP, or EP.
+
+### Contrast with the V2 + Python transceiver
+
+The V2 + Python transceiver (`KvCacheTransceiverV2` in
+`tensorrt_llm/_torch/disaggregation/transceiver.py`) was designed
+with this exact concern. Every per-iteration outcome flows through
+`_consensus_outcome`:
+
+```text
+CANCELLED on any rank   → globally cancelled
+FAILED on any rank      → globally failed
+COMPLETED on every rank → globally completed (else: re-poll next iter)
+```
+
+with TP allgather first then PP allgather
+(`_ctx_consensus_outcome`). The deferred-cleanup pattern is already
+there — `cancel_request` returns `False` if any task is mid-write,
+and the caller retries next iteration — but it's anchored on a
+*globally* consistent decision, not a per-rank one.
+
+The V1 + C++ transceiver path PR #13713 extends does not have this
+machinery. Adding consensus to that path is a substantial design
+effort that has to thread through:
+
+- the per-rank C++ `checkContextTransferStatus` /
+  `checkGenTransferStatus` deadline checks (rank-time skew),
+- the `DisaggPPTerminationHandler` callback contract (one callback
+  per request across all PP ranks vs N callbacks per rank),
+- the MTP scheduler's coupling between `_can_terminate_request_now`
+  and speculative state teardown (atomicity requirement),
+- and the EP routing layer's assumption that every expert sees the
+  same active-request set on each iteration (we have not exercised
+  this combination yet; the design has to anticipate it).
+
+Shipping the cancellation + poison + deferred-cleanup surface
+default-ON would force this design to land *under time pressure*,
+with the regression evidence already in hand. Shipping default-OFF
+gives the architectural rethink room to happen properly. The
+follow-up design doc
+([`docs/design/disagg-inflight-cancel-poison/README.md`](../../design/disagg-inflight-cancel-poison/README.md))
+captures the rethink: the goal becomes "architecturally correct
+request cancellation across V1/V2 × C++/Python × NIXL/UCX × TP/PP/EP"
+rather than "make the existing in-flight cancel less aggressive".
+
+### What `TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1` covers
+
+Single env-var opt-in, all-or-nothing within the cancellation surface:
+
+| Layer / point | Default (unset) behaviour | `=1` behaviour |
+|---|---|---|
+| C++ `CacheSender::Impl::cancelRequest` in-flight-flag branch | Skipped; `cancelRequest` returns `false` for in-flight requests | Flips the cancel flag; `AgentConnection::send` unwinds |
+| C++ `CacheReceiver::Impl::cancelRequest` in-flight-flag branch | Symmetric to sender | Symmetric to sender |
+| C++ `checkContextTransferStatus` / `checkGenTransferStatus` deadline force-evict | Logs once-per-request WARN; future left to complete naturally | Cancels + marks `kDISAGG_TRANS_ERROR` + erases future |
+| C++ `catch (...)` poison call in formatters (Layer 2b) | Catch never fires (the in-flight cancel path that throws is gated upstream) | Catch fires; pool-wide `mPoisoned` set |
+| C++ Layer 5 fail-closed (transitive on poison) | Inert | Active |
+| Python `_can_terminate_request_now` deferral | Returns `True` immediately (no deferral) | Defers when request is in disagg transmission state |
+| Python `_handle_errors` `deferred_requests` population | Always `[]` | Populated with in-transmission requests |
+| Python `DisaggPPTerminationHandler` callback choice | `_do_terminate_request` (synchronous) | `_do_terminate_request_if_safe` (defers) |
+| Python `_check_kv_transfer_timeout` active cancellation + error marking | Logs the timeout once per request per role; future left to complete naturally | Cancels + marks error |
+| Python `cancel_request()` / `has_poisoned_transfer_buffer()` helpers | No-op (returns `False`) | Delegates to C++ |
+
+Orthogonal always-on pieces (no flag): `BufferIndexHolder` RAII,
+`shared_ptr<LlmRequest>` async lifetime, recv-side promise
+idempotency, `handleAsyncSend` eval-order fix, Python idempotency
+guards on `_prepare_disagg_gen_init` / `_recv_disagg_gen_cache`,
+nanobind `nb::keep_alive` on the NIXL agent / status pair.
+
+The flag's atomicity is the load-bearing property: every point above
+either ALL becomes active or ALL stays dormant. Partial enabling
+re-introduces the per-rank-decision-without-consensus failure mode
+(e.g. enabling C++ cancel but not Python deferral re-opens the UAF
+window because Python frees while C++ may still touch the buffer).
+
+---
+
 ## Honest gaps
 
 Three gaps in the empirical case. The architectural arguments hold
