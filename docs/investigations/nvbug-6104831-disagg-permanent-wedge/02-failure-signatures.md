@@ -1,6 +1,6 @@
-# 02 — Failure Signatures (`#1` – `#7`)
+# 02 — Failure Signatures (`#1` – `#9`)
 
-The customer-visible wedge is the union of seven distinct failure
+The customer-visible wedge is the union of nine distinct failure
 signatures in the disaggregated KV-cache transfer path. This file describes
 each one in detail: how it manifests, where it lives in the code, what
 triggers it, what the fix is (or what we still need to learn), and the
@@ -23,6 +23,7 @@ For convenience, the signature labels at a glance:
 | **#6** | Recv-buffer index leak via `!isReady` early-return; subsequent receives wedge in `BaseTransBufferManager::assignBufferIndex()` | `cpp/tensorrt_llm/batch_manager/baseTransBuffer.cpp` (unbounded `cv.wait`) leaked from `CacheReceiver::Impl::requestSync()` (`!isReady` path) | Fine-grained C++ instrumentation across `sendRequestInfo()` body in `run7` |
 | **#7** | A bug class in `CacheSender::Impl::*` C++ code, observed as four manifestations: deadlock in `response()`; ctx mpi4py executor exits; Python-`getattr` SIGSEGV; first-request SIGSEGV in `handleAsyncSend` (PR `#13056` + UCX) | `cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp::CacheSender::Impl::*` | `gdb` post-mortems of `run8`, `pr13056_run1`, `rc11_ucx_run1`, `run9`, `run10`, `run14`/`run14c` |
 | **#8** | rc13 server hang under disagg + block reuse + in-flight cancel | `py_executor.py::_handle_responses` early-termination branch (gated by `enable_partial_reuse_for_disagg`) + `AsyncTransferManager._end_transfer_and_maybe_terminate` (gated by `not should_store_blocks`) — both refuse termination under the right timing, leaving the request with no cleanup owner | rc13 ablation: `CONC=128` passes with block reuse disabled, fails with block reuse enabled regardless of overlap setting |
+| **#9** | Helix CI hang on gen-side `_check_disagg_gen_cache_transfer_status`: rank-asymmetric Python gates skip the C++ `gatherRequestIds` collective while other ranks proceed to a downstream unconditional collective (ADP `tp_allgather` / PP step boundary) | `py_executor.py::_prepare_disagg_gen_init`, `_recv_disagg_gen_cache`, `_check_disagg_gen_transfer_status` (three rank-local gates over `fitting_disagg_gen_init_requests`, `_disagg_gen_kv_recv_started_ids`, and `active_requests` IN\_PROGRESS state); ABBA partner is `_can_queue::tp_allgather` under attention-DP or PP step-boundary collective under `gen_pp > 1` | PR `#13713` CI build `#39529`: `TestDeepSeekV3Lite::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1dp2cp2]` and `[…pp2tp1cp2]` both wedge at the hang-detector's 300 s; the two passing parametrizations (`pp1tp1cp4`, `pp1tp2cp2`) lack the downstream unconditional collective and so don't deadlock |
 
 > **Read this caveat before reading anything else.** Signatures `#1`
 > through `#6` are real TRT-LLM bugs and the chained PRs land their
@@ -694,3 +695,207 @@ the empirical evidence and the full plan.
 
 **PRs:** TBD. Stop-gap is small (~10 lines + integration test);
 Phase 2 is documented in the design doc but not yet implemented.
+
+---
+
+## Signature #9 — Helix CI hang: rank-asymmetric Python gates over a cross-rank C++ collective
+
+**Symptom (PR `#13713` CI build `#39529`, hang-detector trace after 300 s
+on the `fifo_v2-cudagraph:with_padding-pp1dp2cp2` and `…-pp2tp1cp2`
+helix parametrizations of `TestDeepSeekV3Lite::test_auto_dtype_with_helix`):**
+
+```text
+[E] Hang detected after 300 seconds.
+
+# gen ranks 0 and 3:
+File "py_executor.py", line 2380, in _prepare_and_schedule_batch
+    self._prepare_disagg_gen_init(fitting_disagg_gen_init_requests)
+File "py_executor.py", line 3842, in _prepare_disagg_gen_init
+    self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+File "py_executor.py", line 3969, in _recv_disagg_gen_cache
+    self._check_disagg_gen_cache_transfer_status(1 if block_transfer else 0)
+File "py_executor.py", line 4089, in _check_disagg_gen_cache_transfer_status
+    result = self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
+File "kv_cache_transceiver.py", line 244, in check_gen_transfer_status
+    return self.impl.check_gen_transfer_status(at_least_request_num)
+
+# gen ranks 1 and 2 (already past _prepare_and_schedule_batch):
+File "py_executor.py", line 2603, in _executor_loop
+    can_queue, _ = self._can_queue(scheduled_batch)
+File "py_executor.py", line 2269, in _can_queue
+    tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
+File ".../distributed/communicator.py", line 375,
+    in _serialize_and_exchange_lengths
+    comm.Allgather([local_len, MPI.INT64_T], [lengths, MPI.INT64_T])
+```
+
+Ranks 0/3 are blocked inside the C++ `CacheTransceiver::checkGenTransferStatus`
+on its initial `gatherRequestIds(syncComm, …)` cross-rank allgather.
+Ranks 1/2 are blocked in the Python-side `_can_queue` MPI Allgather.
+Both collectives expect every gen-side rank to participate; only some
+do, so the two waits form an ABBA deadlock across two distinct comms on
+overlapping rank sets.
+
+The same shape applies to the `pp2tp1cp2` variant, with the downstream
+partner being a PP step-boundary collective rather than the ADP
+`tp_allgather`.
+
+**Where it lives:** Three rank-local Python gates in
+[`tensorrt_llm/_torch/pyexecutor/py_executor.py`](../../../tensorrt_llm/_torch/pyexecutor/py_executor.py),
+each guarding the only call chain that reaches
+`CacheTransceiver::checkGenTransferStatus` → `gatherRequestIds`:
+
+| Gate site | Predicate | Per-rank source of divergence |
+|---|---|---|
+| `_prepare_disagg_gen_init` (line ~3816) | `if fitting_disagg_gen_init_requests:` | Scheduler output dispatched per-rank under attention-DP; PP step skew |
+| `_recv_disagg_gen_cache` (line ~3931) | `if not recv_reqs: return` | `self._disagg_gen_kv_recv_started_ids` set diverges across ranks when `request_and_receive_async` throws asymmetrically (each rank's `except: discard; raise` only mutates its own set) |
+| `_check_disagg_gen_transfer_status` (line ~3649) | `if need_check:` over `any(req.is_disagg_generation_transmission_in_progress)` | Receiver-future resolution timing is independent across CP-sharded shards, so the IN\_PROGRESS bit transitions to COMPLETE at different wall-clock times on different ranks |
+
+The downstream C++ collective is the `gatherRequestIds(syncComm, …)`
+call in
+[`cpp/tensorrt_llm/batch_manager/cacheTransceiver.cpp`](../../../cpp/tensorrt_llm/batch_manager/cacheTransceiver.cpp)
+inside `CacheTransceiver::checkGenTransferStatus(…)` (gen-side comm is
+`mGroupDataComm` with attention-DP, `mGroupComm` otherwise).
+
+**Root cause:** The three Python gates were not introduced by PR `#13713`
+— they pre-existed. Pre-PR they were *latent* in two ways:
+
+1. **Mismatch between Python and C++ rank sets used to crash, not hang.**
+   The C++ side used to hold raw / weak references to `LlmRequest`; any
+   set divergence between Python's `active_requests` and C++'s
+   `mRequesterFutures` produced a UAF the next time C++ touched the
+   request. The crash surfaced fast and got fixed at some other layer
+   before the gate-driven hang could manifest. PR `#13713`'s lifetime
+   refactor (`shared_ptr<LlmRequest>` storage in
+   `mRequesterFutures` / `mSenderFutures` and in the nanobinding
+   trampoline at
+   [`nanobind/batch_manager/cacheTransceiver.cpp`](../../../cpp/tensorrt_llm/nanobind/batch_manager/cacheTransceiver.cpp))
+   converted the loud UAF into a silent state-divergence deadlock.
+2. **New state-divergence mechanisms.** PR `#13713`'s deadline-bounded
+   `wait_for(effectiveSliceMs)` in `checkGenTransferStatus` (line ~996)
+   replaced the pre-PR blocking `wait_for(future)` — once one rank's
+   future resolves and it erases the entry, another rank can still be
+   pending, producing per-iteration divergence on the next call. PR
+   `#13713` also reordered `setState(IN_PROGRESS)` to run *after*
+   `mCacheReceiver->receiveAsync(…)` in `requestAndReceiveAsync` (line
+   ~414-424); on asymmetric throw the throwing rank's state stays at
+   `INIT` while the non-throwing rank's reaches `IN_PROGRESS`,
+   diverging the `need_check` predicate at gate (3) the next iteration.
+
+The deadlock only manifests when a downstream **unconditional**
+cross-rank collective on the same rank set provides the ABBA partner.
+The two failing helix parametrizations have exactly this:
+
+- **`pp1dp2cp2`** (ADP=True, gen\_tp=2, gen\_cp=2, gen\_pp=1): the ADP
+  branch of
+  [`_can_queue`](../../../tensorrt_llm/_torch/pyexecutor/py_executor.py#L2263-L2275)
+  runs `self.dist.tp_allgather(scheduled_batch.batch_size)` on every
+  iteration, unconditionally.
+- **`pp2tp1cp2`** (ADP=False, gen\_pp=2, gen\_cp=2): the PP step
+  boundary runs an unconditional inter-stage collective on every
+  forward step.
+
+The other two helix parametrizations (`pp1tp1cp4`, `pp1tp2cp2`,
+both ADP=False / PP=1) have no downstream unconditional collective on
+the gen-side comm — the gate divergence still happens, but there is
+no ABBA partner, so the test passes despite the latent bug.
+
+**Why the timeout / cancel knobs don't help this specific deadlock:**
+`gatherRequestIds` runs at the *top* of `checkGenTransferStatus` (line
+~812) — before any per-request `wait_for` slice or `kv_transfer_timeout_ms`
+deadline check (lines ~917-972). Stuck ranks never reach the
+deadline-check code. Setting `TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1` and
+lowering `kv_transfer_timeout_ms=30000` made the failure shape identical
+to the default-config one (hang at 300 s, same stacks).
+
+**Fix:** Remove all three rank-asymmetric gates so every gen-side rank
+enters the C++ call together. The C++ `checkGenTransferStatus` on
+empty `mRequesterFutures` is cheap (a single empty allgather, no inner
+per-request loop work, no state writes); the per-iteration cost of
+"always call" is dominated by that one empty collective.
+
+```python
+# _prepare_disagg_gen_init: hoist out of the rank-local gate
+if fitting_disagg_gen_init_requests:
+    for resource_mgr_type in (...):
+        ...
+self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+
+# _recv_disagg_gen_cache: drop the early-return, guard only the
+# receive-loop work
+if recv_reqs:
+    for req in recv_reqs:
+        ...request_and_receive_async(req)...
+    for req in recv_reqs:
+        if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+            req.py_kv_transfer_start_time = time.time()
+non_gen_first_active = [...]
+block_transfer = ...
+self._check_disagg_gen_cache_transfer_status(1 if block_transfer else 0)
+
+# _check_disagg_gen_transfer_status: drop the if-need-check gate
+non_gen_first_reqs = [...]
+need_check_one = ...
+at_least_num = 1 if need_check_one else 0
+self._check_disagg_gen_cache_transfer_status(at_least_num)
+```
+
+`at_least_num` stays rank-local — it only controls the C++ inner loop's
+`blockAll` vs polling behaviour, never the collective itself, so
+per-rank divergence on this argument is safe.
+
+Each call site carries an in-code comment recording the cross-collective
+ABBA invariant so a future refactor can't silently re-introduce a gate.
+
+**Why "always call" rather than "sync the predicate via an extra
+allreduce":** Both approaches cost one collective per iteration. The
+predicate-sync alternative would need to pick a comm wide enough to
+cover the ABBA partner (TP under ADP, PP under PP > 1), which means
+replicating a decision the C++ side already encodes via
+`mGroupDataComm` / `mGroupComm`. Worse, the bounded-wait timing-skew
+mechanism (#2 above) bypasses the predicate sync entirely — Python's
+`is_disagg_generation_transmission_in_progress` flips to false on the
+rank whose future just resolved *between* the sync and the C++ call,
+so the sync only catches a subset of the divergence sources.
+"Always call" is immune to all sources of divergence by construction.
+
+**Reproducer:** `tests/integration/defs/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1dp2cp2]`
+and `[…-pp2tp1cp2]`, with the gen-side `cache_transceiver_config.backend = "UCX"`
+(direct UCX). Pre-fix: both hang at the 300 s hang-detector. Post-fix:
+both pass under the CI-default configuration (default
+`kv_transfer_timeout_ms=60000`, no `TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL`),
+`447.98 s` / `322.98 s` wall, with the GSM8K hypothesis test landing
+at 63.87 vs the 61.54 threshold — i.e. the model actually serves the
+workload, not a no-op pass.
+
+**Other potentially-affected tests** that share the same trigger
+(disagg + multi-rank gen + ADP-or-PP > 1 + C++ transceiver) but did
+not surface this in CI because they sit behind other gates:
+
+- `TestKimiK2::test_nvfp4` (gen tp=4, ADP=True, default → NIXL → C++
+  transceiver): already SKIP-waived for NVBug 6162328 (unrelated), so
+  PR `#13713` CI never ran it.
+- `TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=False]`
+  (gen pp=2, NIXL, C++ transceiver): listed in
+  `l0_dgx_b200.yml` with an explicit `TIMEOUT (60)` annotation — the
+  extended timeout most plausibly masks the same deadlock by giving
+  the harness room to exit cleanly before the front-end gives up. Worth
+  re-running with the `TIMEOUT (60)` removed once the fix lands; see
+  [`08-next-steps-and-pr-map.md`](08-next-steps-and-pr-map.md).
+- Several other ADP+disagg tests (`TestQwen3_8B::test_gen_first[adp-…]`,
+  `TestNemotron3Super120B::test_ctx_dp2_gen_tp4`) use the Python V2
+  transceiver (`KvCacheTransceiverV2`), which has its own
+  `_consensus_outcome` mechanism instead of the C++ `gatherRequestIds`
+  collective — structurally immune to this specific deadlock.
+
+**Status:** Fixed in PR `#13713` commit
+[`bdfdf8be02`](https://github.com/NVIDIA/TensorRT-LLM/pull/13713). The
+three-gate removal is ~10 lines of net edit + ~30 lines of load-bearing
+comments at each site. Empirically validated on the originally-failing
+configuration (CI-default knobs, two helix parametrizations re-run
+locally on an 8-GPU B300 host, both PASS).
+
+**PRs:** Included in [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713)
+as a separate commit on top of the rc13 combo. See
+[`03-defect-class-stack.md#L11`](03-defect-class-stack.md) for the
+defect-class framing.

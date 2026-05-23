@@ -20,7 +20,8 @@ recommendation, read
 | **#6** Recv-buffer index leak via `!isReady` early return | Combined test + fix in review (chained on `#13640`) | (combined into fix PR) | [#13673](https://github.com/NVIDIA/TensorRT-LLM/pull/13673) | Two-layer fix: RAII cleanup in `sendRequestInfo()` (Layer A) + explicit free in `requestSync()` `!isReady` path (Layer B). Direct cascade from the `#1` fix. |
 | **#7** `pthread_mutex_lock` wedge in `CacheSender::Impl::*` (bug class with 4 manifestations) | Variant D fixed; mutex deadlock variant still needs `gdb` capture | — (unit test deferred until exact mutex / holder identified) | Variant D fix included in [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) (combo PR) | Re-classified in Phase 12 from "NIXL plugin bug" to "TRT-LLM-side `CacheSender::Impl` mutex bug, exposed across both NIXL and direct-UCX backends". Phase 13 broadened to a 4-manifestation class. Phase 14 confirmed and fixed Variant D (eval-order). |
 | **L9** Transport quiescence on unsafe exit (no signature — defense-in-depth) | Folded into combo; MLA port follow-up done | — (focused unit tests being ported alongside the sig regression tests) | [#13728](https://github.com/NVIDIA/TensorRT-LLM/pull/13728) folded directly into [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) | Adds `BufferIndexHolder::poison()`, tri-state `ReadySignalResult{kReady,kNotReady,kCancelled}`, send-side `try/catch` + poison around `sendAllBuffers`, and Python `_fail_closed_for_unquiesced_disagg_transfer()`. The MLA send path was missed by `#13728` and ported to `mlaCacheFormatter.cpp` as part of the PR `#13713` review-fix cleanup (zero-copy disable + try/catch + `sendHolder.poison()`). |
-| **Combo (Approach D)** | In review | (multiple) | [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) | PR `#13056` + PR `#13495` + eval-order fix + Python idempotency guards + PR `#13728` (folded in) + MLA port. The strongest current candidate; see [`06-fix-approaches/D-combo.md`](06-fix-approaches/D-combo.md). |
+| **#9** Helix CI hang from rank-asymmetric Python gates over a cross-rank C++ collective | Fix landed on PR `#13713` head; CI re-run pending | — (covered by `test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1dp2cp2]` and `[…-pp2tp1cp2]` as integration regression tests) | Commit [`bdfdf8be02`](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) on PR `#13713` branch | Drops the three rank-asymmetric Python gates in `_prepare_disagg_gen_init`, `_recv_disagg_gen_cache`, `_check_disagg_gen_transfer_status`. Validated locally on B300 with both failing parametrizations passing under CI-default configuration (default `kv_transfer_timeout_ms`, no `TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL`). Likely also resolves the `TIMEOUT (60)` masking on `TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=False]`; see outstanding-work item below. |
+| **Combo (Approach D)** | In review | (multiple) | [#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) | PR `#13056` + PR `#13495` + eval-order fix + Python idempotency guards + PR `#13728` (folded in) + MLA port + sig `#9` / L11 fix (commit `bdfdf8be02`). The strongest current candidate; see [`06-fix-approaches/D-combo.md`](06-fix-approaches/D-combo.md). |
 
 ### Companion fixes (already in `main`, not in `rc11`)
 
@@ -340,6 +341,68 @@ The marker fires immediately *before* the sig `#1` cancellation
 handler that already fulfills the promise correctly. Rename to
 `cancelled_after_ready_handled` to remove the false-positive in
 future forensic readings.
+
+### 12. Drop `TIMEOUT (60)` on `TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=False]`
+
+`tests/integration/test_lists/test-db/l0_dgx_b200.yml:169` carries
+an explicit `TIMEOUT (60)` annotation on
+`TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=False]`.
+That test's gen-side configuration (gen `pp=2`, NIXL → C++
+transceiver) matches the L11 trigger exactly: multi-rank gen,
+unconditional downstream collective on the same ranks (PP step
+boundary), C++ transceiver. The extended timeout is the most
+plausible mechanism that prevents this test from showing the same
+helix hang in CI — the harness exits at 60 min rather than the
+default 35 min, which is enough margin for the front-end to give
+up cleanly and the test wrapper to mark FAILED instead of hanging
+the CI stage.
+
+**Action:** Once the sig `#9` / L11 fix lands on PR `#13713`,
+re-run `TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=False]`
+on `l0_dgx_b200` without the `TIMEOUT (60)` annotation. If it passes
+within the default timeout, drop the annotation in a small follow-up
+commit. If it still hangs or times out, the test has *additional*
+issues beyond L11 and the annotation should stay until those are
+characterised separately.
+
+**Effort:** One CI re-run + a one-line YAML edit. Worth doing because
+it converts a load-bearing assumption ("L11 fix covers all
+disagg + ADP / PP + C++ transceiver tests") into directly observed
+evidence.
+
+### 13. Audit other rank-asymmetric Python gates over cross-rank C++ collectives
+
+The L11 pattern — "Python-side rank-local predicate guards the only
+call chain into a cross-rank C++ collective" — is structurally fragile
+in any code path that has both. The three gates fixed in commit
+`bdfdf8be02` are the only ones currently surfaced by the hang
+detector, but other paths in `py_executor.py` and the disagg scheduler
+that gate cross-rank C++ calls on per-rank state should be audited
+for the same shape.
+
+Specific candidates worth checking:
+
+- `_check_kv_transfer_timeout` (`py_executor.py:3656+`) iterates
+  `self.active_requests` per-rank and calls `cancel_request` on
+  timed-out requests. Whether this can drive a downstream C++ rank
+  divergence depends on whether `cancel_request` itself enters a
+  collective; needs reading.
+- `_check_disagg_ctx_schedulable_status` (sibling of `_check_disagg_gen_transfer_status`)
+  — ctx-side analogue with similar gate structure on the sender side.
+- Any path that gates on `_disagg_gen_init_prepared_ids` or
+  `_disagg_timed_out_ctx_cancelled_ids`, both of which are populated
+  per-rank.
+
+The audit pattern is mechanical: grep for any Python `if predicate:`
+followed downstream by a call into a C++ method whose body opens with
+an MPI or NCCL collective. If found, either the predicate must be
+synchronised across ranks (extra allreduce) or the C++ call must be
+made unconditional. The latter is almost always simpler and is the
+shape used by the commit `bdfdf8be02` fix.
+
+**Effort:** A few hours of code reading. The L1 / L4 / L8 audits that
+preceded this investigation found similar patterns by inspection; this
+one is no different in shape.
 
 ---
 

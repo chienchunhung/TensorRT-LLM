@@ -1,9 +1,9 @@
-# 03 — Defect Class Stack (`L1`–`L9`)
+# 03 — Defect Class Stack (`L1`–`L11`)
 
-The seven failure signatures (`#1`–`#7`) in
+The nine failure signatures (`#1`–`#9`) in
 [`02-failure-signatures.md`](02-failure-signatures.md) are the customer-
 visible faces of the wedge. This file describes the *deeper* structure
-underneath them: **nine invariant gaps that the rc11 disaggregated KV
+underneath them: **eleven invariant gaps that the rc11 disaggregated KV
 transceiver doesn't actually enforce**.
 
 The first eight (`L1`–`L8`) are *wedge-prevention* invariants — any one
@@ -64,6 +64,7 @@ includes a mechanism that closes the invariant in L_n, or it doesn't.
 | **L8** | **Python scheduler idempotency** — `_prepare_disagg_gen_init` and `_recv_disagg_gen_cache` re-run side effects when the same `py_request_id` is rescheduled while in `DISAGG_GENERATION_INIT` | `py_executor.py::_prepare_disagg_gen_init`, `_recv_disagg_gen_cache` | `KVCacheManager::addSequence` fires `emplaceDone` assertion at `kvCacheManager.cpp:2992`; `request_and_receive_async` is started twice for the same request |
 | **L9** | **Transport quiescence on unsafe exit** — buffer slots returned to the pool while the NIXL/UCX transport may still be writing into them | `cacheFormatter.cpp::CacheFormatter::format` send loop, `mlaCacheFormatter.cpp::MLACacheFormatter::format` send loop, `dataTransceiver.cpp::CacheReceiver::Impl::requestSync` recv path; all paths where `BufferIndexHolder::~BufferIndexHolder` runs on cancel / exception with an in-flight `AgentConnection` | Closing L1–L8 prevents wedges, but the cancel/exception paths still hand pool-owned VRAM back to the next request while the peer (or the local agent thread) may still be writing into those buffers. Risk surface is silent KV-cache corruption / sporadic decode garbage that only manifests under cancel-heavy load |
 | **L10** | **Redundant block-reuse cleanup mechanism on the disagg path** — partial-reuse early-termination + `_end_transfer_and_maybe_terminate` post-transfer termination form a dual-path with implicit hand-off via `should_store_blocks` | `py_executor.py::_handle_responses` (early-termination branch gated by `enable_partial_reuse_for_disagg`), `AsyncTransferManager._end_transfer_and_maybe_terminate` (post-transfer branch gated by `not should_store_blocks`); pin/unpin lifecycle in `start_transfer` / `end_transfer` | Two cleanup owners coordinate via implicit boolean state. Each owner can refuse termination under the right timing (in-transmission guard at the early site, `should_store_blocks=True` skip at the late site), and the cross-product can leave a request with no owner. Customer-visible: server hang on rc13 + block reuse + in-flight cancel. Latent additional symptoms: pin leak on cancel/timeout (gradual GPU OOM), PP > 1 disagg cannot use block reuse, eviction race in the unpin → release window (cache-hit rate degradation), recurring regression risk on adjacent code |
+| **L11** | **Python-side rank-asymmetric gate before a cross-rank C++ collective** — `_prepare_disagg_gen_init`, `_recv_disagg_gen_cache`, and `_check_disagg_gen_transfer_status` each gate the only call chain into the C++ `gatherRequestIds` allgather on per-rank state | `py_executor.py::_prepare_disagg_gen_init` (gate over `fitting_disagg_gen_init_requests`), `_recv_disagg_gen_cache` (gate over `_disagg_gen_kv_recv_started_ids`), `_check_disagg_gen_transfer_status` (gate over `any(req.is_disagg_generation_transmission_in_progress for req in active_requests)`); collective is `cacheTransceiver.cpp::CacheTransceiver::checkGenTransferStatus::gatherRequestIds(syncComm, …)` on `mGroupDataComm` / `mGroupComm` | Latent in rc11 (UAF on the same divergence used to crash loudly before `shared_ptr<LlmRequest>` lifetime closed L2); surfaced by PR `#13713`'s lifetime + bounded-wait + `setState`-reorder changes which silently produce per-rank state divergence. Triggers ABBA deadlock against any downstream **unconditional** cross-rank collective on the same gen-side ranks: `_can_queue::tp_allgather` under attention-DP, PP step-boundary collective under `gen_pp > 1`. Helix CI hang on PR `#13713` build `#39529` (sig `#9`). Latent against any future disagg + ADP / PP test that uses the C++ transceiver — likely already masked by `TIMEOUT (60)` on `TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=False]` |
 
 `L1` through `L6` are C++ defects in the transceiver. `L7` is a
 *regression* introduced by `L2`'s fix (any approach that adds
@@ -77,6 +78,20 @@ reuse on by default in rc13, the dual-path becomes routinely exercised
 and the implicit hand-off between the two cleanup owners breaks. See
 [`05-investigation-timeline.md`](05-investigation-timeline.md) Phase 15
 for the empirical evidence.
+
+`L11` is a Python-side cross-collective ABBA invariant surfaced by
+PR `#13713`'s CI run on the helix parametrizations of
+`TestDeepSeekV3Lite::test_auto_dtype_with_helix`. Like `L8`, it is a
+Python-side defect; unlike `L8`, it was already present in the code
+*before* PR `#13713` but did not manifest as a hang because the
+pre-PR raw-pointer lifetime model (closed by `L2`) crashed loudly on
+the same per-rank state divergence rather than letting the gate-driven
+hang surface. PR `#13713`'s lifetime + bounded-wait + `setState`-reorder
+changes converted that loud crash into the silent gate divergence
+documented in sig `#9`. `L11` would have surfaced eventually on any
+disagg + ADP / PP test running against the C++ transceiver; the helix
+parametrizations were just the first ones to exercise the full trigger
+combination in pre-merge CI.
 
 ---
 
@@ -113,12 +128,16 @@ graph TB
     L10[L10: Redundant block-reuse<br/>cleanup mechanism] --> SIG8[Sig #8: rc13 server hang<br/>under disagg + block reuse<br/>+ in-flight cancel]
     L10 -.->|latent| LATENT[Pin leak / PP=1 restriction /<br/>eviction race / regression risk]
 
+    L11[L11: Python-side rank-asymmetric<br/>gate over cross-rank<br/>C++ collective] --> SIG9[Sig #9: helix CI hang<br/>under ADP / PP > 1<br/>+ C++ transceiver]
+    L2 -.->|silent under shared_ptr| L11
+    L11 -.->|latent| LATENT_L11[TestQwen3NextInstruct[use_py_transceiver=False]<br/>TIMEOUT(60) likely masks the<br/>same deadlock]
+
     SIG2[Sig #2:<br/>trie cascade prune]
     INDEPENDENT[Independent —<br/>eviction-driven, not<br/>cleanup-path]
     SIG2 -.-> INDEPENDENT
 
     classDef sig fill:#ffe,stroke:#b80
-    class SIG1,SIG2,SIG3,SIG4,SIG5,SIG6,SIG7A,SIG7D,SIG8 sig
+    class SIG1,SIG2,SIG3,SIG4,SIG5,SIG6,SIG7A,SIG7D,SIG8,SIG9 sig
 ```
 
 Some additional observations from the mapping:
@@ -155,6 +174,18 @@ Some additional observations from the mapping:
   regression risk on adjacent code. The architectural answer is to
   delete the dual-path entirely (existing design doc Phase 2 — see
   [`docs/design/block-reuse-overlap-scheduler/phase2-unify-reuse-mechanisms.md`](../../design/block-reuse-overlap-scheduler/phase2-unify-reuse-mechanisms.md)).
+- **L11 maps to sig `#9`** (the helix CI hang). L11 also has a
+  dependency on **L2**: pre-`shared_ptr<LlmRequest>`, the per-rank
+  state divergence that drives L11's three gates would have produced
+  a UAF on the next C++ access, surfacing as a loud crash and getting
+  fixed at the divergence source. Once L2 is closed and the C++ side
+  holds its own strong reference, the divergence becomes silent and
+  the gates drive the deadlock instead. L11 is therefore latent in
+  any code base that has L2 closed and has not yet enforced
+  "all gen-side ranks enter `checkGenTransferStatus` together". The
+  fix is mechanical (drop the three gates so all ranks call
+  unconditionally); the C++ side already handles empty
+  `mRequesterFutures` cheaply.
 - **Sig `#2` (trie cascade prune) does not map to any of L1–L10.** It
   is an independent eviction-driven bug, fixed entirely by changing
   `templatedTrie.h::clearNode` to reset the child's `mPrevNode` before
@@ -406,11 +437,16 @@ into a loud, attributable shutdown.
 | L7 | First request after `Response::mRequest` becomes `shared_ptr` SIGSEGVs deterministically in `handleAsyncSend`. Cannot serve any traffic. |
 | L8 | After the system progresses past the burst once, `KVCacheManager::addSequence` fires `emplaceDone` assertion at `kvCacheManager.cpp:2992`. Subsequent requests crash. |
 | L9 | No visible wedge, but the recv buffer pool can be reused while the previous tenant's NIXL/UCX transfer is still in flight. Symptom is silent KV-cache corruption / sporadic decode garbage that only manifests under cancel-heavy load — the worst kind of bug because it does not announce itself. |
+| L10 | Server hangs on rc13 + block reuse + in-flight cancel (sig `#8`). Latent additional symptoms even when the stop-gap is in place: pin leak on cancel/timeout, PP > 1 disagg restricted, eviction race in the unpin → release window. |
+| L11 | Gen-side helix CI hangs on configs that exercise an unconditional downstream cross-rank collective (ADP `tp_allgather` in `_can_queue`, PP step boundary). Hang detector traces show gen ranks split between `check_gen_transfer_status` → `gatherRequestIds` and `_can_queue` → `tp_allgather`. Latent against any future disagg + ADP / PP + C++ transceiver test combination; likely already masked behind `TIMEOUT (60)` on at least one other test (see [`02-failure-signatures.md#signature-9`](02-failure-signatures.md)). |
 
 The L1–L8 entries in this table describe the residual failure mode that
 characterises each of the four candidate fix approaches A/B/C
 respectively. Approach D is the first stack that closes L1–L8, and
 the post-PR-`#13728` fold-in is the first stack that also closes L9.
+L10 was added during the rc13 ablation cycle (Phase 15). L11 was added
+after the helix CI hang on PR `#13713` build `#39529` and is closed by
+the three-gate removal in commit `bdfdf8be02`.
 
 ---
 

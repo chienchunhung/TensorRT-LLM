@@ -99,6 +99,34 @@ validation are still pending.
 > [`08-next-steps-and-pr-map.md`](08-next-steps-and-pr-map.md) item 2
 > for the staged landing plan.
 
+> **Helix CI caveat (sig `#9` / L11):** PR `#13713` build `#39529`
+> exposed a previously-latent rank-asymmetric Python gate defect in
+> the disagg gen-side scheduling path. Three Python gates
+> (`_prepare_disagg_gen_init`, `_recv_disagg_gen_cache`,
+> `_check_disagg_gen_transfer_status`) each read rank-local state
+> while guarding the only call chain into the C++ `gatherRequestIds`
+> cross-rank allgather. Once PR `#13713`'s `shared_ptr<LlmRequest>`
+> lifetime extension closes L2, the per-rank state divergence that
+> used to crash loudly becomes silent — and the gates produce an
+> ABBA deadlock against any downstream unconditional collective on
+> the same gen-side ranks (`_can_queue::tp_allgather` under
+> attention-DP, PP step-boundary collective under `gen_pp > 1`).
+> Helix CI fired on the two parametrizations that meet both
+> conditions (`pp1dp2cp2`, `pp2tp1cp2`); the other two
+> (`pp1tp1cp4`, `pp1tp2cp2`) lack a downstream unconditional
+> collective and so didn't deadlock despite carrying the same
+> latent divergence. **Fix** (commit
+> [`bdfdf8be02`](https://github.com/NVIDIA/TensorRT-LLM/pull/13713)
+> on PR `#13713`): drop all three rank-asymmetric gates so every
+> gen-side rank enters the C++ call together. The C++ side handles
+> empty `mRequesterFutures` cheaply (one empty allgather, no
+> inner-loop work). The same fix likely also resolves the
+> `TIMEOUT (60)` masking on
+> `TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=False]`
+> (gen pp=2, NIXL → C++ transceiver — meets the trigger). See
+> sig `#9` in [`02-failure-signatures.md`](02-failure-signatures.md)
+> and L11 in [`03-defect-class-stack.md`](03-defect-class-stack.md).
+
 ---
 
 ## How to read this investigation
@@ -113,8 +141,8 @@ across sections that are each meant to be readable on its own:
 | **[`00-tldr.md`](00-tldr.md)** | **Start here. 10-minute read.** Summarises the wedge symptom, the eight-layer root cause, the combo fix (PR `#13713`), and the empirical recovery results. Has the architecture and fix-mapping figures inline. Inspires the deeper reads if you want detail. |
 | **[`09-executive-summary-rc11-to-rc13.md`](09-executive-summary-rc11-to-rc13.md)** | **15-minute read covering the full rc11 → rc13 journey.** Extends `00-tldr.md` with the rc13 regression chapter: why block reuse triggers it, what the short-term stop-gap covers and doesn't, why the design doc's Phase 2 deletion is the right long-term answer. Use this for an exec briefing or a new teammate joining mid-investigation. |
 | [`01-background.md`](01-background.md) | Read first if you are new to this code. Architecture diagrams of the disagg deployment, request lifecycle walkthrough, `LlmRequestState` state machine, key files / classes. |
-| [`02-failure-signatures.md`](02-failure-signatures.md) | The eight concrete failure signatures (`#1`–`#8`, with `#8` being the rc13 server hang under disagg + block reuse + in-flight cancel): symptom, code site, root cause, fix, regression test. The "what bugs are there" view. |
-| [`03-defect-class-stack.md`](03-defect-class-stack.md) | The ten-layer `L1`–`L10` defect-class model that emerged from the investigation. Re-frames the eight signatures as the customer-visible faces of underlying invariant gaps. **This is the framework used in the four-approach comparison.** |
+| [`02-failure-signatures.md`](02-failure-signatures.md) | The nine concrete failure signatures (`#1`–`#9`, with `#8` being the rc13 server hang under disagg + block reuse + in-flight cancel, and `#9` being the helix CI hang from rank-asymmetric Python gates over a cross-rank C++ collective): symptom, code site, root cause, fix, regression test. The "what bugs are there" view. |
+| [`03-defect-class-stack.md`](03-defect-class-stack.md) | The eleven-layer `L1`–`L11` defect-class model that emerged from the investigation. Re-frames the nine signatures as the customer-visible faces of underlying invariant gaps. **This is the framework used in the four-approach comparison.** |
 | [`04-reproduction.md`](04-reproduction.md) | How to reproduce the wedge locally with `trtllm-serve` 1P1D, the load shape that matters, and what does *not* reproduce it. |
 | [`05-investigation-timeline.md`](05-investigation-timeline.md) | Chronological journey: Phases 0 (field report) through 14 (current). Useful for understanding *how* the bug class was discovered and why each fix exposed the next, but not required to understand the current state. |
 | [`06-fix-approaches/`](06-fix-approaches/) | The four candidate fix stacks (A, B, C, D), one file each, plus a comparison `README.md` that scores them against the `L1`–`L8` defect class stack. **The `README.md` here is the most important file in the report for picking a fix path.** |
