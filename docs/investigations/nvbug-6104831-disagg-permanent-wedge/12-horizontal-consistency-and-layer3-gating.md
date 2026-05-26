@@ -232,11 +232,62 @@ Every observed failure has both conditions; every test without Condition 1 passe
 
 The theory makes it clear that any fix must address **horizontal consistency** explicitly, instead of relying on the vertical-inconsistency side-effect that pre-PR #13713 had. There are two families of approaches: restore the *implicit* horizontal mechanism (Path A), or build *explicit* horizontal consistency (Path B).
 
-### 5.1 Path A — restore pre-PR-equivalent C++ lifetime when cancel is disabled
+### 5.1 Path A — restore pre-PR-equivalent C++ lifetime via a dedicated lifetime flag
 
-**Idea:** when `TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=0` (default), C++ holds a non-owning reference to `LlmRequest`; behavior matches main. When the flag is on, full `shared_ptr` ownership and the cancel/poison machinery.
+**Idea:** introduce a new env var that controls whether C++ holds a *strong* (`shared_ptr`) or *weak* (raw pointer) reference to `LlmRequest`. Default to strong (PR #13713 behavior); allow opt-out to weak when a deployment or test explicitly accepts the pre-PR UAF window in exchange for restored implicit horizontal consistency.
 
-This re-introduces the pre-PR vertical inconsistency *only when the flag is off*, which restores main-equivalent behavior — including the implicit horizontal consistency that prevented these failures historically. It's a deliberate trade: accept the pre-existing UAF risk (which we know is rare under most workloads) in exchange for shipping PR #13713's cancel/poison machinery as an opt-in safety mechanism.
+```
+  TRTLLM_DISAGG_LLM_REQ_LIFETIME = strong   (default) | weak
+```
+
+This is **deliberately decoupled** from the existing `TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL` flag. Lifetime management and the cancel/poison surface are orthogonal concerns; entangling them is a convenience choice, not a design choice. Decoupling lets each axis be controlled independently:
+
+- For helix / asymmetric tests that the post-PR horizontal-consistency gap is breaking, set `TRTLLM_DISAGG_LLM_REQ_LIFETIME=weak` in the test environment. Restores pre-PR-equivalent behavior including the implicit horizontal synchronization. Accepts the same UAF risk pre-PR had, which was not breaking those specific tests historically.
+- For production where the cancel surface is off (default), `TRTLLM_DISAGG_LLM_REQ_LIFETIME=strong` (default) keeps PR #13713's vertical safety. UAF risk closed.
+- For production where the cancel surface is on (opt-in), strong is required for the cancel mechanism to work cleanly. Combining `inflight_cancel=ON` with `lifetime=weak` is nonsensical and is rejected at startup.
+
+**Allowed combinations:**
+
+| `INFLIGHT_CANCEL` | `LLM_REQ_LIFETIME` | Behavior |
+|---|---|---|
+| OFF (default) | strong (default) | Current PR HEAD: vertical safe, horizontal broken under cross-rank-divergence configs |
+| OFF | weak | Pre-PR equivalent: vertical UAF risk restored, implicit horizontal consistency restored. Tactical for failing tests. |
+| ON | strong | Full new behavior: vertical safe, horizontal mitigated by cancel surface |
+| ON | weak | **Rejected at startup** — cancel needs strong refs to clean up cleanly |
+
+**Implementation — wrapper class:**
+
+```cpp
+class TransceiverLlmRequestRef {
+public:
+    static TransceiverLlmRequestRef make(std::shared_ptr<LlmRequest> req) {
+        return common::getEnvDisaggLlmReqLifetimeWeak()
+            ? TransceiverLlmRequestRef{req.get()}        // weak: raw ptr, no C++ ownership
+            : TransceiverLlmRequestRef{std::move(req)};  // strong: shared_ptr, C++ owns
+    }
+    LlmRequest& operator*()  const { return mStrong ? *mStrong : *mRaw; }
+    LlmRequest* operator->() const { return mStrong ? mStrong.get() : mRaw; }
+    LlmRequest* get() const { return mStrong ? mStrong.get() : mRaw; }
+    // ... copy / move constructors ...
+private:
+    std::shared_ptr<LlmRequest> mStrong;   // null when weak mode
+    LlmRequest* mRaw{nullptr};             // null when strong mode
+};
+```
+
+In weak mode: `mStrong` is null, only `mRaw` is set. C++ does not extend the request's lifetime. When Python destroys the `LlmRequest`, `mRaw` becomes dangling — exactly the pre-PR behavior. This is what restores the implicit horizontal synchronization (§2.2).
+
+In strong mode: `mRaw` is null, `mStrong` holds the shared_ptr. C++ owns its share of the lifetime. PR #13713 vertical safety preserved.
+
+**Plus a startup-time validity check:**
+
+```cpp
+if (getEnvDisaggEnableInflightCancel() && getEnvDisaggLlmReqLifetimeWeak()) {
+    TLLM_THROW("TRTLLM_DISAGG_LLM_REQ_LIFETIME=weak is incompatible with "
+               "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1: cancellation requires "
+               "C++ to hold strong refs to in-flight LlmRequest objects.");
+}
+```
 
 **Scope inventory (verified from headers, §3.1):**
 
@@ -246,57 +297,18 @@ This re-introduces the pre-PR vertical inconsistency *only when the flag is off*
 - 2 internal async APIs `CacheSender::sendAsync` and `CacheReceiver::receiveAsync`
 - Nanobind trampolines + bindings at `cpp/tensorrt_llm/nanobind/batch_manager/cacheTransceiver.cpp` (4 `NB_OVERRIDE_PURE` macros + 4 `.def(...)` entries)
 
-**A1 — Wrapper class (cleanest, ~2-3 engineer-days):**
-
-```cpp
-class TransceiverLlmRequestRef {
-public:
-    static TransceiverLlmRequestRef make(std::shared_ptr<LlmRequest> req) {
-        return common::getEnvDisaggEnableInflightCancel()
-            ? TransceiverLlmRequestRef{std::move(req)}   // strong: vertical consistency
-            : TransceiverLlmRequestRef{req.get()};       // weak:   horizontal consistency (pre-PR)
-    }
-    LlmRequest& operator*()  const { return mStrong ? *mStrong : *mRaw; }
-    LlmRequest* operator->() const { return mStrong ? mStrong.get() : mRaw; }
-    LlmRequest* get() const { return mStrong ? mStrong.get() : mRaw; }
-    // ... copy / move constructors ...
-private:
-    std::shared_ptr<LlmRequest> mStrong;
-    LlmRequest* mRaw{nullptr};
-};
-```
-
 Replace `shared_ptr<LlmRequest>` with `TransceiverLlmRequestRef` in the 2 field types and the 5 API methods. Most existing call sites (`request->mRequestId`, `*request`, etc.) work unchanged.
 
-Risk: with flag off, the UAF window from main is restored. Accepted — same risk as main today. **Caveat:** PR #13713 introduced always-on deadline detection that accesses `request->getKvCacheTransferStart()` and `request->mRequestId`. With flag off, these can dereference a dangling pointer if Python freed the request. Mitigation: hold a `weak_ptr` on the C++ side and lock for the duration of the deadline check, OR accept the same UAF window as main (it has always been there on this path).
+**Effort:** ~2-3 engineer-days for the change and verification. Most of the time is verifying that all access paths — including error paths and lambda captures inside `Impl::receiveAsync` and `Impl::requestAndReceiveAsyncMultiThreads` — handle the weak mode correctly.
 
-**A2 — Prune on timeout (simplest, ~0.5 engineer-day):**
+**Risk:** with `lifetime=weak`, the UAF window from main is restored. Accepted — same risk as main today, which the failing tests have not historically tripped over. **Caveat:** PR #13713 introduced always-on deadline detection in `checkContextTransferStatus` / `checkGenTransferStatus` that accesses `request->getKvCacheTransferStart()` and `request->mRequestId`. Under weak mode these can dereference a dangling pointer if Python freed the request. Mitigations to consider:
 
-Keep `shared_ptr<LlmRequest>` always. When flag is OFF, in `checkContextTransferStatus`'s and `checkGenTransferStatus`'s deadline blocks, immediately erase the entry from the futures vector when the timeout fires, instead of waiting for the future to resolve:
+- Hold a `weak_ptr` on the C++ side and `lock()` for the duration of the deadline check (changes the wrapper from raw pointer to `weak_ptr`); or
+- Accept the same UAF window as main (it has always been there on this path).
 
-```cpp
-if (elapsedMs > kvTransferTimeoutMs.value()) {
-    if (common::getEnvDisaggEnableInflightCancel()) {
-        // existing flag-on path: cancelRequest, mark errored, erase
-    } else {
-        // mimic pre-PR horizontal consistency: forcibly drop the entry so
-        // iteration doesn't see a zombie. Python termination handles KV
-        // block release independently.
-        TLLM_LOG_WARNING("Pruning timed-out request %ld (flag off)", request->mRequestId);
-        request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-        it = mRequesterFutures.erase(it);
-        continue;
-    }
-}
-```
+The first mitigation is cleaner but adds complexity (a third mode). Recommendation: start with raw pointer in weak mode, monitor whether the deadline-check UAF window matters in practice, upgrade to `weak_ptr` if needed.
 
-Effort: ~30-40 net lines of C++ across `checkContextTransferStatus` and `checkGenTransferStatus`.
-
-Risk: less semantically equivalent to main than A1 — main relied on Python's `cancel_request` → `_terminate_request` flow, not the C++ deadline. There's a window where Python may still hold a reference. Need careful state-machine handling to avoid double-free.
-
-**A3 — Python-side aggressive cleanup (not recommended):**
-
-Don't change the storage type. Add a new C++ method `CacheTransceiver::forceEraseTimedOutRequest(uint64_t)` and call it from Python's `_check_kv_transfer_timeout` when flag is off. Smallest C++ diff but adds a "back door" cleanup API that bypasses the future-driven state machine. Listed only for completeness — A1 or A2 is preferable.
+**What about "prune the entry from `mRequesterFutures` on timeout" as a simpler alternative?** Considered and rejected. Keeping `shared_ptr<LlmRequest>` always but erasing entries from the futures vector on the C++ deadline does NOT improve over the wrapper. The worker thread holds its own `shared_ptr` (via the `RequestAndPromise` dequeue) so erasing from `mRequesterFutures` doesn't immediately destroy the object — but Python's downstream `_terminate_request` still frees the KV blocks while the network backend may still be writing into them. Same UAF failure mode as weak mode, but with the abstraction conflated (the type still says "strong" while behavior is "weak"). The wrapper makes the trade-off explicit at the type level.
 
 ### 5.2 Path B — explicit horizontal consistency layer (long-term)
 
@@ -348,11 +360,9 @@ The theory predicts a clean sequence of fixes, each addressing one consistency a
 
 1. **Now: ship PR #13713 + waivers (Path C).** Vertical consistency is the production-critical fix; ship it. Waive the flaky tests with proper documentation. Open the tracking ticket for follow-up.
 
-2. **Immediately after merge: Path A2 (prune-on-timeout, ~0.5 day).** Restores horizontal consistency to pre-PR-equivalent levels when cancel is off (the default). Allows the waivers to be lifted with high confidence.
+2. **Immediately after merge: Path A (wrapper class + new lifetime flag, ~2-3 days).** Introduces `TRTLLM_DISAGG_LLM_REQ_LIFETIME=strong|weak` as a separate axis from the cancel flag. Default `strong` preserves PR #13713's vertical safety. For failing helix / `asymmetric_executor[mpi_kvcache]` tests, set `weak` in the test environment to restore pre-PR-equivalent behavior (including the implicit horizontal synchronization). Allows the waivers to be lifted with high confidence on a per-test basis.
 
-3. **Medium-term: Path A1 (wrapper class, ~2-3 days).** Cleaner architecture for the gating. Same correctness as A2 but expressed via type-level invariants instead of a one-shot prune.
-
-4. **Long-term: Path B (explicit horizontal consistency layer, 1-2 weeks).** The structural answer that matches the theory's prescription: both consistency axes as first-class invariants. Prevents the entire class of bugs from recurring under any future change.
+3. **Long-term: Path B (explicit horizontal consistency layer, ~1-2 weeks).** The structural answer that matches the theory's prescription: both consistency axes as first-class invariants. Prevents the entire class of bugs from recurring under any future change. Once Path B lands, the `LLM_REQ_LIFETIME` flag and its `weak` mode can be removed.
 
 ---
 
@@ -360,11 +370,11 @@ The theory predicts a clean sequence of fixes, each addressing one consistency a
 
 - **Quantify the flake rate.** We have anecdotal evidence (§3.2) that the failures are flaky. A proper measurement would run the failing tests N times on PR #13713 HEAD and on main, computing pass rates. The theory predicts the flake rate should track the time-fraction during which condition 2 (stuck/slow transfer) is true. Estimated effort: 1 day with GPU access.
 
-- **Verify Path A1's UAF window assumption.** PR #13713 added always-on deadline detection that accesses `request->getKvCacheTransferStart()`. With flag off and a weak ref, this can UAF if Python freed the request first. Either accept (matches main) or add a `weak_ptr.lock()` guard. Decision deferred until A1 is implemented.
+- **Verify Path A's UAF window assumption in weak mode.** PR #13713 added always-on deadline detection that accesses `request->getKvCacheTransferStart()`. With `lifetime=weak`, this can UAF if Python freed the request first. Either accept (matches main) or upgrade the wrapper's weak mode from raw pointer to `weak_ptr` with `lock()` on access. Decision deferred until Path A is implemented and the deadline-check UAF window is measured.
 
-- **`asymmetric_executor[mpi_kvcache]` deterministic case.** Even with Path A2 prune-on-timeout, this transport-specific failure may persist. Worth a targeted investigation once the flaky cases are off the critical path. The theory predicts the failure should go away once horizontal consistency is restored under flag-off; if it doesn't, the theory needs refinement.
+- **`asymmetric_executor[mpi_kvcache]` deterministic case.** Even with Path A's weak mode, this transport-specific failure may persist. Worth a targeted investigation once the flaky cases are off the critical path. The theory predicts the failure should go away once horizontal consistency is restored via `lifetime=weak`; if it doesn't, the theory needs refinement.
 
-- **Effect on production users.** If anyone in production runs disagg with helix CP, they will hit this same class of bug. Path A2 with cancel-off is roughly main-equivalent and should be safe. Worth confirming with deployment teams which configurations are actually in use.
+- **Effect on production users.** If anyone in production runs disagg with helix CP under default config (cancel off + lifetime strong), they will hit this same class of bug. Path A with `lifetime=weak` is roughly main-equivalent and should be a safe workaround. Worth confirming with deployment teams which configurations are actually in use.
 
 - **Does Path B's all-gather catch every divergence source?** The theory predicts §4.1's listed sources cover the observed failures. But future features (new parallelism modes, new transports) could introduce new divergence sources. Path B's design should make it easy to add new state to the sync.
 
