@@ -93,8 +93,22 @@ Concretely, on a 72-rank NVL72 launch:
 | **Disaggregated serving (MPI)** | Separate prefill / decode pools, KV cache transferred via NIXL / UCX / MPI transceiver, `trtllm-serve` proxy routes between pools | Production-supported |
 | **Disaggregated + Ray (non-NIXL)** | Ray-managed pools with UCX/MPI transceiver | Supported; covered by `examples/test_ray.py::test_ray_disaggregated_serving` |
 | **Disaggregated + Ray + NIXL** | Ray-managed pools with NIXL transceiver | **Not supported today** — explicit waive at `tests/integration/defs/disaggregated/test_disaggregated.py:597` |
-| **Aggregated B200 NVL8 + IB** | 8-GPU B200 nodes networked by InfiniBand; AlltoAll via DeepEP (`DeepEPLowLatency` NVFP4 is the measured-best variant), no MNNVL rack fabric | Perf work in flight (May 2026, Peiheng Hu); FT story = Phase 1-IB, gated on Audit 3 NIXL-EP outcome or a DeepEP-side mitigation. See [§8.2 Phase 1-IB](08-implementation-plan.md#phase-1-ib--heterogeneous-topology-coverage-deepep-or-nixl-ep-track) |
+| **Aggregated B200 NVL8 + IB** | 8-GPU B200 nodes networked by InfiniBand; AlltoAll via DeepEP family (`DeepEPLowLatency` NVFP4 is the measured-best variant) because cross-node NVLink isn't up | Perf work in flight (May 2026, Peiheng Hu); FT story = Phase 1-IB, gated on Audit 3 NIXL-EP outcome or a DeepEP-side mitigation. See [§8.2 Phase 1-IB](08-implementation-plan.md#phase-1-ib--cross-ib-transport-coverage-nixl-ep-track) |
 | **Standard EP (≤ 8 GPUs)** | Single-node, `ep_size ≤ 8`, no MNNVL | Out of scope for this design; existing process-restart handling is adequate |
+
+### Transport selection: what TRT-LLM actually picks today
+
+`CommunicationFactory.create_strategy()` (`tensorrt_llm/_torch/modules/fused_moe/communication/communication_factory.py:131-213`) runs a try-catch fall-through on the first MoE layer call. **The deployment doesn't pick the transport directly — the substrate does, via the MNNVL gate.**
+
+| Priority | Backend | Gate | Selected when |
+|:---:|:---|:---|:---|
+| 1 | `NVLinkOneSided` | `MnnvlMemory.supports_mnnvl()` returns True (`_mnnvl_utils.py:380-387`; check is "all NVLink up") | Single 8-GPU NVL-class node *or* GB200/GB300 NVL72 rack — any topology where intra-fabric NVLink is fully up |
+| 2 | `NVLinkTwoSided` | Same MNNVL gate | Same as priority 1; secondary attempt |
+| 3 | `DeepEP` | `TRTLLM_CAN_USE_DEEP_EP=1` + `act_dtype == bfloat16` | Cross-IB / cross-fabric peers (no MNNVL); NVSHMEM-based |
+| 4 | `DeepEPLowLatency` | Same as DeepEP | DeepEP construction failed; uses NVSHMEM + IBGDA; production choice for multi-node B200+IB per Peiheng's deck |
+| 5 | `AllGatherReduceScatter` | always | Safety net; NCCL fallback when DeepEP unavailable |
+
+**Implication: the "transport in use" determines the relevant FT mechanism, not the deployment name.** A single 8-GPU NVL-class B200 box and a 72-GPU NVL72 rack both run on `NVLinkOneSided` and share the same FT story (kernel mask + EPLB slot remap, PR 1a.2). Multi-node B200+IB falls through to `DeepEPLowLatency` and gets a different FT story (Phase 1-IB). See [§8.1 Phase 1 MVP](08-implementation-plan.md#81-phase-1-pr-breakdown) and [§8.2 Phase 1-IB](08-implementation-plan.md#phase-1-ib--cross-ib-transport-coverage-nixl-ep-track) for the per-transport mechanism mapping.
 
 **Note on topology symmetry.** Even on NVL72, the fabric is not perfectly BW-symmetric: intra-tray pairs share direct NVLink, cross-tray pairs route through NVSwitch chips (multi-hop), and EPLB workload skew on top creates *effective* per-rank-pair asymmetry even when the *physical* fabric is uniform. B200 NVL8 + IB just makes the asymmetry larger and more measurable (18× peak-BW gap NVL vs IB per Peiheng's deck). Heterogeneous-topology behavior is a property of every WideEP deployment, with different magnitude across rows above. [§7.5](07-phase-3-beyond-failover.md#75-straggler-mitigation-forward-looking) and the [straggler-speculation research arm](straggler-speculation-research/README.md) frame this generally rather than NVL72-specifically.
 

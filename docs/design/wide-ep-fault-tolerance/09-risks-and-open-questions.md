@@ -82,29 +82,47 @@ After both 1a and 1b land: empirical answer to "MNNVL rebuild on the NVL72 fabri
 
 **Pre-requisites that make the audit possible:** Ray-path CI needs EP ≥ 32 tests first. Today largest is TP = 4 (research pass report). So the audit itself is 1–2 weeks *after* Ray-path test coverage is built out.
 
-### Audit 3 — NIXL-EP evaluation as data-plane backend
+### Audit 3 — NIXL-EP evaluation as cross-IB data-plane backend
 
-**Severity × Probability:** Medium × Medium | **Phase:** v1 (post-MVP integration if outcome positive) | **Residual risk:** Medium (outcome shapes v1 priority order)
+**Severity × Probability:** Medium × Medium | **Phase:** Phase 1-IB (cross-IB transport only) | **Residual risk:** Medium (outcome shapes Phase 1-IB feasibility, not NVL72 MVP)
 
-**Why it's named.** The NIXL team has built **NIXL-EP**, an EP-backend variant of NIXL (the same library TRT-LLM already uses as the disagg KV-cache L3 path), and has asked TRT-LLM to evaluate it. vLLM PR [#38534](https://github.com/vllm-project/vllm/pull/38534) is already shipping with NIXL-EP listed as one of the two "FT-enabled backends" (alongside DeepEP). If NIXL-EP carries cleaner FT primitives than NVSHMEM/DeepEP, integrating it as an additional AlltoAll backend would let us close the "DeepEP FT deferred indefinitely" gap without waiting on NVSHMEM `mask_buffer_ptr`.
+**Why it's named.** The NIXL team has built **NIXL-EP** (NIXL's expert-parallel example at `ai-dynamo/nixl/examples/device/ep`), and vLLM has integrated it as an Elastic-EP backend (vLLM PR [#35627](https://github.com/vllm-project/vllm/pull/35627), merged 2026-03-13). For TRT-LLM, NIXL-EP is interesting **specifically for the cross-IB transport role** — replacing DeepEP/DeepEPLowLatency in deployments where MNNVL is not in the path (multi-node B200+IB and similar). It is *not* a candidate to replace `NVLinkOneSided` on NVL72 today; that primary backend stays on the kernel-mask architecture.
 
-**Why it's not MVP.** NVLinkOneSided is the primary AlltoAll backend for NVL72, kernel mask is already in flight as PR #13404, and we have full kernel ownership. NIXL-EP is therefore a *coverage broadening* item, not a survival item — it belongs in v1 alongside NVLinkTwoSided (PR 1a.5–1a.6) and the kernel `check_timeout` hardening (PR 1a.8), not on the MVP critical path.
+**Why it's not MVP.** Multi-node B200+IB is not yet a primary production deployment; the kernel-mask MVP closes the gap for the NVLink-substrate footprint (single-node NVL boxes + GB200/GB300 NVL72 rack) and PR 1a.7 closes the NCCL fallback. NIXL-EP serves the third transport regime (DeepEP-family / cross-IB), which is Phase 1-IB scope.
+
+**Verified API surface (from vLLM PR #35627 + NIXL EP README):**
+
+```python
+buffer = nixl_ep.Buffer(rank, tcp_store_group=...)
+buffer.update_memory_buffers(num_ranks, num_experts_per_rank, num_rdma_bytes, num_nvl_bytes=0)
+buffer.connect_ranks(remote_ranks, activate=True)   # incremental add; activate=False = LL-mode masked
+buffer.disconnect_ranks(remote_ranks)               # incremental remove
+buffer.dispatch(...)
+buffer.combine(...)
+```
+
+Key properties:
+- **Topology mutation, not rank masking.** FT model is `disconnect_ranks([dead])` → topology becomes N-1, not "keep dead rank in topology with bit masked off." This collapses Phase 1 + Phase 2 into one "scale-down then scale-up" path for this transport.
+- **`torch.distributed.TCPStore` dependency.** Means NIXL-EP cannot ride a pure-MPI orchestrator path; needs either Ray, or TCPStore wired alongside MPI.
+- **MNNVL substrate landed** (ai-dynamo/nixl#1415, merged 2026-04-05). **But not yet production-validated at 72-rank scale** — ai-dynamo/nixl#1655 (open 2026-05-19) is still adding 4-GPU single-node topology test coverage. So even if we wanted to use NIXL-EP on NVL72 someday, it isn't ready.
+- **RDMA + NVLink transports** (from NIXL EP README). Currently no de-duplication optimizations per itayalroy's comment on PR #35627.
 
 **Scope.** ~2 weeks, one engineer, runnable in parallel with MVP (no critical-path dependency):
 
 | Step | Work | Output |
 |:---|:---|:---|
-| E1 | Technical-fit assessment — does NIXL-EP's API surface fit into TRT-LLM's `CommunicationFactory` strategy abstraction? What changes would PR 1a.7's NCCL FT wrapper pattern look like for NIXL-EP? | Integration sketch + binding scope estimate |
-| E2 | FT primitive validation — confirm NIXL-EP exposes the `activeRanks`-style masking + abort that vLLM PR #38534 relies on, on a version we can link against. | Empirical FT primitive coverage table |
-| E3 | Perf comparison vs NVLinkOneSided on a ≥ 4-GPU node — bandwidth, latency, kernel launch overhead, steady-state regression. | Quantitative comparison |
-| E4 | Maturity assessment — production deployments, version stability, NVIDIA-internal support story. | Risk register entry |
-| E5 | Write-up + go/no-go recommendation — integrate as v1 backend, defer, or decline. | Decision document |
+| E1 | Technical-fit assessment — does NIXL-EP fit `CommunicationFactory` as a 6th backend (sibling to DeepEP)? What's the TCPStore-alongside-MPI co-existence story, or does the deployment need to switch to Ray orchestrator? | Integration sketch + orchestrator decision |
+| E2 | FT primitive validation — measure `disconnect_ranks([dead]) + connect_ranks([replacement])` latency at 4-GPU + 8-GPU + 16-GPU + 32-GPU scales (matching B200+IB deployment ranges). Confirm topology mutation works mid-iteration with a quiesce point. | Recovery-latency curve vs rank count |
+| E3 | Perf comparison vs DeepEPLowLatency (the current cross-IB production backend) — bandwidth, latency, kernel launch overhead, MoE-layer round-trip. Calibrate against Peiheng's 94 µs NVFP4 number. | Quantitative comparison |
+| E4 | Maturity assessment — version stability, MNNVL roadmap (when is ai-dynamo/nixl#1655 + #1499 + #1530 expected to complete?), NVIDIA-internal NIXL-team support story for cross-IB at production scale. | Risk register entry |
+| E5 | Write-up + go/no-go recommendation — integrate as Phase 1-IB primary path (PRs 1a.9/1a.10), defer (stay on DeepEP 100s-timeout interim IB.1), or decline. | Decision document |
+| E6 | **(new)** Phase 2 impact assessment — confirm that topology mutation collapses Phase 1 + Phase 2 for this transport. What does "Phase 2 = scale-up via `connect_ranks(replacement)`" mean for our §6 design? | Phase-2 design delta |
 
-**Integration scope if E5 is positive.** Two new PRs in Phase 1 v1: **1a.9** (NIXL-EP communication strategy + factory registration) and **1a.10** (NIXL-EP rank-masking + FT primitive integration). Sizes M + M; both depend on PR 1a.1 (EPGroupHealth) and the NIXL-EP version selected in E2.
+**Integration scope if E5 is positive.** Two new PRs land Phase 1-IB's primary path: **1a.9** (NIXL-EP `CommunicationFactory` strategy + factory registration) and **1a.10** (NIXL-EP `EPGroupHealth` integration + scale-down/scale-up wrapper). Sizes M + M; both depend on PR 1a.1 (EPGroupHealth) and the NIXL-EP version selected in E2, plus the TCPStore-alongside-MPI or Ray-pivot decision from E1.
 
-**Strategic value if E5 is positive.** Backend priority order becomes: 1) NVLinkOneSided (primary, NVL72), 2) NVLinkTwoSided (NVLink without MNNVL), 3) NIXL-EP (mask-capable, no NVSHMEM dependency), 4) AllGatherReduceScatter (NCCL fallback), 5) DeepEP / DeepEPLowLatency (deferred). This collapses the deferred-indefinitely status of DeepEP into a *demoted-to-low-priority* status — coverage broadens without us waiting on NVSHMEM's `mask_buffer_ptr` roadmap.
+**Strategic value if E5 is positive.** Phase 1-IB ships on NIXL-EP with `disconnect_ranks` + EPLB redistribute as the recovery mechanism. The DeepEP FT gap stops being "blocking for multi-node B200+IB" because NIXL-EP replaces DeepEP for that transport. Backend priority order for cross-IB deployments becomes: 1) NIXL-EP (preferred for new FT-aware cross-IB deployments), 2) DeepEPLowLatency (legacy / NCCL-domain), 3) AllGatherReduceScatter (safety net).
 
-**Strategic value if E5 is negative.** Bounded cost (~2 engineer-weeks), no MVP impact, audit report still informs whether vLLM's NIXL-EP choice transfers to our stack.
+**Strategic value if E5 is negative.** Phase 1-IB ships on the DeepEP 100s-timeout interim (IB.1). Bounded cost (~2 engineer-weeks for the audit), no MVP impact, no impact on NVL72 deployment path. Plus E6 still gives us a calibrated answer on whether to even consider topology mutation as a Phase 2 architecture for NVL72 down the road.
 
 ## 9.2 Technical risks
 
@@ -127,15 +145,20 @@ The NIXL team has built NIXL-EP and vLLM already uses it as an FT-enabled backen
 
 **Mitigation:** Audit 3 ([§9.1](#audit-3--nixl-ep-evaluation-as-data-plane-backend)) is a bounded 2-week parallel evaluation that produces a go/no-go for v1. If go, the two integration PRs slot into Phase 1 v1 alongside 1a.5–1a.6. If no-go, no schedule impact — MVP and v1 ship unchanged. Either way, NIXL-EP doesn't gate MVP.
 
-### Risk — DeepEP backend limitations
+### Risk — DeepEP backend limitations (applies to cross-IB transport deployments only)
 
-**Severity × Probability:** Medium × High | **Phase:** 1a (MVP), Phase 1-IB | **Residual:** **Medium–High** — was "deferred indefinitely accepted"; downgraded to "deferred conditional on heterogeneous-topology deployment timeline" after B200+IB perf work surfaced
+**Severity × Probability:** Medium × High | **Phase:** Phase 1-IB | **Residual:** **Medium–High** — was "deferred indefinitely accepted"; scope sharpened to "applies when DeepEP-family is the selected L3 transport"
 
-DeepEP only supports specific EP sizes ({2,4,8} intra-node, {16,32,...,128} inter-node); post-failure EP=71 isn't supported. The `mask_buffer_ptr` parameter referenced in vLLM's RFC #27774 is not in DeepEP's public API.
+DeepEP only supports specific EP sizes ({2,4,8} intra-node, {16,32,...,128} inter-node); post-failure EP=71 isn't supported. The `mask_buffer_ptr` parameter referenced in vLLM's RFC #27774 is not in DeepEP's public API. `Buffer.__del__` → `intranode::barrier` deadlock is a known issue (acknowledged at `deep_ep.py:86`).
 
-**Not a blocker for MVP.** NVLinkOneSided is the primary target on NVL72; feature flag ([PR 1d.1](08-implementation-plan.md)) warns if DeepEP is the selected backend when FT is enabled.
+**Not a blocker for MVP.** The MVP closes the FT gap for the entire NVLink-substrate footprint (single-node NVL boxes through NVL72 rack — wherever `MnnvlMemory.supports_mnnvl()` returns True) via PR 1a.2 kernel mask, plus the NCCL fallback via PR 1a.7. The DeepEP-family transport is only selected when MNNVL is *not* available — cross-IB / cross-fabric peers. Feature flag ([PR 1d.1](08-implementation-plan.md)) warns if DeepEP is the selected backend when FT is enabled.
 
-**Becomes a blocker for [Phase 1-IB](08-implementation-plan.md#phase-1-ib--heterogeneous-topology-coverage-deepep-or-nixl-ep-track)** (B200 NVL8 + IB and other non-NVL72 heterogeneous-topology deployments), where DeepEP — specifically `DeepEPLowLatency` NVFP4 — is the *primary* backend, not a fallback. Two mitigation paths once Phase 1-IB activates: (a) the **IB.1 interim** — host-side static kernel timeout (vLLM PR #38534's "FT-enabled backend" 100s pattern; softer than `trap;`, doesn't require NVSHMEM-side changes), or (b) the **IB.2 path** — substitute NIXL-EP for DeepEP via Audit 3 outcome ([§9.1 Audit 3](#audit-3--nixl-ep-evaluation-as-data-plane-backend)). The IB.2 path is preferred when Audit 3 outcome is positive; IB.1 is the fallback when it isn't.
+**Applies to [Phase 1-IB](08-implementation-plan.md#phase-1-ib--cross-ib-transport-coverage-nixl-ep-track) deployments** (multi-node B200+IB, multi-rack non-NVLink-fabric, anything where `CommunicationFactory` falls through to DeepEP-family). Two mitigation paths:
+
+- **IB.1 (interim).** Host-side static kernel timeout (vLLM PR #38534's 100s "FT-enabled backend" pattern). Softer than `trap;`; doesn't require NVSHMEM-side changes; doesn't bound recovery latency tightly.
+- **IB.2 (preferred if Audit 3 positive).** Substitute NIXL-EP for DeepEP. NIXL-EP exposes `connect_ranks` / `disconnect_ranks` for incremental topology mutation; gets a tighter recovery bound (~3s per vLLM Elastic EP claims).
+
+The IB.2 path is preferred when Audit 3 outcome is positive; IB.1 is the fallback when it isn't.
 
 ### Risk — Process-group reconstruction deadlocks
 
@@ -313,10 +336,10 @@ Open item: streaming SSE helpers must be audited so they follow the same boundar
 |:---|:---|:---|:---|:---|:---|
 | MNNVL/NVSHMEM audit outcome | High | Medium | 2a | Audit 1 | **Medium** — gates Phase 2 sizing |
 | Ray-path perf uncharacterized | Medium | High | Future migration | Audit 2 | **Medium–High** — covered when Audit 2 runs |
-| **NIXL-EP integration timing** | Medium | Medium | v1 | Audit 3 (bounded 2-week parallel evaluation); go/no-go decides v1 PRs 1a.9, 1a.10 | **Medium** — outcome shapes v1 priority order |
+| **NIXL-EP integration timing (cross-IB transport)** | Medium | Medium | Phase 1-IB | Audit 3 (bounded 2-week parallel evaluation); go/no-go decides Phase 1-IB primary path (IB.2) vs interim (IB.1) | **Medium** — applies only to cross-IB deployments; NVL72 path unaffected |
 | Ray + disagg + NIXL unsupported | Medium | High | Phase 1-DS / future | Close gap upstream; ship on MPI first | **Medium** — hard gap, closes with upstream fix |
 | NVLink kernel modification | High | Medium | 1a | PR 1a.2 minimal change; correctness-first | **Low** |
-| DeepEP limitations | Medium | High | 1a | NVLink primary; DeepEP deferred | **High (accepted)** |
+| DeepEP limitations (cross-IB transport only) | Medium | High | Phase 1-IB | NIXL-EP via Audit 3 (preferred) or 100s static kernel timeout interim | **Medium–High** — applies only when DeepEP-family is selected transport |
 | PG reconstruction deadlocks | High | Medium | 2a | Coordinated teardown; explicit destroy(); ULFM | **Medium** |
 | Failure broadcast consensus | Medium | Medium | 1c | Two-phase suspect/confirm; monotonic failure | **Low** |
 | EPLB reconfigure timing | Medium | Low | 1b | Iteration-boundary only | **Low** |

@@ -8,6 +8,14 @@ This section unifies all Phase 1 mechanics. Phase 1 keeps the EP group serving t
 
 The Mode B fix. When a rank dies silently, surviving ranks' AlltoAll kernels spin forever on `completion_flags[*][dead_rank]` because the dead peer never writes its flag. Rank masking adds a host-controlled bitmap that the kernel checks before polling each peer; masked peers are skipped. The mask is the *only* data-plane FT primitive that fits TRT-LLM's MNNVL-based path because we own the kernel ([§2.2.1](02-stack-comparison-and-positioning.md#221-kernel-ownership-of-the-performance-critical-alltoall)).
 
+**Scope of applicability — by L3 transport, not deployment name.** The kernel mask applies whenever `NVLinkOneSided` (or `NVLinkTwoSided`) is the selected transport, which `CommunicationFactory` chooses whenever `MnnvlMemory.supports_mnnvl()` returns True (`_mnnvl_utils.py:380-387` — "all NVLink up" check). That covers:
+
+- Single 8-GPU NVL-class node (DGX/HGX B200, B300, H100) — intra-node NVLink up.
+- GB200 / GB300 NVL72 single rack — full rack fabric.
+- Multi-node SLURM/MPI deployments where the inter-node fabric is also NVLink (rare, but it qualifies).
+
+It does **not** apply when the transport falls through to DeepEP / DeepEPLowLatency (selected for cross-IB / cross-non-NVLink-fabric peers — see [§3.5 Transport determines mechanism](03-failure-modes-and-gaps.md#35-transport-determines-mechanism)). That regime is covered separately in [§8.2 Phase 1-IB](08-implementation-plan.md#phase-1-ib--cross-ib-transport-coverage-nixl-ep-track) with a different mechanism (NIXL-EP `disconnect_ranks` + EPLB redistribute, gated on Audit 3). The MVP scope below addresses the NVLink-substrate footprint; Phase 1-IB addresses the cross-IB footprint.
+
 ### Per-backend approach
 
 | Backend | Mechanism | MVP / v1 |

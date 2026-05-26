@@ -229,6 +229,18 @@ We treat the pivot as a **deferred architectural question**, not an MVP decision
 | EPLB static topology | — | — | ✓ (blocks recovery) | §5.2 |
 | No per-rank health / no AlltoAll watchdog | Detection | — | ✓ (no detection) | §5.3 |
 
-Every gap in this table is addressed in Phase 1 except the DeepEP destructor, which is deferred indefinitely pending public `mask_buffer_ptr` — [§9](09-risks-and-open-questions.md) tracks this as an accepted risk.
+Every gap in this table is addressed in Phase 1 (with one conditional path) — see the transport mapping below for which Phase 1 sub-track applies to which deployment.
+
+### 3.5 Transport determines mechanism
+
+The FT mechanism that applies is determined by **which L3 transport is in use**, not by deployment name. `CommunicationFactory` selects the transport via fall-through (see [§1.1 Transport selection](01-user-journey-and-stack.md#transport-selection-what-trt-llm-actually-picks-today)); the FT story follows.
+
+| Transport in use | Selected when (gate) | FT mechanism | Where it lives in this design |
+|:---|:---|:---|:---|
+| `NVLinkOneSided` / `NVLinkTwoSided` | `MnnvlMemory.supports_mnnvl()` True — all NVLink up. Applies to single-node 8-GPU NVL boxes *and* GB200/GB300 NVL72 rack | **Kernel mask + EPLB slot remap.** TRT-LLM owns the kernel; in-place mask at iteration boundary; survivors continue at N-1. | §5.1 (PR 1a.2/1a.5-6); §5.2 (PR 1b.1-3); §5.3-§5.4 for detection / broadcast / MPI fix. MVP scope. |
+| `DeepEP` / `DeepEPLowLatency` | Cross-IB / cross-fabric peers (no MNNVL). Production choice for multi-node B200+IB per Peiheng's deck | **NIXL-EP `disconnect_ranks` + EPLB redistribute** (preferred) *or* **DeepEP 100s kernel-timeout interim** (vLLM PR #38534 pattern) | §8.2 Phase 1-IB; gated on [Audit 3](09-risks-and-open-questions.md#audit-3--nixl-ep-evaluation-as-data-plane-backend). Phase 1 + Phase 2 collapse into one "scale-down then scale-up" path for this transport. |
+| `AllGatherReduceScatter` (NCCL) | DeepEP unavailable; safety-net fallback | **`ncclCommAbort` + reinit** | §5.1 (PR 1a.7), MVP scope. Same primitive vLLM converged on (RFC #30112 / `gpu_worker.py:161`). |
+
+**Implication.** The MVP closes the gap for the entire `NVLinkOneSided` + `AllGatherReduceScatter` footprint at once — single-node NVL boxes, multi-node SLURM/MPI NVL deployments, NVL72 rack, and the NCCL fallback. The DeepEP-family transport (multi-node B200+IB and similar) is covered separately in Phase 1-IB, with a different mechanism that doesn't require us to own a custom kernel for that substrate.
 
 The next section introduces the three-phase architecture that translates these gaps into work.
