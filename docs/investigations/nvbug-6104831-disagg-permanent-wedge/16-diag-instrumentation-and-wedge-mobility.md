@@ -24,7 +24,70 @@ This document is a corrective addendum to documents 12 and 13 in two respects:
 
 ---
 
-## 2. The instrumentation layers and what each one tells us
+## 2. Request lifecycle through the code layers
+
+The diagram below shows how a single disaggregated KV-transfer request flows through Python, the C++ public transceiver, the per-side `Impl` classes, the formatter, and the UCX transport — and where each `[DIAG-*]` tag is emitted along the way.
+
+Two MPI sides (ctx, gen) participate. On each side, the path crosses a Python → C++ public API → `Impl` worker thread → formatter → transport boundary. The two sides exchange three messages: gen → ctx request-info, ctx → gen ready-signal, ctx → gen KV-data.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant PyG as Python gen<br/>PyExecutor
+    participant PyC as Python ctx<br/>PyExecutor
+    participant CtxI as C++ ctx<br/>CacheSender::Impl
+    participant GenI as C++ gen<br/>CacheReceiver::Impl
+    participant Fmt as CacheFormatter<br/>format / unformat
+    participant UCX as UcxConnection
+    Note over PyG,PyC: Phase 0 — Python scheduling
+    PyG->>PyG: _prepare_disagg_gen_init<br/>_recv_disagg_gen_cache
+    Note right of PyG: DIAG-GEN-PREPARE-INPUT<br/>DIAG-GEN-RECV-INPUT<br/>DIAG-GEN-DEDUP-DECISION
+    PyC->>CtxI: respond_and_send_async
+    Note right of PyC: DIAG-PY-CTX-SEND
+    Note right of CtxI: DIAG-CTX-EMPLACE-RESP<br/>(emplaced into<br/>mReadyResponses)
+    PyG->>GenI: request_and_receive_async
+    Note right of PyG: DIAG-PY-GEN-RECV-ASYNC
+    Note right of GenI: DIAG-GEN-REQSYNC-ENTRY<br/>(worker picks up)
+    Note over GenI,CtxI: Phase 2 — gen sends request-info,<br/>ctx receives & decrements count
+    GenI->>UCX: sendRequestInfo
+    Note right of GenI: DIAG-GEN-SEND-INFO-PRE<br/>DIAG-GEN-SEND-INFO-COUNTERPARTS<br/>DIAG-GEN-SEND-INFO-DEST (×N peers)
+    Note right of UCX: DIAG-UCX-SEND-ENTRY<br/>DIAG-UCX-SEND-WAIT<br/>DIAG-UCX-SEND-DONE
+    UCX->>CtxI: request-info delivered
+    Note right of UCX: DIAG-UCX-RECV-ENTRY<br/>DIAG-UCX-RECV-WAIT<br/>DIAG-UCX-RECV-DONE
+    Note right of CtxI: DIAG-CTX-RECV-INFO<br/>DIAG-CTX-COUNTERPARTS<br/>DIAG-CTX-INIT-COUNT (first)<br/>DIAG-CTX-DECR<br/>DIAG-CTX-AWAIT (if count>0)
+    Note right of GenI: DIAG-GEN-SEND-INFO-POST<br/>DIAG-GEN-AWAIT-READY<br/>(parks on ready recv)
+    Note over CtxI: Phase 1 — ctx ready-signal emission<br/>(after final peer's request-info arrives)
+    Note right of CtxI: count == 0 →<br/>DIAG-CTX-READY-PRE
+    CtxI->>UCX: sendReadySignal
+    Note right of UCX: DIAG-UCX-SEND-*
+    UCX->>GenI: ready signal delivered
+    Note right of UCX: DIAG-UCX-RECV-*
+    Note right of GenI: DIAG-GEN-RECV-READY
+    Note right of CtxI: DIAG-CTX-READY-POST
+    Note over CtxI,Fmt: Phase 4 — data transfer (Layer F)
+    Note right of CtxI: DIAG-CTX-SENDSYNC-ENTRY
+    CtxI->>Fmt: format(session)
+    Note right of Fmt: DIAG-CTX-FORMAT-ENTRY
+    Fmt->>UCX: per-peer / per-block sends ×M
+    Note right of UCX: many DIAG-UCX-SEND-*
+    Note right of Fmt: DIAG-CTX-FORMAT-EXIT
+    Note right of CtxI: DIAG-CTX-SENDSYNC-EXIT<br/>DIAG-CTX-PROMISE-SET<br/>(future fulfilled)
+    Note right of GenI: DIAG-GEN-RECVSYNC-ENTRY
+    GenI->>Fmt: unformat(session)
+    Note right of Fmt: DIAG-GEN-UNFORMAT-ENTRY
+    UCX->>Fmt: per-block recvs ×M
+    Note right of UCX: many DIAG-UCX-RECV-*
+    Note right of Fmt: DIAG-GEN-UNFORMAT-EXIT
+    Note right of GenI: DIAG-GEN-RECVSYNC-EXIT<br/>DIAG-GEN-PROMISE-SET<br/>(future fulfilled)
+```
+
+How to read this for the wedge analysis:
+
+- Each phase boundary is a candidate wedge site. The diagram is annotated with the `[DIAG-*]` tags emitted at each boundary, so by counting which tag fired and which didn't for a given reqId in the log, we localize the wedge to one of: Phase 0 (Python scheduling), Phase 1 (ctx ready-signal emission), Phase 2 (gen request-info send / ctx recv), Phase 3 (UCX transport — embedded in 1, 2, 4), Phase 4 (data transfer).
+- The two captured incidents below sit at different phases — the earlier one at Phase 1 (ctx counter never reaches zero), the later one past Phase 1 (every Phase 1/2/3 tag paired up, yet the test still timed out).
+- Tag-by-tag definitions and the precise emission points follow in section 3.
+
+## 3. The instrumentation layers and what each one tells us
 
 The `[DIAG-*]` instrumentation was added in waves, each layer covering one segment of the request lifecycle. Layers A–E shipped on the branch before the later CI run; Layer F was added in response to that run's findings.
 
@@ -107,7 +170,7 @@ Gen side:
 
 ---
 
-## 3. Expected event sequence for a healthy request
+## 4. Expected event sequence for a healthy request
 
 Per reqId, on the ctx side:
 
@@ -149,7 +212,7 @@ A reqId that has an ENTRY but no matching EXIT at any phase identifies the wedge
 
 ---
 
-## 4. Run-by-run findings
+## 5. Run-by-run findings
 
 ### 4.1 Earlier run (Layer A–D only)
 
@@ -210,7 +273,7 @@ This is also consistent with documents 12 §4 and the pre-existing observation t
 
 ---
 
-## 5. What we now know vs. don't know
+## 6. What we now know vs. don't know
 
 **We know:**
 1. The wedge is reproducible at the test level (every CI run of the diag branch on the same test hits a timeout).
@@ -225,7 +288,7 @@ This is also consistent with documents 12 §4 and the pre-existing observation t
 
 ---
 
-## 6. Hypotheses to evaluate against the next CI run
+## 7. Hypotheses to evaluate against the next CI run
 
 If Layer F captures the Phase 4 wedge:
 
@@ -242,7 +305,7 @@ If **no** Phase 4 ENTRY fires for any reqId that completed Phase 1, the wedge is
 
 ---
 
-## 7. Implications for the decomposition plan and the parallel verification branches
+## 8. Implications for the decomposition plan and the parallel verification branches
 
 The flakiness finding sharpens the case for landing the always-on baseline as a separate, small change first, *without* the cancellation surface, and treating subsequent CI runs of that smaller change as the test for whether the wedge race depends on the cancellation surface.
 
@@ -257,7 +320,7 @@ Each branch is a different ablation against the wedge. The first that fails CI o
 
 ---
 
-## 8. Next steps
+## 9. Next steps
 
 1. Re-run CI on the diag branch with Layer F included. Wait for the test timeout to flush buffered stdout, then look at the Phase 4 markers for any reqId.
 2. Based on which Phase 4 site has ENTRY-without-EXIT, narrow further. Likely-needed Layer G additions would be:
@@ -268,7 +331,7 @@ Each branch is a different ablation against the wedge. The first that fails CI o
 
 ---
 
-## 9. Doc relationships
+## 10. Doc relationships
 
 - Supersedes (partially): doc 12 §4 single-mechanism framing of the asymmetric_executor wedge.
 - Supersedes (partially): doc 13 framing of the mpi_kvcache transport hang as the canonical wedge signature.
