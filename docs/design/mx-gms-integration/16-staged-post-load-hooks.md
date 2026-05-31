@@ -1,6 +1,6 @@
 # 16. Staged Post-Load Hooks (Holistic MX + GMS Fix)
 
-**Status:** Locked (2026-05-30) — prep PR landed as TRTLLM-13077 (`[TRTLLM-13077][feat] Deocmpose post_load_weights()`). Wave 1 (alias migration + GMS-RO cutover) is the immediate next step. Full migration is sequenced as Waves 1–4 below.
+**Status:** Locked (2026-05-30) — prep PR open and awaiting review as TRTLLM-13077 (`[TRTLLM-13077][feat] Deocmpose post_load_weights()`); Wave 1 plan is locked and is the immediate follow-up once the prep PR merges. Full migration is sequenced as Waves 1–4 below.
 **Created:** 2026-05-19
 **Drives:**
 - TRTLLM-12440 — `[TRTLLM-12440][feat] Add GMS-only weight sharing support` (merged): review feedback on RO post-load ordering. The §7 ad-hoc mitigation (run full `post_load_weights()` on meta tensors before `materialize_module()`) is the workaround the staged-hook protocol replaces.
@@ -222,7 +222,7 @@ So the migration target is **~13 substantive files** plus 7 trivial alias-only f
 
 | Phase | Status | Vehicle | Risk | Est. LOC | MX receiver value |
 |:------|:-------|:--------|:-----|:---------|:------------------|
-| Prep | ✅ Landed | TRTLLM-13077 | n/a | ~70 (delivered) | — |
+| Prep | Open, review-required (BLOCKED) | TRTLLM-13077 | n/a | ~70 | — |
 | **Wave 1** | **Next** | TBD | LOW | ~165 | 0 (MX still publishes PRE-transform) |
 | Wave 2 | Queued | TBD | HIGH | ~80 | partial (~60% of models become receiver-ready) |
 | Wave 3 | Queued | TBD | HIGH | ~280 | full (100% of models receiver-ready) |
@@ -230,11 +230,11 @@ So the migration target is **~13 substantive files** plus 7 trivial alias-only f
 
 **Migration callout (applies to every wave below that migrates an override):** when a subclass migrates from overriding `post_load_weights()` to overriding `setup_aliases()` / `transform_weights()` / `cache_derived_state()`, the old `post_load_weights()` override **must be removed**. Leaving it in place silently shadows the base-class orchestrator and causes the new staged calls to do nothing. The pattern is: (a) move each block of the old body into the appropriate new method, (b) delete the `def post_load_weights(self):` line, (c) verify by grepping the diff for any remaining `def post_load_weights` in the migrated class.
 
-### Prep PR — ✅ landed as TRTLLM-13077
+### Prep PR — open as TRTLLM-13077 (awaiting review)
 
-`[TRTLLM-13077][feat] Deocmpose post_load_weights()` introduced the contract surface without migrating any model: default no-op `setup_aliases()` / `transform_weights()` / `cache_derived_state()`, the `_weights_transformed` flag with the lifecycle documented above, helper walkers on `ModelLoader` (`_walk_transform`, `_walk_cache_state`, plus a backward-compat orchestrator), and protocol unit tests. Neither TRTLLM-12440's GMS RO branch nor the inflight MX-team refactor is blocked on the migration: each carries a `TODO(STAGED-HOOKS)` against this section and continues with its ad-hoc workaround until its respective wave below cuts it over.
+`[TRTLLM-13077][feat] Deocmpose post_load_weights()` introduces the contract surface without migrating any model: default no-op `setup_aliases()` / `transform_weights()` / `cache_derived_state()`, the `_weights_transformed` flag with the lifecycle documented above, helper walkers on `ModelLoader` (`_walk_transform`, `_walk_cache_state`, plus a backward-compat orchestrator), and protocol unit tests. Neither TRTLLM-12440's GMS RO branch nor the inflight MX-team refactor is blocked on the migration: each carries a `TODO(STAGED-HOOKS)` against this section and continues with its ad-hoc workaround until its respective wave below cuts it over. Wave 1 begins once this prep PR merges.
 
-Original prep-PR scope (kept for record):
+Prep-PR scope:
 
 1. **Define the contract via duck-typed helpers, not via inheritance.** `ModelLoader` already invokes `post_load_weights()` through `getattr(module, 'post_load_weights', None)` + `hasattr` checks — see [model_loader.py](../../../tensorrt_llm/_torch/pyexecutor/model_loader.py). The walkers follow the same pattern so that `Linear`, `Attention`, MoE, Mamba submodules can opt in by simply defining the method, without forced inheritance changes. Optionally provide a `StagedHooksMixin` for type-checking convenience, but do not require it.
 2. Define the three per-module stages — `setup_aliases()`, `transform_weights()` (with `_weights_transformed` guard), `cache_derived_state()` — as documented method names with default no-ops on the existing base classes (`DecoderModelForCausalLM`, plus `nn.Module` defaults via the helper). Subclasses opt in by overriding any subset.
@@ -377,7 +377,7 @@ Total full-migration LOC (Waves 1–4): ~600 in-tree + MX-side publisher flip.
 
 ## References
 
-- **TRTLLM-13077** — `[TRTLLM-13077][feat] Deocmpose post_load_weights()` (merged). Prep PR that introduced the staged-hook contract surface, helper walkers, and `_weights_transformed` lifecycle without migrating any model. Vehicle for the "Prep" row in the phase-status table above.
+- **TRTLLM-13077** — `[TRTLLM-13077][feat] Deocmpose post_load_weights()` (open, awaiting review). Prep PR that introduces the staged-hook contract surface, helper walkers, and `_weights_transformed` lifecycle without migrating any model. Vehicle for the "Prep" row in the phase-status table above.
 - **TRTLLM-12440** — `[TRTLLM-12440][feat] Add GMS-only weight sharing support` (merged). RO-branch ordering trade-off documented inline; `TODO(STAGED-HOOKS)` to be added in the Wave 1 cutover.
 - **TRTLLM-11851** — `[TRTLLM-11851][feat] Add MX-only P2P checkpoint loading support for TRTLLM` (merged). Establishes the current MX publish-PRE-transform contract that Wave 4 flips.
 - Inflight MX-team `[None][refactor] Delegate MX checkpoint loading to ModelExpress` proposal — the publish-pre vs publish-post-transform discussion that surfaced the same architectural gap from the MX side. The homogeneity-assumption hazard raised on its review thread is the motivation for the P1 fail-safe in Wave 4.
