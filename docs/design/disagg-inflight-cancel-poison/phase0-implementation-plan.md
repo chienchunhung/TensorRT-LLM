@@ -6,7 +6,7 @@
 | **JIRA**  | [TRTLLM-12648](https://jirasw.nvidia.com/browse/TRTLLM-12648) tied to [TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721) |
 | **Spec**  | [`phase0-stress-test-suite.md`](phase0-stress-test-suite.md) |
 | **Owner** | Chien-Chun Hung |
-| **Status**| Implementation not started; spec ratified; open questions being resolved |
+| **Status**| Skeleton landed in `upstream/main` (steps 1–3 below). Thread bodies are implemented incrementally (step 4): log_scanner is live; metrics_thread is next, followed by injector, canary, load. |
 
 ## Purpose of this document
 
@@ -194,13 +194,13 @@ registration with no Python changes required.
 
 | Step | Action | Outputs | Status |
 |------|--------|---------|--------|
-| 1 | Read-only exploration: resolve Q3, Q4, Q5 by reading `resource_manager.py`, `_torch/disaggregation/nixl/_agent_{cpp,py}.py`, `ProcessWrapper` / `run_ctx_worker` / `run_gen_worker`. | Updated Q3/Q4/Q5 entries in this doc; brief findings summary in the implementation conversation. | Not started |
-| 2 | Model selection: enumerate `$LLM_MODELS_ROOT`, pick Marathon A candidate, sanity-check VRAM + KV transfer time. | Updated Q6 entry. | Not started |
-| 3 | Harness skeleton: directory structure, stub `DisaggCancellationStressHarness` class with thread fields + lifecycle methods (`start`, `stop`, `wait_until_done`), stub YAML schema parsing, stub pytest test. | Compiles; passes a smoke `harness.start(); harness.stop()` with no threads doing real work. | Not started |
-| 4 | Implement thread bodies (simplest first): log_scanner → metrics → injector → canary → load. | Each thread independently testable; harness assembles them. | Not started |
+| 1 | Read-only exploration: resolve Q3, Q4, Q5 by reading `resource_manager.py`, `_torch/disaggregation/nixl/_agent_{cpp,py}.py`, `ProcessWrapper` / `run_ctx_worker` / `run_gen_worker`. | Updated Q3/Q4/Q5 entries in this doc; brief findings summary in the implementation conversation. | Done |
+| 2 | Model selection: enumerate `$LLM_MODELS_ROOT`, pick Marathon A candidate, sanity-check VRAM + KV transfer time. | Updated Q6 entry. | Done |
+| 3 | Harness skeleton: directory structure, stub `DisaggCancellationStressHarness` class with thread fields + lifecycle methods (`start`, `stop`, `wait_until_done`), stub YAML schema parsing, stub pytest test. | Compiles; passes a smoke `harness.start(); harness.stop()` with no threads doing real work. | Done (landed in `upstream/main`) |
+| 4 | Implement thread bodies (simplest first): log_scanner → metrics → injector → canary → load. | Each thread independently testable; harness assembles them. | In progress — `log_scanner` done; `metrics` next |
 | 5 | Marathon A YAML + canary references: write YAML using resolved Q3/Q4 values; run `generate_canary_references.py` once against Marathon A's model; commit the JSON. | `marathon_a_v1_cpp_deepseek.yaml`, `stress_canary_prompts.json`, generator tool. | Not started |
-| 6 | Validation: full 2-h Marathon A run on developer machine. | PASS log attached to PR1. | Not started |
-| 7 | PR1 submission: register in `llm_function_stress.txt`, write PR description, link to this doc. | PR1 opened. | Not started |
+| 6 | Validation: full 2-h Marathon A run on developer machine. | PASS log attached. | Not started |
+| 7 | Registration: register both marathons in `llm_function_stress.txt`. | Test IDs picked up by weekly stress CI. | Not started |
 
 ## Risks and mitigations
 
@@ -243,8 +243,9 @@ future YAML + test-list additions with no Python changes:
 - [`README.md`](README.md) — overall TRTLLM-12721 design (Phases 0–4).
 - [`docs/investigations/nvbug-6104831-disagg-permanent-wedge/10-ablation-no-midflight-cancel.md`](../../investigations/nvbug-6104831-disagg-permanent-wedge/10-ablation-no-midflight-cancel.md)
   — the §10 ablation experiments this suite generalises.
-- [PR #13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) — the
-  bug fix this suite gates regressions against.
+- <https://github.com/NVIDIA/TensorRT-LLM/pull/13713> — the
+  disaggregated cancellation / poison bug fix this suite gates
+  regressions against.
 - [TRTLLM-12648](https://jirasw.nvidia.com/browse/TRTLLM-12648) —
   weekly stress CI ticket.
 - [TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721) —

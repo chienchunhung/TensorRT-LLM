@@ -4,8 +4,8 @@
 |---|---|
 | **Phase** | 0 (prerequisite to Phases 1–4) |
 | **JIRA** | [TRTLLM-12648](https://jirasw.nvidia.com/browse/TRTLLM-12648) (weekly stress CI) tied to [TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721) (the cancellation/poison improvement initiative) |
-| **Owner** | Implementation TBD — this doc is the spec |
-| **Status** | Spec ready; implementation not started |
+| **Owner** | Chien-Chun Hung |
+| **Status** | Skeleton landed in `upstream/main` at `tests/integration/defs/stress_test/disagg_cancel/`. Thread bodies are being implemented incrementally — `log_scanner_thread` is live; `metrics_thread`, `injector_thread`, `canary_thread`, and `load_thread` remain stubs. |
 
 ## Goal
 
@@ -22,8 +22,9 @@ The suite tests one contract:
 
 Failures **during** stress are explicitly OK — request errors, cancellations, retries during traffic bursts, error spikes during injected peer pauses. What we test is **graceful recovery**: after the transient event ends (SIGCONT, peer respawn, burst subsides), the server returns to a healthy baseline within a bounded time.
 
-This is the regression gate for the bug class fixed by PR
-[#13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) and the
+This is the regression gate for the bug class fixed by the
+disaggregated cancellation / poison work at
+<https://github.com/NVIDIA/TensorRT-LLM/pull/13713> and the
 follow-up work in Phases 1–4 of this design (deferred un-poison,
 multi-slot configs, NIXL callback, progress-based cancel). It is
 also the empirical safety net required by
@@ -547,4 +548,4 @@ The implementation PR should land:
 - [`docs/investigations/nvbug-6104831-disagg-permanent-wedge/10-ablation-no-midflight-cancel.md`](../../investigations/nvbug-6104831-disagg-permanent-wedge/10-ablation-no-midflight-cancel.md) — the §10 ablation experiments this suite generalises into a CI gate.
 - [TRTLLM-12648](https://jirasw.nvidia.com/browse/TRTLLM-12648) — the weekly stress CI JIRA ticket this satisfies.
 - [TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721) — the cancellation/poison improvement initiative this is Phase 0 of.
-- [PR #13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) — the bug fix this suite is gating regressions against.
+- <https://github.com/NVIDIA/TensorRT-LLM/pull/13713> — the disaggregated cancellation / poison bug fix this suite is gating regressions against.
