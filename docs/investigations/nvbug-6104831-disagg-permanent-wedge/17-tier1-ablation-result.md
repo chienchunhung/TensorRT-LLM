@@ -61,6 +61,8 @@ When in-flight cancellation lands, the cancel-throw retry pattern returns and `A
 
 This is the open design question the follow-up PR must answer. Not a port; a redesign.
 
+**Refined in [doc 18](18-pr-14746-prior-art-and-v1-two-layer-gap.md).** An upstream parallel effort ([PR #14746](https://github.com/NVIDIA/TensorRT-LLM/pull/14746)) implements the first option (allgather + union) for a *sibling* per-rank attribute (the timeout flag). The review surfaces a sharper framing: cancellation needs **two** layers of consensus — L1 (flag/intent: which requests to cancel) and L2 (state-transition: do all ranks make identical transitions in response). PR #14746 fixes L1 for the timeout flag. V2's `_consensus_outcome` already covers L2. V1 has no L2 mechanism, so the follow-up cancellation PR on V1 needs to add both — one allgather for the dedup state (L1), one for the `is_cancelled` outcome (L2).
+
 ## 7. Doc relationships
 
 - Closes the hypothesis open at [16 §8](16-diag-instrumentation-and-wedge-mobility.md#8-implications-for-the-decomposition-plan-and-the-parallel-verification-branches).
