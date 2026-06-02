@@ -162,6 +162,7 @@ The device attribute reports fabric is supported (`CU_DEVICE_ATTRIBUTE_HANDLE_TY
 | 4–5 | **Intra-node MNNVL teardown + reallocate prototype** (the centerpiece of Audit 1a) | ⛔ Blocked → Audit 1b | Same IMEX gate as the fabric `cuMemUnmap` test. The driver-side mechanism question (the harder of the two) is already answered by Day 3 posix-FD; the remaining open question is fabric-specific (IMEX + NVSwitch fabric manager interaction), which lands naturally in 1b. |
 | 5 | NVSHMEM teardown / `nvshmem_finalize` behavior | Not started | `nvshmem` Python module not installed in this env |
 | 5 | Written report (this document is a partial substitute) | Partial | This file covers Days 1–3; remaining gaps are gated on container / IMEX / nvshmem unblockers |
+| 6 | **CUDA graph re-capture latency under NCCL rebuild** | Not started — new audit item | Measures the per-`cuda_graph_config.batch_sizes`-entry recapture time after `ncclCommAbort` + `ncclCommInitRank`, to size PR 1a.11 (eager-mode fallback during recapture). Reviewer-driven (Luke); the current ~300 ms – 1.5 s figure is an order-of-magnitude estimate that needs empirical anchoring. Runnable on the same 4-GPU NVLink-connected node used for Days 1–3; no IMEX / NVL72 / NVSHMEM dependencies. ~1 day. |
 
 ### What's left that's actually unblocked on this hardware
 

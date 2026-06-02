@@ -144,6 +144,12 @@ Restarting `MPI.COMM_WORLD` with a dead participant is not feasible on stock MPI
 | **L3 data plane** | NVSHMEM (DeepEP) | No clean story on shipping versions; destructor deadlock | Deferred indefinitely with DeepEP |
 | **L1/L2 control plane** | MPI `COMM_WORLD` | ULFM if available; FT-subcomm workaround otherwise | Single-failure on MPI path; Ray path is cleaner long-term |
 
+### 6.2.4 CUDA graph recapture cost in Phase 2
+
+Phase 2's PG reconstruction invalidates *all* communicators (NCCL + MNNVL + possibly NVSHMEM), which in turn invalidates *every* CUDA graph captured against any of those handles. This is broader than Phase 1's NCCL-only invalidation (where the MoE AlltoAll over MNNVL keeps its graphs via kernel masking). Estimated recapture cost per surviving rank: ~300 ms – 1.5 s across all `cuda_graph_config.batch_sizes` entries — to be empirically anchored by [Audit 1a Day 6](audit-1a-findings.md).
+
+[PR 1a.11](08-implementation-plan.md#1a--rank-masking-in-communication-kernels) (eager-mode fallback + background recapture, Phase 1 v1) **applies unchanged in Phase 2**. After PG reconstruction completes, invalidate the full graph cache atomically; let the PyExecutor's existing eager-fallback dispatch path take over for serving immediately; run warmup-style requests on a background thread to recapture all configured batch sizes in parallel. The user-visible recovery time becomes the rebuild-plus-eager-resume time, not the rebuild-plus-full-recapture time. The eager-fallback mechanism is one of the more leveraged primitives in the design — built once in Phase 1 v1, reused across Phase 2 for free.
+
 ## 6.3 Shadow rank + GMS roles
 
 The MX-GMS workstream contributes Phase 2 acceleration. This subsection clarifies what those contributions actually do — they reduce *weight load time*, not the rest of the rebuild cost. Mistaking the shadow approach for a magic bullet leads to under-scoping; mistaking it for irrelevant misses the sub-second target it enables.
