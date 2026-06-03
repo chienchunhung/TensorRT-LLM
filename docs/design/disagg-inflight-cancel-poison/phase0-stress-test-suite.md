@@ -5,7 +5,7 @@
 | **Phase** | 0 (prerequisite to Phases 1–4) |
 | **JIRA** | [TRTLLM-12648](https://jirasw.nvidia.com/browse/TRTLLM-12648) (weekly stress CI) tied to [TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721) (the cancellation/poison improvement initiative) |
 | **Owner** | Chien-Chun Hung |
-| **Status** | Skeleton landed in `upstream/main` at `tests/integration/defs/stress_test/disagg_cancel/`. Thread bodies are being implemented incrementally — `log_scanner_thread` is live; `metrics_thread`, `injector_thread`, `canary_thread`, and `load_thread` remain stubs. |
+| **Status** | Skeleton + `log_scanner_thread` + `metrics_thread` landed in `upstream/main` at `tests/integration/defs/stress_test/disagg_cancel/`. Three threads remain stubs: `injector_thread`, `canary_thread`, `load_thread`. Also pending: marathon YAML configs + canary references + pytest registration. See [Implementation PR chain](#implementation-pr-chain) below for the per-step status. |
 
 ## Goal
 
@@ -30,6 +30,39 @@ multi-slot configs, NIXL callback, progress-based cancel). It is
 also the empirical safety net required by
 [TRTLLM-12648](https://jirasw.nvidia.com/browse/TRTLLM-12648) for the
 build.nvidia.com issues.
+
+## Implementation PR chain
+
+Phase 0 lands incrementally — one PR per thread body — to keep each PR
+small and reviewable, and to start exercising the harness in CI as soon
+as each component is in. The chain below tracks per-step status. Each
+URL is the upstream merged commit (or pending placeholder); intentionally
+written as the full URL (not the GitHub `#NNNNN` shorthand) so this
+design doc doesn't auto-post cross-reference comments on the implementation
+PRs.
+
+| Step | Component | Status | Landed in |
+|---|---|---|---|
+| 1 | Harness skeleton + initial YAML config + README + `log_scanner_thread` body | **Merged 2026-05-28** | <https://github.com/NVIDIA/TensorRT-LLM/pull/14375> |
+| 2 | `metrics_thread` body (per-worker `trtllm_kv_cache_utilization` scraper, time-series for leak detection) | **Merged 2026-06-02** | <https://github.com/NVIDIA/TensorRT-LLM/pull/14807> |
+| 3 | `injector_thread` body (SIGSTOP/SIGCONT/SIGKILL schedule + optional worker respawn) | Pending | — |
+| 4 | `canary_thread` body (canary client + deterministic prompts + token-equivalence check against precomputed references) | Pending | — |
+| 5 | `load_thread` body (steady-state + burst load wrapper around `run_cancel_stress_test`) | Pending | — |
+| 6 | Marathon YAML configs (`marathon_a_v1_cpp_deepseek.yaml`, `marathon_b_v2_py_qwen.yaml`) + `stress_canary_prompts.json` + reference-generation tool | Pending | — |
+| 7 | Pytest entry points + L0 test list registration in `tests/integration/test_lists/qa/llm_function_stress.txt` | Pending | — |
+
+The chain order is deliberate: `log_scanner_thread` first because it's
+the fail-fast guard the rest of the harness depends on; `metrics_thread`
+second because it's read-only and stand-alone; `injector_thread` /
+`canary_thread` / `load_thread` after because they form the
+read-write/synchronised core; YAML configs and pytest registration last
+because they tie everything together and need all five threads
+operational.
+
+Each PR after the skeleton is expected to be small (~200–500 lines + a
+unit test), and the existing infrastructure tests in
+`tests/unittest/disaggregated/stress_test/` are extended with the new
+thread's coverage as it lands.
 
 ## Background — what this suite is testing against
 
