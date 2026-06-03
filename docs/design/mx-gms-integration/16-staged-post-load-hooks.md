@@ -459,6 +459,74 @@ Total full-migration LOC (Waves 1–4): ~600 in-tree + MX-side publisher flip.
 
 ---
 
+## Status assessment (2026-06-03)
+
+### Anchor PR status
+
+| JIRA | Scope | Status |
+|:-----|:------|:-------|
+| TRTLLM-13077 — `[feat] Decompose post_load_weights()` | Staged-hook contract surface — 3 default-no-op methods on `DecoderModelForCausalLM` + 5 helper walkers + `_weights_transformed` lifecycle | Open, awaiting review; CI cleared modulo intermittent `DGX_H100-PyTorch-3` timeout |
+| TRTLLM-13141 — `[feat] Add backend-agnostic SourceIdentity gate for weight sharing` | `SourceIdentity` API + MX publisher/receiver gate + GMS RW publish / GMS RO pre-materialize check | Open, CI failing on `_quant_to_dict` `torch.dtype` bug; one-line fix |
+
+### What lands once both anchor PRs merge
+
+- ✅ Staged-hook method *contract* (default-no-op stubs + helper walkers; no consumers migrated yet).
+- ✅ `SourceIdentity` shared facility — opaque-bytes design consumed identically by MX and GMS.
+- ✅ MX receiver-side identity check **before** initiating P2P (pre-transfer gate).
+- ✅ GMS RW writer publishes identity; GMS RO checks **before** `materialize_module_from_gms()` (pre-materialize gate, STRICT policy → raises on mismatch).
+
+### A. Correctness gaps still present after both anchor PRs land
+
+**A1. GMS RO meta-tensor divergence — unfixed.** The GMS RO branch still runs the full `post_load_weights()` walk on meta tensors as the §7 workaround. Any module whose hook reads weight data (cached scales, dtype validation, fingerprints) silently produces NaN / 0 / divergent Python state on the RO peer. Resolution: Wave 1.
+
+**A2. MX receiver-side `transform_weights()` skip not yet active.** MX continues to publish PRE-transform; every receiver still redoes FP8 / fused-QKV / MoE packing. The identity gate is defensive but does not unlock the speedup. Resolution: Waves 2–4.
+
+### B. Foundation work needed to close A1 / A2
+
+| Wave | Scope | LOC | Risk | Closes |
+|:-----|:------|:---:|:----:|:-------|
+| Wave 1 | Alias migration on 7 model classes + GMS-RO meta-tensor cutover | ~165 | LOW | A1 |
+| Wave 2 | `Linear` / `Attention` transform migration | ~80 | HIGH | A2 (~60% of zoo) |
+| Wave 3 | MoE + Mamba transform migration | ~280 | HIGH | A2 (~100% of zoo) |
+| Wave 4 | MX publish-POST flip + receiver cutover + per-model allow-list | ~65 + ~5 MX-side | MEDIUM | A2 (consumption) |
+
+### C. Design / process unblockers
+
+- **C1. MX delegation scope — unresolved.** The inflight MX-team `[None][refactor] Delegate MX checkpoint loading to ModelExpress` proposal is still under review. This document recommends transport-only delegation (TRT-LLM keeps orchestration: fallback, validation, telemetry). Decide before Wave 4's MX-side change can be scoped.
+- **C2. Per-model allow-list (Wave 4) — undesigned.** Keyed by `(model_class, transform_protocol_version)`; where it lives, how it is curated, how integration tests gate additions — all open.
+- **C3. `_weights_transformed` flag is unexercised.** Prep PR adds the flag and `_reset_weights_transformed()` walker but no production caller until Wave 2.
+- **C4. Identity-fingerprint completeness.** `SourceIdentity.from_model_config` covers `attn_backend`, quant config, parallel layout, dtype. The P1 precondition also warns about "any future quant scheme or fusion pass". There is no enforcement that newly-added layout-affecting parameters get added to the fingerprint. Worth a CI lint or a registration pattern.
+
+### D. Testing / hygiene gaps
+
+- **D1. No end-to-end MX + GMS integration test.** The end-to-end MX + GMS prototype was a one-off, not a CI regression test. After Waves 1+4, an integration test should cover both happy paths (identity-compatible source → `setup_aliases` + skip transform + `cache_derived_state`) and the identity-mismatch failure paths (MX falls back to disk; GMS raises).
+- **D2. `SourceIdentity` test coverage for non-JSON-typed quant fields.** The `_quant_to_dict` bug discovered in TRTLLM-13141's first CI run (`PydanticSerializationError: Unable to serialize unknown type: <class 'torch.dtype'>`) was missed by `test_source_identity.py`. The fix is one line; the regression test addition is also one line. Add it alongside the bug fix.
+- **D3. Migration-callout enforcement.** A subclass that migrates body into `setup_aliases` / `transform_weights` / `cache_derived_state` but forgets to delete its old `post_load_weights()` override causes the new staged methods to silently no-op. Cheap safety net: orchestrator warns at module init if a class defines `post_load_weights` *and* any of the new staged methods. ~10 LOC.
+
+### Suggested next-step ordering
+
+| # | Action | Vehicle | Effort | Risk |
+|:--|:-------|:--------|:------:|:----:|
+| 1 | Fix `_quant_to_dict` `torch.dtype` bug + add regression test | TRTLLM-13141 | 1 LOC + ~20 LOC test | Low |
+| 2 | Land both anchor PRs | TRTLLM-13077, TRTLLM-13141 | merge work | Low |
+| 3 | Wave 1: alias migration + GMS-RO meta-tensor fix | new ticket | ~165 LOC | LOW |
+| 4 | Resolve MX delegation scope | discussion on the MX-team refactor proposal | n/a | n/a |
+| 5 | Wave 2: `Linear` / `Attention` transform migration | new ticket | ~80 LOC | HIGH |
+| 6 | Wave 3: MoE / Mamba transform migration | new ticket | ~280 LOC | HIGH |
+| 7 | Wave 4: MX publish-POST flip + receiver cutover + per-model allow-list | new ticket | ~65 + ~5 LOC | MEDIUM |
+| 8 | End-to-end MX + GMS integration test | new ticket | ~200 LOC | Low |
+
+### TL;DR
+
+After the two anchor PRs land, MX/GMS will have a working **safety net** (identity gate prevents silent corruption from layout mismatches) but the **functional improvements** are still ahead:
+
+- GMS RO still produces silently-divergent Python-side state on quantized models → **Wave 1** fixes.
+- MX receivers still redo all transforms → **Waves 2–4** unlock the speedup.
+
+~600 more LOC across four sequenced PRs (plus the MX-team delegation decision) gets the integration to fully-functional.
+
+---
+
 ## Coordination with MX and GMS
 
 The staged-hook decomposition is largely an in-tree TensorRT-LLM change. Two interface points need explicit coordination with the upstream weight-sharing libraries.
