@@ -31,42 +31,102 @@ The asymmetry between V2 and V1 at L2 is the key gap. On V2, even before PR #147
 
 Doc 14 ported the V2 `_consensus_outcome` pattern into V1 as an opt-in env-gated path (`TRTLLM_DISAGG_USE_CONSENSUS_OUTCOME`). That work covers L2 for the normal completion / failure path. **It does not cover the cancellation L2** — cancellation is collapsed into FAILED in doc 14 §2.3 (Option A), which works when the only cancellation trigger is internal failure, but not when an external timeout decision needs to be applied identically across ranks.
 
-## 3. Concrete L2 holes that remain on V1 after PR #14746
+## 3. Concrete L2 evidence — V1 vs V2, with line citations
 
-Sites where V1 + PR #14746 still has rank-divergent code on the cancellation path (from the PR's own diff, reading from `pr-14746-head:py_executor.py`):
+The L1/L2 distinction is grounded in code, not just framing. Below is the side-by-side that shows where each path applies (or doesn't) a consensus collective between timeout-detection and state-transition.
 
-1. **Site 1, ctx-side cancel (line 4006):**
-   ```python
-   if request.py_kv_transfer_timed_out and request_id not in completed_req_ids:
-       is_cancelled = self.kv_cache_transceiver.cancel_request(request)   # ← per-rank bool, no allgather
-       if is_cancelled:
-           request.py_kv_transfer_start_time = None
-           request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE         # ← rank-local state set
-           self._end_transfer_and_maybe_terminate(request)
-   ```
-   Even with `py_kv_transfer_timed_out` rank-consistent, `is_cancelled` can disagree (the C++ `CacheSender::cancelRequest` returns true only if the request is currently in `mReadyResponses` and not the active one, or — under the in-flight cancel flag — if the per-request cancel flag was successfully flipped). Different ranks → different state transitions.
+### V2 — consensus on the cancellation *outcome* before state changes
 
-2. **Site 2, gen-side cancel (line 4488):**
-   ```python
-   if request.py_kv_transfer_timed_out:
-       is_cancelled = self.kv_cache_transceiver.cancel_request(request)   # ← per-rank bool, no allgather
-       if is_cancelled:
-           timed_out_requests.append(request)
-       continue
-   ```
-   Same problem: `timed_out_requests` composition diverges across ranks.
+`tensorrt_llm/_torch/disaggregation/transceiver.py:280-298`:
 
-3. **Downstream of Site 2, gen-side cleanup (line 4581-4584):**
-   ```python
-   if self.enable_attention_dp and self.dist.world_size != 1:
-       self._pending_timed_out_requests.extend(timed_out_requests)        # ADP: deferred to synced drain
-   else:
-       for req in timed_out_requests:
-           self._handle_errors(error_msg=..., requests=[req])              # ← non-ADP: rank-local cleanup from divergent list
-   ```
-   The ADP branch buffers and drains under the existing bool-allgather, masking some of the divergence. The non-ADP branch executes `_handle_errors` directly per rank on a possibly-divergent list.
+```python
+def _consensus_outcome(self, to_process, cancelled, failed, completed, allgather, need_sync):
+    # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
+    all_c    = self._allgather_or_passthrough(cancelled, allgather, need_sync)   # ← allgather of locally-CANCELLED rids
+    all_f    = self._allgather_or_passthrough(failed,    allgather, need_sync)
+    all_done = self._allgather_or_passthrough(completed, allgather, need_sync)
+    n = len(all_c)
+    global_cancelled = self._union(all_c)                                        # ← UNION across ranks
+    global_failed    = self._union(all_f)
+    global_completed = self._intersection(all_done, n)                           # ← INTERSECTION across ranks
+    new_cancelled = [rid for rid in to_process if rid in global_cancelled]
+    ...
+```
 
-The fix shape, mirroring PR #14746's pattern: a second `dist.allgather(cancelled_ids)` after `cancel_request` calls, take the union (or intersection — design choice), then apply state transitions strictly from the consensus set. Equivalent in cost (one more small allgather/iter), structurally identical to what PR #14746 added for L1.
+Then `transceiver.py:478` (`_ctx_consensus_outcome`) and `:530` (`_gen_consensus_outcome`) apply state transitions *strictly from these global sets*. Even when individual ranks see different `cancel_request` results, V2 reconciles into a rank-consistent state.
+
+### V1 — no consensus between detection and state change
+
+`cpp/tensorrt_llm/batch_manager/cacheTransceiver.cpp:662-700` (gated by `TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL`):
+
+```cpp
+if (kvTransferTimeoutMs.has_value()) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
+    auto elapsedMs = static_cast<long>(elapsed.count());
+    if (elapsedMs > kvTransferTimeoutMs.value()) {                               // ← per-rank steady-clock check
+        // ... WARN ...
+        if (inflightCancelEnabled) {
+            mCacheSender->cancelRequest(*request);                               // ← per-rank cancel
+            request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);             // ← per-rank state transition
+            requestsStatus.errorRequestIds.insert(request->mRequestId);
+            mTimedOutSenderIds.erase(request->mRequestId);
+            it = mSenderFutures.erase(it);
+            continue;
+        }
+    }
+}
+```
+
+No allgather between line 667 (detection) and line 690 (`setState(kDISAGG_TRANS_ERROR)`). The same function does perform a readiness allgather earlier (`gatherRequestIds(syncComm, contextCompleteRequestIds)` at line ~610), but the timeout-cancellation path at 662-700 is intentionally outside that consensus.
+
+The Python layer above this has matching per-rank-divergent sites at `tensorrt_llm/_torch/pyexecutor/py_executor.py:4332` (ctx) and `:4971` (gen) using per-rank dedup sets `_disagg_timed_out_ctx_cancelled_ids` / `_disagg_timed_out_gen_cancelled_ids`. The Python sites defer the actual state change to C++ (per the "deferred cleanup contract" comment in `py_executor.py:4977`), so the *load-bearing* state-divergence site is the C++ `setState(kDISAGG_TRANS_ERROR)` above.
+
+### Side-by-side
+
+| Layer | Detection | Pre-action consensus? | Action |
+|---|---|---|---|
+| **V2** Python transceiver | per-rank wall-clock + state inspection | **`_consensus_outcome`** allgather UNION of cancelled rids (`transceiver.py:280-298`) | State transition driven from `global_cancelled` — rank-consistent |
+| **V1** C++ CacheTransceiver | per-rank `steady_clock` against `kvTransferTimeoutMs` (`cacheTransceiver.cpp:667`) | **None** between detection and action | `cancelRequest` + `setState(kDISAGG_TRANS_ERROR)` per rank (`cacheTransceiver.cpp:689-690`) |
+
+This is the concrete code answer to "is V1 state transition synced across ranks": **no**. V2 has an explicit consensus primitive named `_consensus_outcome` doing exactly that work. V1 has no equivalent at the timeout-cancellation site.
+
+### PR #14746 against this picture
+
+PR #14746 adds an L1 consensus (`_sync_kv_transfer_timed_out_flags` allgather-unions the *flag*) at the Python layer. On the V1 path that flag is consumed by `py_executor.py:4332` / `:4971` cancellation sites, which then call into the C++ `CacheSender::cancelRequest`. The C++ state-transition at `cacheTransceiver.cpp:690` is unchanged by this PR.
+
+So PR #14746 closes the divergence at *one* of the three V1 sites:
+
+| V1 divergence site | Pre-PR-#14746 | Post-PR-#14746 |
+|---|---|---|
+| Python `py_kv_transfer_timed_out` flag | per-rank (clock-skew detection) | **rank-consistent** (union via allgather) |
+| Python `is_cancelled` boolean from `cancel_request` | per-rank | per-rank (unchanged) |
+| C++ `setState(kDISAGG_TRANS_ERROR)` at `cacheTransceiver.cpp:690` | per-rank | per-rank (unchanged) |
+
+### Is PR #14746 net-negative on V1?  No — strictly improves divergence
+
+Walking through the state machine for "rank A detects timeout, rank B does not (clock skew)" on rid 5:
+
+| Scenario | Before PR #14746 | After PR #14746 | Net |
+|---|---|---|---|
+| Only A's request is at a cancellable point | A: cancels + setState; B: doesn't flag, doesn't try cancel; state unchanged on B | A: cancels + setState; B: union-flags, calls `cancel_request`, returns false (request not cancellable), state unchanged on B | ✅ **same outcome** |
+| Only B's request is at a cancellable point | A: flags + tries cancel, succeeds via local rank's view, setState on A; B: doesn't flag, doesn't cancel; state unchanged on B | A: same as before; B: union-flags, calls `cancel_request`, succeeds, setState on B | ⚠️ **B now also cancels** — but cancellation propagating to more ranks is desirable (the timeout has been declared instance-wide) |
+| Both ranks' requests cancellable | A: cancels + setState; B: doesn't flag, doesn't cancel | A and B: both cancel + setState | ⚠️ **B now also cancels** — same direction, desirable |
+| Neither cancellable | A: tries, no-op; B: doesn't try | A and B: try, no-op | ✅ **same outcome** |
+
+The ⚠️ rows are where PR #14746 changes behavior on V1. In every such case, the change is **more uniform cancellation propagation**, which is the desirable direction for a wall-clock timeout: when the configured timeout has fired anywhere on the instance, we want all ranks to act in concert, not for some to keep the transfer alive.
+
+So:
+
+- **V1 cancellation outcome and state-transition divergence pre-existed PR #14746 and remain.** The PR doesn't introduce them, it just doesn't close them.
+- **PR #14746 strictly reduces V1's divergence surface** by removing the flag-level divergence (clock-skew-driven flag flips happening on different iterations on different ranks).
+- **PR #14746 never introduces new divergence.** No state transition fires "later" or in a new direction because of this change; cancel attempts that wouldn't have succeeded before still don't succeed; cancel attempts that would have succeeded propagate now to more ranks — but in the direction of "more uniformly cancelled," not "more divergent."
+
+The remaining L2 gap on V1 (`cacheTransceiver.cpp:689-690` per-rank state transition) is a *separate* item, owned by our cancellation follow-up. PR #14746 is not the right place to close it because:
+
+1. The PR explicitly targets the V2 path where `_consensus_outcome` already handles L2; the author's scope is appropriate.
+2. Closing V1's L2 requires either a sibling allgather of `is_cancelled` outcomes or landing doc 14's V1 `_consensus_outcome` port — both bigger changes than this PR's scope.
+3. The follow-up cancellation PR can build on the L1 pattern PR #14746 establishes.
 
 ## 4. Empirical evidence and the V1 divergence question
 
