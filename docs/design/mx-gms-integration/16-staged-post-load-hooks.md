@@ -1,6 +1,6 @@
 # 16. Staged Post-Load Hooks (Holistic MX + GMS Fix)
 
-**Status:** Locked (2026-05-31) — prep PR awaiting review as TRTLLM-13077 (`[TRTLLM-13077][feat] Decompose post_load_weights()`); Wave 1 begins once it merges. Full migration sequenced as Waves 1–4 below.
+**Status:** Locked (2026-05-31; updated 2026-06-05 to split former Wave 4 into Waves 4 and 5) — prep PR awaiting review as TRTLLM-13077 (`[TRTLLM-13077][feat] Decompose post_load_weights()`); Wave 1 begins once it merges. Full migration sequenced as Waves 1–5 below.
 **Created:** 2026-05-19
 **Last updated:** 2026-05-31
 **Drives:**
@@ -313,7 +313,7 @@ So the migration target is **~13 substantive files** plus 7 trivial alias-only f
 
 ## Implementation plan
 
-### Phase status (2026-05-31)
+### Phase status (2026-06-05)
 
 | Phase | Status | Vehicle | Risk | Est. LOC | MX receiver value |
 |:------|:-------|:--------|:-----|:---------|:------------------|
@@ -321,7 +321,8 @@ So the migration target is **~13 substantive files** plus 7 trivial alias-only f
 | **Wave 1** | **Next** | TBD | LOW | ~165 | 0 (MX still publishes PRE-transform) |
 | Wave 2 | Queued | TBD | HIGH | ~80 | partial (~60% of models become receiver-ready) |
 | Wave 3 | Queued | TBD | HIGH | ~280 | full (100% of models receiver-ready) |
-| Wave 4 | Queued | TBD (MX-side publisher flip + TRT-LLM receiver cutover) | MEDIUM | ~80 in-tree + MX-side flip | flip + per-model rollout |
+| Wave 4 | Queued | TBD (TRT-LLM-side receiver cutover) | LOW | ~50 in-tree | infrastructure only — allow-list ships empty |
+| Wave 5 | Queued | TBD (MX-side publisher flip + first model in allow-list) | MEDIUM | ~5 MX-side + per-model adds | flip + first end-to-end consumption |
 
 **Migration callout (applies to every wave below that migrates an override):** when a subclass moves from overriding `post_load_weights()` to overriding `setup_aliases()` / `transform_weights()` / `cache_derived_state()`, the old `post_load_weights()` override **must be removed**. Leaving it in place silently shadows the base-class orchestrator and the new staged calls become no-ops. The pattern is: (a) move each block of the old body into the appropriate new method, (b) delete the `def post_load_weights(self):` line, (c) verify by grepping the diff for any remaining `def post_load_weights` in the migrated class.
 
@@ -415,47 +416,67 @@ Prep-PR scope:
 - Idempotency tests green for all 6 quant-method overrides.
 - Manual sweep to confirm no model class is left with a stale `def post_load_weights(self)` that would shadow the staged hooks.
 
-### Wave 4 — MX publish-after-transform flip + P1 fail-safe + receiver cutover (~80 LOC TRT-LLM + MX-side, MEDIUM risk)
+### Wave 4 — MX receiver cutover + per-model allow-list infrastructure (~50 LOC TRT-LLM, LOW risk)
 
 **Scope:**
-- **TRT-LLM source-identity API (~80 LOC):** land `tllm.disagg.compute_source_identity()` and `tllm.disagg.is_source_compatible()` in a `disagg` module callable by both MX and GMS receiver paths. Identity covers the parameters listed in **P1** above. Used by Wave 4's MX receiver cutover; consumed by the GMS RO path opportunistically once `transform_weights()`-skip plumbing exists there too.
+- **MX receiver cutover in `model_loader.py` (~30 LOC):** cut over the MX path from the current full `post_load_weights()` walk to the staged-hook protocol: call `is_source_compatible()` (provided by TRTLLM-13141 / `tllm.disagg.*`); on True AND the model is in the allow-list, run `model.setup_aliases()` → skip `transform_weights()` walk → per-module `cache_derived_state()` walk; on either False, fall back to the current full-load path. The path is exercised only when the upstream MX payload carries post-transform bytes; Wave 4 lands the receiver-side logic regardless of whether the publisher has flipped (Wave 5).
+- **Per-model allow-list framework (~20 LOC):** a TRT-LLM data structure keyed by `(model_class, transform_protocol_version)` plus the lookup helper the receiver consults. **Ships empty in Wave 4** — no model is allow-listed, so the receiver still falls back to the full-load path on every request, identical to today's behavior. The framework exists so Wave 5 (and subsequent per-model additions) can opt models in one at a time without further infrastructure churn.
+
+**Blast radius:** MX-only path. No GMS impact. Allow-list is empty at Wave 4 land, so deployments that upgrade to Wave-4 code see byte-identical behavior to pre-Wave-4. The cutover code path is dormant.
+
+**Risk: LOW.** Pure infrastructure landing with no behavior change:
+- Receiver still defaults to the full-load path because no model is in the allow-list.
+- All branching logic (`is_source_compatible` check, allow-list lookup, staged-hook call sequence) is dead until Wave 5 puts the first model in the allow-list.
+- Fallback path is unchanged from today, exercised on 100% of traffic.
+
+**Dependencies:** Waves 2 and 3 must be complete. Without them, the `transform_weights()` migration is incomplete and Wave 5 could not safely opt any model into the allow-list. (Wave 4 itself only needs the migrations to exist; it doesn't activate anything.)
+
+**MX-side value: 0 in Wave 4** (allow-list empty), unlocks when Wave 5 lands.
+
+**Gate to Wave 5:**
+- Wave-4 receiver cutover passes its own unit test (deliberately allow-list one synthetic model in the test fixture, verify the staged-hook path runs; remove from list, verify fallback path runs).
+- Bit-equivalence test framework for `cache_derived_state()` is in place so Wave 5's first model has a clear validation target.
+
+### Wave 5 — MX publish-after-transform flip + first-model end-to-end cutover (~5 LOC MX-side + per-model adds, MEDIUM risk)
+
+**Scope:**
 - **MX publisher flip (MX-side, ~5 LOC):** the publisher embeds `compute_source_identity()` output in its payload and writes post-transform bytes. Whether this lands inside ModelExpress or stays in TRT-LLM's MX path depends on the "scope of delegation" discussion below — the staged-hook design is agnostic.
-- **MX receiver cutover in `model_loader.py` (~30 LOC):** cut over the MX path from the current full `post_load_weights()` walk to the staged-hook protocol: call `is_source_compatible()`; on True, run `model.setup_aliases()` → skip `transform_weights()` walk → per-module `cache_derived_state()` walk; on False, fall back to the current full-load path. The cutover is also gated on (b) below.
-- **Per-model enable allow-list:** the receiver does not unconditionally trust an identity-compatible source. It consults a TRT-LLM allow-list keyed by `(model_class, transform_protocol_version)`. Models migrate into the allow-list one-by-one as integration testing validates them. Models not on the list run the full path regardless of compatibility.
+- **First model in allow-list (~5 LOC + integration test):** add one production model (typically Llama-3-70B) to the Wave-4 allow-list at the matching `transform_protocol_version`. Once added, MX receivers running that model with a compatible source actually skip `transform_weights()` and consume publisher-baked bytes — the first real unlock of the publish-after-transform speedup.
+- **Bit-equivalence integration test:** verify that `cache_derived_state()` output on the receiver matches disk-loaded reference for the allow-listed model. The test is the gating criterion for adding any further model to the list.
 
-**Blast radius:** MX-only path. No GMS impact. Affects only deployments that enable MX P2P checkpoint loading. Default-off for any model not in the allow-list — a deployment that upgrades to the Wave-4 code while running a not-yet-allow-listed model continues to receive PRE-transform bytes and runs the full receiver-side `post_load_weights()`, identical to today.
+**Blast radius:** MX-only path, only for the allow-listed model. All other models (and any deployment running an unflipped publisher) continue on the full-load path identical to today.
 
-**Risk: MEDIUM.** The publish-after-transform flip is the very change that the MX-team refactor's review flagged as unsafe; the P1 fail-safe is the in-tree answer to that critique. Risk is bounded by:
-- Receiver-side fingerprint check raises before any transform-skip happens.
-- Per-model allow-list prevents accidental cutover for models that did not undergo a transform-equivalence sweep.
+**Risk: MEDIUM.** This is the publish-after-transform flip that the MX-team refactor's review flagged as unsafe; the P1 fail-safe (already in place via TRTLLM-13141 + Wave 4) is the in-tree answer. Risk is bounded by:
+- Receiver-side `is_source_compatible()` raises before any transform-skip happens (the safety net was load-bearing well before Wave 5).
+- Per-model allow-list keeps the cutover scoped: a config mismatch on a non-listed model still goes through the full-load path.
 - Independent of GMS — failure here does not regress GMS or HF loading paths.
 
-**Dependencies:** Waves 2 and 3 must be complete. Without them, the `transform_weights()` migration is incomplete and the receiver cannot safely skip per-module hooks for every model.
+**Dependencies:** Wave 4 (receiver cutover infrastructure + allow-list framework). All Wave 1–3 migrations must be complete because the first allow-listed model's `transform_weights()` must be fully migrated.
 
 **Gate to closing the staged-hook initiative:**
-- At least one production model (typically Llama-3-70B) cut over end-to-end on a multi-host MX deployment.
-- Bit-equivalence verification of `cache_derived_state()` output between disk-loaded and MX-received tensors on that model.
+- First production model (typically Llama-3-70B) cut over end-to-end on a multi-host MX deployment with publisher-flipped MX.
+- Bit-equivalence verification of `cache_derived_state()` output between disk-loaded and MX-received tensors on that model passes in CI.
 - P1 fail-safe verified by deliberately running a config mismatch (e.g., publisher on FlashInfer, receiver on TRTLLM) and observing the raise.
 
-### Per-model incremental rollout strategy (post-Wave-2 / Wave-3 staging into Wave 4)
+### Per-model incremental rollout strategy (post-Wave-3 staging into Wave 5)
 
-Waves 2 and 3 are repo-wide module migrations and cannot be done per-model without leaving the codebase in a split state. But Wave 4's *consumption* of those migrations is gated per-model:
+Waves 2 and 3 are repo-wide module migrations and cannot be done per-model without leaving the codebase in a split state. But Wave 5's *consumption* of those migrations is gated per-model:
 
 - The MX publisher's identity payload carries a `transform_protocol_version` field.
-- The MX receiver in TRT-LLM consults a per-model allow-list and only allows publish-after-transform receive for models on the list at the matching protocol version.
+- The MX receiver in TRT-LLM consults the per-model allow-list (framework landed in Wave 4, first entry landed in Wave 5) and only allows publish-after-transform receive for models on the list at the matching protocol version.
 - After Wave 2 lands, dense Linear/Attention-only models (Llama, Qwen, Mistral, etc.) become candidates. After Wave 3, MoE and Mamba models become candidates.
-- Each model's addition to the allow-list is its own small change, independently revertable, gated by an integration test that verifies bit-equivalence of `cache_derived_state()` output between disk-loaded and MX-received tensors.
-- A model that fails the bit-equivalence sweep stays off the allow-list — Wave 4 ships and is useful even if not every model is in the allow-list on day one.
+- Each model's addition to the allow-list (beyond Wave 5's first entry) is its own small change, independently revertable, gated by an integration test that verifies bit-equivalence of `cache_derived_state()` output between disk-loaded and MX-received tensors. These additions are not separate Waves — they're per-model rollout PRs against the framework Wave 4 provides.
+- A model that fails the bit-equivalence sweep stays off the allow-list — Wave 5 ships and is useful even with only one model in the allow-list on day one.
 
-### Cleanup (post-Wave-4)
+### Cleanup (post-Wave-5)
 
-Once all subclasses have migrated and Wave 4 has shipped:
+Once all subclasses have migrated and Wave 5 has shipped:
 
 - Remove the orchestrator's transitional `post_load_weights()` back-compat path.
 - Consider collapsing `_weights_removed` into `_weights_transformed` if their lifecycles converge in practice (they do not today — `_weights_removed` is sleep/wake, `_weights_transformed` is one-shot — but reassess after the migration settles).
 - Close out the `TODO(STAGED-HOOKS)` markers left by TRTLLM-12440 and the MX-team refactor.
 
-Total full-migration LOC (Waves 1–4): ~600 in-tree + MX-side publisher flip.
+Total full-migration LOC (Waves 1–5): ~580 in-tree + MX-side publisher flip (~5 LOC) + per-model allow-list adds (small, ongoing).
 
 ---
 
@@ -488,7 +509,8 @@ Total full-migration LOC (Waves 1–4): ~600 in-tree + MX-side publisher flip.
 | Wave 1 | Alias migration on 7 model classes + GMS-RO meta-tensor cutover | ~165 | LOW | A1 |
 | Wave 2 | `Linear` / `Attention` transform migration | ~80 | HIGH | A2 (~60% of zoo) |
 | Wave 3 | MoE + Mamba transform migration | ~280 | HIGH | A2 (~100% of zoo) |
-| Wave 4 | MX publish-POST flip + receiver cutover + per-model allow-list | ~65 + ~5 MX-side | MEDIUM | A2 (consumption) |
+| Wave 4 | TRT-LLM-side MX receiver cutover + empty allow-list framework | ~50 | LOW | A2 (infrastructure only) |
+| Wave 5 | MX publisher flip + first model (Llama-3-70B) in allow-list | ~5 MX + ~5 in-tree + test | MEDIUM | A2 (consumption) |
 
 ### C. Design / process unblockers
 
@@ -499,7 +521,7 @@ Total full-migration LOC (Waves 1–4): ~600 in-tree + MX-side publisher flip.
 
 ### D. Testing / hygiene gaps
 
-- **D1. No end-to-end MX + GMS integration test.** The end-to-end MX + GMS prototype was a one-off, not a CI regression test. After Waves 1+4, an integration test should cover both happy paths (identity-compatible source → `setup_aliases` + skip transform + `cache_derived_state`) and the identity-mismatch failure paths (MX falls back to disk; GMS raises).
+- **D1. No end-to-end MX + GMS integration test.** The end-to-end MX + GMS prototype was a one-off, not a CI regression test. After Wave 1 (GMS happy path live) and Wave 5 (MX happy path live for the first allow-listed model), an integration test should cover both happy paths (identity-compatible source → `setup_aliases` + skip transform + `cache_derived_state`) and the identity-mismatch failure paths (MX falls back to disk; GMS raises).
 - **D2. `SourceIdentity` test coverage for non-JSON-typed quant fields.** The `_quant_to_dict` bug discovered in TRTLLM-13141's first CI run (`PydanticSerializationError: Unable to serialize unknown type: <class 'torch.dtype'>`) was missed by `test_source_identity.py`. The fix is one line; the regression test addition is also one line. Add it alongside the bug fix.
 - **D3. Migration-callout enforcement.** A subclass that migrates body into `setup_aliases` / `transform_weights` / `cache_derived_state` but forgets to delete its old `post_load_weights()` override causes the new staged methods to silently no-op. Cheap safety net: orchestrator warns at module init if a class defines `post_load_weights` *and* any of the new staged methods. ~10 LOC.
 
@@ -513,17 +535,18 @@ Total full-migration LOC (Waves 1–4): ~600 in-tree + MX-side publisher flip.
 | 4 | Resolve MX delegation scope | discussion on the MX-team refactor proposal | n/a | n/a |
 | 5 | Wave 2: `Linear` / `Attention` transform migration | new ticket | ~80 LOC | HIGH |
 | 6 | Wave 3: MoE / Mamba transform migration | new ticket | ~280 LOC | HIGH |
-| 7 | Wave 4: MX publish-POST flip + receiver cutover + per-model allow-list | new ticket | ~65 + ~5 LOC | MEDIUM |
-| 8 | End-to-end MX + GMS integration test | new ticket | ~200 LOC | Low |
+| 7 | Wave 4: TRT-LLM-side MX receiver cutover + per-model allow-list framework (ships empty) | new ticket | ~50 LOC | LOW |
+| 8 | Wave 5: MX publisher flip + first model (Llama-3-70B) in allow-list | new ticket | ~5 MX + ~5 in-tree + test | MEDIUM |
+| 9 | End-to-end MX + GMS integration test | new ticket | ~200 LOC | Low |
 
 ### TL;DR
 
 After the two anchor PRs land, MX/GMS will have a working **safety net** (identity gate prevents silent corruption from layout mismatches) but the **functional improvements** are still ahead:
 
 - GMS RO still produces silently-divergent Python-side state on quantized models → **Wave 1** fixes.
-- MX receivers still redo all transforms → **Waves 2–4** unlock the speedup.
+- MX receivers still redo all transforms → **Waves 2–5** unlock the speedup (W2/W3 = `transform_weights()` migration; W4 = receiver-side cutover with empty allow-list, no behavior change; W5 = MX publisher flip + first model in allow-list = first real speedup).
 
-~600 more LOC across four sequenced PRs (plus the MX-team delegation decision) gets the integration to fully-functional.
+~580 more LOC across five sequenced PRs (plus the MX-team delegation decision and per-model allow-list adds) gets the integration to fully-functional.
 
 ---
 
