@@ -155,13 +155,96 @@ So the precise framing is: V1 is not *inherently* divergent today, but it is *la
 
 Updates [17 §6](17-tier1-ablation-result.md#6-implication-for-the-follow-up-cancellation-pr) with the L1 / L2 distinction:
 
-- **L1 consensus for the dedup state** (the A3 problem): apply PR #14746's pattern — `dist.allgather` of the local "started" / "prepared" set per iteration, union, set every rank's flag from the consensus set. Called at a rank-symmetric site inside `_recv_disagg_gen_cache`. Cost: one small allgather per iter under cancel-enabled disagg.
+- **L1 consensus for the dedup state** (the A3 problem): apply PR #14746's pattern — `dist.allgather` of the local "started" / "prepared" set per iteration, union, set every rank's flag from the consensus set. Called at a rank-symmetric site inside `_recv_disagg_gen_cache`.
 
-- **L2 consensus for the cancellation outcome** (the new gap surfaced by §3 above): apply the same pattern to `is_cancelled` — `dist.allgather` of the locally-cancelled ids per iter, union, drive state transitions strictly from the consensus set. Called at the cancellation sites in `_handle_responses` and `_check_disagg_ctx_cache_transfer_status`. Cost: one more small allgather per iter under cancel-enabled disagg.
-
-Both allgathers are lockstep / possibly-empty / same shape as PR #14746's. Total added per-iter coordination under cancel-enabled disagg V1: two small `dist.allgather` calls (plus PR #14746's one for timeouts, if running on a base that includes it). Worth measuring on a 6-rank disagg test before committing.
+- **L2 consensus for the cancellation outcome** (the new gap surfaced by §3 above): apply the same pattern to `is_cancelled` — gather locally-cancelled ids per iter, union, drive state transitions strictly from the consensus set. Called at the cancellation sites in `_handle_responses` and `_check_disagg_ctx_cache_transfer_status`.
 
 The previously-proposed alternative designs (move dedup upstream; different idempotency primitive) remain on the table for L1 but don't address L2. The L2 gap is inherent to the V1 transceiver's lack of a `_consensus_outcome`. The minimal-blast-radius fix is the allgather pattern; the deeper fix is to land doc 14's `_consensus_outcome` port and extend its outcome set to include CANCELLED (vs. doc 14 §2.3's current "cancellation collapses into FAILED" simplification).
+
+### 5.1 Encoding choice — pack `{rid, state}` into one allgather, not three lists
+
+V2's `_consensus_outcome` does **three separate allgathers** (one each for cancelled / failed / completed rid lists). For the V1 follow-up, the recommended design is a **single allgather of packed `(rid, state)` values**, not a port of V2's three-list shape.
+
+**Packing layout** (fits in one `uint64`):
+
+```cpp
+// state in the high 4 bits, rid in the low 60 bits — request ids fit comfortably
+// in 60 bits (we don't generate 2^60 requests); 4 bits encodes the 4-state enum
+// (IN_PROGRESS / COMPLETED / FAILED / CANCELLED) with headroom.
+constexpr uint64_t kStateShift = 60;
+constexpr uint64_t kRidMask = (1ULL << kStateShift) - 1;
+inline uint64_t pack(RequestIdType rid, RequestState s) { return (uint64_t(s) << kStateShift) | (rid & kRidMask); }
+```
+
+**Per-rank build:**
+
+```cpp
+std::vector<uint64_t> local;
+for (auto& req : currentBatch) {
+    if (req.state != IN_PROGRESS) local.push_back(pack(req.id, req.state));
+}
+auto global = gatherRequestIds(syncComm, local);  // existing V1 collective, vector<uint64> in/out — no new primitive
+```
+
+**Consensus reduce** (one pass over `global`, no separate UNION / INTERSECTION helpers):
+
+```cpp
+struct Tally { uint8_t maxState = IN_PROGRESS; int completedCount = 0; };
+std::unordered_map<uint64_t, Tally> tally;
+for (auto packed : global) {
+    auto [rid, s] = unpack(packed);
+    auto& t = tally[rid];
+    t.maxState = std::max(t.maxState, s);                // priority-encoded: CANCELLED > FAILED > COMPLETED > IN_PROGRESS
+    if (s == COMPLETED) t.completedCount++;
+}
+// CANCELLED / FAILED: UNION semantic — maxState already captures it
+// COMPLETED: INTERSECTION — only consensus-COMPLETED when ALL ranks reported COMPLETED
+for (auto& [rid, t] : tally) {
+    if (t.maxState == COMPLETED && t.completedCount < nRanks) t.maxState = IN_PROGRESS;
+}
+```
+
+**Why this beats three allgathers for V1:**
+
+| Aspect | 3-list (V2 shape) | Packed `{rid, state}` |
+|---|---|---|
+| Collectives per iter | 3 (× 2 if PP > 1; the underlying allgatherv is "size sync + data sync" so the constant is higher still) | 1 (same multipliers) |
+| Synchronization barriers | 3 | 1 |
+| Wire bytes (non-IN_PROGRESS rids) | sum of three vectors of uint64 | same (one vector of uint64) |
+| Existing infrastructure on V1 | would need new helper | `gatherRequestIds(syncComm, vector<uint64>)` already in `cacheTransceiver.cpp:482` — zero new collective code |
+| Code clarity | high (intent reads off the three list names) | medium (priority reduce + COMPLETED count condition) |
+
+The latency savings are most visible in: cross-node disagg over TCP/IB (~10× higher per-allgather latency than NVLink), PP > 1 (V2 does TP allgather + PP allgather, so 6 collectives become 2), and hot paths under sustained load.
+
+**Open design questions to resolve in the follow-up PR:**
+
+1. Combine L1 (dedup) and L2 (cancel outcome) into one packed gather, or keep them as two distinct gathers? They run at different lockstep sites; folding into one would require co-locating the call sites. Probably easiest to start with two separate packed gathers (still 2 collectives total, vs. 4+ for three-list shape), then fold if call-site co-location makes sense.
+
+2. Where to define `pack` / `unpack` helpers? Likely in `cacheTransceiver.h` next to `gatherRequestIds`, since both are V1 disagg consensus primitives.
+
+3. RequestState enum value assignment must match the priority ordering exactly: `IN_PROGRESS = 0 < COMPLETED = 1 < FAILED = 2 < CANCELLED = 3`. Worth a `static_assert` near the enum definition so a future enum reorder doesn't silently break the consensus.
+
+### 5.2 V2 propagation — deferred decision, contingent on V1 measurements
+
+If the V1 follow-up's packed-state allgather lands and we observe the predicted latency reduction (especially on multi-node / PP > 1 / ADP configs), the same encoding is **mechanically applicable to V2's `_consensus_outcome`** at `tensorrt_llm/_torch/disaggregation/transceiver.py:280-298`:
+
+- V2 currently calls `_allgather_or_passthrough` three times (one each for `cancelled`, `failed`, `completed` lists)
+- The packed variant collapses to one call, with the same priority-reduce + COMPLETED-count logic
+- V2's two `_consensus_outcome` call sites (`_ctx_consensus_outcome`, `_gen_consensus_outcome`) would each go from 3 → 1 collective, and the ctx-side TP-then-PP chain (already 2 sub-collectives per call) goes from 6 → 2
+
+**Reasons to defer the V2 propagation behind the V1 work:**
+
+1. V2's existing code is reviewable and works; the cost of refactoring V2 without measured benefit is non-trivial (touches V2 test harness, multi-rank integration tests, doc 14's V1 port that mirrors V2's shape).
+2. V2 deployments are typically intra-node (TP within an NVLink domain), where allgather latency is sub-100μs and the 3→1 savings amount to maybe 50μs/iter — real but not transformative.
+3. Measuring on V1 first gives us a concrete data point (under realistic disagg load) to justify the V2 refactor or shelve it. Without measurement, we'd be guessing.
+
+**Trigger to revisit V2:**
+
+- V1 follow-up measurements show >5% wall-clock improvement on a representative disagg config (e.g., the [Phase-0 stress test suite's](../../design/disagg-inflight-cancel-poison/phase0-stress-test-suite.md) marathon configs)
+- OR a V2 deployment on cross-node disagg surfaces synchronization-overhead as a top-3 bottleneck in NVTX traces
+- OR independent maintenance work on V2's `_consensus_outcome` opens the door for a structural change at low marginal cost
+
+Track as a follow-up under TRTLLM-12721, separate from the V1 cancellation PR.
 
 ## 6. Cross-references
 
