@@ -153,6 +153,7 @@ across sections that are each meant to be readable on its own:
 | [`12-horizontal-consistency-and-layer3-gating.md`](12-horizontal-consistency-and-layer3-gating.md) | The vertical / horizontal consistency theory of the post-rc13 CI failures. Lays out why PR `#13713`'s `shared_ptr<LlmRequest>` lifetime fix closes the vertical (UAF) axis but opens the horizontal (cross-rank state divergence) axis, and proposes three fix paths (A — lifetime flag, B — explicit consensus layer, C — waive). The framework everything in docs 13 and 14 builds on. |
 | [`13-cpp-gtest-transport-hang-finding.md`](13-cpp-gtest-transport-hang-finding.md) | Empirical addendum to doc 12 §4.3: the cpp gtest `asymmetric_executor[mpi_kvcache]` wedge is at the MPI/UCX-shm transport layer, not at the gather-point ABBA layer doc 12 hypothesised. Note: refined by doc 14 §3.4 — the transport layer is the *trigger*, but the consistency layer is what amplifies the trigger into a test failure; consensus closes the consistency amplifier (verified empirically: 348 s+FAIL → 46 s+PASS on the same test). |
 | **[`14-cross-rank-consistency-enforcement.md`](14-cross-rank-consistency-enforcement.md)** | **Implementation and empirical validation of doc 12 §5.2 Path B (explicit horizontal consensus layer).** Documents the V2 `_consensus_outcome` pattern ported into V1's C++ `checkContextTransferStatus` / `checkGenTransferStatus` as a four-pass pipeline (readiness consensus → local classify + cache → 2 outcome allgathers → state transitions). Gated behind `TRTLLM_DISAGG_USE_CONSENSUS_OUTCOME` (default OFF, byte-identical to current PR HEAD). Empirically validated across 11 local runs on 4 test families, 4 topologies, 3 transports, 4 models: **all PASSED, zero false positives, 3 of 4 helix-class tests caught real cross-rank divergences, the cache mechanism survived multi-iteration deferral (TinyLlama: same request deferred across iters 2, 3, 4)**. Overhead ~22% on flake-prone tests, ~0% on tests with no divergence. Includes the updated landing plan (§5) that supersedes doc 12 §6's Path A → Path B sequence: Path B works fast enough (~2 days, not 1-2 weeks) that Path A is no longer needed as an interim. |
+| **[`19-exp4-f1-f2-f3-decomposition.md`](19-exp4-f1-f2-f3-decomposition.md)** | **External forensic A/B (exp 4) re-decomposes the decode-side wedge into three independent failures on the same code path.** F1 = `Broken promise` UAF (fixed by shared_ptr port — PR `#14979`'s inner-layer + PR `#14768`'s outer-layer, both subsets of `#13713`). F2 = engine-loop freeze on unbounded `future.get()` (fixed by `cacheTransceiver.cpp` bounded `wait_for(≤50 ms)` poll — only in `#13713`). F3 = stuck transfer's KV blocks are freed *eagerly*, before UCX progress thread has quiesced for them → transport state corrupted → **permanent wedge** (fixed by `py_executor.py` + `AsyncTransferManager` redesign with `_is_unquiesced_disagg_transfer` / `_can_terminate_request_now` — only in `#13713`, structurally not cherry-pickable). **A/B clincher (same harness, single hour):** `#13713` recovers `200/200/200/200`; the largest cachefix-subset trial wedges `5/5 FAIL`. **Bounded polling on its own is insufficient on NIXL** — UCX's background progress thread (`ucxCacheCommunicator.cpp:331 startProgressThread(true)`) means engine-freeze and transfer-stall are separate concerns, so un-freezing the engine does not progress the stuck transfer. Maps F1/F2/F3 onto the existing layer model (L1, L3, L4+L5) and on to the design doc's C4 invariant. The strategic conclusion: **PR `#14979` is necessary but not sufficient for the field wedge; the deployable is `#13713` in full.** Identifies one efficient empirical follow-up — KV-block accounting on the cancel path (candidate Layer G in branch `nvbug6104831-diag-logging`) — to move F3's originating trigger from "inferred" to "proven". |
 
 ---
 
@@ -194,6 +195,22 @@ across sections that are each meant to be readable on its own:
   [`05-investigation-timeline.md`](05-investigation-timeline.md) end-to-end,
   then the "What We Would Do Differently" section in
   [`07-architectural-reflections.md`](07-architectural-reflections.md).
+- **"Can we ship a small subset of `#13713` (e.g. `#14768` + `#14979`) instead of the full PR?"** Read
+  [`19-exp4-f1-f2-f3-decomposition.md`](19-exp4-f1-f2-f3-decomposition.md).
+  It documents an external forensic A/B (`fengyul/dynamo-disagg`
+  exp 4) that decomposes the decode-side wedge into three
+  independent failures (F1 = `Broken promise` UAF, F2 = engine-loop
+  freeze, F3 = eager-free poisons transport) and shows that **the
+  load-bearing fix on NIXL is F3 done safely — quiescence-gated
+  freeing**, which is tangled across `py_executor.py` and the
+  transfer manager API and not cleanly portable. PR `#14979`'s
+  shared_ptr port closes F1 (a co-occurring crash class) but does
+  not recover the wedge by itself; same for adding the bounded poll
+  (F2). The A/B clincher is `#13713 → 200/200/200/200` vs
+  cachefix-subset → `5/5 FAIL`, identical harness, single hour.
+  Implication: **the deployable that passes the reproducer is
+  `#13713` itself**, gated for risk control via
+  `TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL` (default OFF).
 - **"A reviewer asked whether PR `#13713`'s mid-flight cancellation,
   RAII, lifetime, idempotency, and fail-closed-on-unquiesced layers
   are really necessary on top of the deadline-eviction work."** Read

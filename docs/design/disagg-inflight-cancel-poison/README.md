@@ -409,8 +409,25 @@ phase was inserted.)
 **Status:** Behavioural change; predicated on Phase 1's consensus
 contract. The deferred-un-poison mechanism is a per-iteration
 decision on whether each pool slot can be returned to circulation;
-Phase 1 makes that decision globally consistent. Once consensus is
-in place, the mechanism itself follows the original plan:
+Phase 1 makes that decision globally consistent.
+
+> **Load-bearing for recovery, not optional polish.** External
+> forensic exp 4 (write-up:
+> [`19-exp4-f1-f2-f3-decomposition.md`](../../investigations/nvbug-6104831-disagg-permanent-wedge/19-exp4-f1-f2-f3-decomposition.md))
+> showed Trial 2's active drain — cancel + wait-ready + erase —
+> wedged `5/5 FAIL` because it freed *eagerly*, exactly like rc17.
+> Detecting and terminating stuck transfers was never the gap;
+> *freeing them safely* is. The polling-until-quiescence mechanism
+> below is what realizes C4 ("deferred cleanup is a globally
+> consistent decision") on the V1 + C++ path; without it, the
+> field decode wedge does not recover on NIXL regardless of how
+> aggressive the cancel layer is. This is direct empirical
+> evidence that Phase 2 is on the critical path for the field
+> recovery, not just an operability improvement on top of the
+> existing fail-closed surface.
+
+Once consensus is in place, the mechanism itself follows the
+original plan:
 
 - New class: `PendingQuiescenceTracker` (one per pool).
   - Holds `(NixlTransferStatus, slot_id, shared_ptr<LlmRequest>,
@@ -612,6 +629,47 @@ PR #13713 lands (default-OFF, gated under TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL)
   s), both pools poisoned, 3 container restarts, NVCF instance
   recycle. The empirical proof that the current shape is too
   aggressive at production defaults.
+
+- **External forensic exp 4 (`fengyul/dynamo-disagg`,
+  `experiments/exp4-14979-cachefix-subset.md`), written up in-tree
+  as [`19-exp4-f1-f2-f3-decomposition.md`](../../investigations/nvbug-6104831-disagg-permanent-wedge/19-exp4-f1-f2-f3-decomposition.md).**
+  Decomposes the decode-side wedge into three independent failures
+  on the same code path: **F1** (`Broken promise` UAF, fixed by the
+  shared_ptr lifetime port in PR `#14979`), **F2** (engine-loop
+  freeze on unbounded `future.get()`, fixed by `cacheTransceiver.cpp`
+  bounded `wait_for(≤50 ms)` poll in PR `#13713`), and **F3**
+  (eager-free of stuck transfer poisons the UCX progress thread →
+  permanent wedge, fixed by PR `#13713`'s `py_executor.py` +
+  `AsyncTransferManager` redesign with `_is_unquiesced_disagg_transfer`
+  / `_can_terminate_request_now`).
+
+  **The most consequential observation for this design:** on NIXL,
+  F2's bounded poll un-freezes the engine but does *not* progress
+  the stuck transfer, because NIXL/UCX runs its own background
+  progress thread (verified at `cpp/tensorrt_llm/runtime/utils/ucxCacheCommunicator.cpp:331`
+  `startProgressThread(true)`) — engine-freeze and transfer-stall
+  are separate concerns. The load-bearing fix is **F3 done
+  safely = quiescence-gated freeing**, which is exactly what C4
+  ("deferred cleanup is a globally consistent decision") and
+  Phase 2 (deferred un-poison via NIXL status polling) realize.
+
+  **A/B clincher (same cluster, same loadgen, single hour):** PR
+  `#13713` recovers `+30 FAIL → 200/200/200/200`; the largest
+  cachefix-subset trial (`#14979` + bounded poll + active drain)
+  wedges `5/5 FAIL → 000`. Trial 2 is the instructive failure: its
+  drain *engaged* (rc17's `_check_kv_transfer_timeout` already
+  detects and cancels timed-out transfers — *detection was never
+  the gap*) but freed eagerly, exactly like rc17, and poisoned the
+  transport the same way. Detecting and terminating is necessary;
+  **freeing safely** is the load-bearing piece.
+
+  Why this strengthens the design's existing C4 / Phase 2
+  argument: rc17 violates C4 today by making a per-rank "free now"
+  decision the instant cancellation fires; Trial 2 replicates the
+  violation exactly. C4 + Phase 2's polling-until-quiescence are
+  what make the safe-vs-unsafe distinction structurally enforceable,
+  not a wait-longer heuristic. Phase 2 is **load-bearing for
+  recovery on NIXL, not optional operability polish.**
 
 - **V2 transceiver's `_consensus_outcome` implementation** —
   `tensorrt_llm/_torch/disaggregation/transceiver.py`. The reference
