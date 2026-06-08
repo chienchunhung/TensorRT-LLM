@@ -5,7 +5,7 @@
 | **Phase** | 0 (prerequisite to Phases 1–4) |
 | **JIRA** | [TRTLLM-12648](https://jirasw.nvidia.com/browse/TRTLLM-12648) (weekly stress CI) tied to [TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721) (the cancellation/poison improvement initiative) |
 | **Owner** | Chien-Chun Hung |
-| **Status** | Skeleton + `log_scanner_thread` + `metrics_thread` landed in `upstream/main` at `tests/integration/defs/stress_test/disagg_cancel/`. Three threads remain stubs: `injector_thread`, `canary_thread`, `load_thread`. Also pending: marathon YAML configs + canary references + pytest registration. See [Implementation PR chain](#implementation-pr-chain) below for the per-step status. |
+| **Status** | Skeleton + `log_scanner_thread` + `metrics_thread` + `injector_thread` + `canary_thread` landed in `upstream/main` at `tests/integration/defs/stress_test/disagg_cancel/`. One thread remains stub: `load_thread`. Also pending: marathon YAML configs + canary references + pytest registration. See [Implementation PR chain](#implementation-pr-chain) below for the per-step status. |
 
 ## Goal
 
@@ -45,8 +45,8 @@ PRs.
 |---|---|---|---|
 | 1 | Harness skeleton + initial YAML config + README + `log_scanner_thread` body | **Merged 2026-05-28** | <https://github.com/NVIDIA/TensorRT-LLM/pull/14375> |
 | 2 | `metrics_thread` body (per-worker `trtllm_kv_cache_utilization` scraper, time-series for leak detection) | **Merged 2026-06-02** | <https://github.com/NVIDIA/TensorRT-LLM/pull/14807> |
-| 3 | `injector_thread` body (SIGSTOP/SIGCONT/SIGKILL schedule + optional worker respawn) | Pending | — |
-| 4 | `canary_thread` body (canary client + deterministic prompts + token-equivalence check against precomputed references) | Pending | — |
+| 3 | `injector_thread` body (SIGSTOP/SIGCONT/SIGKILL schedule + optional worker respawn) | **Merged 2026-06-04** | <https://github.com/NVIDIA/TensorRT-LLM/pull/14920> |
+| 4 | `canary_thread` body (canary client + deterministic prompts + token-equivalence check against precomputed references) | **Merged 2026-06-08** | <https://github.com/NVIDIA/TensorRT-LLM/pull/15015> |
 | 5 | `load_thread` body (steady-state + burst load wrapper around `run_cancel_stress_test`) | Pending | — |
 | 6 | Marathon YAML configs (`marathon_a_v1_cpp_deepseek.yaml`, `marathon_b_v2_py_qwen.yaml`) + `stress_canary_prompts.json` + reference-generation tool | Pending | — |
 | 7 | Pytest entry points + L0 test list registration in `tests/integration/test_lists/qa/llm_function_stress.txt` | Pending | — |
@@ -515,64 +515,81 @@ needed**:
 
 Track these as a follow-up issue, file/add YAML configs as needed.
 
-## Open questions for the implementing agent to resolve
+## Implementation notes
 
-1. **`run_cancel_stress_test` integration.** The function exits when
-   its inner `asyncio.run(...)` completes. For a marathon, it must
-   loop until `stop_event` is set. Two options:
-   - Wrap the existing function in a `while not stop_event:` loop in
-     the harness's load_thread (multiple short runs back-to-back).
-   - Refactor `run_cancel_stress_test` to take a duration parameter
-     and run continuously.
-   The first is lower-touch and recommended.
+The "Open questions for the implementing agent" section originally
+sat here as TBDs. They have been resolved during implementation of
+steps 1–4 in the PR chain above; the answers are now in the merged
+code. The decisions worth surfacing as an architectural record (i.e.,
+choices a future maintainer would otherwise have to re-derive) are
+below. Read the merged source under
+`tests/integration/defs/stress_test/disagg_cancel/` for the
+canonical reference.
 
-2. **Burst-mode vs steady-state mixing.** The current
-   `run_cancel_stress_test` is burst-only. Either extend it to also
-   send steady-state traffic between bursts, or add a separate
-   `run_steady_state_load` companion. Pick based on what's simpler.
+### Decisions beyond the spec
 
-3. **Exact field name for V1/V2 KV cache manager** — verify against
-   current code. The investigation references this as
-   `kv_cache_manager_class` informally; find the canonical name.
+These are choices the implementation made that the spec did not state
+explicitly. Captured here so a re-pickup can find them quickly.
 
-4. **Exact mechanism for selecting C++ vs Python transceiver** —
-   verify against current code. May be an env var
-   (`TRTLLM_USE_PYTHON_NIXL_AGENT`?), a Python config option, or
-   model-specific selection logic.
+- **Serial marathon execution on a single 8-GPU node.** Each marathon
+  uses 6 GPUs for 3P3D + spares for clients; two in parallel exceeds
+  an 8-GPU node. Pytest parametrize runs serially by default, which
+  delivers the 4 h end-to-end budget on one node. No spec deviation;
+  captures the implicit assumption.
+- **Per-thread PR split, not per-marathon.** The spec's acceptance
+  checklist treated everything as one PR; the actual chain (steps
+  1–7 above) split per thread body to keep each PR small and to
+  start exercising components in CI as soon as each lands. PRs
+  `#14375` / `#14807` / `#14920` / `#15015` each carried one thread
+  body + its unit tests; the remaining PRs cover the load thread,
+  marathon YAMLs, and pytest registration.
+- **Kill-only SIGKILL fallback is the supported initial shape.** The
+  spec permits skipping the respawn if the worker-handle API is too
+  invasive to extend. The injector PR landed with kill-only +
+  "remaining 5 workers absorb the load" assertions; full
+  SIGKILL+respawn is tracked as a follow-up once the handle API
+  matures.
+- **Canary token-equivalence preferred fallback chain.** If greedy-
+  decode determinism is empirically insufficient, the canary uses,
+  in order: (a) exact text equivalence after detokenize, (b) BLEU /
+  ROUGE threshold, (c) length-only sanity check. Each falls back
+  with weaker UAF detection; the active choice is documented in the
+  test README and the canary thread's docstring.
+- **`--smoke` mode for developer iteration.** Optional 10-min
+  marathon shape (1 burst + 1 injection) for local iteration; not
+  registered in CI. Documented in the test README.
 
-5. **`setup_disagg_cluster` worker-handle API** — verify that the
-   handle supports SIGKILL + relaunch, or that it can be extended to.
+### Risks the implementation pinned
 
-6. **Model selection for both marathons** — pick specific HF model
-   paths that:
-   - Are already in the CI model cache (`$LLM_MODELS_ROOT`)
-   - Are big enough to exercise non-trivial KV transfer times (the
-     existing `DeepSeek-V3-Lite-bf16` may be too small)
-   - Match the "DeepSeek-class MLA" and "Qwen-class non-MLA"
-     archetypes
-   - Fit in single 8-GPU node with TP=1 per worker (3P3D = 6 GPUs)
+| Risk | Mitigation in current code |
+|---|---|
+| 2-h marathon too long for local iteration | `--smoke` mode (above). |
+| SIGKILL+respawn API surface invasive | Kill-only fallback (above) is the shipping shape. |
+| Greedy-decode non-determinism breaks canary | Fallback chain (above); the canary PR's `_send_canary_request` records `missing_token_ids` as a server-side error rather than miscounting it as a token-equivalence mismatch. |
+| Prometheus metric scrape format changes | Use `prometheus_client.parser.text_string_to_metric_families`; the metrics PR pinned the metric name `trtllm_kv_cache_utilization` and fails loudly if absent. |
+| Worker log paths / formats change across releases | The log scanner thread reads all stdout/stderr captured by `setup_disagg_cluster`'s worker handles; no hard-coded paths. |
+| 3P3D × 8-GPU node insufficient VRAM headroom | Model selection sanity-checks; smaller-model fallback documented per-marathon YAML. |
+| Pre-commit hooks (D205, ruff-legacy, clang-format) | Code is written lint-clean from the start; pre-commit runs on every commit. |
 
-7. **Greedy-decode determinism.** Confirm that the TRT-LLM PyTorch
-   backend produces deterministic outputs under greedy decoding +
-   fixed seed across runs. If not, the canary token-equivalence check
-   needs an alternative (text-equivalent after detokenize, or BLEU
-   threshold).
+## Acceptance criteria (cumulative across the PR chain)
 
-## Acceptance criteria for the implementation PR
+Originally drafted as a single-PR checklist; the actual chain (steps
+1–7 in [Implementation PR chain](#implementation-pr-chain) above) ships
+incrementally. Status below reflects what has landed in `upstream/main`
+as of 2026-06-08 (PR `#15015` merge).
 
-The implementation PR should land:
-
-- [ ] `tests/integration/defs/stress_test/disagg_cancel/` directory created with the structure above.
-- [ ] `harness.py` module implementing `DisaggCancellationStressHarness` with the 5-thread architecture.
-- [ ] `test_disagg_cancel_stress.py` with one pytest test parametrized over the two YAML configs.
-- [ ] `configs/marathon_a_v1_cpp_deepseek.yaml` and `configs/marathon_b_v2_py_qwen.yaml`.
-- [ ] `configs/stress_canary_prompts.json` with deterministic prompts + reference token IDs for the chosen models.
-- [ ] `tools/generate_canary_references.py` for regenerating references.
-- [ ] `README.md` in the new directory — usage, goals, expected results, troubleshooting.
-- [ ] Two test IDs registered in `tests/integration/test_lists/qa/llm_function_stress.txt`.
-- [ ] At least one full-duration (2 h) successful run of each marathon on the developer's machine before submitting for review.
-- [ ] Clear log output during the test (progress markers every minute, injection events logged loudly).
-- [ ] Documented "how to debug a failure" section in the README — which logs to check, which Prometheus metrics to inspect.
+- [x] `tests/integration/defs/stress_test/disagg_cancel/` directory created with the structure above. (PR `#14375`)
+- [x] `harness.py` module implementing `DisaggCancellationStressHarness` with the 5-thread architecture. (PR `#14375` skeleton; thread bodies in `#14375` / `#14807` / `#14920` / `#15015`; `load_thread` body pending)
+- [x] `README.md` in the new directory — usage, goals, expected results, troubleshooting. (PR `#14375`)
+- [x] Clear log output during the test (progress markers every minute, injection events logged loudly). (each thread PR adds its own structured logging)
+- [ ] `load_thread` body wrapping `run_cancel_stress_test` in a duration-bounded loop. (step 5)
+- [ ] `test_disagg_cancel_stress.py` with one pytest test parametrized over the two YAML configs. (step 7; the smoke entry exists today)
+- [ ] `configs/marathon_a_v1_cpp_deepseek.yaml` and `configs/marathon_b_v2_py_qwen.yaml`. (step 6)
+- [ ] `configs/stress_canary_prompts.json` with deterministic prompts + reference token IDs for the chosen models. (step 6)
+- [ ] `tools/generate_canary_references.py` for regenerating references. (step 6)
+- [ ] Two test IDs registered in `tests/integration/test_lists/qa/llm_function_stress.txt`. (step 7)
+- [ ] At least one full-duration (2 h) successful run of each marathon on the developer's machine before flipping the test on in weekly CI.
+- [ ] Documented "how to debug a failure" section in the README — which logs to check, which Prometheus metrics to inspect. (lands with step 7)
 
 ## Cross-references
 
