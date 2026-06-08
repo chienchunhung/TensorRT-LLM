@@ -1,294 +1,261 @@
-# Phase 0 — Disaggregated Cancellation Stress-Test Suite
+# Phase 0 - Disaggregated Cancellation Stress-Test Suite
 
 | | |
 |---|---|
-| **Phase** | 0 (prerequisite to Phases 1–4) |
-| **JIRA** | [TRTLLM-12648](https://jirasw.nvidia.com/browse/TRTLLM-12648) (weekly stress CI) tied to [TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721) (the cancellation/poison improvement initiative) |
+| **Phase** | 0, prerequisite to behavioural cancellation / poison changes |
+| **JIRA** | [TRTLLM-12648](https://jirasw.nvidia.com/browse/TRTLLM-12648) for weekly stress CI; part of [TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721) |
 | **Owner** | Chien-Chun Hung |
-| **Status** | Skeleton + `log_scanner_thread` + `metrics_thread` + `injector_thread` + `canary_thread` landed in `upstream/main` at `tests/integration/defs/stress_test/disagg_cancel/`. One thread remains stub: `load_thread`. Also pending: marathon YAML configs + canary references + pytest registration. See [Implementation PR chain](#implementation-pr-chain) below for the per-step status. |
+| **Status as of 2026-06-08** | Skeleton, `log_scanner_thread`, `metrics_thread`, `injector_thread`, and `canary_thread` have landed in `upstream/main` under `tests/integration/defs/stress_test/disagg_cancel/`. The remaining implementation work is `load_thread`, marathon configs / canary references, pytest registration, and at least one full-duration run of each marathon. |
+| **Next step** | Implement `load_thread` as a duration-bounded wrapper around the existing cancellation load generator, then wire the two marathon YAMLs and canary references. |
 
-## Goal
+## Scope And Motivation
+
+Phase 0 is the permanent regression gate for the NVBug 6104831
+failure class: disaggregated KV-transfer cancellation races that can
+leave the system wedged, crash worker processes, or force a fail-closed
+pool-wide poison cascade.
+
+The immediate motivation is the cancellation / poison work introduced
+at <https://github.com/NVIDIA/TensorRT-LLM/pull/13713>. That change is
+memory-safe and deliberately fail-closed: if a request is cancelled
+while the remote peer may still be reading or writing an advertised
+transfer buffer, TRT-LLM poisons the transfer pool and the Python
+executor shuts down. That avoids UAF, but it is operationally
+aggressive, so the feature shipped gated and default-OFF.
+
+The customer-visible pressure came from the 2026-05-13 Qwen3-Coder-480B
+incident: the default 60 s transfer timeout fired during transient
+backpressure, both transfer pools became poisoned, containers restarted
+repeatedly, and the serving instance recycled. The investigation also
+found related cleanup-path, lifetime, and block-reuse failures. Phase 0
+turns those ad-hoc reproductions into an in-repository stress suite
+that can run continuously before later phases change behaviour.
 
 The suite tests one contract:
 
-> **A disaggregated TRT-LLM deployment runs for hours under cancellation-heavy load without permanent failure.**
+> A disaggregated TRT-LLM deployment can run for hours under
+> cancellation-heavy load, transient peer pauses, and worker loss
+> without permanent failure.
 
 "Permanent failure" means any of:
 
-- Process crash (SIGSEGV, abort, unexpected exit)
-- Permanent server wedge (after a transient failure, server fails to recover)
-- Silent memory corruption (canary responses don't match expected outputs — UAF symptom)
-- Monotonic resource leak (KV cache utilization grows without bound)
+- Process crash, including SIGSEGV, abort, or unexpected worker exit.
+- Permanent server wedge after a transient event ends.
+- Silent memory corruption, detected by deterministic canary responses
+  that no longer match references.
+- Monotonic resource leak, detected by KV cache utilization growth.
+- Cross-rank divergence once consensus-focused configs are added.
 
-Failures **during** stress are explicitly OK — request errors, cancellations, retries during traffic bursts, error spikes during injected peer pauses. What we test is **graceful recovery**: after the transient event ends (SIGCONT, peer respawn, burst subsides), the server returns to a healthy baseline within a bounded time.
+Transient failures during stress are allowed. Request errors,
+cancellations, retries during bursts, and short canary error spikes
+during injected peer pauses are expected. The assertion is graceful
+recovery: after SIGCONT, worker-loss absorption, or burst completion,
+the deployment must return to a healthy baseline within a bounded time.
 
-This is the regression gate for the bug class fixed by the
-disaggregated cancellation / poison work at
-<https://github.com/NVIDIA/TensorRT-LLM/pull/13713> and the
-follow-up work in Phases 1–4 of this design (deferred un-poison,
-multi-slot configs, NIXL callback, progress-based cancel). It is
-also the empirical safety net required by
-[TRTLLM-12648](https://jirasw.nvidia.com/browse/TRTLLM-12648) for the
-build.nvidia.com issues.
+### Coverage Goals
 
-## Implementation PR chain
+The initial weekly suite covers the two mainstream disaggregated
+deployment cells:
 
-Phase 0 lands incrementally — one PR per thread body — to keep each PR
-small and reviewable, and to start exercising the harness in CI as soon
-as each component is in. The chain below tracks per-step status. Each
-URL is the upstream merged commit (or pending placeholder); intentionally
-written as the full URL (not the GitHub `#NNNNN` shorthand) so this
-design doc doesn't auto-post cross-reference comments on the implementation
-PRs.
-
-| Step | Component | Status | Landed in |
-|---|---|---|---|
-| 1 | Harness skeleton + initial YAML config + README + `log_scanner_thread` body | **Merged 2026-05-28** | <https://github.com/NVIDIA/TensorRT-LLM/pull/14375> |
-| 2 | `metrics_thread` body (per-worker `trtllm_kv_cache_utilization` scraper, time-series for leak detection) | **Merged 2026-06-02** | <https://github.com/NVIDIA/TensorRT-LLM/pull/14807> |
-| 3 | `injector_thread` body (SIGSTOP/SIGCONT/SIGKILL schedule + optional worker respawn) | **Merged 2026-06-04** | <https://github.com/NVIDIA/TensorRT-LLM/pull/14920> |
-| 4 | `canary_thread` body (canary client + deterministic prompts + token-equivalence check against precomputed references) | **Merged 2026-06-08** | <https://github.com/NVIDIA/TensorRT-LLM/pull/15015> |
-| 5 | `load_thread` body (steady-state + burst load wrapper around `run_cancel_stress_test`) | Pending | — |
-| 6 | Marathon YAML configs (`marathon_a_v1_cpp_deepseek.yaml`, `marathon_b_v2_py_qwen.yaml`) + `stress_canary_prompts.json` + reference-generation tool | Pending | — |
-| 7 | Pytest entry points + L0 test list registration in `tests/integration/test_lists/qa/llm_function_stress.txt` | Pending | — |
-
-The chain order is deliberate: `log_scanner_thread` first because it's
-the fail-fast guard the rest of the harness depends on; `metrics_thread`
-second because it's read-only and stand-alone; `injector_thread` /
-`canary_thread` / `load_thread` after because they form the
-read-write/synchronised core; YAML configs and pytest registration last
-because they tie everything together and need all five threads
-operational.
-
-Each PR after the skeleton is expected to be small (~200–500 lines + a
-unit test), and the existing infrastructure tests in
-`tests/unittest/disaggregated/stress_test/` are extended with the new
-thread's coverage as it lands.
-
-## Background — what this suite is testing against
-
-The regression class to catch:
-
-| Class | Example signatures | Trigger |
+| Cell | Why it matters | Initial coverage |
 |---|---|---|
-| Cleanup-path bugs | sigs `#1`, `#4`, `#5`, `#6`, `#7` from the investigation | High concurrency + cancellations + race-window timing |
-| Lifetime UAFs | sig `#7` variants C/D | Cancel-during-transfer load + raw-pointer dereference of LlmRequest in async workers |
-| Cascade outages | 2026-05-13 production incident (Qwen3-Coder-480B) | Cancel races mid-NIXL transfer → pool-wide poison → PyExecutor shutdown |
-| Block-reuse interactions | sig `#8` (rc13 regression) | Disagg + block reuse + in-flight cancel |
+| V1 KV cache manager + C++ transceiver + NIXL | Established production path and the cell extended by the fail-closed cancellation work | Marathon A |
+| V2 KV cache manager + Python transceiver + NIXL | Newer path and the architectural template for consensus semantics | Marathon B |
 
-Full investigation:
-[`docs/investigations/nvbug-6104831-disagg-permanent-wedge/`](../../investigations/nvbug-6104831-disagg-permanent-wedge/),
-particularly:
+The harness must also be parametric enough to add follow-up YAMLs for
+the third valid cell (V1 + Python), direct UCX, block-reuse off, overlap
+off, aggressive timeout, asymmetric P/D ratios, and cross-node
+multi-node coverage without rewriting Python harness code.
 
-- [§02 failure signatures](../../investigations/nvbug-6104831-disagg-permanent-wedge/02-failure-signatures.md)
-- [§10 ablation experiments](../../investigations/nvbug-6104831-disagg-permanent-wedge/10-ablation-no-midflight-cancel.md)
-  — six controlled A/B experiments that this suite generalises into a CI gate.
+The bug patterns to catch are:
 
-The §10 ablation harness lives in
-`local/pr13713-rc13-clean/.repro/` on the developer's machine — that's
-the conceptual basis for this suite, but the production CI version
-must be self-contained inside the TRT-LLM repository.
+| Pattern | Example signal | Test pressure |
+|---|---|---|
+| Cleanup-path race | Broken promise, stuck futures, no recovery after peer pause | Long-running cancellation load plus SIGSTOP/SIGCONT |
+| Lifetime UAF | Crashes or corrupt canary output after request cancellation | Cancel-during-transfer load and deterministic canaries |
+| Poison cascade | Pool-wide poison followed by executor shutdown / restart | 60 s timeout under high concurrency and injected receiver slowness |
+| Block-reuse interaction | KV blocks pinned or reclaimed incorrectly | Block reuse enabled in both initial marathons |
+| Worker-loss absorption | Deployment does not survive one worker loss in a 3P3D shape | SIGKILL of one worker with kill-only fallback |
+| Consensus divergence | Rank-batch mismatch, collective deadlock, unreclaimed KV blocks | Follow-up TP/PP/EP consensus-focused configs before Phase 1 claims full axis coverage |
 
-## Existing infrastructure (reuse, do not duplicate)
+### Initial Non-Scope
 
-The implementation must build on what already exists in TRT-LLM rather
-than create parallel infrastructure.
+- Cross-node multi-node is deferred. The observed cancellation class
+  reproduces single-host, and true cross-node coverage mostly adds
+  deployment-infrastructure variables.
+- TP greater than 1 per worker is deferred from the first two marathon
+  configs to keep the weekly suite within a single 8-GPU node. The
+  consensus dimension is tracked as follow-up coverage, not forgotten.
+- Backend-internal cancellation primitives for UCX/MPI/Mooncake are not
+  part of Phase 0. Phase 0 validates the TRT-LLM harness and regression
+  signatures; later phases decide backend behaviour.
 
-### Reuse as-is
+## Continuous Test Requirements
 
-| File / symbol | What it does |
+### Budget And Frequency
+
+| Requirement | Value |
 |---|---|
-| `tests/integration/defs/disaggregated/test_disaggregated.py::setup_disagg_cluster(...)` | Starts ctx workers, gen workers, and the disagg server from a YAML config. Returns worker handles + server URL. |
-| `tests/integration/defs/disaggregated/test_disaggregated.py::wait_for_server(...)` | Probes `/health` until ready. |
-| `tests/integration/defs/disaggregated/test_disaggregated.py::cleanup_output_files(...)` and `terminate(...)` | Standard teardown. |
-| `tests/integration/defs/disaggregated/test_configs/disagg_config_cancel_stress_test*.yaml` | YAML config schema for ctx/gen worker configuration (model, TP, kv_cache_config, cache_transceiver_config, cuda_graph_config). **Extend** this schema with new `stress_config:` keys (see "Config schema" section below). |
+| Weekly CI budget | 4 h total |
+| Test composition | Two serial 2 h marathons |
+| Local developer mode | Optional smoke mode around 10 min, with one burst and one injection |
+| CI frequency | Weekly stress CI for TRTLLM-12648; opt-in for changes touching disagg cancellation, KV transfer cleanup, or the stress harness |
+| Required environment | `LLM_MODELS_ROOT` set to the chosen model root; NIXL-capable local disagg setup |
 
-### Reuse and extend
+### Hardware Budget
 
-| File / symbol | What's there | What to add |
-|---|---|---|
-| `tests/integration/defs/disaggregated/test_disaggregated.py::run_cancel_stress_test(server_url, num_bursts, requests_per_burst, prompt_len_range, cancel_after_range)` | Async coroutine sending N bursts of K requests with client-side disconnect-during-prefill cancellation. Runs via `asyncio.run`. | Must be drivable from an external thread (so it can run in parallel with the canary client + log scanner + injector). Two options: refactor to expose the inner coroutine (cleanest), or wrap the existing function in a worker thread (lower-touch). **Recommendation: wrap in a worker thread to minimize disruption to existing usage.** |
-| `tests/integration/defs/disaggregated/test_disaggregated.py::run_disaggregated_cancel_test(...)` | Wraps `run_cancel_stress_test` with full disagg cluster setup + final health-check probe via `disagg_client.py`. | The marathon harness is a *generalisation* of this — multi-component (cancel-stress + canary + injector + log scanner + metrics scraper), longer duration, parametrized via YAML. Don't try to extend this function in place — write the new harness as a separate module that can be invoked independently. |
+The initial suite targets one 8-GPU B200 or H100 node. With 3P3D and
+TP=1 per worker, each marathon uses six GPUs for workers, leaving two
+for the disagg server and clients. The two marathons run serially.
 
-### Orthogonal — do not modify
+### Marathon Configurations
 
-- `tests/integration/defs/disaggregated/test_disaggregated.py::test_disaggregated_stress_test` — combined stress + accuracy + aiperf. Different goal.
-- `tests/integration/defs/accuracy/test_llm_api_pytorch.py::TestKimiK2::test_nvfp4_longseq_trtllm_moe_async_cancel` — aggregated (non-disagg) cancellation test, KimiK2 long-seq. Different scope.
+| Test ID | Shape | Config | Model class | Duration |
+|---|---|---|---|---|
+| `marathon_a_v1_cpp_deepseek` | 3P3D local | V1 + C++ transceiver + NIXL, block reuse on, overlap on, 60 s transfer timeout | DeepSeek-class | 2 h |
+| `marathon_b_v2_py_qwen` | 3P3D local | V2 + Python transceiver + NIXL, block reuse on, overlap on, 60 s transfer timeout | Qwen-class | 2 h |
 
-## What's missing from the existing test (the deltas to implement)
+3P3D is deliberate:
 
-The existing `test_disaggregated_cancel_large_context_requests` is a
-short-burst test (~5 bursts × 32 requests) that ends with one normal
-request to verify the server is alive. The marathon suite needs:
+- It exercises multi-pair cleanup paths instead of only a single
+  context/generation pair.
+- It gives redundancy for the kill-only SIGKILL injection.
+- It is close to common production disaggregated shapes while still
+  fitting on one node.
 
-1. **Long duration** — 2 h per test, not minutes.
-2. **Failure injection** — SIGSTOP / SIGCONT / SIGKILL on individual workers, on a schedule.
-3. **Canary client** running in parallel with the load client; deterministic prompts; token-equivalence check vs precomputed reference outputs.
-4. **Log-pattern scanner** — tails worker logs continuously, fails the test if "hard zero" patterns appear (`Broken promise`, `NO RECOVERY`, `Segfault`, `SIGSEGV`, `0xffffffffffffffff`, `Poisoned ... cache transfer buffer`).
-5. **KV cache utilization monitor** — scrapes the `trtllm_kv_cache_utilization` metric from each worker periodically; verifies it doesn't grow monotonically (leak detection).
-6. **Recovery-time measurement** — after each SIGCONT / respawn, measures how long the canary error rate takes to return to baseline.
-7. **Config-knob parametrization** — V1/V2 KV cache, C++/Python transceiver, block reuse on/off, overlap scheduler on/off, transport NIXL/UCX, KV transfer timeout, etc., all controlled by the YAML config.
+The valid KV-cache / transceiver combinations are:
 
-## Test suite specification
+| Combination | Initial plan |
+|---|---|
+| V1 + C++ | Marathon A |
+| V1 + Python | Follow-up YAML |
+| V2 + C++ | Invalid; reject in config validation |
+| V2 + Python | Marathon B |
 
-### Suite composition (4 h total budget)
+### Workload Pattern
 
-| # | Test ID | Mode | Config | Model | Duration |
-|---|---|---|---|---|---|
-| 1 | **Marathon A** | 3P3D local | V1 + C++ transceiver + NIXL, block reuse on, overlap on, 60s timeout | DeepSeek-class | 2 h |
-| 2 | **Marathon B** | 3P3D local | V2 + Python transceiver + NIXL, block reuse on, overlap on, 60s timeout | Qwen-class | 2 h |
+Each marathon repeats the following pattern for 2 h.
 
-Both marathons use 3P3D (3 ctx workers + 3 gen workers) for:
+**Steady state**
 
-1. **Redundancy** — SIGKILL of one worker doesn't kill the deployment; the remaining workers should absorb load.
-2. **Multi-pair coordination** — exercises the L10 dual-cleanup-path scenario that surfaced sig `#8`.
-3. **Mainstream-deployment matching** — typical production deployments have multiple ctx/gen pairs.
+- 64 concurrent in-flight requests.
+- Prompt length uniformly distributed from 4k to 12k input tokens.
+- 512 output tokens.
+- 10 percent client-side cancellation rate, disconnecting during
+  prefill.
 
-The two marathons differ on the (KV-cache, transceiver) axis:
+**Bursts**
 
-| Combination | Valid? | Why |
-|---|---|---|
-| V1 + C++ | ✓ | Mainstream established path — Marathon A |
-| V1 + Python | ✓ | Secondary — deferred to follow-up YAML |
-| **V2 + C++** | **✗** | **Invalid — does not make sense; do not test** |
-| V2 + Python | ✓ | Mainstream modern path — Marathon B |
+- Every 8 min, ramp to 256 concurrent requests for 60 s.
+- Prompt length uniformly distributed from 12k to 16k input tokens.
+- Return to steady state after the burst.
 
-### Hardware budget
+**Injections**
 
-Single 8-GPU node (B200 or H100). With 3P3D and TP=1 per worker, we use
-6 GPUs (3 ctx + 3 gen), leaving 2 spare for the disagg server +
-load/canary clients. **No TP > 1 per worker for the initial cut** —
-TP coverage is exercised by other tests and not the regression class
-this suite is gating against.
-
-### Deployment shape — multi-node decision
-
-**Multi-node is deferred** from this initial suite. Rationale:
-
-- The cancellation regression class fires single-host (the §10
-  ablation experiments are single-host and catch all of sigs `#1`–`#8`).
-- Multi-node only adds unique coverage if ctx pod and gen pod are on
-  *different* nodes (real cross-node RDMA over network). Co-located
-  multi-node = N copies of single-host, which 3P3D already exercises.
-- Cross-node multi-node testing is a deployment-infra correctness
-  concern (orchestrator, Slurm provisioning, network), not a
-  cancellation correctness concern. Track separately.
-
-### Workload schedule (used by both marathons)
-
-Each marathon runs a single workload pattern. The cycle below repeats
-for 2 h.
-
-**Steady-state (continuous, between bursts):**
-
-- CONC = 64 concurrent in-flight requests
-- Prompt lengths: uniform 4 k – 12 k input tokens; 512 output tokens
-- Client-side cancellation rate: 10% (random subset disconnect during prefill)
-
-**Burst events (every ~8 min for 2 h = 15 bursts):**
-
-- CONC ramps to 256 for 60 s
-- Prompts: uniform 12 k – 16 k input tokens (heavier KV transfer load)
-- Returns to steady-state after
-
-**Injection schedule (interleaved with bursts):**
-
-```
+```text
 T+ 15 min : SIGSTOP random gen worker for 20 s, then SIGCONT
 T+ 30 min : SIGSTOP random gen worker for 30 s, then SIGCONT
 T+ 45 min : SIGSTOP random ctx worker for 20 s, then SIGCONT
-T+ 60 min : SIGKILL gen_worker_0 + respawn within 60 s
+T+ 60 min : SIGKILL gen_worker_0, with kill-only absorption in the initial suite
 T+ 75 min : SIGSTOP random gen worker for 20 s, then SIGCONT
 T+ 90 min : SIGSTOP random ctx worker for 30 s, then SIGCONT
 T+105 min : SIGSTOP random gen worker for 20 s, then SIGCONT
 T+120 min : end
 ```
 
-The schedule mixes:
-- **Transient peer pauses** (SIGSTOP/SIGCONT) — exercise the cancel-mid-flight race + recovery
-- **Terminal peer failure** (SIGKILL + respawn) — exercise the worker-loss path that 3P3D redundancy is supposed to absorb
-- **Targeting both gen and ctx workers** — exercises sender-side and receiver-side cleanup symmetrically
+SIGSTOP/SIGCONT creates transient peer pauses, which exercise
+cancel-mid-flight plus recovery. SIGKILL creates terminal worker loss;
+the initial shipped shape validates that the remaining five workers
+absorb load. Full respawn support is a follow-up once worker handles
+expose a stable relaunch API.
 
-### Canary client
+### Canary Requirements
 
-Runs in parallel with the load client for the full 2 h.
+The canary client runs in parallel for the full marathon:
 
-- 5 requests per minute (300 over the 2 h)
-- Prompts: small fixed set (e.g., 10 prompts) loaded from
-  `stress_canary_prompts.json`, with **precomputed reference outputs**
-  (also stored in the JSON file)
-- **Greedy decoding** + fixed seed for determinism
-- Token-equivalence check: canary's response tokens must exactly match
-  the reference
+- 5 requests per minute.
+- Fixed prompt set loaded from `stress_canary_prompts.json`.
+- Greedy decoding with fixed seed.
+- Reference token IDs generated once with the same model and engine
+  config, committed beside the YAMLs.
+- Exact token-equivalence check when deterministic; fallback order is
+  exact detokenized text, BLEU / ROUGE threshold, then length-only
+  sanity. Each fallback is weaker and must be documented in the test
+  README.
 
-Reference outputs must be generated once (in a separate one-shot
-script using the same model + same engine config) and committed
-alongside the YAML config. Regenerate when the model or engine config
-materially changes.
+Reference outputs are generated by:
 
-### Pass criteria (gates that fail the test)
+```text
+tests/integration/defs/stress_test/disagg_cancel/tools/generate_canary_references.py
+```
 
-| Gate | Threshold | Rationale |
-|---|---|---|
-| Hard-zero log patterns | 0 occurrences in any worker log | `Broken promise`, `NO RECOVERY`, `Segfault`, `SIGSEGV`, `0xffffffffffffffff`, `Poisoned ... cache transfer buffer` |
-| All workers alive at end | `is_alive() == True` for every worker process | Crash detection |
-| Final health probe | 5 sequential canary requests must all succeed within 30 s of test end | Permanent-wedge detection |
-| Canary correctness | 100% of returned canaries token-equivalent to reference | UAF detection |
-| Canary error rate (overall) | < 1% over the full 2 h | Baseline service quality |
-| Canary error rate (per-burst / per-injection window) | < 10% during any 1-min window containing burst or injection | Degraded but not failed |
-| Recovery time after injection | < 30 s from SIGCONT (or worker respawn) until canary error rate returns to < 1% baseline | Graceful recovery |
-| KV cache utilization growth | End-of-test utilization ≤ baseline + 10 percentage points | Leak detection |
+Regenerate references when the model checkpoint, dtype, tokenizer,
+max sequence length, or engine config changes in a way that can affect
+greedy output.
 
-`Cannot cancel request` log lines have **no upper bound** — they're
-expected behaviour at the L3 invariant boundary when cancel hits a
-mid-flight request.
+### Pass Criteria
 
-## YAML config schema
+| Gate | Threshold |
+|---|---|
+| Hard-zero log patterns | 0 occurrences in any worker log |
+| Worker liveness | Every non-intentionally-killed worker alive at end |
+| Final health probe | 5 sequential canaries succeed within 30 s of test end |
+| Canary correctness | 100 percent of returned canaries token-equivalent to reference, unless a documented fallback is active |
+| Canary error rate, overall | Less than 1 percent over the full marathon |
+| Canary error rate, burst / injection window | Less than 10 percent during any 1 min window containing burst or injection |
+| Recovery time after injection | Less than 30 s from SIGCONT or accepted worker-loss event until canary error rate returns below 1 percent |
+| KV cache utilization growth | End-of-test utilization no more than baseline plus 10 percentage points |
 
-The harness reads a single YAML per test. Extends the existing
-`disagg_config_cancel_stress_test*.yaml` schema by adding a top-level
-`stress_config:` block. The ctx/gen worker config sections (`hostname`,
-`model`, `backend`, `context_servers`, `generation_servers`) stay
-identical to the existing schema and are passed through to
-`setup_disagg_cluster`.
+Hard-zero log patterns include:
+
+- `Broken promise`
+- `NO RECOVERY`
+- `Segfault`
+- `SIGSEGV`
+- `0xffffffffffffffff`
+- `Poisoned .* cache transfer buffer`
+
+`Cannot cancel request` is not capped. It is expected at the boundary
+where cancellation races an in-flight transfer.
+
+### YAML Configuration Contract
+
+The harness reads one YAML file per marathon. The normal disaggregated
+worker config is passed through to `setup_disagg_cluster`. Phase 0 adds
+a top-level `stress_config:` block.
 
 ```yaml
-# === Existing schema (passed through to setup_disagg_cluster) ===
 hostname: localhost
-model: <model path under llm_models_root, e.g. DeepSeek-R1-Distill-Llama-8B>
+model: <model path under LLM_MODELS_ROOT>
 backend: pytorch
 
 context_servers:
-  num_instances: 3                  # 3P3D
+  num_instances: 3
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
-  disable_overlap_scheduler: false  # overlap ON
+  disable_overlap_scheduler: false
   max_num_tokens: 16384
   max_seq_len: 16384
   kv_cache_config:
-    enable_block_reuse: true        # block reuse ON
+    enable_block_reuse: true
     enable_partial_reuse: true
     free_gpu_memory_fraction: 0.3
-    # kv_cache_manager_class: v1    # or v2 — see "Backend knobs" below
   cache_transceiver_config:
-    backend: NIXL                   # NIXL transport
+    backend: NIXL
     max_tokens_in_buffer: 16384
-    kv_transfer_timeout_ms: 60000   # production default
+    kv_transfer_timeout_ms: 60000
 
 generation_servers:
   num_instances: 3
-  # ... same shape as context_servers
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  # Same shape as context_servers.
 
-# === New: stress harness configuration ===
 stress_config:
-  duration_min: 120                  # 2 h marathon
+  duration_min: 120
+  kv_cache_manager: v1        # v1 | v2
+  transceiver: cpp            # cpp | python; v2 + cpp is invalid
 
-  # Backend knob selections (control the V1/V2 × C++/Python axis)
-  # These get translated into the appropriate worker env vars / config
-  # by the harness before launching trtllm-serve.
-  kv_cache_manager: v1               # v1 | v2  (V2 + C++ is invalid)
-  transceiver: cpp                   # cpp | python
-
-  # Load shape
   base_concurrency: 64
   client_cancel_rate: 0.10
   input_length:
@@ -297,7 +264,6 @@ stress_config:
     max_tokens: 12288
   output_length: 512
 
-  # Burst schedule (repeats every burst_interval_min for duration_min)
   bursts:
     interval_min: 8
     concurrency: 256
@@ -307,38 +273,15 @@ stress_config:
       min_tokens: 12288
       max_tokens: 16384
 
-  # Injection schedule (absolute timestamps in minutes)
   injections:
     - at_min: 15
       type: sigstop
       target: gen_worker_random
       duration_s: 20
-    - at_min: 30
-      type: sigstop
-      target: gen_worker_random
-      duration_s: 30
-    - at_min: 45
-      type: sigstop
-      target: ctx_worker_random
-      duration_s: 20
     - at_min: 60
       type: sigkill
       target: gen_worker_0
-      respawn_within_s: 60
-    - at_min: 75
-      type: sigstop
-      target: gen_worker_random
-      duration_s: 20
-    - at_min: 90
-      type: sigstop
-      target: ctx_worker_random
-      duration_s: 30
-    - at_min: 105
-      type: sigstop
-      target: gen_worker_random
-      duration_s: 20
 
-  # Canary client
   canary:
     prompts_file: stress_canary_prompts.json
     rate_per_min: 5
@@ -350,7 +293,6 @@ stress_config:
     error_rate_injection_window_max: 0.10
     recovery_time_max_s: 30
 
-  # Log scanning
   log_scan:
     hard_zero_patterns:
       - "Broken promise"
@@ -360,242 +302,196 @@ stress_config:
       - "0xffffffffffffffff"
       - "Poisoned .* cache transfer buffer"
 
-  # KV cache leak detection
-  kv_cache_growth_max: 0.10   # final utilization ≤ baseline + 10 percentage points
+  kv_cache_growth_max: 0.10
 ```
 
-### Backend-knob translation (V1/V2 + C++/Python)
+The harness owns translation of `kv_cache_manager` and `transceiver`
+into the current worker config / environment variables. Implementers
+must verify the exact names against the current config classes before
+landing the YAML step, and document the mapping in the harness module
+docstring.
 
-The `kv_cache_manager` and `transceiver` knobs in `stress_config:`
-control config that doesn't have a clean field in the existing schema.
-Implementer must verify the *current* mechanism for each knob:
+## Harness Architecture
 
-- **V1/V2 KV cache manager** — there's a `kv_cache_manager_class` (or
-  similarly named) option somewhere in the TRT-LLM config surface;
-  verify the exact field name and supported values by reading
-  `tensorrt_llm/_torch/pyexecutor/resource_manager.py` and the
-  surrounding config classes. The existing test_llm_api_pytorch tests
-  use `v1_kv_cache` as a parametrize ID — find the corresponding
-  Python-side config field.
-- **C++ vs Python transceiver** — controls whether the NIXL agent
-  goes through C++ bindings (`tensorrt_llm/_torch/disaggregation/nixl/_agent_cpp.py`)
-  or pure Python (`tensorrt_llm/_torch/disaggregation/nixl/_agent_py.py`).
-  Verify the exact selection mechanism (env var? config field?).
+The implementation lives under:
 
-If neither knob is currently surfaceable through YAML, the harness
-can set the appropriate env vars at worker-launch time before invoking
-`setup_disagg_cluster`. Document the mapping clearly in the harness
-module's docstring.
-
-## File layout for the new code
-
-Per the user's preference for a dedicated directory (to attach a README):
-
-```
+```text
 tests/integration/defs/stress_test/disagg_cancel/
-├── README.md                       # User-facing: how to run, what to expect, troubleshooting
+```
+
+It reuses the existing disaggregated test infrastructure instead of
+creating a parallel launcher:
+
+| Existing file / symbol | Use |
+|---|---|
+| `setup_disagg_cluster(...)` | Launch context workers, generation workers, and disagg server from YAML |
+| `wait_for_server(...)` | Probe readiness |
+| `cleanup_output_files(...)` and `terminate(...)` | Standard teardown |
+| `run_cancel_stress_test(...)` | Existing cancellation-heavy load coroutine; `load_thread` wraps it |
+| `disagg_config_cancel_stress_test*.yaml` | Starting point for worker config schema |
+
+The harness owns the cluster and five worker threads:
+
+```text
+DisaggCancellationStressHarness
+├── disagg_cluster        : ctx_workers + gen_workers + disagg_server
+├── load_thread           : repeats cancellation-heavy load until duration elapses
+├── canary_thread         : sends canaries, records success and token equivalence
+├── injector_thread       : fires SIGSTOP/SIGCONT/SIGKILL on schedule
+├── log_scanner_thread    : tails worker logs and fails fast on hard-zero patterns
+└── metrics_thread        : scrapes trtllm_kv_cache_utilization every 30 s
+```
+
+Threads coordinate through `threading.Event`:
+
+- `stop_event` asks all threads to wind down.
+- `failed_event` triggers fail-fast shutdown.
+- Per-thread result objects carry metrics and assertion context back
+  to the pytest entry point.
+
+Threads are preferred over a single asyncio event loop because the
+components are heterogeneous: HTTP load, deterministic canaries,
+subprocess signals, worker relaunch decisions, file tailing, and
+Prometheus scraping. Keeping each component in a thread makes failures
+isolated and easier to debug.
+
+Fail-fast behaviour:
+
+1. A hard-zero log pattern sets `failed_event` immediately and records
+   the offending log line.
+2. Unexpected worker exit sets `failed_event`, except for the
+   intentionally killed worker in the kill-only scenario.
+3. End-of-test gates assert canary correctness, recovery time, final
+   health, and KV utilization growth.
+
+### File Layout
+
+```text
+tests/integration/defs/stress_test/disagg_cancel/
+├── README.md
 ├── __init__.py
-├── harness.py                      # The marathon harness module (see "Harness architecture" below)
-├── test_disagg_cancel_stress.py    # Pytest test definitions (1 per marathon scenario)
+├── harness.py
+├── test_disagg_cancel_stress.py
 └── configs/
-    ├── stress_canary_prompts.json  # Deterministic canary prompts + reference outputs
+    ├── stress_canary_prompts.json
     ├── marathon_a_v1_cpp_deepseek.yaml
     ├── marathon_b_v2_py_qwen.yaml
-    └── README.md                   # Per-config notes (which knobs are exercised)
+    └── README.md
 ```
 
-**Note on placement:** `tests/integration/defs/stress_test/` already
-contains `stress_test.py` (the existing aggregated stress test). Adding
-a `disagg_cancel/` subdirectory keeps the new suite isolated while
-co-locating with the existing stress-test conventions.
+Planned stress test-list entries:
 
-The pytest test IDs to register in
-`tests/integration/test_lists/qa/llm_function_stress.txt`:
-
-```
+```text
 stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_disagg_cancellation_marathon[marathon_a_v1_cpp_deepseek]
 stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_disagg_cancellation_marathon[marathon_b_v2_py_qwen]
 ```
 
-## Harness architecture
+## Implementation Roadmap
 
-Thread-based composition. The harness is a single class that owns five
-worker threads + the disagg cluster:
+Phase 0 lands incrementally, one component at a time, so the harness can
+be reviewed and exercised before the full 4 h suite is enabled.
 
+| Step | Boundary | Status | Upstream link |
+|---|---|---|---|
+| 1 | Harness skeleton, initial config, README, `log_scanner_thread` | Merged 2026-05-28 | <https://github.com/NVIDIA/TensorRT-LLM/pull/14375> |
+| 2 | `metrics_thread` and KV-utilization time series | Merged 2026-06-02 | <https://github.com/NVIDIA/TensorRT-LLM/pull/14807> |
+| 3 | `injector_thread`, SIGSTOP/SIGCONT/SIGKILL schedule, kill-only worker-loss handling | Merged 2026-06-04 | <https://github.com/NVIDIA/TensorRT-LLM/pull/14920> |
+| 4 | `canary_thread`, deterministic prompts, token-equivalence checks | Merged 2026-06-08 | <https://github.com/NVIDIA/TensorRT-LLM/pull/15015> |
+| 5 | `load_thread`, duration-bounded wrapper around `run_cancel_stress_test` | Next | - |
+| 6 | Marathon YAMLs, canary JSON, reference-generation tool | Pending | - |
+| 7 | Pytest marathon entry point and stress test-list registration | Pending | - |
+
+The current status is:
+
+- Done: harness structure, log scanner, metrics scraper, injector, and
+  canary client.
+- In progress next: `load_thread`.
+- Pending after that: two full marathon configs, canary references,
+  reference-generation tool, pytest parametrization, test-list
+  registration, and full-duration validation.
+
+### Step 5 - Load Thread
+
+`load_thread` should drive the existing
+`run_cancel_stress_test(server_url, num_bursts, requests_per_burst,
+prompt_len_range, cancel_after_range)` implementation repeatedly until
+the configured duration elapses. It must:
+
+- Maintain steady-state load and burst windows from `stress_config`.
+- Respect `stop_event` and `failed_event`.
+- Record request counts, cancellation counts, load errors, and burst
+  timestamps for correlation with canary and metrics output.
+- Avoid refactoring the existing disaggregated cancel test unless the
+  current coroutine shape makes wrapping impossible.
+
+### Step 6 - Marathon Configs And References
+
+Add:
+
+- `configs/marathon_a_v1_cpp_deepseek.yaml`
+- `configs/marathon_b_v2_py_qwen.yaml`
+- `configs/stress_canary_prompts.json`
+- `tools/generate_canary_references.py`
+- `configs/README.md` describing model assumptions and config knobs.
+
+This step should also pin the exact config-field / env-var translation
+for V1/V2 and C++/Python selection.
+
+### Step 7 - Pytest And CI Registration
+
+Add a parametrized pytest entry point over the two marathon YAMLs and
+register the two test IDs in:
+
+```text
+tests/integration/test_lists/qa/llm_function_stress.txt
 ```
-DisaggCancellationStressHarness
-├── disagg_cluster        : ctx_workers + gen_workers + disagg_server (from setup_disagg_cluster)
-├── load_thread           : runs run_cancel_stress_test in a loop until duration elapses
-├── canary_thread         : sends 5 canaries/min, records per-request success + token equivalence
-├── injector_thread       : reads injection schedule, fires SIGSTOP/SIGCONT/SIGKILL on schedule
-├── log_scanner_thread    : tails all worker logs, fails fast on hard-zero patterns
-└── metrics_thread        : scrapes trtllm_kv_cache_utilization every 30s, records timeseries
-```
 
-Coordination via `threading.Event` (e.g., a `stop_event` to signal all
-threads to wind down at end of test, a `failed_event` for fail-fast
-signalling if log scanner spots a hard-zero pattern).
+This step should also update the test README with:
 
-### Why threads, not async
+- How to run full marathons.
+- How to run smoke mode.
+- How to inspect logs and metrics after failure.
+- Which failures are expected transient events and which fail the test.
 
-The canary client and load client are HTTP — async would be cleaner.
-But the injector is fundamentally subprocess-based (`os.kill`,
-re-launching workers), the log scanner is file-tailing, and the
-metrics scraper is HTTP-or-subprocess. Forcing all of these into one
-asyncio event loop creates more coupling than it saves. Threads keep
-each component failure-isolated and easier to debug independently.
+### Acceptance Checklist
 
-The existing `run_cancel_stress_test` is async internally (`asyncio.run(...)`
-inside the function). Run it inside the `load_thread` as-is; each
-thread can have its own asyncio event loop.
+- [x] `tests/integration/defs/stress_test/disagg_cancel/` directory exists.
+- [x] `harness.py` contains the five-thread architecture.
+- [x] `README.md` exists in the stress-test directory.
+- [x] Log scanner fails fast on hard-zero patterns.
+- [x] Metrics scraper records `trtllm_kv_cache_utilization`.
+- [x] Injector supports scheduled SIGSTOP/SIGCONT/SIGKILL.
+- [x] Canary thread records deterministic canary results.
+- [ ] `load_thread` runs cancellation-heavy load for the configured duration.
+- [ ] Marathon A and Marathon B YAMLs are committed.
+- [ ] Canary prompts and reference token IDs are committed.
+- [ ] Reference-generation tool is committed.
+- [ ] Parametrized pytest marathon entry point is committed.
+- [ ] Two weekly-stress test IDs are registered.
+- [ ] Each marathon has at least one successful full-duration run before weekly CI enablement.
+- [ ] The stress-test README documents failure debugging.
 
-### Fail-fast behaviour
+## Follow-Up Coverage
 
-Three failure modes:
+The harness should support these as extra YAMLs / test IDs without
+Python rewrites:
 
-1. **Hard-zero pattern** (log scanner spots it) — set `failed_event` immediately, terminate other threads, fail the pytest assertion with the pattern and the offending log line.
-2. **Worker process exits unexpectedly** — `disagg_cluster.assert_all_alive()` called periodically; same as above.
-3. **Pass-criteria gate violation at end** (canary error rate, recovery time, KV growth) — collected at end of test, asserted in the pytest test function.
-
-### Worker respawn on SIGKILL
-
-The injector needs to be able to re-launch a worker after SIGKILL.
-This requires:
-
-- Recording the worker's launch command, env, and log file when the
-  cluster is initially set up. `setup_disagg_cluster` returns worker
-  handles — verify whether the handle exposes enough to relaunch, or
-  add a `relaunch()` method to the worker handle class.
-- Updating the cluster's view of "which worker is which port" if the
-  respawn comes back on a different port.
-- Waiting for the respawned worker's `/health` to return 200 before
-  considering the respawn complete (within `respawn_within_s`).
-
-If this turns out to be too invasive, the alternative is to limit the
-SIGKILL injection to the kill-only step (skip the respawn) and verify
-that the *remaining* workers absorb the load. That's a softer test but
-still meaningful — 3P3D should survive losing one of six workers.
-Document the choice taken.
-
-## Canary references — how to generate
-
-A one-shot script (separate from the pytest test) that:
-
-1. Launches a single inference engine with the same model + engine
-   config (TP, dtype, etc.) as the marathon would use.
-2. Runs each of the canary prompts with greedy decoding + fixed seed.
-3. Records the output token IDs (not the detokenized text — token-level
-   equivalence is what we check).
-4. Writes the prompt + reference token IDs to
-   `stress_canary_prompts.json`.
-
-Suggested location:
-`tests/integration/defs/stress_test/disagg_cancel/tools/generate_canary_references.py`
-
-The README.md should document when to regenerate (model checkpoint
-change, dtype change, max_seq_len change, anything that could shift
-greedy-decode outputs).
-
-## What's deferred (follow-up YAMLs / test IDs)
-
-The harness is parametric, so all of the below land as additional YAML
-configs + test IDs in `llm_function_stress.txt`, **no Python changes
-needed**:
-
-| Deferred scenario | Notes |
+| Scenario | Why |
 |---|---|
-| 1P1D local | Catches single-pair edge cases; small additional time budget |
-| 4P2D local | Asymmetric P/D ratio; tests sender-bias scenarios |
-| V1 + Python combination | The third valid (KV-cache × transceiver) combination |
-| Direct UCX transport | Exercises the non-NIXL code path (no poison on UCX cancellations) |
-| Block reuse off | Verify the cancellation paths work without rc13-style block reuse |
-| Overlap scheduler off | Verify behaviour without overlap |
-| Aggressive timeout (1 s) | The §10 deterministic-race-regression variant; ~20 min run |
-| Multi-node (cross-node 1P1D) | Deployment-infra concern; separate effort |
+| 1P1D local | Single-pair edge cases |
+| 4P2D local | Asymmetric sender/receiver pressure |
+| V1 + Python | Third valid KV-cache / transceiver combination |
+| Direct UCX | Non-NIXL transport behaviour |
+| Block reuse off | Cancellation without the block-reuse interaction |
+| Overlap scheduler off | Cancellation without overlap scheduling |
+| Aggressive 1 s timeout | Deterministic race-regression variant from the investigation |
+| TP/PP/EP consensus configs | Rank-batch divergence and collective-deadlock coverage |
+| Cross-node 1P1D | True multi-node RDMA and deployment-infra coverage |
 
-Track these as a follow-up issue, file/add YAML configs as needed.
+## Cross-References
 
-## Implementation notes
-
-The "Open questions for the implementing agent" section originally
-sat here as TBDs. They have been resolved during implementation of
-steps 1–4 in the PR chain above; the answers are now in the merged
-code. The decisions worth surfacing as an architectural record (i.e.,
-choices a future maintainer would otherwise have to re-derive) are
-below. Read the merged source under
-`tests/integration/defs/stress_test/disagg_cancel/` for the
-canonical reference.
-
-### Decisions beyond the spec
-
-These are choices the implementation made that the spec did not state
-explicitly. Captured here so a re-pickup can find them quickly.
-
-- **Serial marathon execution on a single 8-GPU node.** Each marathon
-  uses 6 GPUs for 3P3D + spares for clients; two in parallel exceeds
-  an 8-GPU node. Pytest parametrize runs serially by default, which
-  delivers the 4 h end-to-end budget on one node. No spec deviation;
-  captures the implicit assumption.
-- **Per-thread PR split, not per-marathon.** The spec's acceptance
-  checklist treated everything as one PR; the actual chain (steps
-  1–7 above) split per thread body to keep each PR small and to
-  start exercising components in CI as soon as each lands. PRs
-  `#14375` / `#14807` / `#14920` / `#15015` each carried one thread
-  body + its unit tests; the remaining PRs cover the load thread,
-  marathon YAMLs, and pytest registration.
-- **Kill-only SIGKILL fallback is the supported initial shape.** The
-  spec permits skipping the respawn if the worker-handle API is too
-  invasive to extend. The injector PR landed with kill-only +
-  "remaining 5 workers absorb the load" assertions; full
-  SIGKILL+respawn is tracked as a follow-up once the handle API
-  matures.
-- **Canary token-equivalence preferred fallback chain.** If greedy-
-  decode determinism is empirically insufficient, the canary uses,
-  in order: (a) exact text equivalence after detokenize, (b) BLEU /
-  ROUGE threshold, (c) length-only sanity check. Each falls back
-  with weaker UAF detection; the active choice is documented in the
-  test README and the canary thread's docstring.
-- **`--smoke` mode for developer iteration.** Optional 10-min
-  marathon shape (1 burst + 1 injection) for local iteration; not
-  registered in CI. Documented in the test README.
-
-### Risks the implementation pinned
-
-| Risk | Mitigation in current code |
-|---|---|
-| 2-h marathon too long for local iteration | `--smoke` mode (above). |
-| SIGKILL+respawn API surface invasive | Kill-only fallback (above) is the shipping shape. |
-| Greedy-decode non-determinism breaks canary | Fallback chain (above); the canary PR's `_send_canary_request` records `missing_token_ids` as a server-side error rather than miscounting it as a token-equivalence mismatch. |
-| Prometheus metric scrape format changes | Use `prometheus_client.parser.text_string_to_metric_families`; the metrics PR pinned the metric name `trtllm_kv_cache_utilization` and fails loudly if absent. |
-| Worker log paths / formats change across releases | The log scanner thread reads all stdout/stderr captured by `setup_disagg_cluster`'s worker handles; no hard-coded paths. |
-| 3P3D × 8-GPU node insufficient VRAM headroom | Model selection sanity-checks; smaller-model fallback documented per-marathon YAML. |
-| Pre-commit hooks (D205, ruff-legacy, clang-format) | Code is written lint-clean from the start; pre-commit runs on every commit. |
-
-## Acceptance criteria (cumulative across the PR chain)
-
-Originally drafted as a single-PR checklist; the actual chain (steps
-1–7 in [Implementation PR chain](#implementation-pr-chain) above) ships
-incrementally. Status below reflects what has landed in `upstream/main`
-as of 2026-06-08 (PR `#15015` merge).
-
-- [x] `tests/integration/defs/stress_test/disagg_cancel/` directory created with the structure above. (PR `#14375`)
-- [x] `harness.py` module implementing `DisaggCancellationStressHarness` with the 5-thread architecture. (PR `#14375` skeleton; thread bodies in `#14375` / `#14807` / `#14920` / `#15015`; `load_thread` body pending)
-- [x] `README.md` in the new directory — usage, goals, expected results, troubleshooting. (PR `#14375`)
-- [x] Clear log output during the test (progress markers every minute, injection events logged loudly). (each thread PR adds its own structured logging)
-- [ ] `load_thread` body wrapping `run_cancel_stress_test` in a duration-bounded loop. (step 5)
-- [ ] `test_disagg_cancel_stress.py` with one pytest test parametrized over the two YAML configs. (step 7; the smoke entry exists today)
-- [ ] `configs/marathon_a_v1_cpp_deepseek.yaml` and `configs/marathon_b_v2_py_qwen.yaml`. (step 6)
-- [ ] `configs/stress_canary_prompts.json` with deterministic prompts + reference token IDs for the chosen models. (step 6)
-- [ ] `tools/generate_canary_references.py` for regenerating references. (step 6)
-- [ ] Two test IDs registered in `tests/integration/test_lists/qa/llm_function_stress.txt`. (step 7)
-- [ ] At least one full-duration (2 h) successful run of each marathon on the developer's machine before flipping the test on in weekly CI.
-- [ ] Documented "how to debug a failure" section in the README — which logs to check, which Prometheus metrics to inspect. (lands with step 7)
-
-## Cross-references
-
-- [`README.md`](README.md) — overall TRTLLM-12721 design doc this is part of.
-- [`docs/investigations/nvbug-6104831-disagg-permanent-wedge/`](../../investigations/nvbug-6104831-disagg-permanent-wedge/) — the investigation that motivates this suite.
-- [`docs/investigations/nvbug-6104831-disagg-permanent-wedge/10-ablation-no-midflight-cancel.md`](../../investigations/nvbug-6104831-disagg-permanent-wedge/10-ablation-no-midflight-cancel.md) — the §10 ablation experiments this suite generalises into a CI gate.
-- [TRTLLM-12648](https://jirasw.nvidia.com/browse/TRTLLM-12648) — the weekly stress CI JIRA ticket this satisfies.
-- [TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721) — the cancellation/poison improvement initiative this is Phase 0 of.
-- <https://github.com/NVIDIA/TensorRT-LLM/pull/13713> — the disaggregated cancellation / poison bug fix this suite is gating regressions against.
+- [`README.md`](README.md) - overall TRTLLM-12721 design roadmap.
+- [`phase1-architectural-design.md`](phase1-architectural-design.md) - in-flight cancellation workflow and implementation plan gated by this suite.
+- [`docs/investigations/nvbug-6104831-disagg-permanent-wedge/`](../../investigations/nvbug-6104831-disagg-permanent-wedge/) - investigation motivating the suite.
+- [`10-ablation-no-midflight-cancel.md`](../../investigations/nvbug-6104831-disagg-permanent-wedge/10-ablation-no-midflight-cancel.md) - controlled A/B experiments generalized by this suite.
+- [`phase1-consensus-collective-design.md`](phase1-consensus-collective-design.md) - consensus design that will be measured against Phase 0 configs.

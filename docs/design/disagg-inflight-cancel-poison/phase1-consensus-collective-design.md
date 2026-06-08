@@ -5,14 +5,14 @@
 | **Phase** | 1 (architectural design — precedes implementation) |
 | **JIRA** | [TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721) |
 | **Owner** | Chien-Chun Hung |
-| **Status** | Design proposal; not yet implemented. Implementation tracked separately as the in-flight cancellation surface follow-up to <https://github.com/NVIDIA/TensorRT-LLM/pull/14768>. |
+| **Status** | Design proposal for the V1 L2 state-consensus primitive. The end-to-end workflow is in [`phase1-architectural-design.md`](phase1-architectural-design.md). |
 | **Depends on** | (1) <https://github.com/NVIDIA/TensorRT-LLM/pull/14768> already merged (always-on lifetime / RAII / dedup / NIXL keep-alive); (2) the upcoming `dataTransceiver` `shared_ptr<LlmRequest>` follow-up at <https://github.com/NVIDIA/TensorRT-LLM/pull/14979>; (3) the V1 `_consensus_outcome` port from doc 14 (env-gated, currently default OFF) as a structural reference point. |
 
 ## Why this exists
 
 The investigation captured in [`docs/investigations/nvbug-6104831-disagg-permanent-wedge/18-pr-14746-prior-art-and-v1-two-layer-gap.md`](../../investigations/nvbug-6104831-disagg-permanent-wedge/18-pr-14746-prior-art-and-v1-two-layer-gap.md) (especially §3) established that the V1 disagg path has a two-layer cross-rank-consistency problem:
 
-- **L1** — *Which* requests are flagged for action (timed-out, cancellation-eligible, etc.). PR #14746 closes this for the timeout flag via `dist.allgather → union`. The in-flight cancellation follow-up needs to do the same for the recv-side dedup state (the A3 problem from doc 17).
+- **L1** — *Which* requests are flagged for action (timed-out, cancellation-eligible, etc.). The timeout-flag implementation at <https://github.com/NVIDIA/TensorRT-LLM/pull/14746> closes this via `dist.allgather → union`. The in-flight cancellation follow-up needs to do the same for the recv-side dedup state (the A3 problem from doc 17).
 - **L2** — *What state transitions* the ranks apply in response. V2 closes this via `KvCacheTransceiverV2._consensus_outcome` (three allgathers — one each for cancelled / failed / completed rids). V1 has no equivalent; this is the gap exercised by `cacheTransceiver.cpp:689-690` where every rank independently does `cancelRequest` + `setState(kDISAGG_TRANS_ERROR)` with no allgather between detection and action.
 
 This document specifies the recommended **consensus collective shape** for the V1 follow-up. It does not specify *where* in the V1 code the collective fires (that is a separate implementation-plan concern); it specifies how the collective should be structured to minimize round-trips, reuse existing V1 infrastructure, and stay reviewable.
@@ -144,7 +144,7 @@ The reduce is **O(N)** where N = total entries in the gathered vector (sum over 
 
 The latency savings are most visible in cross-node disagg over TCP/IB (where per-allgather latency is 10× higher than on NVLink), under PP > 1 (collective count doubles for V2's shape), and on hot paths exercised at high request rates.
 
-## Open design questions for the implementation PR
+## Open design questions for the implementation follow-up
 
 The following remain to be answered in code, not in this design doc:
 
@@ -177,12 +177,13 @@ Any one of:
 - A V2 deployment on cross-node disagg surfaces synchronization overhead as a top-3 bottleneck in NVTX traces.
 - Independent maintenance work on V2's `_consensus_outcome` opens the door for a structural change at low marginal cost.
 
-Track as a follow-up under TRTLLM-12721, separate from the V1 cancellation PR.
+Track as a follow-up under TRTLLM-12721, separate from the V1 cancellation implementation.
 
 ## Cross-references
 
 - [`README.md`](README.md) — the overarching TRTLLM-12721 cancellation re-design document.
+- [`phase1-architectural-design.md`](phase1-architectural-design.md) — the end-to-end cancellation workflow and action list that this collective supports.
 - [Doc 18 §3](../../investigations/nvbug-6104831-disagg-permanent-wedge/18-pr-14746-prior-art-and-v1-two-layer-gap.md#3-concrete-l2-evidence--v1-vs-v2-with-line-citations) — the L1 / L2 framing and the V1-vs-V2 line citations that motivate this design.
 - [Doc 14](../../investigations/nvbug-6104831-disagg-permanent-wedge/14-cross-rank-consistency-enforcement.md) — the env-gated V1 `_consensus_outcome` port that mirrors V2's three-list shape. This design proposes the packed alternative for the cancellation-specific consensus; doc 14's port remains useful as a structural reference but its three-list shape is not the recommended target.
-- [PR #14746](https://github.com/NVIDIA/TensorRT-LLM/pull/14746) — concrete L1 consensus implementation in the `feat/deepseek_v4` branch (single allgather UNION of timeout-flagged rids). The packed design generalizes this to multi-state consensus while preserving the single-collective shape.
+- [Timeout-flag implementation](https://github.com/NVIDIA/TensorRT-LLM/pull/14746) — concrete L1 consensus implementation in the `feat/deepseek_v4` branch (single allgather UNION of timeout-flagged rids). The packed design generalizes this to multi-state consensus while preserving the single-collective shape.
 - [phase0-stress-test-suite.md](phase0-stress-test-suite.md) — the regression gate this design will be measured against once implemented.

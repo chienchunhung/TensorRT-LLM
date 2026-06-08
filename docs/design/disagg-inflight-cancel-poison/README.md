@@ -4,14 +4,51 @@
 |---|---|
 | **JIRA** | [TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721) |
 | **Author** | Chien-Chun Hung |
-| **Status** | Architectural design under active rework after PR `#13713` lands as default-OFF |
-| **Depends on** | [PR `#13713`](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) — introduces the in-flight cancel + poison + deferred-cleanup surface; ships gated under `TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL`, default OFF |
+| **Status** | Architectural design under active rework after the in-flight cancel + poison change at <https://github.com/NVIDIA/TensorRT-LLM/pull/13713> landed as default-OFF |
+| **Depends on** | <https://github.com/NVIDIA/TensorRT-LLM/pull/13713> — introduces the in-flight cancel + poison + deferred-cleanup surface; ships gated under `TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL`, default OFF |
+
+## Start Here
+
+Assuming the `dataTransceiver` `shared_ptr<LlmRequest>` lifetime fix at
+<https://github.com/NVIDIA/TensorRT-LLM/pull/14979> lands, the remaining
+work from the in-flight cancel prototype is not a small cacheTransceiver
+subset. The Dynamo exp4 report shows that PR #14979 closes the
+`Broken promise` / request-lifetime crash, but recovery also requires:
+
+- **Bounded polling** so transfer-status checks cannot wedge the
+  PyExecutor loop on an unready future.
+- **Deadline enforcement** that scans every pending transfer and turns
+  expiry into a rank-consensed cancellation intent, not an immediate
+  unilateral free.
+- **V1 L2 state consensus** so all ranks apply the same CANCELLED /
+  FAILED / COMPLETED / IN_PROGRESS outcome before scheduler, attention,
+  PP, TP, CP, or EP collectives see the next batch.
+- **Quiescence-gated cleanup** so a cancelled request stops scheduling
+  immediately, but KV blocks and transfer buffers are not reused until
+  the transport is terminal or the affected slot is fail-closed.
+- **Bounded quarantine / deferred un-poison** so one mid-flight cancel
+  does not force a pod restart unless all usable transfer capacity is
+  exhausted.
+- **Block-accounting diagnostics** to prove or disprove the inferred
+  F3 trigger: KV-block / credit pressure causing decode to have no free
+  blocks to receive into while prefill holds KV it cannot push.
+
+Detailed reading path:
+
+- [`phase1-architectural-design.md`](phase1-architectural-design.md) -
+  motivation, current status, timed-out request workflow, remaining
+  action items, and implementation approaches.
+- [`phase1-consensus-collective-design.md`](phase1-consensus-collective-design.md) -
+  packed V1 consensus collective proposal for the L2 state-transition
+  gap.
+- [`phase0-stress-test-suite.md`](phase0-stress-test-suite.md) -
+  stress-test gate needed before making cancellation default-ON.
 
 > **Reframe (2026-05-22).** This document was originally scoped as
 > "make the in-flight cancel + poison surface less operationally
 > aggressive". That scope is too narrow. The CI failures uncovered
-> while merging PR `#13713` with `upstream/main` (RC-1 MTP scheduler
-> interaction, RC-2 TP allgather rank-batch divergence, RC-3 PP
+> while merging the in-flight cancellation change with `upstream/main`
+> (RC-1 MTP scheduler interaction, RC-2 TP allgather rank-batch divergence, RC-3 PP
 > termination retry) showed that the cancellation + deferred-cleanup
 > machinery has the same defect class across all of them: **per-rank
 > decisions made without a consensus story across the parallelism
@@ -29,14 +66,16 @@
 
 ## Context
 
-PR `#13713` introduced in-flight cancellation of disaggregated KV
-transfers as part of the NVBug 6104831 fix
+The in-flight cancellation change at
+<https://github.com/NVIDIA/TensorRT-LLM/pull/13713> introduced
+in-flight cancellation of disaggregated KV transfers as part of the
+NVBug 6104831 fix
 (see [investigation](../../investigations/nvbug-6104831-disagg-permanent-wedge/)).
 The cancellation surface requires a memory-safety mechanism because
 NIXL's `releaseXferReq` does not guarantee synchronous remote
 quiescence — the local handle is released, but the remote peer may
 still be reading from / writing to the advertised memory range. The
-shipping shape in `#13713` chose the strictest fail-closed answer:
+shipping shape chose the strictest fail-closed answer:
 
 - On a cancel-mid-flight catch, set a **pool-wide** `mPoisoned` flag.
 - All subsequent buffer acquires throw.
@@ -47,7 +86,7 @@ shipping shape in `#13713` chose the strictest fail-closed answer:
 
 This is *correct for safety* (no UAF; orchestrator gets a loud signal)
 but **operationally aggressive**: one cancel = pod restart. The
-feature is disabled by default in `#13713` for that reason.
+feature is disabled by default for that reason.
 
 The 2026-05-13 Qwen3-Coder-480B production incident showed this firing
 at production-default 60 s timeout under natural transient backpressure
@@ -56,9 +95,9 @@ restarts in 10 min → NVCF instance recycle, ~25 min outage).
 
 ### Three CI failures that expanded the scope
 
-While merging PR `#13713` with `upstream/main`, three real
+While merging the in-flight cancellation change with `upstream/main`, three real
 regressions surfaced — all caused by the **deferred-cleanup
-machinery** that PR `#13713` added alongside the cancel + poison
+machinery** that the change added alongside the cancel + poison
 surface, not the cancel surface itself:
 
 | RC | Test | Per-rank decision that diverges |
@@ -69,7 +108,7 @@ surface, not the cancel surface itself:
 
 These are not three independent bugs. They are three customer-visible
 faces of one architectural gap: **the V1 + C++ transceiver path has
-no consensus mechanism, and PR `#13713` extended it with logic that
+no consensus mechanism, and the change extended it with logic that
 quietly assumed one.** Per-rank "is this request in transmission?"
 queries diverge under TP/PP/EP; per-rank "defer or terminate?"
 decisions create split-brain on the next iteration's batch and on
@@ -110,8 +149,8 @@ or call out the cells it intentionally excludes. This is the matrix:
 |---|---|---|
 | **KV cache manager** | V1 (`KVCacheManager`), V2 (`KVCacheManagerV2`) | V1: independent per-rank state, no consensus. V2: per-rank state, but the V2 *transceiver* (below) enforces consensus on top. |
 | **Cache transceiver runtime** | C++ (`BindKvCacheTransceiver`), Python (`KvCacheTransceiverV2`) | C++: `cancelRequest` per rank, no consensus. Python (V2): `cancel_request` returns `False` if mid-write + `_consensus_outcome` across TP/PP. |
-| **Network backend** | NIXL, direct UCX, MPI (deprecated), Mooncake | NIXL: PR `#13713` adds `release()` / per-request cancel flag. UCX/MPI: no cancellation primitives at the connection layer (cancellation lives in the upper transceiver). |
-| **Parallelism mode** | TP, PP, CP (context-parallel), EP (expert-parallel), ADP (attention-DP), combinations | TP/PP exercised in PR `#13713` testing; CP exercised in RC-2; EP not yet exercised under cancellation pressure. All require per-iteration consensus on which requests are in the batch. |
+| **Network backend** | NIXL, direct UCX, MPI (deprecated), Mooncake | NIXL: the linked in-flight cancellation change adds `release()` / per-request cancel flag. UCX/MPI: no cancellation primitives at the connection layer (cancellation lives in the upper transceiver). |
+| **Parallelism mode** | TP, PP, CP (context-parallel), EP (expert-parallel), ADP (attention-DP), combinations | TP/PP exercised in the linked in-flight cancellation testing; CP exercised in RC-2; EP not yet exercised under cancellation pressure. All require per-iteration consensus on which requests are in the batch. |
 
 **Compatibility restrictions (already in code):**
 
@@ -128,15 +167,16 @@ or call out the cells it intentionally excludes. This is the matrix:
 **The two mainstream cells:**
 
 1. `(V1, C++ transceiver, NIXL or direct UCX, TP/PP/EP/ADP)` — heritage
-   path, the customer deployment shape, what PR `#13713` extends.
+   path, the customer deployment shape, and the path extended by the
+   linked in-flight cancellation change.
 2. `(V2, Python transceiver, NIXL, TP/PP/EP/ADP)` — newer path, has
    built-in consensus, intended forward direction.
 
 The architectural question this design has to answer is: **how do we
 land a cancellation contract that is consistent across both
 mainstream cells (and the network-backend variants under each),
-without re-introducing the per-rank-divergence failure mode that
-PR `#13713`'s deferred-cleanup did?**
+without re-introducing the per-rank-divergence failure mode that the
+first deferred-cleanup implementation exposed?**
 
 ## The consensus invariants
 
@@ -201,7 +241,7 @@ layers to converge eventually.
    both mainstream cells, so operators don't need to think about
    which transceiver runtime they're using.
 
-## Anti-goals (lessons from PR `#13713`)
+## Anti-goals (lessons from the first in-flight cancel implementation)
 
 These are the failure modes the architectural design is explicitly
 avoiding:
@@ -251,64 +291,37 @@ that produced RC-1 / RC-2 / RC-3.
 
 ### Phase 0 — Stress-testing infrastructure for the cancel + poison surface
 
-**Status:** Prerequisite. Should land *before* any of the behavioural
-phases so we can A/B each one and not regress earlier ones.
+**Status:** In progress. This is the prerequisite regression gate for
+every behavioural phase below. The detailed scope, continuous-run
+requirements, harness architecture, and implementation roadmap now live
+in [`phase0-stress-test-suite.md`](phase0-stress-test-suite.md).
 
-The §10 ablation harness already gives us most of what we need — six
-controlled A/B experiments comparing PR `#13713` head against an
-ablation branch — but it lives as ad-hoc scripts in
-`local/pr13713-rc13-clean/.repro/`. We should productionize a subset
-of it as a permanent stress-test suite that **covers both mainstream
-cells of the scenario matrix**:
+Phase 0 productionizes the NVBug 6104831 repro / ablation evidence into
+a maintained stress suite. The first weekly shape is two serial 2 h
+marathons on one 8-GPU node:
 
-- `(V1, C++ transceiver, NIXL + UCX plugin, TP/PP/EP/ADP)` — the
-  customer deployment shape, what PR `#13713` extends.
-- `(V2, Python transceiver, NIXL, TP/PP/EP/ADP)` — the architectural
-  template.
+- Marathon A: V1 KV cache manager + C++ transceiver + NIXL.
+- Marathon B: V2 KV cache manager + Python transceiver + NIXL.
 
-Per-cell tests:
+Both run 3P3D local disaggregated serving under cancellation-heavy load,
+scheduled bursts, deterministic canaries, log scanning, KV-utilization
+monitoring, and SIGSTOP/SIGCONT/SIGKILL injection. This catches the
+cleanup-path, lifetime-UAF, pool-poison cascade, block-reuse, and
+worker-loss failure patterns before later phases change cancellation
+behaviour.
 
-- **Ablation: 1 s timeout, CONC=64, NIXL native.** Exercises the
-  saturation regime where cancels race NIXL mid-flight. Pre-#13713 /
-  ablation-branch behaviour: wedge with 89 `Broken promise` events.
-  Head: 0 broken promises, 2/5 PASS.
-- **Ablation: 5 s timeout + SIGSTOP-gen-8004 for 20 s.** Transient
-  peer pause as a controlled stand-in for the 2026-05-13 incident.
-  Pre-#13713: NO RECOVERY in 60 s. Head: HTTP 200 at +1.71 s, then
-  Layer 5 fail-closed by design.
-- **Baseline: 60 s timeout, CONC=64 / 256, NIXL+UCX, no injected
-  failures.** Smoke test that defenses are dormant under
-  production-default load.
-- **Stress: 60 s timeout, sustained CONC=128, slow receiver simulated
-  via artificial inflight-count pressure on decode.** Closest in-CI
-  approximation of the Qwen 480B production incident.
-- **Consensus stress: TP=2 / PP=2 / EP variants with mid-flight
-  cancellation under load.** Specifically targets the C1–C5
-  invariants. Pass criterion: no rank-batch divergence; no MPI
-  collective deadlock; KV blocks reclaimed within bounded iterations
-  on cancel.
+Current progress as of 2026-06-08:
 
-Each test should report: `Broken promise` count, `Cannot cancel
-request` count, `Poisoned ... cache transfer buffer` count, recovery
-time after injected failure, per-rank batch divergence count
-(consensus violation), final PyExecutor health.
+- Landed: harness skeleton, log scanner, metrics scraper, injector, and
+  canary thread under `tests/integration/defs/stress_test/disagg_cancel/`.
+- Next: `load_thread`, then the two marathon YAMLs plus canary
+  references.
+- Still required before weekly CI enablement: pytest registration,
+  full-duration local runs, and the stress-test README's failure-debug
+  guide.
 
-Code organisation:
-
-- The stress-harness skeleton has landed in
-  `tests/integration/defs/stress_test/disagg_cancel/` (PR `#14375`).
-  Marathon configs cover both mainstream cells.
-- Mark them as nightly / opt-in (they take minutes per case and
-  require multi-process / NIXL setup).
-- Wire each behavioural phase below to a *specific* set of tests so
-  regression is locally visible: e.g., Phase 2 must keep the SIGSTOP
-  test recovering in <5 s; Phase 3 must add a "pool exhausts
-  gracefully after N cancels" test; consensus tests gate any change
-  to the V1 + C++ deferred-cleanup machinery.
-
-The §10 doc itself is the spec for what these tests should measure;
-the work is mostly converting that doc into a maintained suite plus
-extending it for the consensus dimension.
+Phase 0 also remains the place to add consensus-focused TP/PP/EP
+coverage before Phase 1 claims full C1-C5 coverage across those axes.
 
 ### Phase 1 — Architectural design for request cancellation across the scenario matrix
 
@@ -317,83 +330,18 @@ It precedes every operability/poison-shape phase below. Without it,
 landing changes to either mainstream cell risks reopening the same
 defect class that produced RC-1 / RC-2 / RC-3.
 
-**Deliverable:** `phase1-architectural-design.md`, covering the
-following sections at minimum.
+**Status:** The detailed deliverable now lives in
+[`phase1-architectural-design.md`](phase1-architectural-design.md).
+It records the current status after PR #14979, the timed-out request
+workflow, the recommended V1 consensus + quarantine implementation
+path, and the action list needed to make cancellation safe enough to
+turn on by default.
 
-1. **Cancellation contract.** A formal statement of C1–C5 above
-   (cancellation/failure propagate globally, completion requires
-   unanimity, deferred cleanup is a global decision, per-iteration
-   batch composition is the consensus output). Naming the contract
-   makes it reviewable; every later phase's design notes cite the
-   contract.
-
-2. **V2 transceiver as the template.** Document `_consensus_outcome`,
-   `_ctx_consensus_outcome`, `_gen_consensus_outcome` from
-   `tensorrt_llm/_torch/disaggregation/transceiver.py` as the
-   reference implementation. Identify gaps if any (multi-node?
-   ADP-specific paths? EP not yet exercised).
-
-3. **V1 + C++ path alignment strategy.** Three candidates to choose
-   from, with explicit trade-offs:
-
-   - **(a)** Add an equivalent consensus layer to the V1 + C++ path
-     in Python (one rank's `cancel_request` outcome broadcast,
-     mirroring V2). Pros: smallest change to C++; keeps V1 as a
-     supported runtime for at least one more rc cycle. Cons:
-     duplication of consensus logic that already lives in V2;
-     ongoing maintenance of two near-identical paths.
-   - **(b)** Migrate disagg workloads to the V2 runtime where the
-     compat matrix allows, and put V1 + C++ in maintenance mode for
-     cancellation. Pros: single source of truth; V2 is already the
-     intended forward direction. Cons: V2 is NIXL-only; UCX
-     deployments are stuck on V1 unless V2 grows UCX support; the
-     V1 → V2 migration has its own correctness story to write.
-   - **(c)** Extract a shared cancellation orchestrator that both
-     `BindKvCacheTransceiver` and `KvCacheTransceiverV2` delegate
-     to. The orchestrator owns the consensus state; the two
-     runtimes just propagate "session is mid-write" / "session has
-     completed" signals. Pros: cleanest long-term shape. Cons:
-     largest design effort; touches both code paths; needs a
-     migration plan to land safely.
-
-   Picking (a) / (b) / (c) is the central decision Phase 1 has to
-   close. Out of the box, (a) looks like the shortest path for
-   `rc14`/`rc15`; (c) looks like the architectural endgame. The
-   recommendation should justify the choice against operational
-   risk, code-churn, and the deprecation arc for V1.
-
-4. **Deferred cleanup as a consensus output.** Define when "defer
-   the freeing of Python KV resources" is a globally consistent
-   decision (rather than a per-rank one). The naive version is
-   "defer iff *any* rank says the session is still TRANSFERRING";
-   that's correct but may be too aggressive at scale. The design
-   should empirically size the cost.
-
-5. **Network-backend asymmetry handling.** NIXL has a per-request
-   cancel primitive (`releaseXferReq` + the cancel-flag branch
-   PR `#13713` added). Direct UCX and MPI do not; cancellation for
-   those backends is purely Python-level (drop the session, let the
-   transport run to completion). The design has to either (i)
-   accept that UCX/MPI deployments cannot truly cancel a mid-flight
-   transfer and document the deployment-level consequence (longer
-   recovery on peer failures), or (ii) propose what the backend
-   needs to grow. Be explicit.
-
-6. **TP / PP / CP / EP / ADP coverage.** Each parallelism axis
-   imposes its own consistency invariant; the design should call
-   out which ones are covered by C1–C5 and which (if any) need
-   axis-specific reasoning. EP is the one we haven't exercised
-   under cancellation pressure yet — the design should commit to
-   exercising it in Phase 0 before the behavioural phases land.
-
-7. **Migration plan.** How to turn the env-var-gated default-OFF
-   surface into the consensus-driven default-ON surface without
-   re-running RC-1 / RC-2 / RC-3. Suggested arc:
-   `rc14`: design lands as a doc + targeted tests in Phase 0;
-   `rc15`: V1 + C++ consensus implementation lands behind the same
-   env var, flips to default-ON when the consensus tests are green;
-   `rc16`: env var removed; cancellation is unconditional and
-   correct on both mainstream cells.
+The V1 consensus collective shape is split into
+[`phase1-consensus-collective-design.md`](phase1-consensus-collective-design.md)
+because it is a reusable design detail: one packed `(rid, state)`
+allgather, CANCELLED / FAILED as union semantics, COMPLETED as
+intersection semantics.
 
 **Why this is "load-bearing".** Every later phase (deferred
 un-poison, multi-slot, NIXL callback, progress-based cancel) makes
@@ -534,7 +482,7 @@ which is the cleanest answer to the 2026-05-13 incident's root cause.
 ## Dependency
 
 ```
-PR #13713 lands (default-OFF, gated under TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL)
+In-flight cancel + poison fix lands default-OFF, gated under TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL
   │
   ├─> Phase 0 — productionize stress-test suite (covers both mainstream cells)
   │
@@ -616,8 +564,9 @@ PR #13713 lands (default-OFF, gated under TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL)
 
 - **§10 of the NVBug 6104831 investigation** —
   [`docs/investigations/nvbug-6104831-disagg-permanent-wedge/10-ablation-no-midflight-cancel.md`](../../investigations/nvbug-6104831-disagg-permanent-wedge/10-ablation-no-midflight-cancel.md).
-  Six controlled A/B experiments comparing PR `#13713` head against
-  an ablation branch with the cancel surface removed. Shows the
+  Six controlled A/B experiments comparing the in-flight cancel +
+  poison implementation against an ablation branch with the cancel
+  surface removed. Shows the
   pool-wide-poison cascade firing at 1 s timeout / under SIGSTOP.
   The "Why we ship default-OFF" section documents the RC-1 / RC-2 /
   RC-3 CI failures that motivated this design's architectural
@@ -635,11 +584,12 @@ PR #13713 lands (default-OFF, gated under TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL)
   as [`19-exp4-f1-f2-f3-decomposition.md`](../../investigations/nvbug-6104831-disagg-permanent-wedge/19-exp4-f1-f2-f3-decomposition.md).**
   Decomposes the decode-side wedge into three independent failures
   on the same code path: **F1** (`Broken promise` UAF, fixed by the
-  shared_ptr lifetime port in PR `#14979`), **F2** (engine-loop
+  shared_ptr lifetime port at <https://github.com/NVIDIA/TensorRT-LLM/pull/14979>), **F2** (engine-loop
   freeze on unbounded `future.get()`, fixed by `cacheTransceiver.cpp`
-  bounded `wait_for(≤50 ms)` poll in PR `#13713`), and **F3**
+  bounded `wait_for(≤50 ms)` poll in
+  <https://github.com/NVIDIA/TensorRT-LLM/pull/13713>), and **F3**
   (eager-free of stuck transfer poisons the UCX progress thread →
-  permanent wedge, fixed by PR `#13713`'s `py_executor.py` +
+  permanent wedge, fixed by the `py_executor.py` +
   `AsyncTransferManager` redesign with `_is_unquiesced_disagg_transfer`
   / `_can_terminate_request_now`).
 
@@ -653,15 +603,35 @@ PR #13713 lands (default-OFF, gated under TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL)
   ("deferred cleanup is a globally consistent decision") and
   Phase 2 (deferred un-poison via NIXL status polling) realize.
 
-  **A/B clincher (same cluster, same loadgen, single hour):** PR
-  `#13713` recovers `+30 FAIL → 200/200/200/200`; the largest
-  cachefix-subset trial (`#14979` + bounded poll + active drain)
+  The raw report also pins down the likely F3 trigger under the
+  reproducer: NIXL, `free_gpu_memory_fraction=0.2`, concurrency 16,
+  input length around 8k, and a log fingerprint of
+  `exceeded total timeout` → `cancelled before send` → requests that
+  never complete. The inferred mechanism is KV-block / credit pressure:
+  decode has no free blocks to receive into while prefill is holding KV
+  it cannot push. This trigger is plausible but not yet directly
+  traced; the implementation plan therefore includes transceiver-level
+  block-accounting logs around timeout, cancel, and resource release.
+
+  **A/B clincher (same cluster, same loadgen, single hour):** the
+  in-flight cancel + poison implementation recovers
+  `+30 FAIL → 200/200/200/200`; the largest cachefix-subset trial
+  (shared_ptr lifetime port + bounded poll + active drain)
   wedges `5/5 FAIL → 000`. Trial 2 is the instructive failure: its
-  drain *engaged* (rc17's `_check_kv_transfer_timeout` already
-  detects and cancels timed-out transfers — *detection was never
-  the gap*) but freed eagerly, exactly like rc17, and poisoned the
-  transport the same way. Detecting and terminating is necessary;
-  **freeing safely** is the load-bearing piece.
+  drain *engaged* (`Cannot cancel` dropped from 243 to 1, and
+  `exceeded total timeout; cancelling` fired). rc17's
+  `_check_kv_transfer_timeout` already detects and cancels timed-out
+  transfers, so *detection was never the gap*. Trial 2 freed eagerly,
+  exactly like rc17, and poisoned the transport the same way.
+  Detecting and terminating is necessary; **freeing safely** is the
+  load-bearing piece.
+
+  Conclusion from the raw report: there is no small
+  "`#14979` + cacheTransceiver subset" that recovers the field wedge.
+  The safe-subset path (`#14768` → `#14979`) is useful hygiene, but the
+  deployable shape that passes the reproducer needs #13713's bounded
+  poll plus quiescence-gated Python termination / transfer-manager
+  redesign.
 
   Why this strengthens the design's existing C4 / Phase 2
   argument: rc17 violates C4 today by making a per-rank "free now"
@@ -687,11 +657,15 @@ PR #13713 lands (default-OFF, gated under TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL)
   **Action item:** extend with the consensus dimension (TP/PP/EP
   rank-batch divergence checks) and add an EP-bearing model
   (DeepSeek-V3 or Qwen3-MoE) before Phase 1 can claim EP coverage.
-- `phase1-architectural-design.md` — **to be authored — load-bearing.**
-  Cancellation contract (C1–C5), V2 template walkthrough, V1
-  alignment strategy decision (a / b / c), deferred-cleanup as a
-  consensus output, network-backend asymmetry policy, parallelism-
-  axis coverage, migration plan. Every later phase cites this doc.
+- [`phase1-architectural-design.md`](phase1-architectural-design.md) —
+  **DRAFT** — current Phase 1 design: why cancellation is needed under
+  high load, what remains from PR #13713 after PR #14979, timed-out
+  request workflow, implementation approaches, action items, and open
+  questions.
+- [`phase1-consensus-collective-design.md`](phase1-consensus-collective-design.md) —
+  **DRAFT** — packed V1 `(rid, state)` consensus collective for the
+  L2 state-transition gap. This is the concrete collective shape
+  referenced by the architecture doc.
 - `phase2-deferred-un-poison.md` — to be authored — tracker class
   design, lifetime / threading model, deadline policy, NIXL status
   polling cadence. Honours the consensus contract from Phase 1.
