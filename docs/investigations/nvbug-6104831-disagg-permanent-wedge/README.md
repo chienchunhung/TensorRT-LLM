@@ -140,6 +140,7 @@ across sections that are each meant to be readable on its own:
 |---|---|
 | **[`00-tldr.md`](00-tldr.md)** | **Start here. 10-minute read.** Summarises the wedge symptom, the eight-layer root cause, the combo fix (PR `#13713`), and the empirical recovery results. Has the architecture and fix-mapping figures inline. Inspires the deeper reads if you want detail. |
 | **[`09-executive-summary-rc11-to-rc13.md`](09-executive-summary-rc11-to-rc13.md)** | **15-minute read covering the full rc11 → rc13 journey.** Extends `00-tldr.md` with the rc13 regression chapter: why block reuse triggers it, what the short-term stop-gap covers and doesn't, why the design doc's Phase 2 deletion is the right long-term answer. Use this for an exec briefing or a new teammate joining mid-investigation. |
+| **[`20-executive-summary-current.md`](20-executive-summary-current.md)** | **Current leadership/stakeholder briefing.** Explains the failure symptom, root-cause classes, immediate fire mitigations for UAF / `Broken promise` / SIGSEGV / wedges, and the long-term cancellation + temporary poison + deferred un-poison roadmap. Includes two Mermaid diagrams: request lifecycle and safety-to-operability workflow. |
 | [`01-background.md`](01-background.md) | Read first if you are new to this code. Architecture diagrams of the disagg deployment, request lifecycle walkthrough, `LlmRequestState` state machine, key files / classes. |
 | [`02-failure-signatures.md`](02-failure-signatures.md) | The nine concrete failure signatures (`#1`–`#9`, with `#8` being the rc13 server hang under disagg + block reuse + in-flight cancel, and `#9` being the helix CI hang from rank-asymmetric Python gates over a cross-rank C++ collective): symptom, code site, root cause, fix, regression test. The "what bugs are there" view. |
 | [`03-defect-class-stack.md`](03-defect-class-stack.md) | The eleven-layer `L1`–`L11` defect-class model that emerged from the investigation. Re-frames the nine signatures as the customer-visible faces of underlying invariant gaps. **This is the framework used in the four-approach comparison.** |
@@ -168,6 +169,11 @@ across sections that are each meant to be readable on its own:
   journey."** Read [`09-executive-summary-rc11-to-rc13.md`](09-executive-summary-rc11-to-rc13.md).
   Adds the rc13 regression chapter, the short-term stop-gap, and the
   Phase 2 long-term plan on top of the 10-minute story.
+- **"I need the current leadership mental model."** Read
+  [`20-executive-summary-current.md`](20-executive-summary-current.md).
+  It folds in the exp-4 F1/F2/F3 decomposition, the always-on ablation,
+  the cross-rank consensus gap, and the temporary poison / deferred
+  un-poison roadmap.
 - **"I'm picking up this investigation cold and have 30 minutes."** Read
   [`00-tldr.md`](00-tldr.md) first, then
   [`01-background.md`](01-background.md), then
