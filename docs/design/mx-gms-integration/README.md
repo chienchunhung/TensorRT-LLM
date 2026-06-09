@@ -2,7 +2,7 @@
 
 **Status:** Draft (Revised) — [Prototype available](https://github.com/chienchunhung/TensorRT-LLM/tree/dynamo-integration-prototype)
 **Created:** 2026-04-01
-**Last Updated:** 2026-05-19
+**Last Updated:** 2026-06-09
 
 ---
 
@@ -54,6 +54,7 @@ The integration targets three critical production pain points simultaneously: sl
 14. [Open Questions & Discussion](14-open-questions.md) — Performance follow-ups, compile cache design, API stability, operational questions, deferred items
 15. [Prototype Validation Plan](15-prototype-validation-plan.md) — Strategy for validating PR #13045 against the §11 baseline (working plan; results will fold back into §11)
 16. [Staged Post-Load Hooks](16-staged-post-load-hooks.md) — Holistic fix for the conflated `post_load_weights()` semantics surfaced by PR #13926 (GMS RO ordering) and PR #14151 (MX publish-pre vs publish-post-transform). Decomposes into `setup_aliases` / `transform_weights` / `cache_derived_state` stages; tiny prep PR scope + family-PR migration sequence.
+17. [Snapshot Integration Assessment](17-snapshot-assessment.md) — Assesses how Dynamo Snapshot, MX, and GMS fit together for TRT-LLM fast startup, including standalone `trtllm-serve` ownership versus Dynamo orchestration.
 
 ---
 
@@ -64,3 +65,4 @@ The integration targets three critical production pain points simultaneously: sl
 | MX Integration (Part II) | **P1 (Tier 1)** | 0-2 months | vLLM already has `--load-format mx`; competitive catch-up |
 | GMS Integration (Part II) | **P2 (Tier 2)** | 2-4 months | Enables crash resilience, <5s shadow failover, and zero-downtime operations; differentiation |
 | Extensions (Part III) | **P2 (Tier 2)** | 4-6 months | Shadow failover, compile cache, disagg interaction, KV cache extension path |
+| Snapshot Compatibility (Part VI) | **P2 (Tier 2)** | parallel investigation | Defines Dynamo-agnostic TRT-LLM lifecycle hooks while keeping standalone MX/GMS fast-start first-class |
