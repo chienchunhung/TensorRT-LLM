@@ -5,7 +5,7 @@
 | **Phase** | 1, load-bearing architecture before default-ON cancellation |
 | **JIRA** | [TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721) |
 | **Owner** | Chien-Chun Hung |
-| **Status as of 2026-06-08** | Design draft. Assumes the `dataTransceiver` `shared_ptr<LlmRequest>` lifetime fix in <https://github.com/NVIDIA/TensorRT-LLM/pull/14979> will merge soon. |
+| **Status as of 2026-06-09** | Design draft. Assumes the `dataTransceiver` `shared_ptr<LlmRequest>` lifetime fix in <https://github.com/NVIDIA/TensorRT-LLM/pull/14979> will merge soon. V1 terminal-state consensus is in draft at <https://github.com/NVIDIA/TensorRT-LLM/pull/15139>; bounded transfer-status polling is in draft at <https://github.com/NVIDIA/TensorRT-LLM/pull/15181>. |
 | **Main dependency** | The in-flight cancel prototype at <https://github.com/NVIDIA/TensorRT-LLM/pull/13713>, which remains the only known implementation that passes the Dynamo field reproducer. |
 | **Related prior art** | Timeout-flag rank consensus in <https://github.com/NVIDIA/TensorRT-LLM/pull/14746>; V1 packed consensus proposal in [`appendix-v1-consensus-collective.md`](appendix-v1-consensus-collective.md). |
 
@@ -54,10 +54,10 @@ The current state is best understood through the F1 / F2 / F3
 decomposition in
 [`19-exp4-f1-f2-f3-decomposition.md`](../../investigations/nvbug-6104831-disagg-permanent-wedge/19-exp4-f1-f2-f3-decomposition.md):
 
-| Layer | Status after PR #14979 | What it means |
+| Layer | Status after PR #14979 and active follow-ups | What it means |
 |---|---|---|
 | **F1: request lifetime UAF / `Broken promise`** | Closed by PR #14768 plus PR #14979. `cacheTransceiver` and `dataTransceiver` workers hold `shared_ptr<LlmRequest>` while async work can still dereference the request. | Necessary foundation. It prevents a real crash class but does not recover the NIXL wedge by itself. |
-| **F2: engine-loop freeze on unbounded `future.get()`** | Not closed by PR #14979. PR #13713 capped polling with bounded `wait_for` slices. | Required so the PyExecutor loop can keep scheduling, checking deadlines, serving health, and processing cancellation while a transfer is stuck. |
+| **F2: engine-loop freeze on unbounded `future.get()`** | Not closed by PR #14979. PR #15181 recreates the minimal bounded-polling slice from PR #13713 as an open draft stacked on PR #15139. | Required so the PyExecutor loop can keep scheduling, checking deadlines, serving health, and processing cancellation while a transfer is stuck. PR #15181 is intentionally liveness-only: a poll-slice timeout leaves the request in the same state and queue. |
 | **F3: eager-free poisons transport / permanent wedge** | Not closed by PR #14979. PR #13713 deferred Python cleanup until transfer state was terminal, but paired that with aggressive pool-wide poison for memory safety. | The load-bearing recovery problem. Detecting timeout and calling cancel is insufficient; cleanup must be quiescence-gated and rank-consistent. |
 
 The raw exp4 report adds three important qualifications:
@@ -72,9 +72,10 @@ The raw exp4 report adds three important qualifications:
   `exceeded total timeout; cancelling` fired), but it still wedged
   because the drain freed eagerly, exactly like rc17.
 - **There is no small `#14979 + cacheTransceiver` recovery subset.**
-  PR #14979 closes F1; bounded polling closes F2; the deployment only
-  recovers when F3 is also fixed through the Python termination /
-  transfer-manager redesign that gates freeing on transport quiescence.
+  PR #14979 closes F1; PR #15181 closes the narrow F2 engine-liveness
+  slice; the deployment only recovers when F3 is also fixed through the
+  Python termination / transfer-manager redesign that gates freeing on
+  transport quiescence.
 
 PR #14746 is relevant but not sufficient. It closes **L1** consensus for
 the timeout flag: all ranks agree on which request IDs timed out. It
@@ -99,7 +100,7 @@ Assuming PR #14979 lands, the remaining merge work from PR #13713 is not
 
 | Piece | Why it remains required | Merge shape |
 |---|---|---|
-| **Bounded polling** | Prevents `checkContextTransferStatus` / `checkGenTransferStatus` from parking the engine loop on an unready future. Without this, timeout and cancellation code may never run. | Make status checks non-blocking or bounded, with a small cap such as 50 ms per future. Keep shutdown-drain paths as the only intentionally blocking paths. |
+| **Bounded polling** | Prevents `checkContextTransferStatus` / `checkGenTransferStatus` from parking the engine loop on an unready future. Without this, timeout and cancellation code may never run. | PR #15181 is the current scoped draft: finite status checks use bounded `wait_for` slices, poll-slice timeout is non-terminal, and shutdown / explicit drain paths remain the only intentionally blocking paths. |
 | **Deadline enforcement** | A transfer whose future never becomes ready must still age out. The check must scan every pending transfer, not only transfers that were selected by readiness consensus. | Represent deadline expiry as a local intent first. Use PR #14746-style L1 union so every rank sees the same timed-out IDs before action. |
 | **L2 cancellation outcome consensus** | A consistent timeout flag is not enough if ranks independently decide cancel success, request state, or cleanup timing. | Add a V1 consensus outcome equivalent to V2's `_consensus_outcome`. The preferred encoding is the packed `(rid, state)` allgather in [`appendix-v1-consensus-collective.md`](appendix-v1-consensus-collective.md). |
 | **Transport-safe cancel** | NIXL `releaseXferReq` / cancel flags can request unwind, but they are not a synchronous proof that the peer has stopped touching advertised memory. | Preserve the PR #13713 fail-closed checks, but route unknown-quiescence slots into quarantine instead of immediately treating the whole process as unrecoverable. |
@@ -124,7 +125,10 @@ easy to collapse: detection, consensus, cancellation, and cleanup.
 2. Poll status without wedging the engine
    - Every executor iteration calls check*TransferStatus().
    - The status check performs wait_for(0) / bounded wait_for slices only.
-   - Ready futures are consumed; unready futures stay tracked.
+   - PR #15181 implements the first scoped version: finite polls yield
+     after a bounded slice; slice timeout is not a request timeout.
+   - Ready futures are consumed; unready futures stay tracked with the
+     same request state.
 
 3. Detect deadline expiry as local intent
    - Each rank compares monotonic elapsed time against kv_transfer_timeout_ms.
@@ -173,8 +177,11 @@ physical reuse is delayed until quiescence or fail-closed isolation.**
 The shortest safe path is to keep V1 + C++ supported for current
 deployments while adding the missing consensus and cleanup semantics:
 
-1. Land the bounded status polling from PR #13713, scoped to
-   `checkContextTransferStatus` and `checkGenTransferStatus`.
+1. Land the bounded status polling from PR #15181, scoped to
+   `checkContextTransferStatus` and `checkGenTransferStatus`. This is a
+   liveness-only subset of PR #13713: it prevents an unready future from
+   blocking finite status polls, but it does not enforce deadlines,
+   request cancellation, deferred cleanup, or buffer quarantine.
 2. Use PR #14746's L1 timeout-flag union where available.
 3. Add V1 L2 outcome consensus with the packed-state allgather.
 4. Re-introduce NIXL cancel / fail-closed memory-safety checks behind
@@ -223,7 +230,7 @@ V1 work entirely.
 |---|---|---|
 | P0 | Finish Phase 0 stress harness: `load_thread`, marathon YAMLs, canary references, pytest registration, full-duration runs. | Weekly stress suite can run two 2 h marathons and produce canary / log / KV-util evidence. |
 | P0 | Add TP/PP/EP consensus-focused stress configs. | Rank-batch divergence, collective deadlock, and unreclaimed-KV regressions fail loudly. |
-| P1 | Land bounded C++ transfer-status polling. | A stuck future cannot block the engine loop longer than the configured slice; shutdown drain remains explicit. |
+| P1 | Land bounded C++ transfer-status polling in PR #15181. | A stuck future cannot block finite status polls longer than the configured slice; poll timeout leaves request state unchanged; shutdown drain remains explicit. |
 | P1 | Land V1 L2 cancellation outcome consensus. | The same request receives the same CANCELLED / FAILED / COMPLETED / IN_PROGRESS outcome on every rank. |
 | P1 | Route deadline expiry through consensus before state changes. | Timeout detection may be per-rank, but state mutation is never per-rank. |
 | P1 | Reintroduce transport-safe NIXL cancel with request lifetime already protected by PR #14979. | No request UAF, no broken promise, no eager free after cancel. |

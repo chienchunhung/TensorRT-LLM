@@ -100,7 +100,7 @@ pull-request status into one place.
 | Inner transceiver lifetime | `std::future_error: Broken promise`, UAF, worker-side cleanup storms | Inner `dataTransceiver` `Response` / `RequestAndPromise` still held raw pointers and async workers captured by reference | Port inner structures and async worker capture sites to `shared_ptr<LlmRequest>` | Single RAII transfer-session object owns request, promise, cancel token, and buffers | [NVIDIA/TensorRT-LLM 14979](https://github.com/NVIDIA/TensorRT-LLM/pull/14979): open, in flight |
 | Promise lifecycle | Sender-side or receiver-side `Broken promise` instead of attributable request error | Cancel paths erased or destroyed promises without exactly-one fulfillment | Move cancelled sender response out before erase and set a structured exception; set a structured exception before erasing queued receiver requests | Promise fulfillment becomes part of a unified transfer-session terminal transition, including future in-flight cancellation races | [NVIDIA/TensorRT-LLM 14979](https://github.com/NVIDIA/TensorRT-LLM/pull/14979): open, in flight for straightforward sender/receiver cases; broader in-flight-cancel promise races remain follow-up |
 | Eval-order crash | First-request SIGSEGV after moving to `shared_ptr` | Code read `resp.mRequest->mRequestId` and moved `resp` in the same function call; argument evaluation order made the read unsafe | Materialize request id before moving the response object | Code pattern banned or linted for move-sensitive request holders | [NVIDIA/TensorRT-LLM 14979](https://github.com/NVIDIA/TensorRT-LLM/pull/14979): open, in flight |
-| Event-loop freeze | `PyExecutor` hang detector fires; no new scheduling or cancellation processing | Engine loop called unbounded `future.get()` on a not-yet-ready transfer future | Replace unbounded `get()` with bounded/non-blocking `wait_for` polling | Transfer polling never blocks the scheduler; stuck transfers are handled by cancel/quiescence state | Covered in closed [NVIDIA/TensorRT-LLM 13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713); scoped to be recreated |
+| Event-loop freeze | `PyExecutor` hang detector fires; no new scheduling or cancellation processing | Engine loop called unbounded `future.get()` on a not-yet-ready transfer future | Replace unbounded `get()` with bounded/non-blocking `wait_for` polling | Transfer polling never blocks the scheduler; stuck transfers are handled by cancel/quiescence state | [NVIDIA/TensorRT-LLM 15181](https://github.com/NVIDIA/TensorRT-LLM/pull/15181): open draft, stacked on 15139; liveness-only bounded polling, no timeout/cancel/cleanup semantics |
 | Buffer-slot leak | Receiver pool waits forever, especially with default size-1 recv pool | Manual buffer-index acquire/release missed early-return and exception paths | `BufferIndexHolder` RAII releases slots on normal and exception exits | Buffer ownership is part of transfer-session RAII with explicit quarantine states | [NVIDIA/TensorRT-LLM 14768](https://github.com/NVIDIA/TensorRT-LLM/pull/14768): merged |
 | In-flight transport cancellation | Timeout changes Python state but C++ worker remains stuck in transport wait | Python timeout could not interrupt an in-flight NIXL transfer | Add per-request cancel flag and NIXL `releaseXferReq` path before freeing resources | Cancellation is global, rank-consistent, and transport-aware before cleanup runs | Covered in closed [NVIDIA/TensorRT-LLM 13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713); future redesign needed |
 | Unsafe eager free | Permanent post-burst wedge or silent corruption risk after cancellation | KV blocks or transfer buffers can return to the pool while UCX/NIXL may still touch them | Fail closed by poisoning when quiescence is unknown | Temporary poison: reserve slot, poll terminal status, un-poison on success/failure, permanently poison only on deadline | Covered as fail-closed in closed [NVIDIA/TensorRT-LLM 13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713); temporary un-poison is scoped to be created |
@@ -126,12 +126,12 @@ flowchart TB
         B1 --> B2 --> B3 --> B4 --> B5 --> B6
     end
 
-    subgraph Current["Current hardening lane: 14768 merged, 14979 in flight"]
+    subgraph Current["Current hardening lane: 14768 merged, 14979 / 15139 / 15181 in flight"]
         C1["Request enters disagg transfer"]
         C2["Outer lifetime pinned<br/>buffer-index RAII active"]
         C3["Inner dataTransceiver lifetime pinned<br/>(after 14979 lands)"]
-        C4["Trivial UAF, Broken-promise,<br/>and eval-order crash class reduced"]
-        C5["But no complete in-flight cancel,<br/>no temporary un-poison,<br/>and consensus still in progress"]
+        C4["Terminal transfer-state consensus<br/>(15139) plus bounded polling<br/>(15181) under review"]
+        C5["But no deadline-enforced cancel,<br/>no quiescence-gated cleanup,<br/>and no temporary un-poison yet"]
         C1 --> C2 --> C3 --> C4 --> C5
     end
 
@@ -183,11 +183,16 @@ map, but each landing step below should be independently reviewable, testable, a
 3. **Consensus foundation:** finish
    [NVIDIA/TensorRT-LLM 15139](https://github.com/NVIDIA/TensorRT-LLM/pull/15139). Scope: terminal
    request-state consensus only, not full cancellation.
-4. **Safe in-flight cancellation:** add cancellation intent, bounded polling, and transport cancel on top of
-   consensus; do not free resources until the transfer is terminal or quarantined.
-5. **Temporary quarantine:** add `PendingQuiescenceTracker`, deferred un-poison, per-slot lifecycle, deadline
+4. **Bounded polling liveness:** finish
+   [NVIDIA/TensorRT-LLM 15181](https://github.com/NVIDIA/TensorRT-LLM/pull/15181). Scope: finite
+   `checkContextTransferStatus` / `checkGenTransferStatus` calls yield after bounded slices; poll-slice timeout
+   is non-terminal and leaves the request in the same state/queue. It is intentionally stacked on 15139 and does
+   not implement deadline enforcement, request cancellation, deferred cleanup, or buffer poison handling.
+5. **Safe in-flight cancellation:** add cancellation intent, deadline enforcement, and transport cancel on top of
+   consensus plus bounded polling; do not free resources until the transfer is terminal or quarantined.
+6. **Temporary quarantine:** add `PendingQuiescenceTracker`, deferred un-poison, per-slot lifecycle, deadline
    fallback, and multi-slot pool configuration.
-6. **Separate transport work:** track direct-UCX throughput/cancel parity independently from the NIXL wedge
+7. **Separate transport work:** track direct-UCX throughput/cancel parity independently from the NIXL wedge
    recovery path.
 
 Keep two boundaries visible: 14768 + 14979 reduce crash risk but do not solve the permanent wedge; permanent
@@ -201,5 +206,6 @@ fail-closed poison is a safety net, while temporary quarantine and un-poison is 
 | [NVIDIA/TensorRT-LLM 14768](https://github.com/NVIDIA/TensorRT-LLM/pull/14768) | Merged | Outer request lifetime, buffer-index RAII, NIXL agent keep-alive, observe-only timeout warnings. |
 | [NVIDIA/TensorRT-LLM 14979](https://github.com/NVIDIA/TensorRT-LLM/pull/14979) | Open, in flight | Inner `dataTransceiver` lifetime, eval-order crash, straightforward promise fulfillment. |
 | [NVIDIA/TensorRT-LLM 15139](https://github.com/NVIDIA/TensorRT-LLM/pull/15139) | Open draft | V1 terminal request-state consensus. |
+| [NVIDIA/TensorRT-LLM 15181](https://github.com/NVIDIA/TensorRT-LLM/pull/15181) | Open draft | Bounded finite transfer-status polling; poll timeout is non-terminal and does not cancel, fail, or free requests. |
 | [NVIDIA/TensorRT-LLM 15174](https://github.com/NVIDIA/TensorRT-LLM/pull/15174) | Open draft | Stress-test PR chain; QA stress-list registration for disagg cancellation marathon. |
-| Future cancellation/quarantine work | Scoped, to be created | In-flight cancellation, temporary poison, deferred un-poison, multi-slot pools. |
+| Future cancellation/quarantine work | Scoped, to be created | Deadline enforcement, in-flight cancellation, temporary poison, deferred un-poison, multi-slot pools. |
