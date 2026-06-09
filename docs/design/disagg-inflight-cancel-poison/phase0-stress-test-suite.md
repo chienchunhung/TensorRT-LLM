@@ -494,4 +494,4 @@ Python rewrites:
 - [`phase1-architectural-design.md`](phase1-architectural-design.md) - in-flight cancellation workflow and implementation plan gated by this suite.
 - [`docs/investigations/nvbug-6104831-disagg-permanent-wedge/`](../../investigations/nvbug-6104831-disagg-permanent-wedge/) - investigation motivating the suite.
 - [`10-ablation-no-midflight-cancel.md`](../../investigations/nvbug-6104831-disagg-permanent-wedge/10-ablation-no-midflight-cancel.md) - controlled A/B experiments generalized by this suite.
-- [`phase1-consensus-collective-design.md`](phase1-consensus-collective-design.md) - consensus design that will be measured against Phase 0 configs.
+- [`appendix-v1-consensus-collective.md`](appendix-v1-consensus-collective.md) - V1 consensus collective appendix that will be measured against Phase 0 configs.

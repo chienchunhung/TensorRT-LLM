@@ -7,7 +7,7 @@
 | **Owner** | Chien-Chun Hung |
 | **Status as of 2026-06-08** | Design draft. Assumes the `dataTransceiver` `shared_ptr<LlmRequest>` lifetime fix in <https://github.com/NVIDIA/TensorRT-LLM/pull/14979> will merge soon. |
 | **Main dependency** | The in-flight cancel prototype at <https://github.com/NVIDIA/TensorRT-LLM/pull/13713>, which remains the only known implementation that passes the Dynamo field reproducer. |
-| **Related prior art** | Timeout-flag rank consensus in <https://github.com/NVIDIA/TensorRT-LLM/pull/14746>; V1 packed consensus proposal in [`phase1-consensus-collective-design.md`](phase1-consensus-collective-design.md). |
+| **Related prior art** | Timeout-flag rank consensus in <https://github.com/NVIDIA/TensorRT-LLM/pull/14746>; V1 packed consensus proposal in [`appendix-v1-consensus-collective.md`](appendix-v1-consensus-collective.md). |
 
 ## Motivation
 
@@ -101,7 +101,7 @@ Assuming PR #14979 lands, the remaining merge work from PR #13713 is not
 |---|---|---|
 | **Bounded polling** | Prevents `checkContextTransferStatus` / `checkGenTransferStatus` from parking the engine loop on an unready future. Without this, timeout and cancellation code may never run. | Make status checks non-blocking or bounded, with a small cap such as 50 ms per future. Keep shutdown-drain paths as the only intentionally blocking paths. |
 | **Deadline enforcement** | A transfer whose future never becomes ready must still age out. The check must scan every pending transfer, not only transfers that were selected by readiness consensus. | Represent deadline expiry as a local intent first. Use PR #14746-style L1 union so every rank sees the same timed-out IDs before action. |
-| **L2 cancellation outcome consensus** | A consistent timeout flag is not enough if ranks independently decide cancel success, request state, or cleanup timing. | Add a V1 consensus outcome equivalent to V2's `_consensus_outcome`. The preferred encoding is the packed `(rid, state)` allgather in [`phase1-consensus-collective-design.md`](phase1-consensus-collective-design.md). |
+| **L2 cancellation outcome consensus** | A consistent timeout flag is not enough if ranks independently decide cancel success, request state, or cleanup timing. | Add a V1 consensus outcome equivalent to V2's `_consensus_outcome`. The preferred encoding is the packed `(rid, state)` allgather in [`appendix-v1-consensus-collective.md`](appendix-v1-consensus-collective.md). |
 | **Transport-safe cancel** | NIXL `releaseXferReq` / cancel flags can request unwind, but they are not a synchronous proof that the peer has stopped touching advertised memory. | Preserve the PR #13713 fail-closed checks, but route unknown-quiescence slots into quarantine instead of immediately treating the whole process as unrecoverable. |
 | **Quiescence-gated cleanup** | The Dynamo exp4 Trial 2 failure shows that active drain plus eager free still wedges. The raw report also notes rc17 already reaches `_check_kv_transfer_timeout` and terminates timed-out transfers; safe freeing, not detection, is the gap. | Keep Python KV resources, request transfer metadata, and buffer ownership pinned until C++ reports terminal status or the quarantine deadline expires. This requires the `py_executor.py` / `AsyncTransferManager` redesign, not a cacheTransceiver-only patch. |
 | **Bounded quarantine / deferred un-poison** | Pool-wide poison at first cancel is safe but too disruptive. | Add a `PendingQuiescenceTracker` that polls NIXL status for quarantined slots and returns them to the pool when terminal. Only fail closed when the quarantine deadline expires or the pool is exhausted. |
@@ -257,7 +257,7 @@ V1 work entirely.
 ## Cross-References
 
 - [`README.md`](README.md) - overall roadmap and evidence summary.
-- [`phase1-consensus-collective-design.md`](phase1-consensus-collective-design.md) - packed V1 consensus collective proposal.
+- [`appendix-v1-consensus-collective.md`](appendix-v1-consensus-collective.md) - packed V1 consensus collective proposal.
 - [`phase0-stress-test-suite.md`](phase0-stress-test-suite.md) - regression gate for this design.
 - [`../../investigations/nvbug-6104831-disagg-permanent-wedge/19-exp4-f1-f2-f3-decomposition.md`](../../investigations/nvbug-6104831-disagg-permanent-wedge/19-exp4-f1-f2-f3-decomposition.md) - external Dynamo exp4 F1/F2/F3 analysis.
 - [`../../investigations/nvbug-6104831-disagg-permanent-wedge/18-pr-14746-prior-art-and-v1-two-layer-gap.md`](../../investigations/nvbug-6104831-disagg-permanent-wedge/18-pr-14746-prior-art-and-v1-two-layer-gap.md) - PR #14746 prior art and V1 L1/L2 gap.

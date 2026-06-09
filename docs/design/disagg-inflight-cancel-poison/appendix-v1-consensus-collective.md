@@ -1,23 +1,27 @@
-# Phase 1 — V1 disagg cancellation consensus collective design
+# Appendix - V1 Packed Consensus Collective
 
 | | |
 |---|---|
-| **Phase** | 1 (architectural design — precedes implementation) |
+| **Scope** | Appendix to [`phase1-architectural-design.md`](phase1-architectural-design.md) |
 | **JIRA** | [TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721) |
 | **Owner** | Chien-Chun Hung |
-| **Status** | Design proposal for the V1 L2 state-consensus primitive. The end-to-end workflow is in [`phase1-architectural-design.md`](phase1-architectural-design.md). |
-| **Depends on** | (1) <https://github.com/NVIDIA/TensorRT-LLM/pull/14768> already merged (always-on lifetime / RAII / dedup / NIXL keep-alive); (2) the upcoming `dataTransceiver` `shared_ptr<LlmRequest>` follow-up at <https://github.com/NVIDIA/TensorRT-LLM/pull/14979>; (3) the V1 `_consensus_outcome` port from doc 14 (env-gated, currently default OFF) as a structural reference point. |
+| **Status** | Subdesign for the V1 L2 state-consensus primitive; not a separate Phase 1 deliverable. |
+| **Depends on** | Phase 1's cancellation workflow and the L1 / L2 gap analysis in [Doc 18](../../investigations/nvbug-6104831-disagg-permanent-wedge/18-pr-14746-prior-art-and-v1-two-layer-gap.md). |
 
 ## Why this exists
 
-The investigation captured in [`docs/investigations/nvbug-6104831-disagg-permanent-wedge/18-pr-14746-prior-art-and-v1-two-layer-gap.md`](../../investigations/nvbug-6104831-disagg-permanent-wedge/18-pr-14746-prior-art-and-v1-two-layer-gap.md) (especially §3) established that the V1 disagg path has a two-layer cross-rank-consistency problem:
+[`phase1-architectural-design.md`](phase1-architectural-design.md)
+defines the end-to-end cancellation workflow and names the V1 L2
+state-transition gap. This appendix specifies the recommended
+collective encoding for that one piece: how V1 should gather and reduce
+per-rank request outcomes once a lockstep call site has been chosen.
 
-- **L1** — *Which* requests are flagged for action (timed-out, cancellation-eligible, etc.). The timeout-flag implementation at <https://github.com/NVIDIA/TensorRT-LLM/pull/14746> closes this via `dist.allgather → union`. The in-flight cancellation follow-up needs to do the same for the recv-side dedup state (the A3 problem from doc 17).
-- **L2** — *What state transitions* the ranks apply in response. V2 closes this via `KvCacheTransceiverV2._consensus_outcome` (three allgathers — one each for cancelled / failed / completed rids). V1 has no equivalent; this is the gap exercised by `cacheTransceiver.cpp:689-690` where every rank independently does `cancelRequest` + `setState(kDISAGG_TRANS_ERROR)` with no allgather between detection and action.
+It intentionally does **not** restate the full cancellation motivation,
+the timed-out request workflow, the quiescence / quarantine lifecycle,
+or the default-ON migration plan. Those belong to the Phase 1
+architecture doc. This file is only the low-level consensus primitive.
 
-This document specifies the recommended **consensus collective shape** for the V1 follow-up. It does not specify *where* in the V1 code the collective fires (that is a separate implementation-plan concern); it specifies how the collective should be structured to minimize round-trips, reuse existing V1 infrastructure, and stay reviewable.
-
-## The decision
+## Collective Decision
 
 **Use a single allgather of packed `(rid, state)` values for both L1 and L2 consensus, rather than V2's pattern of three separate allgathers per category.**
 

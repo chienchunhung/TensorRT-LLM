@@ -38,8 +38,8 @@ Detailed reading path:
 - [`phase1-architectural-design.md`](phase1-architectural-design.md) -
   motivation, current status, timed-out request workflow, remaining
   action items, and implementation approaches.
-- [`phase1-consensus-collective-design.md`](phase1-consensus-collective-design.md) -
-  packed V1 consensus collective proposal for the L2 state-transition
+- [`appendix-v1-consensus-collective.md`](appendix-v1-consensus-collective.md) -
+  packed V1 consensus collective appendix for the L2 state-transition
   gap.
 - [`phase0-stress-test-suite.md`](phase0-stress-test-suite.md) -
   stress-test gate needed before making cancellation default-ON.
@@ -337,11 +337,11 @@ workflow, the recommended V1 consensus + quarantine implementation
 path, and the action list needed to make cancellation safe enough to
 turn on by default.
 
-The V1 consensus collective shape is split into
-[`phase1-consensus-collective-design.md`](phase1-consensus-collective-design.md)
-because it is a reusable design detail: one packed `(rid, state)`
-allgather, CANCELLED / FAILED as union semantics, COMPLETED as
-intersection semantics.
+The V1 consensus collective mechanics are split into
+[`appendix-v1-consensus-collective.md`](appendix-v1-consensus-collective.md)
+as an appendix because they are a reusable implementation detail: one
+packed `(rid, state)` allgather, CANCELLED / FAILED as union semantics,
+COMPLETED as intersection semantics.
 
 **Why this is "load-bearing".** Every later phase (deferred
 un-poison, multi-slot, NIXL callback, progress-based cancel) makes
@@ -662,10 +662,11 @@ In-flight cancel + poison fix lands default-OFF, gated under TRTLLM_DISAGG_ENABL
   high load, what remains from PR #13713 after PR #14979, timed-out
   request workflow, implementation approaches, action items, and open
   questions.
-- [`phase1-consensus-collective-design.md`](phase1-consensus-collective-design.md) —
-  **DRAFT** — packed V1 `(rid, state)` consensus collective for the
-  L2 state-transition gap. This is the concrete collective shape
-  referenced by the architecture doc.
+- [`appendix-v1-consensus-collective.md`](appendix-v1-consensus-collective.md) —
+  **DRAFT APPENDIX** — packed V1 `(rid, state)` consensus collective
+  for the L2 state-transition gap. This is the concrete collective
+  shape referenced by the architecture doc, not a second Phase 1
+  deliverable.
 - `phase2-deferred-un-poison.md` — to be authored — tracker class
   design, lifetime / threading model, deadline policy, NIXL status
   polling cadence. Honours the consensus contract from Phase 1.
