@@ -2968,7 +2968,9 @@ class MLA(nn.Module):
 
         return weight_param, scale_param
 
-    def post_load_weights(self):
+    def transform_weights(self):
+        if getattr(self, "_weights_transformed", False):
+            return
         has_fp8_block_scales = (
             self.kv_b_proj.quant_config
             and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales())
@@ -2981,3 +2983,7 @@ class MLA(nn.Module):
 
             self.v_b_proj, self.v_b_proj_scale = self.resmooth_parameters(
                 self.v_b_proj, self.v_b_proj_scale, recipe=(1, 128, 128))
+        self._weights_transformed = True
+
+    def post_load_weights(self):
+        self.transform_weights()
