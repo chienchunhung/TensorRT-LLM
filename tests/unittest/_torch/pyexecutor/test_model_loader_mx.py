@@ -256,3 +256,58 @@ def test_reset_weights_transformed_only_resets_existing_flags():
     assert model.child._weights_transformed is False
     assert model.transformed_child._weights_transformed is False
     assert not hasattr(model.removed_child, "_weights_transformed")
+
+
+def test_linear_post_load_weights_uses_idempotent_transform_hook():
+    from tensorrt_llm._torch.modules.linear import Linear
+
+    linear = Linear.__new__(Linear)
+    nn.Module.__init__(linear)
+    quant_method = SimpleNamespace(transform_weights=MagicMock())
+    linear.quant_method = quant_method
+
+    linear.post_load_weights()
+    linear.transform_weights()
+
+    quant_method.transform_weights.assert_called_once_with(linear)
+    assert linear._weights_transformed is True
+
+    linear._weights_transformed = False
+    linear.transform_weights()
+    assert quant_method.transform_weights.call_count == 2
+
+
+def test_attention_post_load_weights_uses_idempotent_transform_hook(monkeypatch):
+    from tensorrt_llm._torch.modules import attention as attention_mod
+    from tensorrt_llm._torch.modules.attention import Attention
+
+    attention = Attention.__new__(Attention)
+    nn.Module.__init__(attention)
+    quant_mode = SimpleNamespace(has_fp8_block_scales=lambda: True)
+    attention.kv_b_proj = SimpleNamespace(quant_config=SimpleNamespace(quant_mode=quant_mode))
+    attention.k_b_proj_trans = "k_weight"
+    attention.k_b_proj_trans_scale = "k_scale"
+    attention.v_b_proj = "v_weight"
+    attention.v_b_proj_scale = "v_scale"
+
+    calls = []
+
+    def fake_resmooth_parameters(self, weight, scale, *, recipe):
+        calls.append((weight, scale, recipe))
+        return f"{weight}_transformed", f"{scale}_transformed"
+
+    monkeypatch.setattr(attention_mod, "get_sm_version", lambda: 120)
+    monkeypatch.setattr(Attention, "resmooth_parameters", fake_resmooth_parameters)
+
+    attention.post_load_weights()
+    attention.transform_weights()
+
+    assert calls == [
+        ("k_weight", "k_scale", (1, 128, 128)),
+        ("v_weight", "v_scale", (1, 128, 128)),
+    ]
+    assert attention.k_b_proj_trans == "k_weight_transformed"
+    assert attention.k_b_proj_trans_scale == "k_scale_transformed"
+    assert attention.v_b_proj == "v_weight_transformed"
+    assert attention.v_b_proj_scale == "v_scale_transformed"
+    assert attention._weights_transformed is True
