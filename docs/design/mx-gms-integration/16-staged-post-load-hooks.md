@@ -38,16 +38,16 @@ This status snapshot was refreshed from the GitHub PR metadata and commit status
 
 | PR | Status | What it provides |
 |:--|:--|:--|
-| [#14770](https://github.com/NVIDIA/TensorRT-LLM/pull/14770) / TRTLLM-13077 | Merged on 2026-06-03 | Adds default staged-hook methods, `ModelLoader` walkers, and `_weights_transformed` lifecycle support. No model behavior migrated. |
-| [#14878](https://github.com/NVIDIA/TensorRT-LLM/pull/14878) / TRTLLM-13141 | Merged on 2026-06-12 | Adds `SourceIdentity`, source compatibility policies, MX pre-transfer gate, and GMS strict pre-materialize gate plumbing. |
+| [PR 14770](https://github.com/NVIDIA/TensorRT-LLM/pull/14770) / TRTLLM-13077 | Merged on 2026-06-03 | Adds default staged-hook methods, `ModelLoader` walkers, and `_weights_transformed` lifecycle support. No model behavior migrated. |
+| [PR 14878](https://github.com/NVIDIA/TensorRT-LLM/pull/14878) / TRTLLM-13141 | Merged on 2026-06-12 | Adds `SourceIdentity`, source compatibility policies, MX pre-transfer gate, and GMS strict pre-materialize gate plumbing. |
 
 ### In-Flight PRs
 
 | Wave | PR | Current state | Scope | Notes |
 |:--|:--|:--|:--|:--|
-| Wave 1 | [#15014](https://github.com/NVIDIA/TensorRT-LLM/pull/15014) / TRTLLM-13246 | Open, non-draft, mergeable, and approved by Funatiq on 2026-06-15. Current head is `6ba212d`; `blossom-ci` is pending in PR_Github #54327. | Moves alias-only model hooks to `setup_aliases()` and cuts GMS RO over to `setup_aliases()` -> SourceIdentity check -> materialize -> `cache_derived_state()`. | Previous full L0 on head `4352612` passed in PR_Github #53930 / L0 #43023 on 2026-06-12. The pending rerun validates final review-fix churn on the new head. |
-| Wave 2 | [#15288](https://github.com/NVIDIA/TensorRT-LLM/pull/15288) / TRTLLM-13246 | Open draft, mergeable, and stacked on #15014. Current head is `bfebf3a`; `blossom-ci` is pending in PR_Github #54338. | Moves Linear and Attention/MLA tensor-layout work into `transform_weights()` with `_weights_transformed` guards. | Older full CI attempts on head `67267df` failed, while targeted B200 coverage in PR_Github #53990 passed on 2026-06-13. The pending run validates the latest stack move. |
-| MX delegation | [#14151](https://github.com/NVIDIA/TensorRT-LLM/pull/14151) | Open, not draft, currently not mergeable. Current head is `088aa36`; no combined commit status is posted for that head. | Delegates low-level ModelExpress checkpoint loading to the `modelexpress` package. | Adds end-to-end ModelExpress + TRT-LLM validation notes for Kimi-K2.5-NVFP4. This affects where MX carries source identity and publish-after-transform metadata, but the staged-hook design is agnostic to that ownership split. |
+| Wave 1 | [PR 15014](https://github.com/NVIDIA/TensorRT-LLM/pull/15014) / TRTLLM-13246 | Open, non-draft, mergeable, and approved by Funatiq on 2026-06-15. Current head is `6ba212d`; `blossom-ci` is pending in PR_Github #54327. | Moves alias-only model hooks to `setup_aliases()` and cuts GMS RO over to `setup_aliases()` -> SourceIdentity check -> materialize -> `cache_derived_state()`. | Previous full L0 on head `4352612` passed in PR_Github #53930 / L0 #43023 on 2026-06-12. The pending rerun validates final review-fix churn on the new head. |
+| Wave 2 | [PR 15288](https://github.com/NVIDIA/TensorRT-LLM/pull/15288) / TRTLLM-13246 | Open draft, mergeable, and stacked on [PR 15014](https://github.com/NVIDIA/TensorRT-LLM/pull/15014). Current head is `bfebf3a`; `blossom-ci` is pending in PR_Github #54338. | Moves Linear and Attention/MLA tensor-layout work into `transform_weights()` with `_weights_transformed` guards. | Older full CI attempts on head `67267df` failed, while targeted B200 coverage in PR_Github #53990 passed on 2026-06-13. The pending run validates the latest stack move. |
+| MX delegation | [PR 14151](https://github.com/NVIDIA/TensorRT-LLM/pull/14151) | Open, not draft, currently not mergeable. Current head is `088aa36`; no combined commit status is posted for that head. | Delegates low-level ModelExpress checkpoint loading to the `modelexpress` package. | Adds end-to-end ModelExpress + TRT-LLM validation notes for Kimi-K2.5-NVFP4. This affects where MX carries source identity and publish-after-transform metadata, but the staged-hook design is agnostic to that ownership split. |
 
 ### What Is Still Not Done
 
@@ -158,7 +158,7 @@ def post_load_weights(self) -> None:
 - `_walk_full_post_load(model)` preserves the existing `post_load_weights()` behavior.
 - `_reset_weights_transformed(...)` clears transform guards only when fresh untransformed bytes are rebound.
 
-Wave 1 currently uses a recursive alias walk, matching the implementation in #15014.
+Wave 1 currently uses a recursive alias walk, matching the implementation in [PR 15014](https://github.com/NVIDIA/TensorRT-LLM/pull/15014).
 
 ## Per-Path Behavior
 
@@ -265,10 +265,10 @@ Migration rule: when a class moves logic into staged hooks, delete its old `post
 
 | Phase | Vehicle | Status | Risk | Runtime behavior change |
 |:--|:--|:--|:--|:--|
-| Prep | #14770 | Merged | Low | None; adds contract surface and walkers |
-| Source identity | #14878 | Merged | Medium | Adds compatibility gates; existing paths remain safe/fallback-oriented |
-| Wave 1 | #15014 | Approved; latest CI pending | Low | Fixes GMS RO ordering and migrates alias-only model hooks |
-| Wave 2 | #15288 | Draft; latest CI pending | High | Migrates Linear and Attention/MLA transforms; no MX transform-skip yet |
+| Prep | [PR 14770](https://github.com/NVIDIA/TensorRT-LLM/pull/14770) | Merged | Low | None; adds contract surface and walkers |
+| Source identity | [PR 14878](https://github.com/NVIDIA/TensorRT-LLM/pull/14878) | Merged | Medium | Adds compatibility gates; existing paths remain safe/fallback-oriented |
+| Wave 1 | [PR 15014](https://github.com/NVIDIA/TensorRT-LLM/pull/15014) | Approved; latest CI pending | Low | Fixes GMS RO ordering and migrates alias-only model hooks |
+| Wave 2 | [PR 15288](https://github.com/NVIDIA/TensorRT-LLM/pull/15288) | Draft; latest CI pending | High | Migrates Linear and Attention/MLA transforms; no MX transform-skip yet |
 | Wave 3 | TBD | Planned | High | Migrates MoE, Mamba, min-latency, and sparse transform paths |
 | Wave 4 | TBD | Planned | Low | Adds MX receiver cutover and empty per-model allow-list; no model enabled yet |
 | Wave 5 | TBD | Planned | Medium | MX publisher emits post-transform bytes and first model enters allow-list |
@@ -333,7 +333,7 @@ Additional models roll out through small allow-list PRs after bit-equivalence va
 
 MX needs to carry enough metadata for the receiver to know whether incoming bytes are raw or post-transform and whether they are layout-compatible.
 
-Open coordination point: #14151 proposes delegating source discovery, identity construction, RDMA transfer, fallback behavior, source publication, and metadata lifecycle to ModelExpress. The staged-hook design works either way:
+Open coordination point: [PR 14151](https://github.com/NVIDIA/TensorRT-LLM/pull/14151) proposes delegating source discovery, identity construction, RDMA transfer, fallback behavior, source publication, and metadata lifecycle to ModelExpress. The staged-hook design works either way:
 
 - If ModelExpress owns the full checkpoint-loading flow, TensorRT-LLM should provide a SourceIdentity provider/checker that ModelExpress calls.
 - If TensorRT-LLM keeps orchestration and ModelExpress stays transport-focused, TensorRT-LLM calls SourceIdentity directly and passes opaque bytes through MX metadata.
@@ -380,14 +380,14 @@ Longer-term, add one MX + GMS integration regression that covers:
 
 ## References
 
-- [#13531](https://github.com/NVIDIA/TensorRT-LLM/pull/13531) / TRTLLM-11851 - MX-only P2P checkpoint loading support, merged. Establishes current publish-pre-transform behavior.
-- [#13926](https://github.com/NVIDIA/TensorRT-LLM/pull/13926) / TRTLLM-12440 - GMS-only weight sharing support, merged. Introduces the GMS RO workaround Wave 1 replaces.
-- [#13045](https://github.com/NVIDIA/TensorRT-LLM/pull/13045) - End-to-end MX + GMS prototype.
-- [#14770](https://github.com/NVIDIA/TensorRT-LLM/pull/14770) / TRTLLM-13077 - Staged-hook prep, merged.
-- [#14878](https://github.com/NVIDIA/TensorRT-LLM/pull/14878) / TRTLLM-13141 - SourceIdentity gate, merged.
-- [#15014](https://github.com/NVIDIA/TensorRT-LLM/pull/15014) / TRTLLM-13246 - Wave 1, approved and waiting on latest CI for head `6ba212d`.
-- [#15288](https://github.com/NVIDIA/TensorRT-LLM/pull/15288) / TRTLLM-13246 - Wave 2, draft and waiting on latest CI for head `bfebf3a`.
-- [#14151](https://github.com/NVIDIA/TensorRT-LLM/pull/14151) - ModelExpress delegation proposal, open and currently not mergeable.
-- [ai-dynamo/dynamo #7053](https://github.com/ai-dynamo/dynamo/pull/7053) - Upstream GMS prototype that surfaced the alias-resolution ordering issue.
+- [PR 13531](https://github.com/NVIDIA/TensorRT-LLM/pull/13531) / TRTLLM-11851 - MX-only P2P checkpoint loading support, merged. Establishes current publish-pre-transform behavior.
+- [PR 13926](https://github.com/NVIDIA/TensorRT-LLM/pull/13926) / TRTLLM-12440 - GMS-only weight sharing support, merged. Introduces the GMS RO workaround Wave 1 replaces.
+- [PR 13045](https://github.com/NVIDIA/TensorRT-LLM/pull/13045) - End-to-end MX + GMS prototype.
+- [PR 14770](https://github.com/NVIDIA/TensorRT-LLM/pull/14770) / TRTLLM-13077 - Staged-hook prep, merged.
+- [PR 14878](https://github.com/NVIDIA/TensorRT-LLM/pull/14878) / TRTLLM-13141 - SourceIdentity gate, merged.
+- [PR 15014](https://github.com/NVIDIA/TensorRT-LLM/pull/15014) / TRTLLM-13246 - Wave 1, approved and waiting on latest CI for head `6ba212d`.
+- [PR 15288](https://github.com/NVIDIA/TensorRT-LLM/pull/15288) / TRTLLM-13246 - Wave 2, draft and waiting on latest CI for head `bfebf3a`.
+- [PR 14151](https://github.com/NVIDIA/TensorRT-LLM/pull/14151) - ModelExpress delegation proposal, open and currently not mergeable.
+- [ai-dynamo/dynamo PR 7053](https://github.com/ai-dynamo/dynamo/pull/7053) - Upstream GMS prototype that surfaced the alias-resolution ordering issue.
 - [05-challenges.md](05-challenges.md#7-module-path-resolution-gms-specific) - Earlier write-up of the GMS module-path resolution problem.
 - [12-risks.md](12-risks.md) - Risk row for module path resolution and aliased layers.
