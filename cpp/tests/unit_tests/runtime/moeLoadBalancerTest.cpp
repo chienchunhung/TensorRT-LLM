@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -290,6 +290,64 @@ INSTANTIATE_TEST_SUITE_P(PlacementTests, MoePlacementTest,
         std::replace(name.begin(), name.end(), ')', '_');
         return name;
     });
+
+TEST(MoeLoadBalancerMaskOnlyTest, ReconfigureMaskOnlyRemovesDeadRankSlots)
+{
+    setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+
+    constexpr int kExpertCount = 4;
+    constexpr int kTopK = 2;
+    constexpr int kEpRank = 0;
+    constexpr int kEpSize = 4;
+    constexpr int kSlotCountPerRank = 2;
+    constexpr int kDeadRank = 2;
+    constexpr int kInvalidSlotId = kEpSize * kSlotCountPerRank;
+
+    MoeLoadBalancer loadBalancer(kEpRank, kEpSize, /*layerUpdatesPerIter=*/0);
+    auto layer = loadBalancer.AddLayer(kExpertCount, kTopK, kSlotCountPerRank);
+
+    // Each expert has at least one surviving replica after rank 2 is masked.
+    std::vector<int> initialAssignments{
+        0, 1, // rank 0
+        0, 2, // rank 1
+        1, 3, // rank 2 (dead)
+        2, 3  // rank 3
+    };
+    layer->setInitialWeightAssignments(initialAssignments);
+    loadBalancer.finalizeModel();
+
+    loadBalancer.reconfigureMaskOnly({kDeadRank});
+
+    auto* placementCpuInfo = layer->getPlacementCpuInfo();
+    for (int localSlotId = 0; localSlotId < kSlotCountPerRank; ++localSlotId)
+    {
+        EXPECT_EQ(placementCpuInfo->oldRankExpertIds[kDeadRank][localSlotId], -1);
+    }
+
+    std::vector<int> expectedReplicaCounts{2, 1, 2, 1};
+    int totalReplicaCount = 0;
+    for (int expertId = 0; expertId < kExpertCount; ++expertId)
+    {
+        EXPECT_EQ(placementCpuInfo->placementInfoForGPU.expertReplicaCount[expertId],
+            expectedReplicaCounts[expertId]);
+        totalReplicaCount += expectedReplicaCounts[expertId];
+    }
+
+    for (int replicaOffset = 0; replicaOffset < totalReplicaCount; ++replicaOffset)
+    {
+        int const globalSlotId = placementCpuInfo->placementInfoForGPU.globalSlotIds[replicaOffset];
+        EXPECT_GE(globalSlotId, 0);
+        EXPECT_LT(globalSlotId, kInvalidSlotId);
+        EXPECT_NE(globalSlotId / kSlotCountPerRank, kDeadRank);
+    }
+    for (int replicaOffset = totalReplicaCount; replicaOffset < kInvalidSlotId; ++replicaOffset)
+    {
+        EXPECT_EQ(placementCpuInfo->placementInfoForGPU.globalSlotIds[replicaOffset], kInvalidSlotId);
+    }
+
+    loadBalancer.shutdown();
+}
 
 // Iteration control parameter structure
 struct IterConfig

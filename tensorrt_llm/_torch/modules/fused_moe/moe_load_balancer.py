@@ -989,6 +989,15 @@ class MoeLoadBalancer:
         if enable_update_weights is not None:
             self.enable_update_weights = enable_update_weights
 
+    def reconfigure_mask_only(self, dead_ranks: List[int]):
+        """
+        Reconfigure EPLB routing so slots on dead EP ranks are unreachable.
+        """
+        if self.in_iter:
+            raise RuntimeError(
+                "Cannot reconfigure EPLB mask while an iteration is active")
+        self.load_balancer_impl.reconfigure_mask_only(list(dead_ranks))
+
     def start_iter(self):
         """
         Start a new iteration.
