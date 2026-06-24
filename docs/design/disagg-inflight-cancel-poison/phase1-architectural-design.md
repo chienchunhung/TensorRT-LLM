@@ -264,6 +264,10 @@ V1 work entirely.
 ## Cross-References
 
 - [`README.md`](README.md) - overall roadmap and evidence summary.
+- [`bounded-polling-admission-accounting.md`](bounded-polling-admission-accounting.md) -
+  Qwen HELIX CI follow-up explaining why bounded transfer polling must
+  account `DISAGG_GENERATION_TRANS_IN_PROGRESS` as admitted capacity
+  without treating it as decode-ready compute work.
 - [`appendix-v1-consensus-collective.md`](appendix-v1-consensus-collective.md) - packed V1 consensus collective proposal.
 - [`phase0-stress-test-suite.md`](phase0-stress-test-suite.md) - regression gate for this design.
 - [`../../investigations/nvbug-6104831-disagg-permanent-wedge/19-exp4-f1-f2-f3-decomposition.md`](../../investigations/nvbug-6104831-disagg-permanent-wedge/19-exp4-f1-f2-f3-decomposition.md) - external Dynamo exp4 F1/F2/F3 analysis.

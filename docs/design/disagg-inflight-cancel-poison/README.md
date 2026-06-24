@@ -662,6 +662,11 @@ In-flight cancel + poison fix lands default-OFF, gated under TRTLLM_DISAGG_ENABL
   high load, what remains from PR #13713 after PR #14979, timed-out
   request workflow, implementation approaches, action items, and open
   questions.
+- [`bounded-polling-admission-accounting.md`](bounded-polling-admission-accounting.md)
+  — addendum from the Qwen HELIX CI investigation. Documents why
+  bounded transfer polling must be paired with explicit admission
+  accounting for `DISAGG_GENERATION_TRANS_IN_PROGRESS`: active transfers
+  should consume admission capacity without becoming decode-ready.
 - [`appendix-v1-consensus-collective.md`](appendix-v1-consensus-collective.md) —
   **DRAFT APPENDIX** — packed V1 `(rid, state)` consensus collective
   for the L2 state-transition gap. This is the concrete collective
