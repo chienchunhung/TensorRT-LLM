@@ -51,6 +51,114 @@ larger than practical KV-transfer backend capacity. If that happens,
 we will still need an explicit transfer-admission window or credit
 limit derived from transfer-buffer/backend capacity.
 
+## Queueing vs Transfer Service Rate
+
+The 300 s timeout experiment is important evidence: with bounded
+polling enabled, the failing Qwen HELIX tests passed when
+`kv_transfer_timeout_ms` was extended from 60 s to 300 s. That points
+away from a hard deadlock. Transfers continued to make progress; the
+60 s failure mode was primarily deadline accounting under burst
+admission.
+
+The precise distinction is:
+
+```text
+time in DISAGG_GENERATION_TRANS_IN_PROGRESS
+  = queueing delay inside the transfer machinery
+  + actual transport service time
+  + completion / consensus observation delay
+```
+
+`DISAGG_GENERATION_TRANS_IN_PROGRESS` means the request has been handed
+to the transfer machinery. It does not guarantee that the request's KV
+bytes are actively moving on the transport at that instant. Admitting a
+large burst can therefore start many timeout clocks for requests that
+are effectively waiting behind the physical transfer service lane.
+
+This means the downside of burst admission does **not** require proving
+that the raw transport service rate degrades when more requests are
+queued. Even if the service rate stayed roughly constant, requests near
+the back of the burst can exceed the request-level transfer deadline
+because their timeout starts before they receive service.
+
+Current defaults make the mismatch visible:
+
+- The C++ transceiver can store many generation receive futures in
+  `mRequesterFutures`; that vector is not the transport concurrency
+  limit.
+- In the C++ data transceiver, request-side concurrency is disabled by
+  default because `TRTLLM_REQUEST_KV_CACHE_CONCURRENT` is unset. The
+  receive path therefore uses one shared request worker / receive
+  resource by default.
+- `TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM` defaults to `1`, so the
+  sender side also defaults to one request-level send worker.
+- Preallocated receive buffers default to one slot unless
+  `TRTLLM_REQUEST_KV_CACHE_CONCURRENT` is enabled. With concurrent mode
+  enabled, `TRTLLM_KVCACHE_RECV_BUFFER_COUNT` defaults to `2`.
+- In the Python/V2 transceiver, `max_concurrent_sessions` is very large
+  (`max_batch_size * 20000`), while `TRTLLM_KV_TRANSFER_NUM_THREADS`
+  defaults to `1`. The NIXL agent has its own internal thread count
+  (`TRTLLM_NIXL_NUM_THREADS`, default `8`), but that is not the same
+  thing as allowing thousands of request-level transfers to receive
+  service concurrently.
+
+So the current shape is:
+
+```text
+requests allowed into transfer-in-progress:
+  many / effectively unbounded at the request-state layer
+
+request-level transfer service resources:
+  small by default, often approximately one lane
+```
+
+That mismatch explains why a bounded-polling design needs explicit
+admission accounting even if the transport itself is healthy.
+
+## Cross-Framework Principle
+
+"Serialize request-level KV transfers by default" is not the general
+principle across LLM inference systems. The broader principle is that
+KV memory and KV movement are schedulable resources. The serving stack
+should bound and account them the same way it bounds decode batch
+slots, KV blocks, and prefill/decode work.
+
+This is aligned with the direction of other LLM serving systems:
+
+- vLLM's PagedAttention work made KV-cache memory management a first-
+  class serving problem.
+- SGLang's runtime uses RadixAttention to make KV reuse central to
+  scheduling efficiency.
+- Mooncake-style disaggregated serving treats KV cache as the center of
+  the serving architecture and uses SLO/load-aware scheduling around it.
+- LMCache-style designs emphasize batched KV movement and compute/I/O
+  pipelining rather than treating transfer as an incidental side effect.
+
+The better long-term shape is therefore not simply "keep transfer
+concurrency at one." It is:
+
+```text
+transfer admission window:
+  bounded and rank-consistent
+
+actual transfer concurrency:
+  configurable / autotuned per backend and topology
+
+timeout accounting:
+  starts when a request is admitted into the transfer window, not while
+  it is merely waiting behind that window
+
+metrics:
+  report queued transfer-admission latency separately from active
+  transport service time
+```
+
+Increasing physical transfer concurrency can be a valid performance
+optimization, but it is a separate tuning track from the correctness
+fix. The risks are GPU transfer-buffer memory growth, dynamic-buffer
+fallback or NIXL failure paths, decode/prefill bandwidth contention,
+worse tail latency, and more complex cancellation / cleanup races.
+
 ## Current Behavior
 
 On the generation side, `CapacityScheduler` first collects

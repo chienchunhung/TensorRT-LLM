@@ -666,7 +666,10 @@ In-flight cancel + poison fix lands default-OFF, gated under TRTLLM_DISAGG_ENABL
   — addendum from the Qwen HELIX CI investigation. Documents why
   bounded transfer polling must be paired with explicit admission
   accounting for `DISAGG_GENERATION_TRANS_IN_PROGRESS`: active transfers
-  should consume admission capacity without becoming decode-ready.
+  should consume admission capacity without becoming decode-ready. Also
+  separates transfer queueing latency from actual transport service
+  rate, and records the follow-up need for a tunable transfer-admission
+  window / transfer-concurrency policy.
 - [`appendix-v1-consensus-collective.md`](appendix-v1-consensus-collective.md) —
   **DRAFT APPENDIX** — packed V1 `(rid, state)` consensus collective
   for the L2 state-transition gap. This is the concrete collective
