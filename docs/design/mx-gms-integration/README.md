@@ -2,7 +2,7 @@
 
 **Status:** Draft (Revised) — [Prototype available](https://github.com/chienchunhung/TensorRT-LLM/tree/dynamo-integration-prototype)
 **Created:** 2026-04-01
-**Last Updated:** 2026-06-09
+**Last Updated:** 2026-06-26
 
 ---
 
@@ -55,6 +55,7 @@ The integration targets three critical production pain points simultaneously: sl
 15. [Prototype Validation Plan](15-prototype-validation-plan.md) — Strategy for validating PR #13045 against the §11 baseline (working plan; results will fold back into §11)
 16. [Staged Post-Load Hooks](16-staged-post-load-hooks.md) — Holistic fix for the conflated `post_load_weights()` semantics surfaced by PR #13926 (GMS RO ordering) and PR #14151 (MX publish-pre vs publish-post-transform). Decomposes into `setup_aliases` / `transform_weights` / `cache_derived_state` stages; tiny prep PR scope + family-PR migration sequence.
 17. [Snapshot Integration Assessment](17-snapshot-assessment.md) — Assesses how Dynamo Snapshot, MX, and GMS fit together for TRT-LLM fast startup, including standalone `trtllm-serve` ownership versus Dynamo orchestration.
+18. [Dynamo GMS Standalone Failover Gap Analysis](18-dynamo-pr11000-gaps.md) — Reviews ai-dynamo/dynamo PR #11000 against the TRT-LLM MX/GMS design and records packaging, launch, executor, KV/cache, and validation gaps.
 
 ---
 
