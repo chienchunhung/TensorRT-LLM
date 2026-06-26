@@ -20,6 +20,12 @@ state cache blocks, placeholder blocks, radix-tree lookup for snapshot
 positions, memory-budget accounting, forced context chunking at snapshot
 boundaries, and tests for hybrid block reuse with MTP.
 
+PR #12896 was motivated by hybrid MTP, where draft and verification work happen
+inside one request. The project scoped here is broader: reuse SSM state for a
+new request whose prompt shares a prefix with earlier requests. The merged
+foundation is still relevant because it puts recurrent-state snapshots into the
+same prefix-indexed cache machinery used by attention KV blocks.
+
 This document scopes the remaining project work as a follow-up to that
 foundation: validate the supported surface, close major integration gaps, add
 production observability, and decide when hybrid SSM block reuse can be enabled
@@ -38,6 +44,13 @@ Shared-prefix workloads are common in production serving:
   repository context.
 - Multi-tenant serving sees repeated chat templates and common instruction
   prefixes across requests.
+
+The agentic benchmark draft that motivates this work has the same shape. It
+models multi-turn trajectories where each turn can carry a large precomputed or
+cached input prefix plus a much smaller fresh input suffix. It also permits
+reuse within a trajectory and system-prompt reuse across trajectories. That
+means the target workload is not only "continue one live request"; it is many
+new requests that repeatedly replay a long prefix.
 
 For attention-only models, KV block reuse avoids recomputing the shared prefix.
 For hybrid SSM/linear-attention models, the same optimization requires matching
@@ -90,6 +103,7 @@ that support pitchable and production-ready:
 - Hybrid models using the unified `CppMambaHybridCacheManager` path.
 - Exact snapshot-boundary reuse first.
 - Aggregate serving first.
+- Inter-request reuse for repeated prompts inside one serving instance.
 - Single model identity, single tokenizer, same quantization and runtime layout.
 - Explicit opt-in validation before changing model defaults.
 
@@ -210,6 +224,11 @@ This is one of the largest remaining gaps. Without these counters, it is hard to
 pitch the feature beyond correctness because we cannot easily quantify SSM
 snapshot hit rate, memory overhead, or saved prefill work.
 
+For the motivating agentic benchmark, the key metric should be cached-prefix
+tokens skipped for hybrid layers. Reporting only KV hit rate is insufficient
+because a hybrid model can hit attention KV blocks while still missing the SSM
+snapshot needed to skip the same prefix.
+
 ## Major Gaps
 
 ### Default Enablement
@@ -251,6 +270,26 @@ The tests added by PR #12896 validate important correctness and MTP surfaces, bu
 the pitch still needs workload evidence for agent loops, branching, RAG, and
 long shared-prefix serving.
 
+The motivating benchmark requires a specific validation mode: multiple requests
+or turns in the same trajectory reuse a previously processed prefix, with only a
+small fresh suffix. This should be measured separately from MTP draft/verify
+reuse so the project can prove it addresses the shared-prefix prompt scenario.
+
+### Session-Aware Routing and Eviction
+
+Agentic workloads often introduce delays between turns. Prefix reuse therefore
+depends on the cache surviving scheduling gaps and on routing follow-up turns to
+an instance that owns the relevant KV and SSM snapshots.
+
+Remaining gaps:
+
+- Confirm session-aware routing can preserve both KV and recurrent-state cache
+  locality.
+- Measure snapshot eviction under realistic inter-turn delays and high
+  concurrency.
+- Decide whether recurrent-state snapshots need a different eviction priority
+  from attention KV blocks.
+
 ## Phased Plan
 
 ### Phase 0: Audit PR #12896 and Document Supported Surface
@@ -270,6 +309,7 @@ long shared-prefix serving.
   prefix matches.
 - Measure latency, throughput, cache hit rate, and memory overhead on
   shared-prefix agentic workloads.
+- Measure inter-request reuse separately from intra-request MTP reuse.
 
 ### Phase 2: Production Hardening
 
