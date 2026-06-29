@@ -14,7 +14,7 @@ The Mode B fix. When a rank dies silently, surviving ranks' AlltoAll kernels spi
 - GB200 / GB300 NVL72 single rack — full rack fabric.
 - Multi-node SLURM/MPI deployments where the inter-node fabric is also NVLink (rare, but it qualifies).
 
-It does **not** apply when the transport falls through to DeepEP / DeepEPLowLatency (selected for cross-IB / cross-non-NVLink-fabric peers — see [§3.5 Transport determines mechanism](03-failure-modes-and-gaps.md#35-transport-determines-mechanism)). That regime is covered separately in [§8.2 Phase 1-IB](08-implementation-plan.md#phase-1-ib--cross-ib-transport-coverage-nixl-ep-track) with a different mechanism (NIXL-EP `disconnect_ranks` + EPLB redistribute, gated on Audit 3). The MVP scope below addresses the NVLink-substrate footprint; Phase 1-IB addresses the cross-IB footprint.
+It does **not** apply when the transport falls through to DeepEP / DeepEPLowLatency (selected for cross-IB / cross-non-NVLink-fabric peers — see [§3.5 Transport determines mechanism](03-failure-modes-and-gaps.md#35-transport-determines-mechanism)). That regime is covered separately in [§8.2 Phase 1-IB](pr-execution/08-implementation-plan.md#phase-1-ib--cross-ib-transport-coverage-nixl-ep-track) with a different mechanism (NIXL-EP `disconnect_ranks` + EPLB redistribute, gated on Audit 3). The MVP scope below addresses the NVLink-substrate footprint; Phase 1-IB addresses the cross-IB footprint.
 
 ### Per-backend approach
 
@@ -268,7 +268,7 @@ The dominant Mode B failure (kernel spinning on dead-peer flag) is what makes th
 
 ### Single-failure consensus is trivial
 
-For MVP single-failure: any surviving rank's report is authoritative. Multi-failure consensus ([§8.2 PR 1c.6](08-implementation-plan.md#82-phase-2-pr-breakdown), v1) implements two-phase suspect → confirm to avoid masking a slow-but-alive rank.
+For MVP single-failure: any surviving rank's report is authoritative. Multi-failure consensus ([§8.2 PR 1c.6](pr-execution/08-implementation-plan.md#82-phase-2-pr-breakdown), v1) implements two-phase suspect → confirm to avoid masking a slow-but-alive rank.
 
 ### Lessons from PR #12718 implementation
 
@@ -427,7 +427,7 @@ For completeness, items deferred from MVP to v1:
 - **NVLinkTwoSided + AllGatherReduceScatter masking** ([§5.1](#per-backend-approach)).
 - **Full `reconfigure` with weight migration** for zero-replica experts ([§5.2 v1](#v1-full-reconfigure-with-weight-migration)).
 - **Multi-failure consensus** with two-phase suspect → confirm protocol.
-- **NCCL FT wiring** in the custom NCCL ops (PR 1a.7 in [§8](08-implementation-plan.md)).
+- **NCCL FT wiring** in the custom NCCL ops (PR 1a.7 in [§8](pr-execution/08-implementation-plan.md)).
 - **Kernel-side `check_timeout` tightening + `trap;` replacement** with a host-visible flag (PR 1a.8).
 
 §8 sizes each as named PRs.

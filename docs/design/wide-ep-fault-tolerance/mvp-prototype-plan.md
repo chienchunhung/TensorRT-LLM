@@ -6,7 +6,7 @@
 
 ## 1. Why this exists
 
-The MVP is shipped as 14 separate PRs across four tracks ([§8.1](08-implementation-plan.md#81-phase-1-pr-breakdown)). Each PR is reviewable in isolation, but the *integration contracts between them* (who calls `EPGroupHealth.mark_failed`, when the kernel re-reads the mask, what triggers `reconfigure_mask_only`, how the survivor-side NCCL collective interacts with the watchdog) only become visible end-to-end. Discovering an interface mismatch at the integration stage — after six PRs have landed — is expensive.
+The MVP is shipped as 14 separate PRs across four tracks ([§8.1](pr-execution/08-implementation-plan.md#81-phase-1-pr-breakdown)). Each PR is reviewable in isolation, but the *integration contracts between them* (who calls `EPGroupHealth.mark_failed`, when the kernel re-reads the mask, what triggers `reconfigure_mask_only`, how the survivor-side NCCL collective interacts with the watchdog) only become visible end-to-end. Discovering an interface mismatch at the integration stage — after six PRs have landed — is expensive.
 
 A **3–5 day throwaway end-to-end prototype** on a 4 or 8-GPU node validates those seams ahead of the production PRs. It does **not** replace the MVP; every prototype component is stubbed to the absolute minimum needed to exercise the seam, and the prototype code is discarded once the production PRs land.
 
@@ -198,7 +198,7 @@ When the prototype is complete and the findings are written up:
 - Each production PR design ingests the prototype findings — interface contract changes go into the PR description before the PR is opened.
 - The per-event timeline JSON gets pulled into PR 1d.4's fault-injection harness as the reference baseline.
 - The prototype's hardware setup (especially IMEX, if configured) is reused for the rest of Audit 1a (Days 4–5: intra-node MNNVL teardown prototype) and for the eventual MVP integration testing.
-- The findings inform what changes (if any) need to be made to the MVP critical-path Gantt chart in [§8.1](08-implementation-plan.md#phase-1-mvp-critical-path).
+- The findings inform what changes (if any) need to be made to the MVP critical-path Gantt chart in [§8.1](pr-execution/08-implementation-plan.md#phase-1-mvp-critical-path).
 
 ## 10. What this does *not* replace
 

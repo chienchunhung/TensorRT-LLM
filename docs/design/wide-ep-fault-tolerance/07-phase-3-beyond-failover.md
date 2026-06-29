@@ -9,7 +9,7 @@ Phase 3 splits into two threads:
 - **Hard-failure precursors** (§7.1, §7.2, §7.4) — detect ranks heading toward Mode A/B and mitigate before failure lands. Reuses Phase 1+2 primitives.
 - **Soft-failure / straggler mitigation** (§7.5, forward-looking) — rank stays alive indefinitely but slow; the goal is to bound tail latency, not to recover from death. This is genuinely new design surface, sketched at radar level here; detailed design is a follow-up.
 
-Phase 3 is the lowest-priority phase, not staffed for MVP, and treated at discussion level; [§8.3](08-implementation-plan.md#83-phase-3-rough-plan) sizes the work at work-track granularity rather than per-PR detail.
+Phase 3 is the lowest-priority phase, not staffed for MVP, and treated at discussion level; [§8.3](pr-execution/08-implementation-plan.md#83-phase-3-rough-plan) sizes the work at work-track granularity rather than per-PR detail.
 
 The capabilities below share one design property: they all reuse primitives built in Phases 1 and 2 (with §7.5 also introducing kernel-level changes that go beyond what 1+2 land). Phase 3 doesn't introduce a new communication layer or new storage medium; it adds policy on top of the mechanisms already in place.
 
@@ -147,7 +147,7 @@ Speculative execution for stragglers has a deep classical-systems literature in 
 
 Two reasons. (1) Detailed design needs to settle the open questions above before sizing — the choice between A, A+D, A+D+C, or A+B+D materially changes the engineering scope from ~5 weeks to ~3+ months. (2) Option B in particular is research-grade: the prior art is in classical batch-job scheduling, translating to AlltoAll combine semantics is novel architecture work, and the path to real numbers needs a real WideEP deployment. Both warrant a focused mini-design doc rather than scope creep into this one.
 
-[§8.3](08-implementation-plan.md#83-phase-3-rough-plan) lists straggler mitigation as a Phase 3.5 follow-on track without per-PR sizing.
+[§8.3](pr-execution/08-implementation-plan.md#83-phase-3-rough-plan) lists straggler mitigation as a Phase 3.5 follow-on track without per-PR sizing.
 
 ### Unified variability framing — connection to §7.1, §7.3, and the research arm
 
@@ -193,4 +193,4 @@ Phase 3 is the smallest incremental investment per capability because it reuses 
 - 7.4 predictive is gated on telemetry infrastructure that probably isn't in scope for this design at all.
 - **7.5 straggler mitigation** — radar-level only here; detailed design is a Phase 3.5 follow-on, with options A and D the natural lightweight first cut. Option B (speculative redundant compute) is research-grade and warrants its own design doc.
 
-[§8.3](08-implementation-plan.md#83-phase-3-rough-plan) sizes this in weeks of work-track effort (not per-PR) because Phase 3 scope will meaningfully refine once Phase 2 is done and production experience is informing what matters most.
+[§8.3](pr-execution/08-implementation-plan.md#83-phase-3-rough-plan) sizes this in weeks of work-track effort (not per-PR) because Phase 3 scope will meaningfully refine once Phase 2 is done and production experience is informing what matters most.

@@ -148,7 +148,7 @@ Restarting `MPI.COMM_WORLD` with a dead participant is not feasible on stock MPI
 
 Phase 2's PG reconstruction invalidates *all* communicators (NCCL + MNNVL + possibly NVSHMEM), which in turn invalidates *every* CUDA graph captured against any of those handles. This is broader than Phase 1's NCCL-only invalidation (where the MoE AlltoAll over MNNVL keeps its graphs via kernel masking). Estimated recapture cost per surviving rank: ~300 ms – 1.5 s across all `cuda_graph_config.batch_sizes` entries — to be empirically anchored by [Audit 1a Day 6](audit-1a-findings.md).
 
-[PR 1a.11](08-implementation-plan.md#1a--rank-masking-in-communication-kernels) (eager-mode fallback + background recapture, Phase 1 v1) **applies unchanged in Phase 2**. After PG reconstruction completes, invalidate the full graph cache atomically; let the PyExecutor's existing eager-fallback dispatch path take over for serving immediately; run warmup-style requests on a background thread to recapture all configured batch sizes in parallel. The user-visible recovery time becomes the rebuild-plus-eager-resume time, not the rebuild-plus-full-recapture time. The eager-fallback mechanism is one of the more leveraged primitives in the design — built once in Phase 1 v1, reused across Phase 2 for free.
+[PR 1a.11](pr-execution/08-implementation-plan.md#1a--rank-masking-in-communication-kernels) (eager-mode fallback + background recapture, Phase 1 v1) **applies unchanged in Phase 2**. After PG reconstruction completes, invalidate the full graph cache atomically; let the PyExecutor's existing eager-fallback dispatch path take over for serving immediately; run warmup-style requests on a background thread to recapture all configured batch sizes in parallel. The user-visible recovery time becomes the rebuild-plus-eager-resume time, not the rebuild-plus-full-recapture time. The eager-fallback mechanism is one of the more leveraged primitives in the design — built once in Phase 1 v1, reused across Phase 2 for free.
 
 ## 6.3 Shadow rank + GMS roles
 
@@ -220,7 +220,7 @@ Phase2.Begin → Phase2.Rebuilding → Phase2.Complete (success)
                                                   → Phase2.Begin (retry, when ready)
 ```
 
-**What this means for the design:** the rebuild critical section must be *interruptible* — a second-failure detection during rebuild must reach the rebuild coordinator. The same FT subcomm carries this signal. Implementation work belongs in the Phase 2 PR breakdown ([§8.2](08-implementation-plan.md#82-phase-2-pr-breakdown)) and is one of the items the audit needs to validate empirically.
+**What this means for the design:** the rebuild critical section must be *interruptible* — a second-failure detection during rebuild must reach the rebuild coordinator. The same FT subcomm carries this signal. Implementation work belongs in the Phase 2 PR breakdown ([§8.2](pr-execution/08-implementation-plan.md#82-phase-2-pr-breakdown)) and is one of the items the audit needs to validate empirically.
 
 **Open question:** can the survivors' processes recover from a half-completed rebuild? If teardown ran on the old comm but init didn't complete on the new one, are the survivors in a recoverable state, or do they need to fall back to Phase 1's existing-comm masking? The audit covers this for MNNVL; NCCL's behavior is documented (yes, recoverable); MPI without ULFM is the worst case.
 
@@ -232,6 +232,6 @@ To summarize what's needed before Phase 2 work can begin:
 2. **MNNVL/NVSHMEM teardown audit** ([§9](09-risks-and-open-questions.md) named risk) — sizes the MNNVL rebuild PR realistically.
 3. **PR 1a.7 (NCCL FT wiring)** merged — Phase 2's NCCL rebuild path depends on it.
 4. **MX-GMS Phase 2 (GMS zero-copy)** — soft dependency for the < 1 s shadow path; not required for minutes-class baseline.
-5. **Orchestrator integration** — for cold-provisioning a replacement (either via Ray actor spawn or via an MPI-side spawn protocol); detail in [§8.2](08-implementation-plan.md#82-phase-2-pr-breakdown).
+5. **Orchestrator integration** — for cold-provisioning a replacement (either via Ray actor spawn or via an MPI-side spawn protocol); detail in [§8.2](pr-execution/08-implementation-plan.md#82-phase-2-pr-breakdown).
 
 Phase 2 work begins after Phase 1 v1 ships and audits complete.

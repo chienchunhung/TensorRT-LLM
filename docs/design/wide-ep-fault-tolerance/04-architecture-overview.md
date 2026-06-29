@@ -95,7 +95,7 @@ stateDiagram-v2
 3. **Elastic scaling (up/down)** (§7.3). Adding capacity to a healthy group (join new rank without a preceding failure) uses the Phase 2 rebuild primitives; removing capacity gracefully uses the Phase 1 masking primitives. Phase 3 glues these into a scaling API.
 4. **Predictive failure detection** (§7.4). Model-based predictions from error-rate trends, thermal patterns, ECC correction counts. Further out than the above — requires historical telemetry infrastructure.
 
-Phase 3 is the lowest-priority phase and is not staffed for MVP. The rough plan in [§8.3](08-implementation-plan.md#83-phase-3-rough-plan) scopes it at work-track level.
+Phase 3 is the lowest-priority phase and is not staffed for MVP. The rough plan in [§8.3](pr-execution/08-implementation-plan.md#83-phase-3-rough-plan) scopes it at work-track level.
 
 ## Phase comparison
 
@@ -175,7 +175,7 @@ Each workstream is separately owned. Dependencies are:
 - Single-GPU failure as MVP; multi-failure consensus in v1.
 
 **Deferred track (in scope but after MVP).**
-- Disaggregated serving FT. Per-pool collective-level FT from the primary track applies unchanged within each pool; the new work is cross-pool coordination at the `trtllm-serve` proxy layer. Tracked as Phase 1-DS in [§8](08-implementation-plan.md); starts after Phase 1 MVP, parallelizable with Phase 1 v1.
+- Disaggregated serving FT. Per-pool collective-level FT from the primary track applies unchanged within each pool; the new work is cross-pool coordination at the `trtllm-serve` proxy layer. Tracked as Phase 1-DS in [§8](pr-execution/08-implementation-plan.md); starts after Phase 1 MVP, parallelizable with Phase 1 v1.
 
 **Out of scope.**
 - DeepEP / DeepEPLowLatency FT — requires public NVSHMEM `mask_buffer_ptr`, which doesn't exist. In scope as a v1 target *if* the upstream API becomes available; indefinitely deferred otherwise.
@@ -185,4 +185,4 @@ Each workstream is separately owned. Dependencies are:
 
 ## How to read the rest of the doc
 
-[§5](05-phase-1-immediate-survival.md) is the densest technical section — it unifies what v1 split across five documents (rank masking, EPLB, detection, MPI signal handlers, end-to-end wiring) because they all land together as Phase 1. [§6](06-phase-2-full-restoration.md) is the restoration work with explicit treatment of what restarts vs what stays alive. [§7](07-phase-3-beyond-failover.md) is discussion-level for prevention/scaling. [§8](08-implementation-plan.md) breaks everything into named PRs with sizes and dependencies. [§9](09-risks-and-open-questions.md) names the two audits that gate later work and tabulates every risk.
+[§5](05-phase-1-immediate-survival.md) is the densest technical section — it unifies what v1 split across five documents (rank masking, EPLB, detection, MPI signal handlers, end-to-end wiring) because they all land together as Phase 1. [§6](06-phase-2-full-restoration.md) is the restoration work with explicit treatment of what restarts vs what stays alive. [§7](07-phase-3-beyond-failover.md) is discussion-level for prevention/scaling. [§8](pr-execution/08-implementation-plan.md) breaks everything into named PRs with sizes and dependencies. [§9](09-risks-and-open-questions.md) names the two audits that gate later work and tabulates every risk.

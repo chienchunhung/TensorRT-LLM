@@ -59,7 +59,7 @@ Two audits are called out as named risks because they gate downstream work and t
 
 #### Combined deliverable
 
-After both 1a and 1b land: empirical answer to "MNNVL rebuild on the NVL72 fabric is a 100 ms operation / 1 s operation / not feasible on this version." Sizes [§8.2 PR 2a.2](08-implementation-plan.md#2a--process-group-reconstruction) definitively.
+After both 1a and 1b land: empirical answer to "MNNVL rebuild on the NVL72 fabric is a 100 ms operation / 1 s operation / not feasible on this version." Sizes [§8.2 PR 2a.2](pr-execution/08-implementation-plan.md#2a--process-group-reconstruction) definitively.
 
 **Mitigation if worse than expected.** If MNNVL rebuild is > 1 s in the best case, Phase 2's sub-second claim softens to "multi-second." Shadow+GMS still provides most of the win (weight load time dominated, ~100 ms), but the overall Phase 2 target moves.
 
@@ -143,7 +143,7 @@ The kernel mask change touches performance-critical CUDA synchronization. Potent
 
 The NIXL team has built NIXL-EP and vLLM already uses it as an FT-enabled backend (PR #38534). For TRT-LLM, the open question is whether NIXL-EP fits cleanly into `CommunicationFactory` and whether its FT primitives (`activeRanks`-style masking + abort) are mature enough to integrate as a v1 backend. Two failure modes: (a) **integration is harder than estimated** — version skew, API mismatch, or perf regression vs NVLinkOneSided pushes the two new PRs (1a.9, 1a.10) past v1's window; (b) **deferring too long lets vLLM's NIXL-EP stack become the de-facto standard before we ship** — a coverage gap that's harder to close later.
 
-**Mitigation:** Audit 3 ([§9.1](#audit-3--nixl-ep-evaluation-as-data-plane-backend)) is a bounded 2-week parallel evaluation that produces a go/no-go for v1. If go, the two integration PRs slot into Phase 1 v1 alongside 1a.5–1a.6. If no-go, no schedule impact — MVP and v1 ship unchanged. Either way, NIXL-EP doesn't gate MVP.
+**Mitigation:** Audit 3 ([§9.1](#audit-3--nixl-ep-evaluation-as-cross-ib-data-plane-backend)) is a bounded 2-week parallel evaluation that produces a go/no-go for v1. If go, the two integration PRs slot into Phase 1 v1 alongside 1a.5–1a.6. If no-go, no schedule impact — MVP and v1 ship unchanged. Either way, NIXL-EP doesn't gate MVP.
 
 ### Risk — DeepEP backend limitations (applies to cross-IB transport deployments only)
 
@@ -151,9 +151,9 @@ The NIXL team has built NIXL-EP and vLLM already uses it as an FT-enabled backen
 
 DeepEP only supports specific EP sizes ({2,4,8} intra-node, {16,32,...,128} inter-node); post-failure EP=71 isn't supported. The `mask_buffer_ptr` parameter referenced in vLLM's RFC #27774 is not in DeepEP's public API. `Buffer.__del__` → `intranode::barrier` deadlock is a known issue (acknowledged at `deep_ep.py:86`).
 
-**Not a blocker for MVP.** The MVP closes the FT gap for the entire NVLink-substrate footprint (single-node NVL boxes through NVL72 rack — wherever `MnnvlMemory.supports_mnnvl()` returns True) via PR 1a.2 kernel mask, plus the NCCL fallback via PR 1a.7. The DeepEP-family transport is only selected when MNNVL is *not* available — cross-IB / cross-fabric peers. Feature flag ([PR 1d.1](08-implementation-plan.md)) warns if DeepEP is the selected backend when FT is enabled.
+**Not a blocker for MVP.** The MVP closes the FT gap for the entire NVLink-substrate footprint (single-node NVL boxes through NVL72 rack — wherever `MnnvlMemory.supports_mnnvl()` returns True) via PR 1a.2 kernel mask, plus the NCCL fallback via PR 1a.7. The DeepEP-family transport is only selected when MNNVL is *not* available — cross-IB / cross-fabric peers. Feature flag ([PR 1d.1](pr-execution/08-implementation-plan.md)) warns if DeepEP is the selected backend when FT is enabled.
 
-**Applies to [Phase 1-IB](08-implementation-plan.md#phase-1-ib--cross-ib-transport-coverage-nixl-ep-track) deployments** (multi-node B200+IB, multi-rack non-NVLink-fabric, anything where `CommunicationFactory` falls through to DeepEP-family). Two mitigation paths:
+**Applies to [Phase 1-IB](pr-execution/08-implementation-plan.md#phase-1-ib--cross-ib-transport-coverage-nixl-ep-track) deployments** (multi-node B200+IB, multi-rack non-NVLink-fabric, anything where `CommunicationFactory` falls through to DeepEP-family). Two mitigation paths:
 
 - **IB.1 (interim).** Host-side static kernel timeout (vLLM PR #38534's 100s "FT-enabled backend" pattern). Softer than `trap;`; doesn't require NVSHMEM-side changes; doesn't bound recovery latency tightly.
 - **IB.2 (preferred if Audit 3 positive).** Substitute NIXL-EP for DeepEP. NIXL-EP exposes `connect_ranks` / `disconnect_ranks` for incremental topology mutation; gets a tighter recovery bound (~3s per vLLM Elastic EP claims).
@@ -307,7 +307,7 @@ With `tp=32, pp=2, ep=16`, each PP stage has its own EP group. A failure in one 
 
 ### Q7 — WideEP FT × disaggregated serving
 
-In scope as Phase 1-DS ([§8.2](08-implementation-plan.md#phase-1-ds--disaggregated-serving-ft)). Per-pool FT from the primary track applies unchanged within each pool; Phase 1-DS adds cross-pool coordination. Ray + disagg + NIXL is a hard gap (see above); Phase 1-DS on MPI first, Ray follows if the gap closes.
+In scope as Phase 1-DS ([§8.2](pr-execution/08-implementation-plan.md#phase-1-ds--disaggregated-serving-ft)). Per-pool FT from the primary track applies unchanged within each pool; Phase 1-DS adds cross-pool coordination. Ray + disagg + NIXL is a hard gap (see above); Phase 1-DS on MPI first, Ray follows if the gap closes.
 
 ### Q8 — When to revisit the Ray pivot
 
@@ -384,7 +384,7 @@ Phase 2 (PG reconstruction over MNNVL) and [§7.5](07-phase-3-beyond-failover.md
 
 - **CUDA driver team** — fabric handle teardown semantics under peer death. [Audit 1a Day 3](audit-1a-findings.md) (posix-FD variant) showed `cuMemUnmap` of a dead-peer region completes in ~0.25 ms with no fault. Need explicit confirmation that the fabric-handle path matches and that future driver versions preserve the behavior. Engage when [Audit 1b](#audit-1--mnnvl--nvshmem-teardown-capability) is being planned.
 - **NVSwitch fabric manager team** — what does the fabric manager do when an MNNVL domain member disappears? Does it interfere with rank-masked AlltoAll, or with our rebuild flow? Audit 1b is partly about answering this empirically; their team's expectations should be cross-checked beforehand. Engage early.
-- **IMEX team** — does IMEX support re-exchanging memory grants among surviving members without daemon restart? Engage when planning [PR 2a.2](08-implementation-plan.md#2a--process-group-reconstruction) (MNNVL teardown + reallocate).
+- **IMEX team** — does IMEX support re-exchanging memory grants among surviving members without daemon restart? Engage when planning [PR 2a.2](pr-execution/08-implementation-plan.md#2a--process-group-reconstruction) (MNNVL teardown + reallocate).
 
 **§7.5 (Forward-looking straggler / resize work).** Same MNNVL stack as Phase 2, plus dynamic-resize requirements (adding a rank to a live fabric domain). Higher bar than Phase 2's "rebuild after death."
 

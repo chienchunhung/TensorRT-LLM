@@ -1,6 +1,6 @@
 # WideEP Fault Tolerance for TensorRT-LLM
 
-**Status:** Draft v2 (full rewrite) | **Last updated:** 2026-04-23
+**Status:** Draft v2 (full rewrite) | **Last updated:** 2026-06-29
 
 ## Quick read
 
@@ -23,28 +23,45 @@ See [§0 Executive Summary](00-executive-summary.md) for the full headline pictu
 | **5** | [Phase 1: Immediate Survival](05-phase-1-immediate-survival.md) | Rank masking + EPLB + detection + MPI-path FT-enabling + end-to-end flow. |
 | **6** | [Phase 2: Full Restoration](06-phase-2-full-restoration.md) | What restarts vs stays alive; per-backend PG reconstruction; shadow + GMS; second-failure handling. |
 | **7** | [Phase 3: Beyond Failover](07-phase-3-beyond-failover.md) | Latency anomaly detection, preemptive migration, elastic scaling, predictive detection. |
-| **8** | [Implementation Plan](08-implementation-plan.md) | Per-PR breakdown for Phase 1 + Phase 2, Phase 3 rough plan, timelines. |
+| **8** | [Implementation Plan](pr-execution/08-implementation-plan.md) | Per-PR breakdown for Phase 1 + Phase 2, Phase 3 rough plan, timelines. |
 | **9** | [Risks and Open Questions](09-risks-and-open-questions.md) | Named audits, 14 technical risks with residual ratings, 8 open design questions. |
+
+## PR execution workspace
+
+All implementation planning and dependency tracking is consolidated in the [PR execution workspace](pr-execution/README.md).
+
+| Artifact | Document | Scope |
+|:---|:---|:---|
+| **MVP (v0)** | [MVP PR dependency graph](pr-execution/mvp-dependency-graph.md) | Live upstream PR status, merged prerequisites, Phase 1 MVP merge order, and the paused prototype sidecar. |
+| **V1** | [V1 PR dependency graph](pr-execution/v1-dependency-graph.md) | Phase 1 v1 plus the parallel Phase 1-DS and conditional Phase 1-IB tracks. |
+| **V2** | [V2 PR dependency graph](pr-execution/v2-dependency-graph.md) | Maps V2 to Phase 2 Restoration because the roadmap has no separately named V2 product milestone. |
+
+The [JIRA work-item ledger](pr-execution/jira-work-item-ledger.md) maps all 22 supplied tickets to graph nodes, milestones, workflow states, assignees, and delivery PRs.
 
 ## Related workstreams
 
 | Workstream | Status | Relationship to this design |
 |:---|:---|:---|
-| [PR #12718: Fatal Error Detection](https://github.com/NVIDIA/TensorRT-LLM/pull/12718) | In review (squashed; bench-shutdown regression fixed) | Foundation — provides `classify_error()` + `ErrorBudget` + `pre_shutdown()` non-blocking pattern that §5.3 extends per-rank. See [§5.3 *Lessons from PR #12718 implementation*](05-phase-1-immediate-survival.md#lessons-from-pr-12718-implementation) for design takeaways. |
+| [PR #12718: Fatal Error Detection](https://github.com/NVIDIA/TensorRT-LLM/pull/12718) | Merged 2026-04-27 | Foundation — provides `classify_error()` + `ErrorBudget` + `pre_shutdown()` non-blocking pattern that §5.3 extends per-rank. See [§5.3 *Lessons from PR #12718 implementation*](05-phase-1-immediate-survival.md#lessons-from-pr-12718-implementation) for design takeaways. |
 | MX + GMS + TRT-LLM Integration | Design complete | Acceleration — GMS zero-copy import cuts Phase 2 recovery from minutes to ~100ms; enables shadow EP ranks (§6.3) |
 
-## In-flight PRs against this design
+## Tracked MVP PRs
 
-| PR | Title | Status | Section |
-|:---|:---|:---|:---|
-| [#13302](https://github.com/NVIDIA/TensorRT-LLM/pull/13302) | WideEP FT: add EPGroupHealth thread-safe rank mask | In review | §5.3, PR 1a.1 |
-| [#13404](https://github.com/NVIDIA/TensorRT-LLM/pull/13404) | WideEP FT: NVLinkOneSided kernel mask | Open | §5.1, PR 1a.2 |
-| [#14160](https://github.com/NVIDIA/TensorRT-LLM/pull/14160) | WideEP FT: add MPI signal handler replacement (1d.0) | Open | §5.4, PR 1d.0 |
-| [#14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198) | WideEP FT: scaffold MVP end-to-end prototype | Draft (DO NOT SUBMIT — preview only) | [mvp-prototype-plan.md](mvp-prototype-plan.md) |
+Status snapshot: 2026-06-29 12:58 PDT. The [MVP dependency graph](pr-execution/mvp-dependency-graph.md) records PR status, blocked/unblocked edges, the dependency-ready action frontier, and full dependency context.
+
+| Plan ID | PR | JIRA work item(s) | Title | PR status | Section |
+|:---|:---|:---|:---|:---|:---|
+| 1a.1 | [#13302](https://github.com/NVIDIA/TensorRT-LLM/pull/13302) | [TRTLLM-12199](https://jirasw.nvidia.com/browse/TRTLLM-12199) | WideEP FT: add EPGroupHealth thread-safe rank mask | Merged 2026-06-17 PDT | §5.3 |
+| 1d.0 | [#14160](https://github.com/NVIDIA/TensorRT-LLM/pull/14160) | [TRTLLM-13550](https://jirasw.nvidia.com/browse/TRTLLM-13550) | WideEP FT: add MPI signal handler replacement | Merged 2026-06-22 PDT | §5.4 |
+| 1a.2 | [#13404](https://github.com/NVIDIA/TensorRT-LLM/pull/13404) | [TRTLLM-12200](https://jirasw.nvidia.com/browse/TRTLLM-12200) | WideEP FT: NVLinkOneSided kernel mask | Approved; `blossom-ci` pending | §5.1 |
+| 1a.3 + 1a.4 | [#15524](https://github.com/NVIDIA/TensorRT-LLM/pull/15524) | [TRTLLM-12556](https://jirasw.nvidia.com/browse/TRTLLM-12556), [TRTLLM-12557](https://jirasw.nvidia.com/browse/TRTLLM-12557) | WideEP FT: add Python rank-mask wiring and AlltoAll watchdog | Review required; `blossom-ci` pending | §5.1 |
+| 1b.1 + 1b.2 | [#15525](https://github.com/NVIDIA/TensorRT-LLM/pull/15525) | [TRTLLM-13543](https://jirasw.nvidia.com/browse/TRTLLM-13543), [TRTLLM-13544](https://jirasw.nvidia.com/browse/TRTLLM-13544) | WideEP FT: add EPLB mask-only reconfigure | Review required; CI green | §5.2 |
+| 1c.1 | [#15677](https://github.com/NVIDIA/TensorRT-LLM/pull/15677) | [TRTLLM-13546](https://jirasw.nvidia.com/browse/TRTLLM-13546) | Add WideEP FT error-classification patterns | Review required; `blossom-ci` failing | §5.3 |
+| MVP prototype | [#14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198) | [TRTLLM-12728](https://jirasw.nvidia.com/browse/TRTLLM-12728) | WideEP FT: scaffold MVP end-to-end prototype | Draft, paused, `DO NOT SUBMIT` | [Prototype plan](mvp-prototype-plan.md) |
 
 ## MVP de-risking — end-to-end prototype
 
-Before all 14 MVP PRs land, a **3–5 day end-to-end prototype** on a 4 or 8-GPU node validates the integration seams between tracks (kernel mask ↔ EPLB ↔ watchdog ↔ broadcast ↔ engine hook) ahead of the production PRs. See [MVP prototype plan](mvp-prototype-plan.md) for the full plan, including hardware options (HGX/DGX B200/B300/H100 vs. GB200/GB300 NVL72 tray), IMEX setup steps for GB200/GB300, the kill-and-survive test recipe, and exit criteria. Findings as the prototype runs are collected in [MVP prototype findings](mvp-prototype-findings.md), each routed to the specific production PR that should incorporate the fix. The prototype reuses PR #13302 (`EPGroupHealth`) and PR #14160 (1d.0 signal-handler replacement) as-is; everything else is stubbed. Scaffolding is shipped as preview-only draft **[PR #14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198)** (`prototypes/wide_ep_ft_mvp/`); the directory is discarded once the production PRs land.
+Before the full MVP PR set lands, a **3–5 day end-to-end prototype** on a 4 or 8-GPU node validates the integration seams between tracks (kernel mask ↔ EPLB ↔ watchdog ↔ broadcast ↔ engine hook) ahead of the production PRs. See [MVP prototype plan](mvp-prototype-plan.md) for the full plan, including hardware options (HGX/DGX B200/B300/H100 vs. GB200/GB300 NVL72 tray), IMEX setup steps for GB200/GB300, the kill-and-survive test recipe, and exit criteria. Findings as the prototype runs are collected in [MVP prototype findings](mvp-prototype-findings.md), each routed to the specific production PR that should incorporate the fix. The prototype reuses PR #13302 (`EPGroupHealth`) and PR #14160 (1d.0 signal-handler replacement) as-is; everything else is stubbed. Scaffolding is shipped as preview-only draft **[PR #14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198)** (`prototypes/wide_ep_ft_mvp/`); the directory is discarded once the production PRs land.
 
 ## Forward-looking research exploration
 
