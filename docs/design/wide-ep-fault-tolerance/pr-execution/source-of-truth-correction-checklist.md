@@ -4,7 +4,7 @@
 
 **Correction started:** 2026-06-30 PDT
 
-**Progress snapshot:** 2026-06-30 14:23 PDT. Independent final audits of the in-repo contract, Google Doc, and MVP/V1/V2 dependency proof pass. Corrected heads `d19aadea` (#15524), `ee9aa0a4` (#15785), and `94274a3f` (#15788) are published with green DCO/pre-commit, and `blossom-ci` is pending. Unchecked canonical MVP items below are genuine implementation, review/CI, or physical-hardware gates, not hidden documentation debt.
+**Progress snapshot:** 2026-06-30 14:23 PDT. Independent final audits of the in-repo contract, Google Doc, and MVP/V1/V2 dependency proof pass; correction commit `36bb8d58` is published on `docs-and-plans`. Corrected heads `d19aadea` (#15524), `ee9aa0a4` (#15785), and `94274a3f` (#15788) are published with green DCO/pre-commit, and `blossom-ci` is pending. Unchecked canonical MVP items below are genuine implementation, review/CI, or physical-hardware gates, not hidden documentation debt.
 
 **Scope:** in-repo design and execution documents, the canonical Google Doc, all affected in-flight PRs, and the no-mock end-to-end MVP prototype branch.
 
@@ -102,7 +102,7 @@ The final composition check merged the published #15524 and #15788 heads with `g
 
 ## Publication and closure
 
-- [ ] **C80 — In-repo docs published:** commit with DCO and push the corrected `docs-and-plans` branch.
+- [x] **C80 — In-repo docs published:** commit with DCO and push the corrected `docs-and-plans` branch.
 - [x] **C81 — Google Doc published:** connector readback proves the corrected content is present in the intended document.
 - [x] **C82 — PR branches published:** push every necessary code/history correction and update the upstream PR descriptions.
 - [x] **C83 — CI requested:** trigger the appropriate TensorRT-LLM CI after branch changes and record blockers without mislabeling PR review state.
