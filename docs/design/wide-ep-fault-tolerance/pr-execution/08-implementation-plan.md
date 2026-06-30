@@ -146,7 +146,7 @@ The exact action frontier, edge state, and live PR qualifiers are maintained in 
 
 ### No-mock end-to-end prototype
 
-The integration branch `WideEP-FT/e2e-mvp-prototype` starts from current upstream `main` (which contains merged #13404 and #15525) and stacks the published heads of #15524, #15677, #15785, #15789, and #15788. It is a reference implementation and hardware test vehicle, not a merge unit. Corrections land in their owning PRs first and are then restacked into this branch.
+[TRTLLM-12728](https://jirasw.nvidia.com/browse/TRTLLM-12728) is tracked by draft [PR #15801](https://github.com/NVIDIA/TensorRT-LLM/pull/15801), branch `WideEP-FT/e2e-mvp-prototype`. The branch starts from upstream `main` (which contains merged #13404 and #15525) and stacks the published heads of #15524, #15677, #15785, #15789, and #15788. Published head `5a76856e` contains 14 DCO-signed integration commits and was merge-tree-clean against `upstream/main` at PR creation. It is a reference implementation and hardware test vehicle, not a substitute production merge unit. Corrections land in their owning PRs first and are then restacked into this branch.
 
 Unlike historical draft [#14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198), the new prototype must use real worker processes, real communication and load-balancing components, a realistic model/workload, and physical GPU fault injection. Its first runnable policy may force eager mode. Missing 1a.8, 1b.2a, 1c.3a, 1c.4a–1c.4c, and 1d.0a are implemented as production-shaped slices that guide their owning PRs, not replaced by mocks. See the [prototype plan](../mvp-prototype-plan.md).
 

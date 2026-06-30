@@ -48,7 +48,7 @@ The [JIRA work-item ledger](pr-execution/jira-work-item-ledger.md) preserves all
 
 ## Tracked MVP PRs
 
-Status snapshot: 2026-06-30 14:23 PDT. The [MVP dependency graph](pr-execution/mvp-dependency-graph.md) is authoritative for live PR status, blocked/unblocked edges, the dependency-ready action frontier, and corrected scope. This table is a delivery map, not a substitute for the graph.
+Status snapshot: 2026-06-30 14:38 PDT. The [MVP dependency graph](pr-execution/mvp-dependency-graph.md) is authoritative for live PR status, blocked/unblocked edges, the dependency-ready action frontier, and corrected scope. This table is a delivery map, not a substitute for the graph.
 
 | Plan ID | PR | JIRA work item(s) | Title | PR status | Section |
 |:---|:---|:---|:---|:---|:---|
@@ -61,11 +61,12 @@ Status snapshot: 2026-06-30 14:23 PDT. The [MVP dependency graph](pr-execution/m
 | 1a.7 | [#15789](https://github.com/NVIDIA/TensorRT-LLM/pull/15789) | [TRTLLM-12560](https://jirasw.nvidia.com/browse/TRTLLM-12560) | Add NCCL fault-tolerance wrapper for WideEP | Draft; `blossom-ci` pending | §5.1 |
 | 1c.3 | [#15785](https://github.com/NVIDIA/TensorRT-LLM/pull/15785) | [TRTLLM-13548](https://jirasw.nvidia.com/browse/TRTLLM-13548) | Add MPI FT subcommunicator and broadcast thread | Draft; corrected head `ee9aa0a4`; DCO/pre-commit green; `blossom-ci` pending | §5.3 |
 | 1d.3 | [#15788](https://github.com/NVIDIA/TensorRT-LLM/pull/15788) | [TRTLLM-13553](https://jirasw.nvidia.com/browse/TRTLLM-13553) | Add WideEP rank-health telemetry | Draft; corrected head `94274a3f`; DCO/pre-commit green; `blossom-ci` pending | §5.5 |
-| Historical scaffold | [#14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198) | [TRTLLM-12728](https://jirasw.nvidia.com/browse/TRTLLM-12728) | Stub-heavy seam-finding prototype; not MVP proof | Draft, paused, `DO NOT SUBMIT` | [Prototype findings](mvp-prototype-findings.md) |
+| MVP integration prototype | [#15801](https://github.com/NVIDIA/TensorRT-LLM/pull/15801) | [TRTLLM-12728](https://jirasw.nvidia.com/browse/TRTLLM-12728) | Production-component E2E MVP integration vehicle | Draft; head `5a76856e`; mergeable; all initial checks green (base freshness skipped for draft) | [Prototype plan](mvp-prototype-plan.md) |
+| Historical scaffold | [#14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198) | [TRTLLM-12728](https://jirasw.nvidia.com/browse/TRTLLM-12728), historical predecessor; current vehicle #15801 | Stub-heavy seam-finding prototype; not MVP proof | Draft, paused, `DO NOT SUBMIT` | [Prototype findings](mvp-prototype-findings.md) |
 
 ## MVP de-risking — end-to-end prototype
 
-The new MVP prototype is a **production-component vertical slice**, stacked from current `main` plus the actual in-flight PR heads. It must run a real MoE model/workload on physical GPUs, kill a real non-rank-0 worker, discard every output from the failed epoch, and prove that later requests complete correctly through the same recovery transaction production will use. Unit mocks remain useful, but cannot satisfy the MVP exit gate. See [MVP prototype plan](mvp-prototype-plan.md).
+Draft [PR #15801](https://github.com/NVIDIA/TensorRT-LLM/pull/15801) is the new **production-component vertical-slice** integration vehicle, stacked from `main` plus the actual in-flight PR heads. It must run a real MoE model/workload on physical GPUs, kill a real non-rank-0 worker, discard every output from the failed epoch, and prove that later requests complete correctly through the same recovery transaction production will use. Unit mocks remain useful, but cannot satisfy the MVP exit gate. See [MVP prototype plan](mvp-prototype-plan.md).
 
 [PR #14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198) is retained only as historical seam-finding evidence. Its stub-heavy runs found useful issues—especially poisoned `MPI_Finalize`—but did not prove an end-to-end working recovery path. Intra-node physical validation is item 1d.4; 1d.4a adds production FABRIC/IMEX process-death and approved inaccessible-peer-memory/device-loss acceptance at rack scale.
 

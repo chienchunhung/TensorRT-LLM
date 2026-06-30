@@ -2,7 +2,7 @@
 
 [< Back to WideEP Fault Tolerance](../README.md) · [Implementation plan](08-implementation-plan.md) · [Correction checklist](source-of-truth-correction-checklist.md)
 
-**Status snapshot:** 2026-06-30 14:23 PDT
+**Status snapshot:** 2026-06-30 14:38 PDT
 
 **Scope:** corrected Phase 1 MVP merge units and acceptance gates.
 
@@ -135,7 +135,7 @@ flowchart TB
     MVP_EXIT["MVP EXIT<br/>correct survivor serving on hardware"]
 
     OLD_PROTO["Historical prototype · #14198<br/>CONTEXT"]
-    NEW_PROTO["No-mock integration prototype<br/>CONTEXT"]
+    NEW_PROTO["No-mock integration prototype · #15801<br/>DRAFT CONTEXT"]
     NVL72_RESOURCE["NVL72 rack resource<br/>CONTEXT"]
     APPROVED_FAULT_METHOD["Approved destructive-fault method<br/>EXTERNAL ACCEPTANCE GATE"]
 
@@ -484,7 +484,7 @@ flowchart TB
     C1_3["★ 1c.3 · #15785<br/>DRAFT"]
     D1_3["★ 1d.3 · #15788<br/>DRAFT"]
     OLD_PROTO["Historical prototype · #14198<br/>CONTEXT"]
-    NEW_PROTO["No-mock integration prototype<br/>CONTEXT"]
+    NEW_PROTO["No-mock integration prototype · #15801<br/>DRAFT CONTEXT"]
     NVL72_RESOURCE["NVL72 rack resource<br/>CONTEXT"]
     APPROVED_FAULT_METHOD["Approved destructive-fault method<br/>EXTERNAL ACCEPTANCE GATE"]
     C1_4B["1c.4b · atomic coordinator<br/>PLANNED"]
@@ -554,6 +554,7 @@ An action can be dependency-ready while still blocked by code correctness, revie
 | 1c.3 | [#15785](https://github.com/NVIDIA/TensorRT-LLM/pull/15785) | Draft; corrected head `ee9aa0a4`; DCO/pre-commit green; `blossom-ci` pending | Distinct monotonic detected-state evidence/broadcast; committed membership and normal survivor collectives remain separate. |
 | 1a.7 | [#15789](https://github.com/NVIDIA/TensorRT-LLM/pull/15789) | Draft; `blossom-ci` pending | Manual NCCL abort/rebuild primitive; coordinator and graph recovery remain separate items. |
 | 1d.3 | [#15788](https://github.com/NVIDIA/TensorRT-LLM/pull/15788) | Draft; corrected head `94274a3f`; DCO/pre-commit green; `blossom-ci` pending | Passive committed-membership telemetry; it must not drive recovery. |
+| MVP integration prototype / [TRTLLM-12728](https://jirasw.nvidia.com/browse/TRTLLM-12728) | [#15801](https://github.com/NVIDIA/TensorRT-LLM/pull/15801) | Draft; head `5a76856e`; mergeable; all initial checks green (base freshness skipped for draft) | Aggregate no-mock integration/hardware-test vehicle. Context only; not a substitute merge unit and not E2E-complete yet. |
 | Historical prototype | [#14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198) | Draft, paused, `DO NOT SUBMIT` | Mock-heavy seam-finding evidence only; not an MVP implementation dependency. |
 
 ## Tracking decisions
@@ -564,6 +565,7 @@ An action can be dependency-ready while still blocked by code correctness, revie
 - 1a.8 and 1a.11 are MVP ship gates, not V1 polish. They are removed from the V1 delivery set.
 - 1c.3 is notification/consensus; 1c.3a and 1c.4a own survivor-only control and attention-DP/PyExecutor collectives.
 - 1d.4 is the intra-node real-component E2E gate. 1d.4a is the rack FABRIC/IMEX process-death and inaccessible-peer-memory containment gate; process death alone cannot prove Q3. Neither prototype node can satisfy those production gates by itself.
+- [TRTLLM-12728](https://jirasw.nvidia.com/browse/TRTLLM-12728) / draft #15801 is the `NEW_PROTO` aggregate integration vehicle. Its dashed edges remain non-blocking context, so opening the PR does not change the eight-item production action frontier.
 
 ## Updating this graph
 

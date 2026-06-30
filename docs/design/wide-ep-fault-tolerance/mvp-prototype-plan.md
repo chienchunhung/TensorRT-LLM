@@ -2,11 +2,13 @@
 
 [< Back to Overview](README.md)
 
-**Status:** Active corrected plan • **Owner:** WideEP FT track • **Last updated:** 2026-06-30
+**Status:** Active corrected plan; [TRTLLM-12728](https://jirasw.nvidia.com/browse/TRTLLM-12728) integration tracked in draft [PR #15801](https://github.com/NVIDIA/TensorRT-LLM/pull/15801) • **Owner:** WideEP FT track • **Last updated:** 2026-06-30
 
 ## 1. Goal and evidence boundary
 
 Build a working vertical slice of the corrected MVP on physical GPUs, using real worker processes, a real MoE model and representative serving workload, and the production CUDA/MNNVL, NCCL, MPI, EPLB, PyExecutor, and request-lifecycle paths. The prototype exists to expose integration defects early, guide the owning PRs, and make realistic hardware testing possible while those PRs are still being reviewed.
+
+Draft [PR #15801](https://github.com/NVIDIA/TensorRT-LLM/pull/15801), branch `WideEP-FT/e2e-mvp-prototype`, is the aggregate integration and hardware-test vehicle. It is intentionally not a substitute merge unit for the component PRs and does not claim E2E success while the missing vertical slices below remain open.
 
 [PR #14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198) is historical seam-finding scaffolding. Its mocks and stubs helped expose issues such as poisoned `MPI_Finalize`, but it never demonstrated a working end-to-end recovery path. No seam-correctness, output-correctness, scale-independence, or recovery-latency claim from that branch is an MVP proof.
 
@@ -98,9 +100,9 @@ The production-component prototype succeeds only when all of the following hold:
 
 No sub-10-second production guarantee is claimed until the physical acceptance data supports it. Detection timeout is only one term; kernel escape, reconciliation, admission, communicator rebuild, graph policy, and request recovery all contribute to the measured interval.
 
-## 8. Relationship to historical PR #14198
+## 8. Relationship between draft PR #15801 and historical PR #14198
 
-The historical branch may contribute test-driver mechanics, event-log ideas, and the observation that poisoned MPI shutdown needs explicit ownership. The following conclusions are explicitly invalid as proof because they were derived from mocked or isolated paths:
+Draft #15801 supersedes #14198 as the integration vehicle. The historical branch may contribute test-driver mechanics, event-log ideas, and the observation that poisoned MPI shutdown needs explicit ownership. The following conclusions are explicitly invalid as proof because they were derived from mocked or isolated paths:
 
 - direct watchdog → `mark_failed` is a safe commit path;
 - failure broadcast is off the recovery critical path;

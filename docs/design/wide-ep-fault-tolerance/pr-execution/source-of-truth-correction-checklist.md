@@ -4,7 +4,7 @@
 
 **Correction started:** 2026-06-30 PDT
 
-**Progress snapshot:** 2026-06-30 14:23 PDT. Independent final audits of the in-repo contract, Google Doc, and MVP/V1/V2 dependency proof pass; correction commit `36bb8d58` is published on `docs-and-plans`. Corrected heads `d19aadea` (#15524), `ee9aa0a4` (#15785), and `94274a3f` (#15788) are published with green DCO/pre-commit, and `blossom-ci` is pending. Unchecked canonical MVP items below are genuine implementation, review/CI, or physical-hardware gates, not hidden documentation debt.
+**Progress snapshot:** 2026-06-30 14:38 PDT. Independent final audits of the in-repo contract, Google Doc, and MVP/V1/V2 dependency proof pass; correction commit `36bb8d58` is published on `docs-and-plans`. Corrected heads `d19aadea` (#15524), `ee9aa0a4` (#15785), and `94274a3f` (#15788) are published with green DCO/pre-commit, and `blossom-ci` is pending. [TRTLLM-12728](https://jirasw.nvidia.com/browse/TRTLLM-12728)'s aggregate production-component prototype is published as draft [#15801](https://github.com/NVIDIA/TensorRT-LLM/pull/15801) at head `5a76856e`; it is mergeable with all initial checks green (base freshness skipped for draft), but remains context rather than an MVP-complete merge unit. Unchecked canonical MVP items below are genuine implementation, review/CI, or physical-hardware gates, not hidden documentation debt.
 
 **Scope:** in-repo design and execution documents, the canonical Google Doc, all affected in-flight PRs, and the no-mock end-to-end MVP prototype branch.
 
@@ -74,7 +74,7 @@ This checklist is the control record for the 2026-06-30 design correction. A che
 - [x] **C53 — Links and structure:** preserve heading/list style and link the in-repo plan, graphs, PRs, and supporting sources with readable labels.
 - [x] **C54 — Connector verification:** re-read the edited document and verify target identity, section order, text, headings, lists, and hyperlinks; record any rendered-layout limitation.
 
-Google Docs body synchronization is complete and independently audited at revision `ALtnJHzhKIb008QuJYeQ3YEcq3OGbHgR51Yman1OMFjEZ-RqTAj9E1w06x_XpVI1_DdOPA4YJ4b13AhKrJfUHTjE0lCH-LuKh_v_8huA6SY`. The separate Drive Comments API rejected attempts to annotate stale comment threads with `appNotAuthorizedToFile`; no comment thread was changed, and this does not affect the verified document body.
+Google Docs body synchronization was independently audited before publication and the TRTLLM-12728 / #15801 tracker/check update was connector-readback-verified at revision `ALtnJHzgER3rLEIYdAmGZsmJXgLlDqKcY-5HbSKL6aLPAZlydxbDz7h9Lvy_8rIpvVEjg1vQNVLAmilYDg0yzX_se5-mwiPxu6j6oDSdSow`. The separate Drive Comments API rejected attempts to annotate stale comment threads with `appNotAuthorizedToFile`; no comment thread was changed, and this does not affect the verified document body.
 
 ## In-flight PR alignment
 
@@ -91,9 +91,9 @@ The final composition check merged the published #15524 and #15788 heads with `g
 
 ## No-mock MVP prototype and validation
 
-- [x] **C70 — Integration worktree:** create `WideEP-FT/e2e-mvp-prototype` from current upstream `main` and stack the published PR heads without changing the source PR branches.
+- [x] **C70 — Integration worktree and draft:** create `WideEP-FT/e2e-mvp-prototype` from upstream `main`, stack the published PR heads without changing the source PR branches, and publish the [TRTLLM-12728](https://jirasw.nvidia.com/browse/TRTLLM-12728) aggregate as draft #15801.
 - [x] **C71 — Stack construction:** integrate #13404, #15524, #15677, #15785, #15789, and #15788; resolve the shared communicator import/header conflict while retaining both changes.
-- [x] **C72a — Correction restack:** rebuild the branch on current `upstream/main` (`81290eb6` at validation), then bring published #15524 head `d19aadea`, #15785 head `ee9aa0a4`, and #15788 head `94274a3f` semantics into the prototype while preserving the integrated PR stack and conflict resolution. The local branch is 14 commits ahead of that base and clean.
+- [x] **C72a — Correction restack:** rebuild the branch on `upstream/main` (`81290eb6` at stack validation), then bring published #15524 head `d19aadea`, #15785 head `ee9aa0a4`, and #15788 head `94274a3f` semantics into the prototype while preserving the integrated PR stack and conflict resolution. Draft #15801 publishes the resulting 14-commit head `5a76856e`; it was merge-tree-clean against refreshed `upstream/main` `a721a086` at PR creation.
 - [ ] **C72b — Missing vertical slices:** implement the coordinator, survivor membership, admission, kernel-abort, request-disposition, and poisoned-lifecycle slices needed for a real vertical path.
 - [x] **C73a — Local validation:** run formatting/lint, compile checks, focused behavioral tests or smoke tests, DCO checks, graph/stale-claim checks, and diff checks in every changed branch. The #15785 lightweight detected-state suite passed 57 focused tests (the broader earlier harness passed 71); repository-native pytest for #15524/#15788 remains unavailable locally because the environment lacks PyTorch. The restacked integration branch passes syntax compilation and `git diff --check`.
 - [ ] **C73b — CI acceptance:** complete `blossom-ci` on the corrected PR heads and triage any head-specific failure without attributing unrelated infrastructure failures to the changes.
