@@ -2,7 +2,7 @@
 
 [< Back to WideEP Fault Tolerance](../README.md) · [Implementation plan](08-implementation-plan.md)
 
-**Status snapshot:** 2026-06-29 13:21 PDT
+**Status snapshot:** 2026-06-30 10:40 PDT
 
 **Scope mapping:** The roadmap does not define a product milestone named “V2.” In this graph, **V2 means §8.2 Phase 2 Restoration**: replacing the dead rank, rebuilding process groups, and restoring full N-rank capacity. It does not mean the “Draft v2” revision of the design document itself.
 
@@ -37,7 +37,7 @@ White, heavy-border nodes are milestone, hardware, or external-project gates rat
 ```mermaid
 flowchart LR
     V1_GATE["Phase 1 V1 complete<br/>release gate · not satisfied"]
-    M_A7["Phase 1 1a.7 · NCCL FT wrapper<br/>PR: not opened · planned<br/>JIRA: TRTLLM-12560<br/>★ dependency-ready MVP action"]
+    M_A7["Phase 1 1a.7 · NCCL FT wrapper<br/>PR: #15789 · draft · merge conflict · DCO action required<br/>JIRA: TRTLLM-12560<br/>★ dependency-ready MVP action"]
     M_B5["Phase 1 V1 1b.5 · full EPLB reconfigure<br/>PR: not opened · planned<br/>JIRA: not mapped"]
     NVL_NODE["≥4-GPU NVLink-connected node<br/>audit hardware"]
     NVL72["NVL72 or equivalent<br/>hardware access"]
@@ -111,11 +111,13 @@ flowchart LR
     linkStyle 0,2,12,13 stroke:#6b7280,stroke-width:2px,stroke-dasharray:6 4;
     linkStyle 4,18,22 stroke:#dc2626,stroke-width:3px,stroke-dasharray:6 4;
 
+    classDef draft fill:#ffedd5,stroke:#f97316,color:#7c2d12,stroke-width:2px;
     classDef planned fill:#f3f4f6,stroke:#6b7280,color:#374151,stroke-dasharray:5 5;
     classDef gate fill:#ffffff,stroke:#111827,color:#111827,stroke-width:3px;
     classDef candidate stroke:#d97706,stroke-width:5px,stroke-dasharray:0;
 
-    class M_A7,M_B5,A0A,A0B,A1,A2,A3,A4,A5,A6,A7,A8,B1,B2,B3,B4,C1,C2,C3 planned;
+    class M_A7 draft;
+    class M_B5,A0A,A0B,A1,A2,A3,A4,A5,A6,A7,A8,B1,B2,B3,B4,C1,C2,C3 planned;
     class V1_GATE,NVL_NODE,NVL72,MX1,MX2 gate;
     class M_A7,A0A candidate;
 ```
@@ -124,14 +126,14 @@ flowchart LR
 
 **2a.0a — intra-node teardown audit** is the only V2 action-frontier node. It has no parent implementation PR and the roadmap explicitly allows it to start before V1 completes. A suitable ≥4-GPU NVLink-connected node is still a resource requirement, shown by the gray dashed edge; the gold marker means dependency-ready, not resource-booked.
 
-The gold 1a.7 prerequisite anchor is a dependency-ready **MVP** action reused in this view; it is not a V2 candidate.
+The gold 1a.7 / #15789 prerequisite anchor is a dependency-ready **MVP** draft action reused in this view; it is not a V2 candidate.
 
 The MX-GMS-specific 2b.1 and 2b.4 nodes are not candidates: their external MX-GMS interfaces are unsatisfied optional-track prerequisites, shown as red dashed edges.
 
 ## Critical sequencing
 
 1. **Audit in parallel with Phase 1:** 2a.0a can start before V1 completes. It sizes the rebuild work; 2a.0b requires rack hardware and gates the final 2a.2 ship decision.
-2. **Baseline rebuild:** V1 completion plus 1a.7 unlocks 2a.1. The baseline path then converges through 2a.2 and 2a.5 into 2a.6.
+2. **Baseline rebuild:** V1 completion plus merged 1a.7 / #15789 unlocks 2a.1. The baseline path then converges through 2a.2 and 2a.5 into 2a.6.
 3. **Conditional DeepEP work:** 2a.3 and 2a.4 are deferred. Their edges into 2a.6 are dashed so they do not accidentally block the MNNVL baseline when DeepEP is out of scope.
 4. **Capacity restoration:** 2a.6 unlocks EPLB rebalance, second-failure handling, shadow activation, and replacement provisioning.
 5. **Acceleration is soft:** MX-GMS shortens weight-load latency but must not gate a correct minutes-class disk-reload path.

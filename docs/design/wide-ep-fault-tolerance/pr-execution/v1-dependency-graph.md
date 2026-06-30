@@ -2,7 +2,7 @@
 
 [< Back to WideEP Fault Tolerance](../README.md) · [Implementation plan](08-implementation-plan.md)
 
-**Status snapshot:** 2026-06-29 13:21 PDT
+**Status snapshot:** 2026-06-30 10:40 PDT
 
 **Scope:** Phase 1 v1 plus the two post-MVP parallel tracks, Phase 1-DS and conditional Phase 1-IB.
 
@@ -44,9 +44,9 @@ flowchart LR
         direction TB
         M_A1["MVP 1a.1 · EPGroupHealth<br/>PR: #13302 · merged<br/>JIRA: TRTLLM-12199"]
         M_A2["MVP 1a.2 · kernel-mask pattern<br/>PR: #13404 · approved · blossom-ci pending<br/>JIRA: TRTLLM-12200<br/>★ dependency-ready action"]
-        M_A7["MVP 1a.7 · NCCL FT wrapper<br/>PR: not opened · planned<br/>JIRA: TRTLLM-12560<br/>★ dependency-ready action"]
-        M_B1["MVP 1b.1 + 1b.2 · mask-only EPLB<br/>PR: #15525 · review required · CI green<br/>JIRA: TRTLLM-13543 / TRTLLM-13544<br/>★ dependency-ready action"]
-        M_C3["MVP 1c.3 · FT broadcast<br/>PR: not opened · planned<br/>JIRA: TRTLLM-13548<br/>★ dependency-ready action"]
+        M_A7["MVP 1a.7 · NCCL FT wrapper<br/>PR: #15789 · draft · merge conflict · DCO action required<br/>JIRA: TRTLLM-12560<br/>★ dependency-ready action"]
+        M_B1["MVP 1b.1 + 1b.2 · mask-only EPLB<br/>PR: #15525 · merged 2026-06-29 PDT<br/>JIRA: TRTLLM-13543 / TRTLLM-13544"]
+        M_C3["MVP 1c.3 · FT broadcast<br/>PR: #15785 · draft · blossom-ci pending<br/>JIRA: TRTLLM-13548<br/>★ dependency-ready action"]
         M_D4["MVP 1d.4 · E2E harness<br/>PR: not opened · planned<br/>JIRA: TRTLLM-13554"]
     end
 
@@ -111,23 +111,24 @@ flowchart LR
     B1_7 --> D1_6
     M_D4 --> D1_7
 
-    linkStyle 0,1,2,3,4,5,6,7,8,9,10,13,14,15,16,17,18,19,20,21,22,23,24 stroke:#dc2626,stroke-width:3px;
-    linkStyle 11 stroke:#16a34a,stroke-width:3px;
+    linkStyle 0,1,2,3,4,5,6,7,8,9,10,13,14,16,17,18,19,20,21,22,23,24 stroke:#dc2626,stroke-width:3px;
+    linkStyle 11,15 stroke:#16a34a,stroke-width:3px;
     linkStyle 12 stroke:#dc2626,stroke-width:3px,stroke-dasharray:6 4;
 
     classDef merged fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px;
+    classDef draft fill:#ffedd5,stroke:#f97316,color:#7c2d12,stroke-width:2px;
     classDef reviewing fill:#dbeafe,stroke:#2563eb,color:#1e3a8a,stroke-width:2px;
     classDef approved fill:#ede9fe,stroke:#7c3aed,color:#3b0764,stroke-width:2px;
     classDef planned fill:#f3f4f6,stroke:#6b7280,color:#374151,stroke-dasharray:5 5;
     classDef gate fill:#ffffff,stroke:#111827,color:#111827,stroke-width:3px;
     classDef candidate stroke:#d97706,stroke-width:5px,stroke-dasharray:0;
 
-    class M_A1 merged;
+    class M_A1,M_B1 merged;
+    class M_A7,M_C3 draft;
     class M_A2 approved;
-    class M_B1 reviewing;
-    class M_A7,M_C3,M_D4,A1_5,A1_6,A1_8,A1_9,A1_10,A1_11,B1_4,B1_5,B1_6,B1_7,C1_5,C1_6,D1_6,D1_7 planned;
+    class M_D4,A1_5,A1_6,A1_8,A1_9,A1_10,A1_11,B1_4,B1_5,B1_6,B1_7,C1_5,C1_6,D1_6,D1_7 planned;
     class MVP,AUDIT3 gate;
-    class M_A2,M_A7,M_B1,M_C3 candidate;
+    class M_A2,M_A7,M_C3 candidate;
 ```
 
 ## Parallel Phase 1-DS graph
@@ -137,7 +138,7 @@ This track starts after MVP and can run in parallel with core V1. It is not part
 ```mermaid
 flowchart LR
     M_D4["MVP 1d.4 · E2E harness<br/>PR: not opened · planned<br/>JIRA: TRTLLM-13554"]
-    M_C1["MVP 1c.1 · error classification<br/>PR: #15677 · review required · CI failing<br/>JIRA: TRTLLM-13546<br/>★ dependency-ready action"]
+    M_C1["MVP 1c.1 · error classification<br/>PR: #15677 · review required · blossom-ci pending<br/>JIRA: TRTLLM-13546<br/>★ dependency-ready action"]
     RAY_GAP["Ray + disagg + NIXL support<br/>required only for a Ray deployment"]
 
     DS1["DS.1 · per-pool FT harness<br/>planned"]
@@ -214,7 +215,7 @@ flowchart LR
 
 ## Candidate actions now
 
-None of the V1, Phase 1-DS, or Phase 1-IB implementation nodes qualify yet. Every implementation path has an unsatisfied MVP release/component dependency, shown by at least one red ancestral edge. Gold prerequisite anchors are dependency-ready **MVP** actions reused here, not V1 candidates. Audit and external-integration gates may proceed as preparatory work, but they are not PR action-frontier nodes.
+None of the V1, Phase 1-DS, or Phase 1-IB implementation nodes qualify yet. Every implementation path has an unsatisfied MVP release/component dependency, shown by at least one red ancestral edge. The #15525 → 1b.4 component edge is now green, but the global MVP release edge still blocks 1b.4. Gold prerequisite anchors are dependency-ready **MVP** actions reused here, not V1 candidates. Audit and external-integration gates may proceed as preparatory work, but they are not PR action-frontier nodes.
 
 ## JIRA work-item mapping
 
@@ -223,6 +224,7 @@ See the [canonical JIRA work-item ledger](jira-work-item-ledger.md) for all 22 s
 ## Tracking decisions
 
 - Core V1 contains 12 unconditional plan IDs plus 2 Audit-3-conditional NIXL-EP IDs. The summary range in §8.4 still includes 1a.7 even though 1a.7 was promoted to MVP; this graph follows the per-PR scope rows.
+- Reused MVP anchors reflect the live delivery state: #15525 is merged, while #15789 and #15785 are draft PRs. Only merged anchors turn their outgoing component edge green.
 - `1d.6` requires multi-failure consensus and the completed full-EPLB branch. The graph shows terminal dependencies 1c.6, 1b.6, and 1b.7; 1b.4 and 1b.5 are satisfied transitively.
 - Phase 1-DS and Phase 1-IB are visible here because both are scheduled after MVP and parallel to V1, but neither silently expands the core V1 ship gate.
 - IB.2 is an umbrella alias for core PR units 1a.9 and 1a.10, not an additional implementation PR.

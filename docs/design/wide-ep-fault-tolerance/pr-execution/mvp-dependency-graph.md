@@ -2,7 +2,7 @@
 
 [< Back to WideEP Fault Tolerance](../README.md) · [Implementation plan](08-implementation-plan.md)
 
-**Status snapshot:** 2026-06-29 12:58 PDT
+**Status snapshot:** 2026-06-30 10:40 PDT
 
 **Scope:** Phase 1 MVP (v0), using the per-PR rows in [§8.1](08-implementation-plan.md#81-phase-1-pr-breakdown) as the source of truth.
 
@@ -46,20 +46,20 @@ flowchart LR
         A1_1["1a.1 · EPGroupHealth<br/>PR: #13302 · merged<br/>JIRA: TRTLLM-12199"]
         A1_2["1a.2 · NVLinkOneSided kernel mask<br/>PR: #13404 · approved · blossom-ci pending<br/>JIRA: TRTLLM-12200<br/>★ dependency-ready action"]
         A1_34["1a.3 + 1a.4 · Python binding and watchdog<br/>PR: #15524 · review required · blossom-ci pending<br/>JIRA: TRTLLM-12556 (1a.3) / TRTLLM-12557 (1a.4)"]
-        A1_7["1a.7 · NCCL FT wrapper<br/>PR: not opened · planned<br/>JIRA: TRTLLM-12560<br/>★ dependency-ready action"]
+        A1_7["1a.7 · NCCL FT wrapper<br/>PR: #15789 · draft · merge conflict · DCO action required<br/>JIRA: TRTLLM-12560<br/>★ dependency-ready action"]
     end
 
     subgraph EPLB["1b · EPLB topology adaptation"]
         direction TB
-        B1_12["1b.1 + 1b.2 · mask-only C++ and Python API<br/>PR: #15525 · review required · CI green<br/>JIRA: TRTLLM-13543 (1b.1) / TRTLLM-13544 (1b.2)<br/>★ dependency-ready action"]
-        B1_3["1b.3 · iteration-boundary integration<br/>PR: not opened · planned<br/>JIRA: TRTLLM-13545"]
+        B1_12["1b.1 + 1b.2 · mask-only C++ and Python API<br/>PR: #15525 · merged 2026-06-29 PDT<br/>JIRA: TRTLLM-13543 (1b.1) / TRTLLM-13544 (1b.2)"]
+        B1_3["1b.3 · iteration-boundary integration<br/>PR: not opened · planned<br/>JIRA: TRTLLM-13545<br/>★ dependency-ready action"]
     end
 
     subgraph DETECT["1c · Failure detection and broadcast"]
         direction TB
-        C1_1["1c.1 · EP error patterns<br/>PR: #15677 · review required · CI failing<br/>JIRA: TRTLLM-13546<br/>★ dependency-ready action"]
+        C1_1["1c.1 · EP error patterns<br/>PR: #15677 · review required · blossom-ci pending<br/>JIRA: TRTLLM-13546<br/>★ dependency-ready action"]
         C1_2["1c.2 · per-rank health budgets<br/>PR: not opened · planned<br/>JIRA: TRTLLM-13547"]
-        C1_3["1c.3 · MPI FT subcomm and broadcast<br/>PR: not opened · planned<br/>JIRA: TRTLLM-13548<br/>★ dependency-ready action"]
+        C1_3["1c.3 · MPI FT subcomm and broadcast<br/>PR: #15785 · draft · blossom-ci pending<br/>JIRA: TRTLLM-13548<br/>★ dependency-ready action"]
         C1_4["1c.4 · model-engine health hook<br/>PR: not opened · planned<br/>JIRA: TRTLLM-13549"]
     end
 
@@ -68,7 +68,7 @@ flowchart LR
         D1_0["1d.0 · MPI signal-handler replacement<br/>PR: #14160 · merged<br/>JIRA: TRTLLM-13550"]
         D1_1["1d.1 · feature flag and config gate<br/>PR: not opened · planned<br/>JIRA: TRTLLM-13551"]
         D1_2["1d.2 · degraded health reporting<br/>PR: not opened · planned<br/>JIRA: TRTLLM-13552"]
-        D1_3["1d.3 · per-rank telemetry<br/>PR: not opened · planned<br/>JIRA: TRTLLM-13553<br/>★ dependency-ready action"]
+        D1_3["1d.3 · per-rank telemetry<br/>PR: #15788 · draft · DCO action required<br/>JIRA: TRTLLM-13553<br/>★ dependency-ready action"]
         D1_4["1d.4 · 4-GPU fault-injection harness<br/>PR: not opened · planned<br/>JIRA: TRTLLM-13554"]
         D1_5["1d.5 · steady-state overhead regression<br/>PR: not opened · planned<br/>JIRA: TRTLLM-13555"]
         MVP_EXIT["MVP exit criteria<br/>single-rank survival end to end"]
@@ -115,8 +115,8 @@ flowchart LR
     D1_0 -.-> PROTO
     PROTO -.->|timing baseline only| D1_4
 
-    linkStyle 3,5,6,9,10,11,12,14,15,16,17,18,20,22,23,24,25,26 stroke:#dc2626,stroke-width:3px;
-    linkStyle 0,2,4,7,8,13,19 stroke:#16a34a,stroke-width:3px;
+    linkStyle 3,6,9,10,11,12,14,15,16,17,18,20,22,23,24,25,26 stroke:#dc2626,stroke-width:3px;
+    linkStyle 0,2,4,5,7,8,13,19 stroke:#16a34a,stroke-width:3px;
     linkStyle 1,21,27,28,29 stroke:#6b7280,stroke-width:2px,stroke-dasharray:6 4;
 
     classDef merged fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px;
@@ -127,13 +127,13 @@ flowchart LR
     classDef gate fill:#ffffff,stroke:#111827,color:#111827,stroke-width:3px;
     classDef candidate stroke:#d97706,stroke-width:5px,stroke-dasharray:0;
 
-    class P12718,P13119,A1_1,D1_0 merged;
-    class PROTO draft;
-    class A1_34,B1_12,C1_1 reviewing;
+    class P12718,P13119,A1_1,B1_12,D1_0 merged;
+    class PROTO,A1_7,C1_3,D1_3 draft;
+    class A1_34,C1_1 reviewing;
     class A1_2 approved;
-    class A1_7,B1_3,C1_2,C1_3,C1_4,D1_1,D1_2,D1_3,D1_4,D1_5 planned;
+    class B1_3,C1_2,C1_4,D1_1,D1_2,D1_4,D1_5 planned;
     class MVP_EXIT gate;
-    class A1_2,A1_7,B1_12,C1_1,C1_3,D1_3 candidate;
+    class A1_2,A1_7,B1_3,C1_1,C1_3,D1_3 candidate;
 ```
 
 ## Candidate actions now
@@ -141,11 +141,11 @@ flowchart LR
 | Node | JIRA tracking | PR delivery | Why dependency-unblocked | Immediate action |
 |:---|:---|:---|:---|:---|
 | **1a.2 / #13404** | [TRTLLM-12200](https://jirasw.nvidia.com/browse/TRTLLM-12200) · In Review · [Chien-Chun Hung](https://jirasw.nvidia.com/secure/ViewProfile.jspa?name=chienchunh) | Approved; `blossom-ci` pending | Root merge unit; no parent PR | Clear `blossom-ci`, then merge. |
-| **1a.7** | [TRTLLM-12560](https://jirasw.nvidia.com/browse/TRTLLM-12560) · To Do · Unassigned | No PR; planned | Its only parent, 1a.1 / #13302, is merged | Open and implement the NCCL FT wrapper PR. |
-| **1b.1 + 1b.2 / #15525** | [TRTLLM-13543](https://jirasw.nvidia.com/browse/TRTLLM-13543) · In Progress · [Chien-Chun Hung](https://jirasw.nvidia.com/secure/ViewProfile.jspa?name=chienchunh)<br/>[TRTLLM-13544](https://jirasw.nvidia.com/browse/TRTLLM-13544) · To Do · Unassigned | Review required; CI green | Standalone on `main`; no parent PR | Satisfy the remaining required reviews. |
-| **1c.1 / #15677** | [TRTLLM-13546](https://jirasw.nvidia.com/browse/TRTLLM-13546) · In Progress · Unassigned | Review required; `blossom-ci` failing | Its only parent, #12718, is merged | Resolve review feedback and the failing CI run. |
-| **1c.3** | [TRTLLM-13548](https://jirasw.nvidia.com/browse/TRTLLM-13548) · To Do · Unassigned | No PR; planned | Its only parent, 1a.1 / #13302, is merged | Open and implement the FT subcommunicator/broadcast PR. |
-| **1d.3** | [TRTLLM-13553](https://jirasw.nvidia.com/browse/TRTLLM-13553) · To Do · Unassigned | No PR; planned | Its only parent, 1a.1 / #13302, is merged | Open and implement per-rank telemetry. |
+| **1a.7 / #15789** | [TRTLLM-12560](https://jirasw.nvidia.com/browse/TRTLLM-12560) · To Do · Unassigned | Draft; merge conflict; DCO action required | Its only parent, 1a.1 / #13302, is merged | Resolve the `main` conflict and DCO, finish the draft, then request review. |
+| **1b.3** | [TRTLLM-13545](https://jirasw.nvidia.com/browse/TRTLLM-13545) · To Do · Unassigned | No PR; planned | Its only parent, 1b.1 + 1b.2 / #15525, is merged | Open and implement iteration-boundary reconfigure integration. |
+| **1c.1 / #15677** | [TRTLLM-13546](https://jirasw.nvidia.com/browse/TRTLLM-13546) · In Progress · Unassigned | Review required; `blossom-ci` pending | Its only parent, #12718, is merged | Satisfy the required reviews and complete `blossom-ci`. |
+| **1c.3 / #15785** | [TRTLLM-13548](https://jirasw.nvidia.com/browse/TRTLLM-13548) · To Do · Unassigned | Draft; `blossom-ci` pending | Its only parent, 1a.1 / #13302, is merged | Finish draft validation, then mark ready for review. |
+| **1d.3 / #15788** | [TRTLLM-13553](https://jirasw.nvidia.com/browse/TRTLLM-13553) · To Do · Unassigned | Draft; DCO action required | Its only parent, 1a.1 / #13302, is merged | Resolve DCO, finish the draft, then mark ready for review. |
 
 ## Live PR snapshot
 
@@ -157,8 +157,11 @@ flowchart LR
 | 1d.0 | [TRTLLM-13550](https://jirasw.nvidia.com/browse/TRTLLM-13550) | [#14160](https://github.com/NVIDIA/TensorRT-LLM/pull/14160) | Merged 2026-06-22 PDT | Prevents a failed rank from aborting the whole MPI world. |
 | 1a.2 | [TRTLLM-12200](https://jirasw.nvidia.com/browse/TRTLLM-12200) | [#13404](https://github.com/NVIDIA/TensorRT-LLM/pull/13404) | Approved; merge state blocked while `blossom-ci` is pending | Kernel-mask critical path; also the live stack base for #15524. |
 | 1a.3 + 1a.4 | [TRTLLM-12556](https://jirasw.nvidia.com/browse/TRTLLM-12556), [TRTLLM-12557](https://jirasw.nvidia.com/browse/TRTLLM-12557) | [#15524](https://github.com/NVIDIA/TensorRT-LLM/pull/15524) | Review required; `blossom-ci` pending | Combines Python/factory wiring with the watchdog and is explicitly stacked on #13404. |
-| 1b.1 + 1b.2 | [TRTLLM-13543](https://jirasw.nvidia.com/browse/TRTLLM-13543), [TRTLLM-13544](https://jirasw.nvidia.com/browse/TRTLLM-13544) | [#15525](https://github.com/NVIDIA/TensorRT-LLM/pull/15525) | Review required; CI green | Combines the C++/nanobind entry point with the Python wrapper; standalone on `main`. |
-| 1c.1 | [TRTLLM-13546](https://jirasw.nvidia.com/browse/TRTLLM-13546) | [#15677](https://github.com/NVIDIA/TensorRT-LLM/pull/15677) | Review required; `blossom-ci` failing | Newly opened since the June 26 roadmap status block. |
+| 1b.1 + 1b.2 | [TRTLLM-13543](https://jirasw.nvidia.com/browse/TRTLLM-13543), [TRTLLM-13544](https://jirasw.nvidia.com/browse/TRTLLM-13544) | [#15525](https://github.com/NVIDIA/TensorRT-LLM/pull/15525) | Merged 2026-06-29 PDT | Combines the C++/nanobind entry point with the Python wrapper; now satisfies the parent edge into 1b.3. |
+| 1c.1 | [TRTLLM-13546](https://jirasw.nvidia.com/browse/TRTLLM-13546) | [#15677](https://github.com/NVIDIA/TensorRT-LLM/pull/15677) | Review required; `blossom-ci` pending | Error-classification prerequisite for 1c.2. |
+| 1a.7 | [TRTLLM-12560](https://jirasw.nvidia.com/browse/TRTLLM-12560) | [#15789](https://github.com/NVIDIA/TensorRT-LLM/pull/15789) | Draft; merge conflict; DCO action required | NCCL fault-tolerance wrapper; dependency-ready because #13302 is merged. |
+| 1c.3 | [TRTLLM-13548](https://jirasw.nvidia.com/browse/TRTLLM-13548) | [#15785](https://github.com/NVIDIA/TensorRT-LLM/pull/15785) | Draft; `blossom-ci` pending | Independent failure-propagation control plane; dependency-ready because #13302 is merged. |
+| 1d.3 | [TRTLLM-13553](https://jirasw.nvidia.com/browse/TRTLLM-13553) | [#15788](https://github.com/NVIDIA/TensorRT-LLM/pull/15788) | Draft; DCO action required | Passive rank-health telemetry; dependency-ready because #13302 is merged. |
 | Prototype | [TRTLLM-12728](https://jirasw.nvidia.com/browse/TRTLLM-12728) | [#14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198) | Draft, paused, `DO NOT SUBMIT` | Reference sidecar only; it does not replace any production merge unit. |
 
 ## JIRA work-item mapping
@@ -168,10 +171,11 @@ See the canonical [JIRA work-item ledger](jira-work-item-ledger.md) for all 22 s
 ## Tracking decisions
 
 - The graph follows the formal `Deps` rows, with one live override: #15524 says it is stacked on #13404, so `1a.2 → #15524` is a hard edge.
-- #15525 is standalone on `main`. Closed fork-only staging PRs are superseded and are not production dependencies.
+- #15525 was standalone on `main` and merged on 2026-06-29 PDT. Its outgoing edge to 1b.3 is now satisfied. Closed fork-only staging PRs are superseded and are not production dependencies.
 - #15524 explicitly absorbs the 1a.3 Python/factory binding slice into 1a.4, and #15525 absorbs the 1b.2 Python wrapper into 1b.1. Each pair is therefore one live merge node.
+- #15789, #15785, and #15788 are draft delivery PRs for 1a.7, 1c.3, and 1d.3 respectively. Opening a draft changes node status but does not satisfy any outgoing dependency edge.
 - The per-PR tables enumerate 18 MVP IDs even though the timeline summary says “14 PRs.” The two live consolidations reduce the current maximum to 16 merge units; later integrations may consolidate further.
-- #14198 is deliberately outside the production merge path. Its remaining resume triggers are #13404, #15524, planned 1c.3, and NVL72 access; its useful output is a timing baseline for 1d.4.
+- #14198 is deliberately outside the production merge path. Its remaining resume triggers are #13404, #15524, #15785, and NVL72 access; its useful output is a timing baseline for 1d.4.
 
 ## Updating this graph
 
