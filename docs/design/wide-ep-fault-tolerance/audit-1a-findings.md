@@ -1,9 +1,9 @@
-# Audit 1a — Intra-node findings (in progress)
+# Audit 1a — Historical intra-node findings and corrected evidence boundary
 
-[< Back to Overview](README.md) | [§9.1 Audit 1](09-risks-and-open-questions.md#audit-1--mnnvlnvshmem-teardown-capability)
+[< Back to Overview](README.md) | [§9.1 Audit 1](09-risks-and-open-questions.md#audit-1--baseline-mnnvl-teardown-and-rack-containment-capability)
 
-**Status:** Days 1–3 of 5 complete (NCCL rebuild + MPI signal handler + driver-side `cuMemUnmap`). Day 4–5 work (intra-node MNNVL fabric prototype) **gated on IMEX daemon configuration** which is not active on this node — fabric handle creation returns `CUDA_ERROR_NOT_PERMITTED`. Equivalent driver-mechanism validation completed via the posix-FD variant; fabric-handle equivalence is an Audit 1b validation point.
-**Hardware:** 8× NVIDIA B300 SXM6 (single node), NVLink full mesh.
+**Status:** Historical Audit 1a snapshot. Days 1–3 completed (NCCL experiment + MPI signal-handler experiment + driver-side `cuMemUnmap`). The original Day 4–5 plan incorrectly treated IMEX as an intra-node B300 prerequisite; see the correction below. FABRIC/IMEX validation is now the explicit 1d.4a rack-fabric acceptance item.
+**Hardware:** 8× NVIDIA B300 SXM6 (single node, GPUs connected through the platform's NVSwitch/NVLink domain).
 **Software:** PyTorch 2.11.0a0+eb65b36914.nv26.02 (NCCL 2.29.2), OpenMPI 4.1.9a1 (FT Checkpoint: NO; no ULFM module), CUDA 13.1, Python 3.12, cuda-python 13.1.1.
 **Date:** 2026-04-25.
 
@@ -12,9 +12,9 @@
 Four Day 1–3 findings that affect Phase 2 sizing and PR 1d.0 scope:
 
 1. **`torch.distributed` on PyTorch 2.11 does not provide a recoverable peer-death path** for any of the documented modes (`TORCH_NCCL_ASYNC_ERROR_HANDLING`, `TORCH_NCCL_BLOCKING_WAIT`). The headline-candidate `dist.shrink_group(ranks_to_exclude=…, shrink_flags=SHRINK_ABORT)` API itself hangs indefinitely after peer death in this build. **Implication for PR 2a.1 (NCCL teardown):** cannot be a one-liner around `dist.shrink_group`; needs lower-level work (drop to `ncclCommAbort` + `ncclCommInitRank` directly, or wait for a fixed PT release).
-2. **Detection in pure Python works.** `dist.all_reduce(…, async_op=True)` plus a main-thread `work.is_completed()` polling loop delivers a clean exception at exactly the configured deadline. This validates §5.3 / 1c.4's design assumption that detection can sit above NCCL rather than inside it.
-3. **Mode A (§3) needs a two-part fix, not one.** Replacing `MPI_Abort` with `_exit(N)` in `mpiUtils.cpp` (PR 1d.0) is necessary but **not sufficient**: `mpirun` itself propagates termination on any abnormal child exit, regardless of the exit code. Audit empirically confirms the launch flag `--mca orte_enable_recovery 1` is also required for survivors to outlive a peer death. With both fixes, survivors stay alive; without recovery flag, they die in 18–60 s under default mpirun.
-4. **Driver-side teardown of dead-peer regions is essentially free.** With the owner SIGKILLed, the survivor's `cuMemUnmap` returns `CUDA_SUCCESS` in **0.25 ms**, `cuMemRelease` in **1.27 ms**, `cuMemAddressFree` in **0.008 ms** — total ~1.5 ms. The mapping itself even survives the kill: 2 s after the SIGKILL the survivor still reads back the owner's pre-kill data correctly. This is the answer PR 2a.2 was waiting for: **driver-side cleanup is not a Phase 2 bottleneck**, ms-scale at most. (Tested with `CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR`; the equivalent `CU_MEM_HANDLE_TYPE_FABRIC` test is gated on IMEX setup — see Day 3 section.)
+2. **A bounded host polling mechanism can surface a timeout.** `dist.all_reduce(…, async_op=True)` plus `work.is_completed()` polling delivered an exception at the configured deadline. This does **not** validate degraded execution: survivor-only management collectives (1c.3a/1c.4a), the atomic coordinator (1c.4b), request disposition (1c.4c), and runtime kernel escape (1a.8) were absent.
+3. **The MPI propagation/lifecycle portion of prompt-evidence Q1/Q3 needs more than signal-handler replacement.** Replacing `MPI_Abort` with `_exit(N)` in `mpiUtils.cpp` (merged 1d.0) is necessary but not sufficient: this OpenMPI launcher also required `--mca orte_enable_recovery 1` for survivors to outlive a peer death. Even then, ordinary world collectives and `MPI_Finalize` remain unsafe; 1d.1 owns launcher/runtime admission and 1d.0a owns the poisoned-MPI lifecycle and shutdown contract.
+4. **One POSIX-FD driver micro-case tears down quickly.** With the owner SIGKILLed, the survivor's `cuMemUnmap` returned `CUDA_SUCCESS` in **0.25 ms**, `cuMemRelease` in **1.27 ms**, and `cuMemAddressFree` in **0.008 ms**. This is useful local evidence for the x86_64 intra-node path, but it does not answer full `MnnvlMemory` recovery, fan-out to 71 survivors, workspace/communicator rebuild, or FABRIC/IMEX behavior. It therefore cannot close or precisely size PR 2a.2 by itself.
 
 ## Day 1 — NCCL rebuild prototype
 
@@ -42,8 +42,8 @@ Four Day 1–3 findings that affect Phase 2 sizing and PR 1d.0 scope:
 
 **Conclusions for the design:**
 
-- Default PT behavior is unrecoverable. **A single rank death today kills every survivor** with SIGABRT, in any code that uses `torch.distributed` collectives — TP `all_reduce` in attention, embedding `all_gather`, the `AllGatherReduceScatter` MoE fallback, etc. This is a real pre-existing exposure, separate from the NVLink kernel hang (Mode B).
-- §5.3 / 1c.4's main-thread detection design is sound. The `async_op=True` + polling pattern is a clean substitute for the unusable PT watchdog and gives full control over detection latency.
+- Default PT behavior is unrecoverable. **A single rank death today kills every survivor** with SIGABRT, in any code that uses `torch.distributed` collectives — TP `all_reduce` in attention, embedding `all_gather`, the `AllGatherReduceScatter` MoE fallback, etc. This is a real pre-existing exposure, separate from the Q2 live/silent MNNVL kernel hang.
+- The bounded polling mechanism is useful for detection, but the earlier conclusion that it validated 1c.4 end-to-end is superseded. 1c.4 remains the model-engine hook; 1c.4a owns degraded membership and 1c.4b owns the recovery transaction.
 - **PR 2a.1 (NCCL teardown) sizing must reflect that `dist.shrink_group(SHRINK_ABORT)` is not a working path in PT 2.11.** Either the work moves to a lower abstraction (call `ncclCommAbort` + `ncclCommInitRank` from C / via cython) or PR 2a.1 waits for an upstream PyTorch fix. Either way it's larger than a thin Python wrapper.
 
 **Caveats:**
@@ -85,13 +85,14 @@ Run with each launcher mode (default mpirun vs `--mca orte_enable_recovery 1`) w
 
 **Key finding F2.** `mpirun` terminates the world on **any** abnormal exit, not just `MPI_Abort`. Tested 5 distinct death paths — `os._exit(0)`, `os._exit(2)`, `MPI_Abort(2)`, `SIGKILL`, and uncaught Python exception. All produce the same outcome under default mpirun: survivors die within 20 s. Even `os._exit(0)` (clean, success-coded) triggers mpirun's "child departed unexpectedly" path. **Replacing `MPI_Abort` with `_exit(2)` in `mpiUtils.cpp` does not save the survivors on its own.**
 
-**Key finding F3.** `--mca orte_enable_recovery 1` stops the propagation. With this flag, the same `exit2` and `sigkill` death scenarios run the full 45 s test budget without mpirun stepping in. **This is the missing piece for PR 1d.0.** It's a launch-flag change, not a source change, but it must be documented and (ideally) defaulted on by `trtllm-serve` when FT is enabled.
+**Key finding F3.** `--mca orte_enable_recovery 1` stopped propagation in this OpenMPI 4.1.9a1 setup. With this flag, the same `exit2` and `sigkill` scenarios ran the full 45-second test budget without mpirun stepping in, although survivors still hung in the broken collective. This is deployment-specific evidence, not a portable MPI contract. Merged 1d.0 owns the catchable signal path; 1d.1 must validate/admit each launcher/runtime mode, and 1d.0a owns poisoned shutdown.
 
 **Key finding F4.** Even with `enable_recovery`, survivors remain stuck inside `MPI.COMM_WORLD.Allreduce(...)` because (a) default error handler is `MPI_ERRORS_ARE_FATAL`, and (b) `Allreduce` has no timeout — it spins until completion or process death. To complete the recovery story the design needs to combine:
 
-1. **Launch flag:** `mpirun --mca orte_enable_recovery 1` (PR 1d.0 documents this; ideally `trtllm-serve` sets it when `--enable-fault-tolerance`).
-2. **Per-rank error handler:** `comm.Set_errhandler(MPI.ERRORS_RETURN)` on the FT subcomm (already PR 1c.3).
-3. **Main-thread bounded wait on collectives:** the same `async_op=True` + polling pattern proven in the NCCL track (already PR 1c.4-style detection).
+1. **Launcher/runtime admission (1d.1):** for this tested OpenMPI build, `mpirun --mca orte_enable_recovery 1`; other supported environments require equivalent destructive evidence rather than assuming this flag is portable.
+2. **Failure notification:** `MPI_ERRORS_RETURN` on the 1c.3 FT signaling communicator.
+3. **Survivor control membership:** 1c.3a `ActiveRankMap` plus 1c.4a conversion of ordinary PyExecutor/attention-DP management collectives to survivor-only membership.
+4. **Recovery transaction:** 1c.4b coordinates abort, reconciliation, admission, quiescence, EPLB preparation, survivor communicator rebuild, graph policy, and the atomic mask + `ActiveRankMap` + generation commit; 1c.4c applies request disposition before resume.
 
 (2) and (3) are already in the design. The new addition surfaced by Day 2 is item (1).
 
@@ -99,8 +100,8 @@ Run with each launcher mode (default mpirun vs `--mca orte_enable_recovery 1`) w
 
 **Conclusions for the design:**
 
-- §3 Mode A diagnosis confirmed empirically: mpirun is the propagation mechanism, not just `MPI_Abort` itself.
-- **PR 1d.0 scope expands by one item:** must include a launcher / docs note that `--mca orte_enable_recovery 1` is required when FT is enabled. Trivial to add but mandatory.
+- The §3 prompt-evidence MPI diagnosis was confirmed empirically: `mpirun` is a propagation mechanism, not just `MPI_Abort` itself.
+- The launcher requirement is deployment-specific evidence from this OpenMPI build, not a universal MPI flag. Merged 1d.0 removes handler `MPI_Abort`; 1d.1 admits a tested survivor-preserving launcher/runtime mode, while 1d.0a prevents poisoned-world collectives/`MPI_Finalize` during survivor shutdown.
 - §5.3 / PR 1c.3 (FT subcomm with `MPI_ERRORS_RETURN`) is necessary, not optional. Audit confirms.
 
 **Caveats:**
@@ -128,23 +129,23 @@ Run with each launcher mode (default mpirun vs `--mca orte_enable_recovery 1`) w
 
 **Total driver-side teardown: ~1.5 ms.** No segfault, no hang. The mapping itself survives the owner's death (peer can still read the data 2 s after SIGKILL); cleanup is a clean local-process operation.
 
-This isolates the CUDA driver behavior from any fabric-specific subsystem. **PR 2a.2 sizing: driver-side cleanup is not a Phase 2 bottleneck, accounting for at most 1–2 ms of the recovery budget.**
+This isolates one local CUDA-driver operation from any fabric-specific subsystem. It does not establish an upper bound for full PR 2a.2 recovery: fan-out, imported mappings, fabric membership, handle exchange, workspace allocation, communicator construction, and quiescence were absent.
 
-### Fabric-handle variant (`CU_MEM_HANDLE_TYPE_FABRIC`) — gated on IMEX
+### Fabric-handle variant (`CU_MEM_HANDLE_TYPE_FABRIC`) — separate rack-path evidence
 
-Repeated the same test with fabric handles (the actual MNNVL allocation type). Result:
+Repeated the same micro-test with FABRIC handles. This is **not** the normal current `MnnvlMemory` handle type on the tested x86_64 B300 host; it is the relevant path for Grace/aarch64 NVL72. Result:
 
 ```
 cuMemCreate(prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC)
   -> CUDA_ERROR_NOT_PERMITTED: operation not permitted
 ```
 
-The device attribute reports fabric is supported (`CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED = 1`), and the kernel-side IMEX channel exists (`dmesg`: `nv-caps-imex channel0 created`), but the user-space `nvidia-imex` daemon is not running on this single-node B300 host. Without the IMEX domain configured, fabric handle creation is denied at the driver level.
+The device attribute reported fabric support (`CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED = 1`) and the kernel-side channel existed, but the host was not configured as an IMEX domain, so fabric-handle creation was denied. That outcome neither blocks nor invalidates the x86 POSIX-FD intra-node path; it simply provides no 1d.4a evidence.
 
 **Implication for the audit split:**
 
-- The driver mechanism itself is proven to behave gracefully (posix-FD variant). The fabric-handle path uses the same underlying VA / mapping machinery; the difference is the inter-process address-space coupling, which on rack-fabric NVLink is mediated by IMEX.
-- Confirming fabric-handle equivalence numerically is therefore an **Audit 1b validation point**, not a separate bottleneck. When NVL72 (or any IMEX-configured node) becomes available, re-running the fabric variant is a 5-minute test against the same prototype script.
+- The POSIX-FD result proves only its tested local operation. Do not infer FABRIC equivalence from shared VA/mapping APIs.
+- Re-running the micro-test on NVL72 is useful Audit 1b setup evidence, but 1d.4a must exercise the full production-component process-death flow and a separately approved inaccessible-peer-memory/device-loss case. Neither a five-minute `cuMemUnmap` test nor healthy-GPU SIGKILL proves Q3 containment.
 
 ### Caveats
 
@@ -157,12 +158,12 @@ The device attribute reports fabric is supported (`CU_DEVICE_ATTRIBUTE_HANDLE_TY
 | Day | Item | Status | Blocking dependency |
 |:---|:---|:---|:---|
 | 3 | `cuMemUnmap` semantics on dead-peer regions (posix-FD) | ✅ **Done** | — |
-| 3 | `cuMemUnmap` semantics on dead-peer regions (fabric handle) | ⛔ Blocked → Audit 1b | `nvidia-imex` daemon not active on this single-node B300; fabric handle creation returns `CUDA_ERROR_NOT_PERMITTED`. Equivalence to posix-FD result is the validation point. |
+| 3 | `cuMemUnmap` semantics on dead-peer regions (FABRIC handle) | Deferred to Audit 1b / 1d.4a setup evidence | The tested x86_64 B300 is a POSIX-FD production path; FABRIC/IMEX evidence requires Grace/aarch64 NVL72 or equivalent. No equivalence is assumed. |
 | 3 | DeepEP destructor (`Buffer.__del__` → `intranode::barrier`) deadlock + explicit `destroy()` ordering | Not started | DeepEP requires `tensorrt_llm` package import, which is broken in this dev tree (pre-existing `fp4_quantize_with_residual` mirror error). Container with matching C++ binary needed. |
-| 4–5 | **Intra-node MNNVL teardown + reallocate prototype** (the centerpiece of Audit 1a) | ⛔ Blocked → Audit 1b | Same IMEX gate as the fabric `cuMemUnmap` test. The driver-side mechanism question (the harder of the two) is already answered by Day 3 posix-FD; the remaining open question is fabric-specific (IMEX + NVSwitch fabric manager interaction), which lands naturally in 1b. |
+| 4–5 | **Intra-node MNNVL teardown + reallocate prototype** | Superseded by no-mock MVP integration prototype | On x86_64 DGX/HGX B200/B300, TRT-LLM's `MnnvlMemory` selects `CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR`; IMEX is not required merely because the GPUs are connected by NVSwitch. Run the real production component there. Reserve FABRIC/IMEX for 1d.4a on Grace/aarch64 NVL72 or equivalent. |
 | 5 | NVSHMEM teardown / `nvshmem_finalize` behavior | Not started | `nvshmem` Python module not installed in this env |
 | 5 | Written report (this document is a partial substitute) | Partial | This file covers Days 1–3; remaining gaps are gated on container / IMEX / nvshmem unblockers |
-| 6 | **CUDA graph re-capture latency under NCCL rebuild** | Not started — new audit item | Measures the per-`cuda_graph_config.batch_sizes`-entry recapture time after `ncclCommAbort` + `ncclCommInitRank`, to size PR 1a.11 (eager-mode fallback during recapture). Reviewer-driven (Luke); the current ~300 ms – 1.5 s figure is an order-of-magnitude estimate that needs empirical anchoring. Runnable on the same 4-GPU NVLink-connected node used for Days 1–3; no IMEX / NVL72 / NVSHMEM dependencies. ~1 day. |
+| 6 | **CUDA graph re-capture latency under NCCL rebuild** | Open MVP validation | Measures recapture after `ncclCommAbort` + `ncclCommInitRank` for promoted MVP item 1a.11. Until measured, the prototype runs eager and treats graph invalidation/recapture as a ship gate, not a v1 optimization. |
 
 ### What's left that's actually unblocked on this hardware
 
@@ -171,13 +172,13 @@ The device attribute reports fabric is supported (`CU_DEVICE_ATTRIBUTE_HANDLE_TY
 
 ### What's left that needs different hardware / IMEX setup
 
-- Fabric-handle `cuMemUnmap` equivalence (already framed as Audit 1b validation).
-- Intra-node MNNVL prototype using `MnnvlMemory` (TRT-LLM Python wrapper requires fabric handles internally; same IMEX gate).
+- FABRIC-handle `cuMemUnmap` behavior and full rack recovery, with no equivalence inferred from POSIX-FD (Audit 1b / 1d.4a).
+- Production `MnnvlMemory` on the x86_64 B300 node uses the POSIX-FD handle path and is suitable for the intra-node no-mock prototype. It does not prove the Grace/aarch64 FABRIC path.
 - **All "rack-fabric specific" questions in §9.1 Audit 1b** — explicitly out of scope for 1a.
 
 ## Hardware notes
 
-This audit ran on **B300 SXM6** which is fabric-capable but is not the same as the NVL72 rack fabric. The intra-node fabric API is exercised by Day 4–5 (when those run), but item §9.1 Audit 1b — rack-fabric validation — remains a separate, independent effort. The work here is intentionally scoped to "run anywhere with ≥ 4 NVLinked GPUs" so rack time is a smaller follow-on.
+This audit ran on an **8-GPU B300 SXM6 system with NVSwitch**. The meaningful software-path distinction is not "NVSwitch versus no NVSwitch": TRT-LLM's Python `MnnvlMemory` currently selects POSIX-FD sharing on x86_64 B200/B300 hosts and FABRIC handles on Grace/aarch64 GB200/GB300. The former validates production components intra-node; only the latter exercises IMEX and rack-fabric grant semantics. Item 1d.4a therefore remains a separate acceptance run on NVL72 or equivalent FABRIC/IMEX hardware.
 
 ## Files and reproduction
 

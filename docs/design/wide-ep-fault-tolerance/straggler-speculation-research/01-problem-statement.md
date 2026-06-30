@@ -12,16 +12,16 @@
 
 | Deployment | Topology asymmetry source | Magnitude |
 |:---|:---|:---|
-| NVL72 single rack | intra-tray NVLink vs cross-tray NVSwitch (multi-hop) | 1.5–2× peak-BW spread across pairs |
+| NVL72 single rack | local vs cross-tray paths through the NVSwitch fabric | 1.5–2× peak-BW spread across pairs |
 | Multi-rack via NVLink + IB | intra-rack NVLink vs cross-rack IB | 5–10× depending on cross-rack share |
-| **B200 NVL8 + IB** | intra-node NVLink (~900 GB/s) vs cross-node IB (~50 GB/s) | **18× peak BW** (Peiheng Hu, May 2026) |
+| **B200 NVL8 + IB** | intra-node NVSwitch/NVLink domain (~900 GB/s) vs cross-node IB (~50 GB/s) | **18× peak BW** (Peiheng Hu, May 2026) |
 
 DeepSeek-V3-class workload: 256 experts, top-8, 58 MoE layers per forward iteration, attention-DP. Every MoE layer runs an N-way AlltoAll for token dispatch and combine; the collective is the critical path of every iteration.
 
 Two structural properties of the setting matter:
 
 1. **Synchronous N-way collective.** AlltoAll is bottlenecked by `max(per_rank_latency)`. Every rank waits for the slowest. There is no per-token or per-pair short-circuit — the iteration advances together.
-2. **Replicated experts as routing state.** EPLB maintains expert replication for load balancing (replication ≥ 2 in production DeepSeek). Replicas are not spare task instances waiting to be spawned — they are pre-allocated GPU memory, mapped into the routing table. Tokens dispatched to "expert E" can already land on rank A's slot or rank B's slot depending on routing.
+2. **Some experts have additional copies as routing state.** EPLB uses extra expert slots for load balancing, but the canonical DeepSeek-V3 EP=72 / four-slots-per-rank layout has 288 slots for 256 experts: only 32 extra copies. At least 224 experts are therefore singletons unless the configuration allocates substantially more capacity. Where copies exist, they are pre-allocated GPU memory mapped into the routing table rather than spare tasks that can be spawned on demand. MVP item 1b.2a separately enforces the FT admission invariant needed for a selected workload/failure domain; this research must not assume blanket replication.
 
 These two properties create a setting that prior straggler-mitigation work did not address. Crucially, heterogeneous topology — once it exists — multiplies the consequences of both: asymmetric BW makes the synchronous-collective tail worse, *and* it makes replica placement matter (which replica you pick changes which fabric link carries the token).
 
@@ -77,7 +77,7 @@ This is **the central technical contribution** of any paper in this space.
 
 ### Q2. When is replica-routing speculation enough vs when is full speculative compute needed?
 
-Latency-aware replica routing (Option A in §7.5) is a much cheaper form of speculation: it doesn't duplicate compute, it just biases token dispatch toward fast replicas. For a workload where most experts have replicas, A captures most of the available speculation benefit at near-zero cost.
+Latency-aware replica routing (Option A in §7.5) is a much cheaper form of speculation: it doesn't duplicate compute, it biases token dispatch toward fast copies **where more than one usable copy exists**. Its coverage is therefore workload- and placement-dependent; the canonical 288-slot/256-expert layout does not make "most experts replicated" a safe default.
 
 Open question: for what variability severity / what workload skew does A's expected-value benefit dominate B's strict-tail-bound benefit? At low severity (e.g., +10 % rank latency on one rank), A probably wins on cost-effectiveness. At high severity (one rank at 3× latency due to thermal throttling, or one rank-pair at 18× BW asymmetry due to IB vs NVLink), B's strict bound may be needed to meet SLA.
 
@@ -120,7 +120,7 @@ Auto-scaling fits the joint-formulation framing as a **temporal extension** of t
 
 ### Q6. FT recovery state as a variability source *(not a separate technique)*
 
-When a rank fails and the Phase 1 mask + EPLB slot remap activates, the system is operating in a *transient* state: some experts have only one surviving replica, placement is locally suboptimal, and the surviving ranks running the dead rank's load are *systematically slower* until the next EPLB rebalance. From the AlltoAll barrier's perspective, this looks identical to any other variability source: per-rank execution time elevated on a subset of ranks for a transient period.
+When a rank fails and the atomic Phase 1 recovery commit activates, the system is operating in a *transient* state: admitted configurations still have at least one usable copy per expert (1b.2a), but copy coverage may be reduced, placement is locally suboptimal, and survivors absorb the dead rank's load until later rebalance. A configuration that cannot satisfy that invariant fails admission rather than silently zeroing an expert contribution. From the AlltoAll barrier's perspective, the admitted degraded state still looks like other variability sources: elevated per-rank execution time on a subset of ranks.
 
 **The contribution: the speculative scheduler responds identically to FT-recovery transient state and any other variability source.** It does not require a separate "FT-aware" code path. The unified observation pipeline (per-rank execution time, fabric BW telemetry, EPLB generation counter) is sufficient.
 
@@ -132,7 +132,7 @@ Choices the design / paper takes as given:
 
 - **WideEP, not standard EP.** Results are about EP ≥ 32. Smaller EP doesn't have the AlltoAll tail-domination problem to the same degree.
 - **Heterogeneous topology as the *general* setting.** The kernel-level combine work is over MNNVL (the backend TRT-LLM owns); the *findings* generalize to NCCL- or NVSHMEM-based AlltoAll on B200+IB and similar.
-- **Replication ≥ 2.** The DeepSeek production default. Lower replication eliminates Option A (no replicas to choose between) and makes Option B's overhead more punishing.
+- **Measured copy coverage, not blanket replication.** Experiments must report per-expert copy counts and failure-domain placement. Option A applies only to the subset with multiple usable copies; 1b.2a governs whether the configuration is safe to admit for FT.
 - **Inference, not training.** Tail latency under SLA is the objective. Training tolerates per-iteration tail differently and is out of scope.
 - **Single variability source dominant at a time.** Multi-source compounding (e.g., one thermally-throttled rank *and* one degraded NVLink lane *and* in-progress FT recovery) is an open question for follow-on work.
 

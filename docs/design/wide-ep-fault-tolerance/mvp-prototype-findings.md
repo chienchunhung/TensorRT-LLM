@@ -1,173 +1,105 @@
-# WideEP FT MVP Prototype — Findings
+# Historical WideEP FT MVP Prototype — Findings and Corrections
 
-[< Back to Overview](README.md) • [Prototype plan](mvp-prototype-plan.md) • [Audit 1a findings](audit-1a-findings.md)
+[< Back to Overview](README.md) • [Corrected prototype plan](mvp-prototype-plan.md) • [Audit 1a findings](audit-1a-findings.md)
 
-**Status:** Living document — updated as the prototype runs. • **Owner:** WideEP FT track • **Last updated:** 2026-05-19
+**Status:** Archived evidence from historical draft [PR #14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198); conclusions corrected against the production design • **Owner:** WideEP FT track • **Last updated:** 2026-06-30
 
-This file collects the seam-contract issues, performance surprises, and integration-risk discoveries surfaced by running the throwaway scaffolding at `prototypes/wide_ep_ft_mvp/` on the [`WideEP-FT/mvp-prototype`](https://github.com/chienchunhung/TensorRT-LLM/tree/WideEP-FT/mvp-prototype) branch (preview draft [PR #14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198)).
+## Evidence boundary
 
-Per [`mvp-prototype-plan.md` §9](mvp-prototype-plan.md#9-after-the-prototype), each finding here feeds back into the design of a specific production PR — the prototype's value is exactly this list.
+PR #14198 used POSIX shared-memory flags, a Python watchdog, pseudo-AlltoAll work, direct local health mutation, a stub MPI notification path, and simplified reconfiguration. It was useful for finding interface and lifecycle questions, but it was not an end-to-end working prototype and cannot prove the production recovery path.
 
----
+The corrected [prototype plan](mvp-prototype-plan.md) requires real worker processes, physical GPUs, a real model/workload, and the production CUDA/MNNVL, NCCL, MPI, EPLB, PyExecutor, and request-lifecycle paths. No code or timing result below satisfies 1d.4 or 1d.4a acceptance.
 
-## F1. The watchdog's completion-flag view must NOT require peer participation
+| Historical finding | Current disposition | Owning corrected item |
+|:---|:---|:---|
+| F1: watchdog reads must not require the failed peer | **Retained, with limited evidence.** The semantic requirement is correct; the POSIX mock did not validate MNNVL behavior. | 1a.4, 1d.4, 1d.4a |
+| F2: survivors can hang in `MPI_Finalize` after peer death | **Retained and promoted to explicit MVP work.** | 1d.0a; 1c.3 supplies failure evidence, not shutdown ownership |
+| F3: independent detection makes broadcast non-critical | **Invalid as a production conclusion.** Detection is evidence only; reconciliation, common survivor membership, and atomic commit remain on the critical path. | 1c.3, 1c.3a, 1c.4b |
+| F4: watchdog timeout is the only meaningful latency knob | **Invalid.** Running-kernel escape, reconciliation, admission, control/data communicator rebuild, graph policy, and request disposition can all dominate. | 1a.8, 1b.2a, 1c.3a, 1c.4a–1c.4c, 1a.11 |
+| F5: recovery is scale-independent | **Invalid beyond the mocked 4/8-process loop.** | 1d.4a and scale/performance evidence |
+| OQ2: iteration-hook placement is near-noise | **Invalid.** The boundary is a correctness gate: launches must quiesce before a common generation is committed. | Existing 1c.4 hook, 1c.4b, 1a.11 |
 
-**Surfaced during:** initial scaffolding review (before first run).
+## F1. Watchdog observation must not require peer participation
 
-**Where:** [`prototypes/wide_ep_ft_mvp/stubs/shm_completion_flags.py`](https://github.com/chienchunhung/TensorRT-LLM/blob/WideEP-FT/mvp-prototype/prototypes/wide_ep_ft_mvp/stubs/shm_completion_flags.py) (the prototype's substitute) replaces an initial design that used `MPI.COMM_WORLD.allgather` as the completion-flag view.
+The scaffolding initially considered `MPI.COMM_WORLD.allgather` for completion-flag observation and correctly rejected it: a detector cannot depend on a collective that includes the suspected dead rank. The historical POSIX shared-memory substitute preserved that one property.
 
-**Why it matters.** If the watchdog's "read every peer's flag" path requires a collective involving the dead peer, the dead peer's non-participation blocks the watchdog and the watchdog can never fire. The MNNVL fabric-memory property "host can read peer flags without peer participation" is *load-bearing*, not incidental. This was almost lost in the scaffolding pass because `allgather` is the cheapest single-node substitute for "every rank's view of every other rank's counter" — but it has fundamentally wrong fault-tolerance semantics.
+The production contract is stronger:
 
-**Implication for production [PR 1a.4](pr-execution/08-implementation-plan.md#81-phase-1-pr-breakdown).** Whatever the production `AlltoAllWatchdog` uses to read the completion-flag table — MNNVL fabric memory, NVSHMEM-equivalent, or any future substitute — the read path **must be zero-collective**. Any alternative that requires peer participation must be rejected during PR 1a.4 design review. The MNNVL fabric-memory access pattern is the contract, not just an optimization.
+- the observation path is zero-collective and does not require peer progress;
+- a watchdog publishes failure evidence rather than updating the committed data-plane mask;
+- item 1a.8 provides an independent bounded escape for an already-running polling kernel; and
+- 1d.4 exercises the real intra-node path under destructive process death; 1d.4a adds rack FABRIC/IMEX process death plus an approved inaccessible-peer-memory/device-loss case for Q3 containment.
 
-**Prototype mitigation.** POSIX shared memory (`/dev/shm/wide_ep_ft_proto/run_<id>/rank_<i>.counter`); each rank `mmap`s its own counter file rw and peers' files ro. Single-node only, but preserves the zero-collective read property.
+This finding informs 1a.4 review, but the mock did not establish that the real MNNVL mapping remains readable, correctly ordered, or sufficient for recovery after a peer dies.
 
----
+## F2. Poisoned-world finalization can hang
 
-## F2. Survivors hang in `MPI_Finalize` after a peer SIGKILL
+In the historical eight-process B300 smoke run, the victim received `SIGKILL`; surviving Python interpreters later entered mpi4py's `MPI_Finalize` path and did not complete. This corroborated the earlier isolated MPI audit: removing the signal-handler `MPI_Abort` propagation is necessary but does not make an MPI world healthy after peer death.
 
-**Surfaced during:** first Level A smoke run on 8× B300 node, 2026-05-18.
+The corrected ownership is:
 
-**Symptom.** Driver injects SIGKILL on the victim at iteration N. Survivors complete their main loop, return from `main()`. Python interpreter shuts down. `mpi4py`'s `atexit` hook calls `MPI_Finalize`. **`MPI_Finalize` hangs forever** because it is a collective and the dead victim cannot participate. The driver never sees `loop_end` events from any survivor and times out.
+- merged 1d.0 / [#14160](https://github.com/NVIDIA/TensorRT-LLM/pull/14160) replaces the old signal-time abort behavior;
+- 1c.3 records/reconciles failure evidence and may expose a poisoned-world signal;
+- **1d.0a** owns the lifecycle policy: prohibit unsafe world collectives and finalization after peer death, select the survivor control path, and provide deterministic survivor/failed-rank shutdown; and
+- 1d.4 validates the behavior in a real inference process, including implicit teardown collectives and normal/abnormal shutdown variants.
 
-This is exactly the [audit-1a Day 2 F4 finding](audit-1a-findings.md#day-2--mpi-signal-handler--exit-mitigation) ("survivors hang in their next collective after a peer death") manifesting at *process-shutdown time* rather than at the next in-loop collective. The audit prototype exercised it within an `Allreduce` loop; this prototype shows it also fires through `MPI_Finalize` on normal shutdown.
+The historical unconditional `os._exit(0)` was a diagnostic workaround, not a production fix. Production behavior must be conditional, observable, and coordinated with resource cleanup; it must not silently turn all shutdowns into abrupt exits.
 
-**Why it matters.** Even with the [1d.0 signal-handler replacement (PR #14160)](https://github.com/NVIDIA/TensorRT-LLM/pull/14160) installed, even with `--mca orte_enable_recovery 1` on `mpirun`, even with the watchdog → broadcast → reconfigure cascade working perfectly, **survivors will silently hang on shutdown**. There is no error message, no signal, no diagnostic — just `MPI_Finalize` never returning. From the operator's perspective the cluster simply stops responding when the inference job tries to end.
+## F3. Local detector agreement did not prove recovery consensus
 
-**Implication for production PRs.** The fix is a Python-side coordinated shutdown path that detects "we are in a poisoned-world state" and calls `_exit(0)` instead of letting `MPI_Finalize` run. Distinct ownership questions:
+In one mocked four-process run, three survivors' local timers reported the same dead peer within roughly 2 ms, before the stub notification callback recorded a separate receive event. That observation proves only that identical local timers can fire at similar times in a quiet test.
 
-- **[PR 1d.0](pr-execution/08-implementation-plan.md#81-phase-1-pr-breakdown) (signal-handler replacement, in flight as PR #14160).** The current C++ handler installs `_exit(137)` on `SIGABRT`/`SIGSEGV` — but normal post-cascade shutdown doesn't go through a signal. 1d.0's scope is *signal-time* shutdown; the *atexit-time* shutdown belongs to a different PR. **No 1d.0 change required for F2** — flagging here so reviewers don't conflate the two.
-- **[PR 1c.3](pr-execution/08-implementation-plan.md#81-phase-1-pr-breakdown) (MPI FT subcomm + broadcast thread).** Likely owns the "is the world poisoned?" check, since it already tracks active vs. failed ranks in the FT subcomm. **Suggest adding:** `MpiFtSubcomm.world_is_poisoned() -> bool` for the shutdown path to consult.
-- **[PR 1c.4](pr-execution/08-implementation-plan.md#81-phase-1-pr-breakdown) (model engine health-check hook).** The cleanest place to install the shutdown handler is wherever the model engine wires its main loop — the same place that registers the iteration-boundary hook can register an `atexit` (or equivalent) that consults `world_is_poisoned()` and `_exit(0)`s if true, otherwise lets normal shutdown proceed. **This is where the production fix for F2 should live.**
+The previous conclusions—“broadcast is off the critical path,” “every survivor may call `mark_failed` directly,” and “the iteration hook can pick up any local mark”—are unsafe and withdrawn. Real detectors may disagree, arrive at different times, or observe different evidence. A direct detector-to-mask path can launch different generations, reconfigure placement before communicator readiness, and corrupt the failed epoch.
 
-**Prototype mitigation.** The worker calls `os._exit(0)` unconditionally after the main loop's `loop_end` event. See [`prototypes/wide_ep_ft_mvp/scripts/kill_and_survive_worker.py`](https://github.com/chienchunhung/TensorRT-LLM/blob/WideEP-FT/mvp-prototype/prototypes/wide_ep_ft_mvp/scripts/kill_and_survive_worker.py) — the inline comment explicitly cites this finding. Production must be conditional (`_exit` only if `world_is_poisoned`, else `return` normally) so legitimate shutdowns still run `MPI_Finalize` cleanly.
+The corrected flow is:
 
-**Open sub-questions for production design.**
+1. watchdog/MPI/NCCL paths publish evidence and 1a.8 aborts the failed epoch;
+2. 1c.3 reconciles the failed-rank set;
+3. 1c.4b validates 1b.2a admission, quiesces launches, and prepares EPLB placement;
+4. under the same transaction, 1c.3a/1c.4a prepare survivor control membership and an immutable `ActiveRankMap`, 1a.7 rebuilds supported NCCL communicators, and 1a.11 applies eager fallback plus graph invalidation;
+5. only 1c.4b atomically commits the common mask, `ActiveRankMap`, and generation; and
+6. 1c.4c disposes failed-epoch requests before serving resumes.
 
-- Should the "skip `MPI_Finalize`" decision happen at every rank independently (based on local `EPGroupHealth.has_failures()`), or via a broadcast from one designated rank? Independent decisions are simpler but assume every survivor has seen the same broadcast — already a PR 1c.3 invariant for single-failure but may not hold under multi-failure (PR 1c.6).
-- Does `--mca orte_enable_recovery 1` change `MPI_Finalize`'s behavior in any way? Audit 1a Day 2 did not test this specifically; worth a focused micro-prototype if PR 1c.3 doesn't already validate it.
-- Are there other implicit collectives in the inference shutdown path (e.g. CUDA context destroy on driver-mapped MNNVL memory)? This prototype only exercises the MPI shutdown path; the CUDA-driver path is Audit 1a Day 3's territory but wasn't tested under "survivor with poisoned MNNVL mapping" conditions. **Defer to [Audit 1b](09-risks-and-open-questions.md#audit-1b--rack-fabric-validation-pending-nvl72-access).**
+Notification can be concurrent; common committed state is still a correctness-critical synchronization boundary.
 
----
+## F4. Stub timing did not characterize recovery latency
 
-## F3. Detection is parallel, not serial — broadcast is consensus backup, not primary spreading
+The historical timeout sweep measured approximately `configured Python timer + 100 ms` in a pseudo-workload:
 
-**Surfaced during:** first successful Level A run, 2026-05-19. Raw event distribution from [`prototypes/wide_ep_ft_mvp/results/np4-iter40.json`](https://github.com/chienchunhung/TensorRT-LLM/blob/WideEP-FT/mvp-prototype/prototypes/wide_ep_ft_mvp/results/np4-iter40.json):
+| Stub watchdog timeout | Historical mocked-loop result |
+|:---|:---|
+| 1 s | 1.10 s |
+| 2 s | 2.10 s |
+| 5 s | 5.11 s |
+| 10 s | 10.13 s |
 
-| Event | Rank 0 | Rank 1 | Rank 3 |
-|---|---|---|---|
-| `watchdog_marked_failed(peer=2)` | t=88624.804 | t=88624.806 | t=88624.804 |
-| `broadcast_received(peer=2)` | — | — | — |
+This is useful only as a check that the timer stub behaved as configured. It does not select a production default or establish recovery headroom. The mock omitted the real running-kernel escape, failed-epoch drain, per-expert admission, survivor MPI/ADP/NCCL rebuild, CUDA graph transition, request disposition, and realistic first-response latency.
 
-**All three survivors detected the dead peer independently within 2 ms.** Zero `broadcast_received` events fired because by the time the MPI broadcast arrived on any survivor, that survivor's local watchdog had already called `mark_failed` (which is idempotent), so the recv-side `mark_failed` returned `False` and the broadcast-received callback was correctly skipped.
+Production timeout remains configurable and must be chosen from physical-hardware false-positive and recovery measurements. The event trace in the corrected prototype plan reports every recovery phase separately; no single timeout is assumed to dominate.
 
-**Why it matters.** The implicit assumption "rank A detects, broadcasts to B/C/D, they apply" is *not* the actual data path. The actual data path is "every rank's local zero-collective watchdog detects independently; the broadcast is a consensus backup for the small skew window where one rank's watchdog is slower than another's." This matches the production [§5.3 design](05-phase-1-immediate-survival.md#layer-1--alltoall-watchdog-the-host-side-abort-hook) (Layer 1 = primary, scale-independent), but is worth flagging explicitly so reviewers and operators don't model the system as broadcast-driven.
+## F5. Four-versus-eight stub parity is not scale evidence
 
-**Implication for production PRs.**
+The mocked loop produced nearly identical timestamps at four and eight processes because each local timer ran the same code and the omitted recovery work did not scale with rank count. It did not exercise a 72×72 completion table, real MNNVL/NVSwitch traffic, rack FABRIC/IMEX, survivor communicator construction, 58-layer EPLB state, attention-DP gathers, or realistic request scheduling.
 
-- **[PR 1c.3](pr-execution/08-implementation-plan.md#81-phase-1-pr-breakdown) (MPI FT subcomm).** The broadcast must continue to exist — there is still a ~ms skew window where one survivor has detected and another hasn't, and during that window the AlltoAll kernel could race. But the broadcast's *latency budget* is relaxed: it doesn't need to be on the critical path. Production can prefer slower-but-more-reliable primitives (e.g. a barrier+broadcast at iteration boundaries, per [PR 1c.5](pr-execution/08-implementation-plan.md#81-phase-1-pr-breakdown)) without affecting recovery time.
-- **[PR 1c.4](pr-execution/08-implementation-plan.md#81-phase-1-pr-breakdown) (model engine hook).** The `EPGroupHealth.generation` check at iteration boundary picks up *any* survivor's local mark_failed; the broadcast is only needed to handle the case where rank A's hook ran *before* its watchdog fired but *after* peer's watchdog fired. The broadcast handles this case but is not on the critical path for the common case where every survivor's watchdog has already fired by the next iteration boundary.
+Therefore the prior statement that recovery time is scale-independent, and its extrapolation to 72 ranks, are withdrawn. Only 1d.4a and the associated steady-state/recovery measurements can support a rack-scale claim.
 
-**Driver fix.** The driver's `t_mark_failed_propagated` measurement initially required a `broadcast_received` event on every survivor; updated to count "ranks whose local `mark_failed` succeeded (via either watchdog or broadcast)" so the parallel-detection case is correctly measured.
+## OQ2. Iteration-boundary placement remains a correctness question
 
----
+The historical run observed its stub generation callback within one synthetic loop interval. That does not make hook placement a performance-only choice. A launch after failure evidence but before quiescence/atomic commit may use stale placement, mask, communicator, or CUDA graph state.
 
-## F4. Detection latency dominates the recovery budget; relationship is linear
+Item 1c.4 remains the existing model-engine health-check hook. Item 1c.4b turns it into the coordinated transition `detect → abort failed epoch → reconcile evidence → validate admission → quiesce → prepare EPLB → rebuild survivor control/NCCL → apply graph policy → commit mask + ActiveRankMap + generation`; item 1c.4c then applies request disposition before resume. Item 1a.11 invalidates stale captures and selects eager execution before the commit; generation-bound graph recapture starts only after the new generation is committed.
 
-**Surfaced during:** OQ4 watchdog-timeout sweep, 2026-05-19. Identical workload (4 ranks, kill at iter 40, 400 iters total), varying `--watchdog-timeout-sec`:
+## Reopened questions for the production-component prototype
 
-| Watchdog timeout | Total recovery (t_first_new_request_completed) | Budget verdict |
-|---|---|---|
-| 1 s | 1.10 s | ✓ PASS |
-| 2 s | 2.10 s | ✓ PASS |
-| **5 s (default)** | **5.11 s** | **✓ PASS (default)** |
-| 10 s | 10.13 s | ✗ **FAIL** |
+- [ ] Can 1a.8 release a real dispatch/combine kernel in bounded time without `trap;` or CUDA-context poisoning?
+- [ ] Do 1a.7 and 1c.3a rebuild NCCL and control communicators over exactly the same survivor map?
+- [ ] Does 1c.4a remove the dead rank from every attention-DP/PyExecutor management collective?
+- [ ] Does 1b.2a prove every layer/expert remains served for the injected failure, rather than relying on aggregate slot count?
+- [ ] Does 1c.4c suppress every failed-epoch output and give every queued/in-flight request an explicit disposition?
+- [ ] Does 1d.0a avoid poisoned-world collectives and complete deterministic shutdown?
+- [ ] Do eager fallback and 1a.11 prevent any stale CUDA graph from crossing the committed generation?
+- [ ] What are the measured phase-by-phase latency and false-positive rates on intra-node NVSwitch and on rack FABRIC/IMEX?
 
-`recovery ≈ watchdog_timeout + 100 ms`. The 100 ms tail is one poll interval (50 ms in this run) + iteration boundary delay + reconfigure (~10 µs).
+## Status
 
-**Why it matters.** The watchdog timeout is the *only* meaningful tuning knob for recovery latency. Everything else (broadcast, EPLB reconfigure, iteration boundary) is in the noise.
-
-**Implication for production PRs.**
-
-- **[PR 1a.4](pr-execution/08-implementation-plan.md#81-phase-1-pr-breakdown) default value.** 5 s default is well-chosen — fits the 10 s recovery budget with ~50% headroom for everything else (NCCL surfaces, model engine drain, first new request latency).
-- **[PR 1d.1](pr-execution/08-implementation-plan.md#81-phase-1-pr-breakdown) (LLMArgs).** The watchdog timeout **must** be exposed as a tunable config field (not buried as a constant). Deployments with stricter latency SLAs (e.g. < 5 s recovery) should be able to dial it down to 1-2 s at the cost of higher false-positive risk on noisy systems.
-
-**Open sub-questions.**
-
-- **False-positive floor.** At what timeout does spurious detection become a problem in production? The single-node prototype has near-zero noise; the 72-rank NVL72 case may show natural completion-flag pauses (load imbalance, EPLB stride, GC pauses) that fire a 1 s watchdog spuriously. Validation belongs to [Audit 1b](09-risks-and-open-questions.md#audit-1b--rack-fabric-validation-pending-nvl72-access).
-- **Poll-interval scaling.** Default 100 ms poll wastes ~99% of CPU samples; this prototype uses 50 ms with no measurable cost, but at 72 ranks × 1 watchdog thread/rank the steady-state cost may matter. Worth profiling in PR 1a.4 to find the right default.
-
----
-
-## F5. Recovery time is scale-independent across 4 vs 8 ranks (validates §5 claim)
-
-**Surfaced during:** Level A end-to-end runs at `--np 4` and `--np 8`, 2026-05-19. Identical kill timing (iter 40) and identical detection config (5 s timeout, 100 ms poll), measured wall-clock from kill to first new request completed at N−1:
-
-| `--np` | `t_kill` | `t_watchdog_fires` | `t_propagated` | `t_reconfigure_done` | **Total recovery** |
-|---|---|---|---|---|---|
-| 4 | 2.056 s | 7.108 s | 7.110 s | 7.120 s | **7.168 s** |
-| 8 | 2.056 s | 7.109 s | 7.111 s | 7.121 s | **7.168 s** |
-
-**Identical to within 1 ms across every measured event.** Doubling the EP size adds zero recovery latency.
-
-**Why it matters.** The plan [§5 "What this prototype validates"](mvp-prototype-plan.md#5-what-the-prototype-validates--does-not-validate) claims "Order-of-magnitude on the < 10 s recovery target. Detection dominates the budget, and detection is scale-independent." This is now empirically confirmed at small N; the claim's extrapolation to 72 ranks is justified by the same property (every rank's local watchdog is independent — there's nothing in the design that scales with N).
-
-**Caveats.** The prototype does not exercise:
-
-- The 72×72 completion-flag table itself (`kMaxRanks` 64→128 register-pressure question is still pending for [PR 1a.2](pr-execution/08-implementation-plan.md#81-phase-1-pr-breakdown)).
-- The MPI broadcast at scale (would scale ~O(N) but is off the critical path per F3).
-- The EPLB reconfigure at 58 layers vs the prototype's 2 layers (~30× more work, but the prototype's per-layer cost is ~6 µs so 58 layers ≈ 350 µs, still well in the noise).
-
-These three pending items are [Audit 1b](09-risks-and-open-questions.md#audit-1b--rack-fabric-validation-pending-nvl72-access) territory; the prototype's "scale-independent" claim is robust within its scope.
-
----
-
-## OQ2. Iteration-boundary semantics — answered
-
-The plan asked: "Where exactly does the model engine check `EPGroupHealth.generation` — top of iteration before any kernel launches, or after fwd setup? The latter risks launching one more iteration's kernels with the old mask."
-
-**Empirical answer from Level A runs.** The iteration-boundary hook fires within `t_iteration_boundary - t_mark_failed_propagated = 7-8 ms` of detection, well below the `iter_sleep_sec = 50 ms` cadence. Even an iteration-boundary check placed "wrong" (after fwd setup instead of before) would add at most one `iter_sleep_sec` of stale-mask exposure — ~50 ms in the prototype, likely 100-500 ms in production depending on token batch sizes.
-
-**Implication.** The "where in the iteration to check" question becomes a near-noise design choice compared to the 5 s detection budget. Production [PR 1c.4](pr-execution/08-implementation-plan.md#81-phase-1-pr-breakdown) can prioritize *cleanest integration point* over *earliest possible check point*; the cost difference is small.
-
----
-
-## Pending findings
-
-Successfully closed: **F1, F2, F3, F4, F5, OQ2, OQ4.**
-
-Still pending:
-
-- [ ] **OQ1: Watchdog vs. NCCL collective ordering.** Not validated empirically — requires adding `torch.distributed` (NCCL backend) initialization + a real allreduce to the worker, plus GPU contexts. Significant new work. *Quick a-priori analysis:* the watchdog should fire first because NCCL's async-error scan interval is typically ≥ 1 s while the watchdog is bounded by `timeout + poll_interval`. Validated empirically once we have a kernel-stub integration (currently blocked alongside the kernel-side 1a.2/1a.3 work).
-- [ ] **Seam-stressing kill points** (during dispatch / combine / routing / EPLB-stride) — blocked on the kernel-side 1a.2/1a.3 integration; see [`prototypes/wide_ep_ft_mvp/kernel/README.md`](https://github.com/chienchunhung/TensorRT-LLM/blob/WideEP-FT/mvp-prototype/prototypes/wide_ep_ft_mvp/kernel/README.md).
-- [ ] **False-positive floor characterization** (F4 sub-question) — needs NVL72 noisy-workload data; deferred to Audit 1b.
-- [ ] **Failure-during-recovery stress case** (multi-failure ordering) — out of MVP scope per PR 1c.6.
-
----
-
-## Status: paused (2026-05-19)
-
-The prototype's primary mandate ([§1 of the plan](mvp-prototype-plan.md#1-why-this-exists)) is empirically discharged: the MVP integration story works, the < 10 s recovery target is achievable in principle (5.11 s with default config), and the seam contracts are correct. Six findings + two open questions closed; the remaining four pending items all hit diminishing returns vs. continuing work on the production PRs that they unblock.
-
-[Draft PR #14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198) is left in `Draft (DO NOT SUBMIT)` state. The branch `WideEP-FT/mvp-prototype` continues to carry private cherry-picks of PR #13302 (1a.1) and PR #14160 (1d.0) plus the throwaway scaffolding under `prototypes/wide_ep_ft_mvp/`; if either parent PR lands on `main` while the prototype is paused, rebasing this branch will drop the cherry-pick as already-applied with no manual intervention.
-
-### When to resume
-
-Resume the prototype when *any* of the following events unblock a pending item:
-
-| Trigger | Unblocks | Action |
-|---|---|---|
-| **[PR 1a.2](pr-execution/08-implementation-plan.md#81-phase-1-pr-breakdown) (#13404, NVLinkOneSided kernel mask) lands or reaches stable review state** | Seam-stressing kill points (dispatch / combine / routing / EPLB-stride) + OQ1 (NCCL ordering, which becomes free once the kernel is in the loop) | Cherry-pick #13404 onto `WideEP-FT/mvp-prototype` per Path A in [`kernel/README.md`](https://github.com/chienchunhung/TensorRT-LLM/blob/WideEP-FT/mvp-prototype/prototypes/wide_ep_ft_mvp/kernel/README.md); replace the pseudo-AlltoAll loop in `kill_and_survive_worker.py` with the real kernel; rerun with `--kill-during {dispatch,combine,routing,eplb-stride}` variants. |
-| **[PR 1a.4](pr-execution/08-implementation-plan.md#81-phase-1-pr-breakdown) (AlltoAllWatchdog production) lands** | Validates that the production watchdog reproduces the prototype's F3/F4/F5 numbers under real MNNVL fabric memory (not POSIX shm). | Swap `stubs/alltoall_watchdog.py` for the production watchdog in the worker; rerun Level A; diff timeline against the regression baseline JSONs already committed under `prototypes/wide_ep_ft_mvp/results/`. |
-| **[PR 1c.3](pr-execution/08-implementation-plan.md#81-phase-1-pr-breakdown) (MPI FT subcomm) lands** | Lets the prototype use the production FT subcomm instead of the `Isend/Irecv` stub on `COMM_WORLD`. Also exposes `MpiFtSubcomm.world_is_poisoned()` which the prototype's F2 mitigation can be tightened against. | Swap `stubs/mpi_ft_subcomm.py` for the production component; rerun Level A; document any new propagation-time delta vs. F3 baseline. |
-| **NVL72 access becomes available** | False-positive floor characterization (F4 sub-question) + the actually-72-rank scale validation that F5 cannot extrapolate to with certainty. | Coordinate with [Audit 1b](09-risks-and-open-questions.md#audit-1b--rack-fabric-validation-pending-nvl72-access); prototype runs as written should port to NVL72 once IMEX is configured per [mvp-prototype-plan.md §3](mvp-prototype-plan.md#3-hardware). |
-| **PR 1d.4 (fault-injection harness) starts** | The prototype's `kill_and_survive_driver.py` becomes the reference implementation for the production harness; timeline JSONs become the regression baseline. | Hand off `scripts/kill_and_survive_driver.py` + `results/*.json` to PR 1d.4 author; archive the prototype dir per [mvp-prototype-plan.md §9](mvp-prototype-plan.md#9-after-the-prototype). |
-
-### How to resume (mechanical steps)
-
-1. `cd /home/scratch.chienchunh_coreai/dev/TensorRT-LLM-mvp-prototype` (or recreate the worktree from `WideEP-FT/mvp-prototype`).
-2. `git fetch fork && git rebase fork/WideEP-FT/mvp-prototype` — picks up any cherry-pick drops if a parent PR landed.
-3. `git fetch upstream && git rebase upstream/main` — picks up upstream churn.
-4. Apply the trigger-specific action above.
-5. Rerun the Level A baseline (`--np 4 --kill-at-iteration 40`) and diff the resulting `np4-iter40.json` against the regression baseline; verify F3/F4/F5 still hold before adding new variants.
-6. Append the new findings to this file as F6+, following the F1-F5 template.
+Historical PR #14198 remains archived as seam-finding evidence and should not be resumed as the integration vehicle. Build the new integration worktree from current upstream `main`, stack the exact production PR heads, implement missing production-shaped slices under their final item IDs, and record new results separately. The corrected prototype plan and the source-of-truth implementation/dependency documents supersede all scheduling and completion claims that appeared here before 2026-06-30.

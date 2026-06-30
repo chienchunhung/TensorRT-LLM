@@ -5,12 +5,14 @@
 **Time spent:** ~half a day pre-drafting + ~5 hr Audit 1a Days 1–3 prototyping
 **Status:** Items 1–6 verified; **item 7 partially answered by Audit 1a Days 1–3** (sections below); item 8 light-pass complete.
 
+> **Historical evidence snapshot (superseded for execution status).** The confirmations below apply to the April 2026 source revision. They must not be read as current "zero uses," capacity, or PR-status claims. In particular, PR #13404 raised `kMaxRanks` from 64 to 128 and added the launch-time mask foundation. The June correction pass promoted 1a.8/1a.11, separated detection from committed membership, and added 1b.2a, 1c.3a, 1c.4a, 1c.4b, 1c.4c, 1d.0a, and 1d.4a; 1c.4 remains the model-engine hook.
+
 ---
 
 ## ✅ Confirmed
 
 **Item 6 — v1 line anchors all hold against current source:**
-- `kMaxRanks = 64` at `cpp/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h` ("Maximum supported EP size") ✓
+- At the April snapshot, `kMaxRanks = 64` in `moeAlltoAllKernels.h`; PR #13404 has since raised the current limit to 128 ✓ historical / resolved
 - 300s in-kernel timeout `(300ll * 2000ll * 1000ll * 1000ll)` confirmed in `moeAlltoAllKernels.cu` (`#define check_timeout(s) ...`) ✓
 - Dispatch release+wait + combine release+wait loops with `st.relaxed.sys.u32` / `ld.relaxed.sys.u32` PTX confirmed; both end with `asm volatile("trap;")` on timeout ✓
 - Combine accumulator's `dst_idx < 0` → `acc[k].fill(0.0f)` skip pattern confirmed (the natural template for routing-pass masking) ✓
@@ -59,20 +61,20 @@
 
 1. **Ray + disagg + NIXL is unsupported** (`tests/integration/defs/disaggregated/test_disaggregated.py:597`): "Ray orchestrator is not supported with NIXL(DEFAULT) cache transceiver backend." Material for §9 future-migration risk and Phase 1-DS scoping. Disagg + Ray works only with non-NIXL transceivers today.
 
-2. **`mpiUtils.cpp` `forwardAbortToParent` variant additionally `kill(getppid(), SIGKILL)`** before `MPI_Abort`. The reviewer's bare-claim quote understates this — it's not just propagation through MPI, the launcher process is also signaled. Worth naming in §3.1 Mode A.
+2. **`mpiUtils.cpp` `forwardAbortToParent` variant additionally `kill(getppid(), SIGKILL)`** before `MPI_Abort`. The reviewer's bare-claim quote understates this — it's not just propagation through MPI, the launcher process is also signaled. This became part of §3.1's Q1/Q3 prompt-evidence MPI analysis.
 
 3. **Two-mode launch path** (`mpirun + MPICommExecutor` vs `MpiPoolSession + MPIPoolExecutor`) — both exist, with different failure modes. The §1.1 user journey should specify which case it walks through (the production `mpirun` case).
 
 ## 🧪 Empirical follow-up — Audit 1a partial (Item 7)
 
-**Hardware:** 8× B300 SXM6 single node, NVLink full mesh. **Software:** PyTorch 2.11 (NCCL 2.29.2), OpenMPI 4.1.9a1 (no ULFM), CUDA 13.1, cuda-python 13.1.1. **Date:** 2026-04-25. **Tracks completed:** NCCL rebuild (Day 1, 6 runs / 6 modes), MPI signal handler (Day 2, 7 runs / 7 modes), driver-side `cuMemUnmap` posix-FD variant (Day 3). Reproducible prototypes live in [`research-pass-prototypes/`](research-pass-prototypes/) (5 single-file scripts, see that subdir's README for run commands); this section captures the headline findings.
+**Hardware:** 8× B300 SXM6 single node, connected through its NVSwitch/NVLink domain. **Software:** PyTorch 2.11 (NCCL 2.29.2), OpenMPI 4.1.9a1 (no ULFM), CUDA 13.1, cuda-python 13.1.1. **Date:** 2026-04-25. **Tracks completed:** NCCL experiment (Day 1, 6 runs / 6 modes), MPI signal handler (Day 2, 7 runs / 7 modes), driver-side POSIX-FD `cuMemUnmap` variant (Day 3). POSIX-FD is the relevant TRT-LLM `MnnvlMemory` handle mode on x86_64 B200/B300; Grace/aarch64 NVL72 uses FABRIC handles and IMEX and remains 1d.4a scope.
 
 ### Headline findings
 
 1. **PT 2.11's `torch.distributed` has no recoverable peer-death path** for any documented mode. `dist.shrink_group(ranks_to_exclude=…, shrink_flags=SHRINK_ABORT)` — the API the design hoped for — itself hangs > 60 s after a peer SIGKILL in this build (with or without `ASYNC_ERROR_HANDLING`). Default config (`ASYNC=1, BLOCKING=0`) SIGABRTs all survivors at the watchdog timeout.
-2. **Detection in pure Python works.** `dist.all_reduce(…, async_op=True)` + main-thread `work.is_completed()` polling delivers a clean exception at exactly the configured deadline (5054 ms vs a 5000 ms budget; tunable freely). Validates §5.3 / 1c.4's design assumption that detection sits above NCCL.
-3. **Mode A needs a TWO-part fix.** Replacing `MPI_Abort` with `_exit(N)` in `mpiUtils.cpp` (PR 1d.0) is necessary but **not sufficient**: under default `mpirun`, a single rank exit (any code, including `_exit(0)` and `SIGKILL`) takes down all survivors in 18–60 s. Adding the launch flag `--mca orte_enable_recovery 1` stops the propagation; survivors then need `MPI_ERRORS_RETURN` (already PR 1c.3) plus bounded-wait collectives (1c.4-style) to escape the broken collective the dead rank was in.
-4. **Driver-side teardown of dead-peer regions is essentially free.** Posix-FD cross-process share + SIGKILL of owner: peer's `cuMemUnmap` returns `CUDA_SUCCESS` in **0.25 ms**, `cuMemRelease` in **1.27 ms**, `cuMemAddressFree` in **0.008 ms** — total **~1.5 ms**. The mapping survives the kill: 2 s after SIGKILL the survivor still reads the owner's pre-kill pattern. **Driver-side cleanup is not a Phase 2 bottleneck.**
+2. **The isolated timeout detector works.** `dist.all_reduce(…, async_op=True)` + main-thread `work.is_completed()` polling delivered a clean exception at the configured deadline. It did not validate survivor-only management collectives or recovery commit; those are now 1c.3a, 1c.4a, and 1c.4b.
+3. **The Q1/Q3 MPI propagation path needs a lifecycle fix beyond 1d.0.** Replacing `MPI_Abort` with `_exit(N)` is necessary but not sufficient. This OpenMPI build also needed `--mca orte_enable_recovery 1`; 1d.1 therefore owns launcher/runtime admission, while survivors still require 1c.3 notification, 1c.3a/1c.4a survivor membership, and 1d.0a protection from poisoned-world collectives and `MPI_Finalize`.
+4. **One POSIX-FD driver micro-case cleans up quickly.** Cross-process share + owner SIGKILL produced `cuMemUnmap` **0.25 ms**, `cuMemRelease` **1.27 ms**, and `cuMemAddressFree` **0.008 ms** in the tested peer. This bounds only those local calls; it does not bound full MNNVL teardown/reallocation, 71-peer fan-out, communicator/workspace rebuild, or FABRIC/IMEX behavior.
 
 ### Empirical numbers (intra-node, single survivor / single peer)
 
@@ -89,8 +91,8 @@
 
 ### What lands in §9.1 Audit 1b (deferred to NVL72-class hardware)
 
-- `cuMemUnmap` fabric-handle equivalence: `CU_MEM_HANDLE_TYPE_FABRIC` allocation requires the `nvidia-imex` daemon, which is not active on this single-node B300 (kernel-side `nv-caps-imex channel0 created` is present but no IMEX domain configured). `cuMemCreate(... FABRIC)` returns `CUDA_ERROR_NOT_PERMITTED`. The driver mechanism is proven (posix-FD); fabric-handle equivalence is a 5-minute re-run on an IMEX-configured node.
-- Intra-node MNNVL `MnnvlMemory` rebuild prototype (Days 4–5 in §9.1 plan): same IMEX gate.
+- `CU_MEM_HANDLE_TYPE_FABRIC` teardown and the full production recovery flow on Grace/aarch64 NVL72. The B300 host was not an IMEX domain, so `cuMemCreate(... FABRIC)` returned `CUDA_ERROR_NOT_PERMITTED`; POSIX-FD behavior does not prove FABRIC equivalence.
+- The no-mock x86_64 intra-node `MnnvlMemory` recovery prototype is **not** IMEX-gated because current TRT-LLM selects POSIX-FD there. It is 1d.4 work; rack FABRIC/IMEX is the separate 1d.4a gate.
 - DeepEP destructor + explicit `destroy()` ordering (Day 3 secondary item): blocked here on a `tensorrt_llm` package import error (pre-existing `fp4_quantize_with_residual` mirror issue in this dev tree). Needs a container with matching C++ binary.
 - NVSHMEM `nvshmem_finalize` behavior (Day 5): `nvshmem` Python module not installed in this env.
 
@@ -98,25 +100,25 @@
 
 - Single-node intra-node only. Cross-node propagation (NCCL FT, MPI mpirun behavior, fabric memory teardown) may differ.
 - 4-rank scale on the rebuild and signal-handler tests; 1 owner / 1 peer on the cuMemUnmap test. Fan-out cost at 71 surviving peers per dead rank is unknown.
-- Did not run the full `--mca orte_enable_recovery 1` + `MPI_ERRORS_RETURN` + bounded-wait collective combination end-to-end. Each piece tested in isolation; integrated path is the next step (1–2 hr).
+- Did not run a production-component recovery transaction. Combining launcher settings and `MPI_ERRORS_RETURN` in another micro-test would still omit 1a.8, 1b.2a, 1c.3a, 1c.4a–1c.4c, 1d.0a, real requests, and physical acceptance.
 
 ## ❓ Deferred (intentionally)
 
-- **Item 7 — NVSHMEM/MNNVL teardown.** No longer fully deferred: Audit 1a Days 1–3 done (above). Days 4–5 (intra-node MNNVL prototype, NVSHMEM teardown) and the rack-fabric portion (Audit 1b) remain.
+- **Item 7 — NVSHMEM/MNNVL teardown.** Isolated Days 1–3 evidence is retained above. The no-mock intra-node production path (1d.4), NVSHMEM-specific work if that backend is selected, and rack FABRIC/IMEX acceptance (1d.4a/Audit 1b) remain.
 - **Item 8 — Disagg Ray (light pass complete)** — see new gap #1 above.
 
 ---
 
 ## Implications for the rewrite
 
-1. §3.1 Mode A — quote `mpiUtils.cpp` and name the additional `kill(getppid(), SIGKILL)` behavior.
+1. §3.1 Q1/Q3 MPI propagation path — quote `mpiUtils.cpp` and name the additional `kill(getppid(), SIGKILL)` behavior.
 2. §3.3 / §11 — Ray-path soft claim is **"not characterized at WideEP scale,"** not "untested." Cite specific largest config (TP=4).
 3. §1.1 user journey — anchor on `mpirun -np N trtllm-serve <model> --tp N --ep N` invocation.
-4. §3.2 L1 gap — Item 1 finding lets us state confidently that today MPI worker death = full executor abort, no salvage path; cite `proxy.py:229–234` and `mpi_session.py:167–168`.
+4. §3.2 L1 gap — The April source showed MPI worker death flowing to full executor abort. The corrected design adds survivor paths, but that historical source observation is not proof those new paths work until 1d.4.
 5. §3.3 — HostMoeTensorSharer's hard-baked MPI dependency (no `TLLM_DISABLE_MPI` guards) is a concrete cost item for any future Ray pivot.
 6. §11 — Add new risk: "Disagg + Ray + NIXL unsupported" if §11 covers cross-track interactions.
-7. **§5.4 / PR 1d.0 (Audit 1a Day 2):** PR 1d.0 scope must include the launch-flag piece (`--mca orte_enable_recovery 1`), not only the `_exit(N)` source change. Without the flag, default `mpirun` propagates termination to survivors regardless of the in-process signal handler; with both, survivors stay alive long enough for `MPI_ERRORS_RETURN` (PR 1c.3) + bounded-wait collectives (1c.4) to drive recovery.
+7. **§5.4 / 1d.0a (Audit 1a Day 2):** merged 1d.0 addresses the signal path. The follow-up lifecycle item must validate launcher-specific recovery settings, prohibit poisoned-world management collectives, and skip `MPI_Finalize` when it cannot complete. `MPI_ERRORS_RETURN` on 1c.3 alone does not make ordinary executor collectives survivor-safe.
 8. **§8.2 PR 2a.1 (Audit 1a Day 1):** NCCL teardown for the AllGatherReduceScatter fallback path cannot be a thin wrapper around `dist.shrink_group(SHRINK_ABORT)` in PT 2.11 — that API hangs after peer death in this build. Either drop below `torch.distributed` (call `ncclCommAbort` + `ncclCommInitRank` directly via cython / C) or wait for an upstream fix. Sizing should reflect the lower-level option.
-9. **§8.2 PR 2a.2 (Audit 1a Day 3):** Driver-side cleanup of dead-peer fabric memory budgets at ~1–2 ms (posix-FD; fabric-handle equivalence pending Audit 1b validation). PR 2a.2 sizing previously had to assume "novel work, hard to bound" — now bounded.
+9. **§8.2 PR 2a.2 (Audit 1a Day 3):** The tested POSIX-FD unmap/release calls consumed ~1–2 ms for one peer. Treat that as a lower-level input, not a bound on PR 2a.2; FABRIC/IMEX, fan-out, handle exchange, workspace, and communicator reconstruction remain unmeasured.
 
 Ready to produce the per-section diff plan from these findings.

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """MPI signal handler / `_exit` mitigation prototype for WideEP FT Audit 1.
 
-Question (per design §3 "Mode A" + §5.4 / PR 1d.0):
+Question (per design §3 Q1/Q3 MPI propagation path + §5.4 / PR 1d.0):
     When one MPI rank dies abnormally, does it:
       A) Take down all surviving ranks via MPI_Abort propagation?
       B) Exit alone, letting survivors continue MPI operations on a

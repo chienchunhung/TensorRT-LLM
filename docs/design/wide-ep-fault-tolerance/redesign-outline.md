@@ -5,6 +5,8 @@
 
 **Strategy:** Full rewrite in place on the `docs-and-plans` branch, replacing the v1 files. Reviewer comment anchors against the v1 files will break — accepted trade-off for clarity.
 
+> **Historical planning artifact (superseded 2026-06-30).** This outline records how the April rewrite was organized; it is not the current execution source of truth. The corrected MVP promotes 1a.8 (running-kernel escape) and 1a.11 (CUDA graph recovery), and adds 1b.2a (FT placement admission), 1c.3a (survivor control/`ActiveRankMap`), 1c.4a (degraded management membership), 1c.4b (atomic coordinator), 1c.4c (failed-epoch/request disposition), 1d.0a (poisoned-MPI lifecycle), and 1d.4a (FABRIC/IMEX acceptance). Item 1c.4 remains the model-engine hook. See `pr-execution/` for live scope and status.
+
 ---
 
 ## Outline
@@ -23,7 +25,7 @@ Short. What changed in this version + the headline decisions (MPI for MVP, Ray a
 *Merges v1 §2 (Current State) + §3 (Competitive Landscape) into a single comparison-and-positioning section.*
 
 - **§2.1 Layer-by-layer comparison: TRT-LLM vs vLLM vs SGLang** — at L1, L2, L3, what does each engine use? Not a feature checklist but a structural comparison.
-- **§2.2 What makes TRT-LLM's position unique** — kernel ownership of MNNVL/NVLinkOneSided (SGLang/vLLM depend on Mooncake/DeepEP); EPLB maturity (online migration, host-side shm, replication); MX-GMS roadmap (no competitor has this); NVL72-native design. The point: design choices in this doc only make sense given these advantages — they cannot be ported wholesale to vLLM or SGLang.
+- **§2.2 What makes TRT-LLM's position unique** — kernel ownership of MNNVL/NVLinkOneSided (competitors delegate to backend-specific Mooncake, generic collective, DeepEP, or NIXL paths); EPLB maturity; MX-GMS roadmap; NVL72-native design. The point: these choices cannot be ported wholesale to vLLM or SGLang.
 - **§2.3 Implications for FT design strategy** — kernel-level masking is the natural path because we own the kernel; full-restoration via shadow EP ranks is a unique capability TRT-LLM can offer.
 
 ### §3. Failure Modes & FT Gaps in TRT-LLM's Stack
@@ -38,7 +40,7 @@ Short. What changed in this version + the headline decisions (MPI for MVP, Ray a
 ### §4. Three-Phase Recovery & Resilience Architecture
 *Carries v1 §4 forward, expanded to three phases.*
 
-- **§4.1 Phase 1 — Survive.** Mask failed rank, EPLB slot remap, continue serving at N-1.
+- **§4.1 Phase 1 — Survive.** Abort the failed epoch, reconcile evidence, validate admission, quiesce, prepare EPLB, rebuild survivor control/NCCL, apply graph policy, atomically commit mask + `ActiveRankMap` + generation, dispose failed-epoch requests, then continue serving at N-1.
 - **§4.2 Phase 2 — Restore.** PG reconstruction, replacement rank joins, full N capacity.
 - **§4.3 Phase 3 — Prevent / Scale.** Proactive degradation detection, preemptive migration, elastic scaling.
 - **§4.4 Phase comparison table.**
@@ -47,9 +49,9 @@ Short. What changed in this version + the headline decisions (MPI for MVP, Ray a
 ### §5. Phase 1: Immediate Survival
 *Merges v1 §5 (Rank Masking) + §6 (EPLB) + §7 (Detection) + the §8 PR #12718 integration + the §7.4 MPI-path FT-enabling work.*
 
-- **§5.1 Rank masking in communication kernels** — NVLinkOneSided primary path, NVLinkTwoSided + AllGatherReduceScatter follow-ons; what changes in the kernel and why.
+- **§5.1 Rank masking and runtime kernel escape** — NVLinkOneSided primary path, host-visible abort/generation for an already-running kernel, and CUDA-graph policy; NVLinkTwoSided + AllGatherReduceScatter follow-ons.
 - **§5.2 EPLB topology adaptation** — `reconfigure_mask_only` for MVP slot-remap; full reconfigure with weight migration for v1.
-- **§5.3 Failure detection & PR #12718 integration** *(absorbs v1 §8 PR #12718 part.)* Three-layer detection stack; how we extend PR #12718's classifier without changing the three string-literal classes; per-rank `ErrorBudget`; failure broadcast protocol.
+- **§5.3 Failure detection & PR #12718 integration** *(absorbs v1 §8 PR #12718 part.)* Detection state stays separate from committed communication membership; notification is followed by survivor-control reconciliation and an atomic recovery transaction.
 - **§5.4 MPI-path FT-enabling work** *(absorbs v1 §7.4.)* Signal handler replacement for `mpiUtils.cpp:199-210`; `MPIPoolExecutor` audit + routing-around for FT signaling; FT subcomm with `MPI_ERRORS_RETURN` + non-blocking Isend/Irecv.
 - **§5.5 End-to-end flow & timing** — the <10s overall budget vs <10ms reconfigure-step distinction; what happens at each iteration boundary.
 
@@ -73,14 +75,14 @@ Short. What changed in this version + the headline decisions (MPI for MVP, Ray a
 *Carries v1 §9 forward, with Phase 3 added as rough plan.*
 
 - **§8.1 Phase 1 PR breakdown** — detailed (carries forward from v1 §9 Phase 1).
-- **§8.2 Phase 2 PR breakdown** — detailed (carries forward from v1 §9 Phase 2). MNNVL/NVSHMEM audit gates the size estimates.
+- **§8.2 Phase 2 PR breakdown** — detailed (carries forward from v1 §9 Phase 2). The MNNVL audit gates baseline sizing; DeepEP/NVSHMEM audit work is conditional.
 - **§8.3 Phase 3 rough plan** — *new.* Sized at the work-track level (not per-PR) since the audits and Phase 2 work need to land first.
 - **§8.4 Timeline summary** — phase totals, dependencies, critical path.
 
 ### §9. Risks and Open Questions
 *Carries v1 §10 forward; promotes both audits to named risks per Q5.*
 
-- **MNNVL/NVSHMEM teardown capability audit** as a named Phase-2-prerequisite risk.
+- **MNNVL teardown capability audit** as a named Phase-2 prerequisite, with DeepEP/NVSHMEM as a conditional backend track.
 - **Ray-path WideEP perf characterization** as a named risk gating any future Ray pivot.
 - All v1 risks carry forward, restated against the new doc structure.
 

@@ -61,6 +61,8 @@ Concretely, on a 72-rank NVL72 launch:
 4. **MoE-specific setup:**
    - `MoeLoadBalancer` per layer instantiates with a `MoeLoadBalanceMetaInfo` (`expertCount=256, topK=8, epRank=R, epSize=72, slotCountPerRank=4`).
    - `HostMoeTensorSharer` (`moe_load_balancer.py:127`) publishes node-local POSIX shm segments containing all in-node expert weights, using `global_mpi_comm.Split_type(MPI.COMM_TYPE_SHARED)` to discover node-local peers (`moe_load_balancer.py:896–897`). Every rank on a node attaches to every peer's shm segment.
+
+   The canonical numbers are an important admission constraint: `72 ranks × 4 slots/rank = 288 slots` for 256 experts, so there are only 32 slots beyond one copy per expert. Even with ideal allocation, at least 224 experts are singleton. Therefore neither this configuration nor `num_redundant_experts=32` implies “replication ≥ 2.” Even a larger slot budget would be insufficient proof unless placement also keeps copies on distinct admitted failure domains. Item 1b.2a verifies that invariant per layer before FT serving is enabled.
 5. **AlltoAll backend selection** — runs lazily on the first MoE layer call:
    - `CommunicationFactory.create_strategy()` (`tensorrt_llm/_torch/modules/fused_moe/communication/communication_factory.py`) picks based on hardware capabilities.
    - On NVL72 with full MNNVL fabric connectivity → **NVLinkOneSided** (priority 1).
@@ -70,6 +72,8 @@ Concretely, on a 72-rank NVL72 launch:
    - Every rank exchanges fabric handles over MPI and maps every peer's region into its address space.
    - The `completion_flags[kMaxRanks][kMaxRanks]` table sits in this symmetric memory; this is the table the AlltoAll kernel will spin on.
 7. **Server is ready.** Rank 0 listens on port 8000.
+
+**Rank-0 scope.** In this launch shape rank 0 owns the only HTTP listener. Killing rank 0 therefore loses the frontend even if ranks 1–71 recover correctly. The MVP physical E2E test kills a non-rank-0 worker. Supporting rank-0 failure requires an external proxy/listener or frontend failover and must not be implied by worker-survival results; item 1d.1 makes this policy an explicit admission gate.
 
 ### What lives where on each rank, in steady state
 
@@ -88,13 +92,13 @@ Concretely, on a 72-rank NVL72 launch:
 
 | Model | Layout | Status |
 |:---|:---|:---|
-| **Aggregated multi-node MPI (SLURM)** | `srun -n 72 trtllm-serve …` across 2–8 nodes; same MPI-attach launch path | Production-supported; same FT story as NVL72 |
+| **Aggregated multi-node MPI (SLURM)** | `srun -n 72 trtllm-serve …` across 2–8 nodes; same MPI-attach launch path | Production-supported, but FT follows the selected L3 transport: MNNVL uses the corrected MVP path, DeepEP-family cross-IB uses Phase 1-IB, and NCCL fallback uses 1a.7 |
 | **Aggregated K8s + Ray** | `--orchestrator_type ray`; KubeRay manages cluster; `torch.distributed` over TCP store + NCCL/Gloo | Functional CI exists at TP ≤ 4 (Llama-3.1 8B); **not characterized at WideEP scale** — see [§2.1](02-stack-comparison-and-positioning.md) |
 | **Disaggregated serving (MPI)** | Separate prefill / decode pools, KV cache transferred via NIXL / UCX / MPI transceiver, `trtllm-serve` proxy routes between pools | Production-supported |
 | **Disaggregated + Ray (non-NIXL)** | Ray-managed pools with UCX/MPI transceiver | Supported; covered by `examples/test_ray.py::test_ray_disaggregated_serving` |
 | **Disaggregated + Ray + NIXL** | Ray-managed pools with NIXL transceiver | **Not supported today** — explicit waive at `tests/integration/defs/disaggregated/test_disaggregated.py:597` |
 | **Aggregated B200 NVL8 + IB** | 8-GPU B200 nodes networked by InfiniBand; AlltoAll via DeepEP family (`DeepEPLowLatency` NVFP4 is the measured-best variant) because cross-node NVLink isn't up | Perf work in flight (May 2026, Peiheng Hu); FT story = Phase 1-IB, gated on Audit 3 NIXL-EP outcome or a DeepEP-side mitigation. See [§8.2 Phase 1-IB](pr-execution/08-implementation-plan.md#phase-1-ib--cross-ib-transport-coverage-nixl-ep-track) |
-| **Standard EP (≤ 8 GPUs)** | Single-node, `ep_size ≤ 8`, no MNNVL | Out of scope for this design; existing process-restart handling is adequate |
+| **Standard EP (≤ 8 GPUs)** | Usually single-node, `ep_size ≤ 8`; MNNVL availability depends on the platform and selected backend | Out of scope because WideEP availability is the target, not because MNNVL is necessarily absent; existing restart handling is the baseline |
 
 ### Transport selection: what TRT-LLM actually picks today
 
@@ -108,7 +112,7 @@ Concretely, on a 72-rank NVL72 launch:
 | 4 | `DeepEPLowLatency` | Same as DeepEP | DeepEP construction failed; uses NVSHMEM + IBGDA; production choice for multi-node B200+IB per Peiheng's deck |
 | 5 | `AllGatherReduceScatter` | always | Safety net; NCCL fallback when DeepEP unavailable |
 
-**Implication: the "transport in use" determines the relevant FT mechanism, not the deployment name.** A single 8-GPU NVL-class B200 box and a 72-GPU NVL72 rack both run on `NVLinkOneSided` and share the same FT story (kernel mask + EPLB slot remap, PR 1a.2). Multi-node B200+IB falls through to `DeepEPLowLatency` and gets a different FT story (Phase 1-IB). See [§8.1 Phase 1 MVP](pr-execution/08-implementation-plan.md#81-phase-1-pr-breakdown) and [§8.2 Phase 1-IB](pr-execution/08-implementation-plan.md#phase-1-ib--cross-ib-transport-coverage-nixl-ep-track) for the per-transport mechanism mapping.
+**Implication: the "transport in use" determines the relevant FT mechanism, not the deployment name.** A single 8-GPU NVL-class B200 box and a 72-GPU NVL72 rack can both select `NVLinkOneSided`, so both need the #13404 next-launch mask, 1a.8 running-kernel escape, admitted EPLB placement, and atomic survivor commit. The rack additionally requires 1d.4a FABRIC/IMEX acceptance. Multi-node B200+IB can fall through to `DeepEPLowLatency` and therefore has a different Phase 1-IB story.
 
 **Note on topology symmetry.** Even on NVL72, the fabric is not perfectly BW-symmetric: intra-tray pairs share direct NVLink, cross-tray pairs route through NVSwitch chips (multi-hop), and EPLB workload skew on top creates *effective* per-rank-pair asymmetry even when the *physical* fabric is uniform. B200 NVL8 + IB just makes the asymmetry larger and more measurable (18× peak-BW gap NVL vs IB per Peiheng's deck). Heterogeneous-topology behavior is a property of every WideEP deployment, with different magnitude across rows above. [§7.5](07-phase-3-beyond-failover.md#75-straggler-mitigation-forward-looking) and the [straggler-speculation research arm](straggler-speculation-research/README.md) frame this generally rather than NVL72-specifically.
 
@@ -129,7 +133,7 @@ graph TB
     end
 
     subgraph "L3 — Data plane"
-        MNNVL["MNNVL fabric memory<br/>(NVLinkOneSided primary,<br/>NVLinkTwoSided variant)<br/>cuMemCreate FABRIC,<br/>raw PTX writes"]
+        MNNVL["MNNVL shared CUDA memory<br/>(NVLinkOneSided primary,<br/>NVLinkTwoSided variant)<br/>POSIX-FD on x86_64 / FABRIC on Grace,<br/>raw PTX writes"]
         NVSHMEM["NVSHMEM<br/>(DeepEP, DeepEPLowLatency)<br/>symmetric memory,<br/>one-sided puts/gets"]
         NCCL["NCCL<br/>(AllGatherReduceScatter,<br/>TP allreduces, PP send/recv)<br/>collective primitives"]
     end
@@ -172,6 +176,8 @@ How processes coordinate before the data plane runs: rendezvous, bootstrap, barr
 | FT primitives | None wired in TRT-LLM today (zero non-test uses of `MPI_ERRORS_RETURN`, `MPI_Comm_revoke`, ULFM) | Inherits PyTorch's `destroy_process_group` + `init_process_group` abort/rebuild support |
 | Failure visibility | Slow / dead peer poisons `MPI.COMM_WORLD` | `torch.distributed` collectives raise on abort |
 
+The table hides a critical runtime detail: attention-DP/PyExecutor performs ordinary management collectives over static MPI groups, not only one-time bootstrap. The MPI path uses blocking `Allgather`/`Allgatherv`-style exchanges for rank state, new requests, batch sizes, token counts, and model inputs. A dedicated FT notification subcommunicator can report a death, but it does not make those existing collectives safe. Item 1c.3a creates a survivor-only control communicator and logical-to-physical `ActiveRankMap`; item 1c.4a moves the attention-DP/PyExecutor exchanges onto that membership before serving resumes.
+
 ### L3 — Data plane
 
 The actual high-throughput tensor movement during inference. **Three different libraries live here**, used by different EP backends.
@@ -186,7 +192,7 @@ Critically: **NVLinkOneSided does not use NCCL or NVSHMEM.** It uses MNNVL fabri
 
 ### What's shared, what's not
 
-It's natural to assume MNNVL, NCCL, NVSHMEM (and **NIXL**, which TRT-LLM uses as the L3 path for disaggregated KV cache transfer; vLLM additionally uses a "NIXL-EP" variant as an EP-level data plane with `activeRanks`-style masking — see vLLM PR #38534) share more than they do. They share the **physical fabric** (NVLink + NVSwitch + MNNVL pages on NVL72, plus IB / RoCE for cross-rack) and the **CUDA driver substrate** (`cuMem*`, streams, contexts, GPU memory subsystem). NCCL on NVL72 will in fact choose MNNVL fabric pages as its transport when available — the same hardware that NVLinkOneSided uses directly. So in terms of where the bytes ultimately move, all four can hit the same fabric.
+It's natural to assume MNNVL, NCCL, NVSHMEM (and **NIXL**, which TRT-LLM uses as the L3 path for disaggregated KV cache transfer; vLLM additionally uses a "NIXL-EP" variant as an EP-level data plane with incremental `connect_ranks` / `disconnect_ranks` topology mutation — see vLLM PR #35627) share more than they do. They share the **physical fabric** (NVLink + NVSwitch + MNNVL pages on NVL72, plus IB / RoCE for cross-rack) and the **CUDA driver substrate** (`cuMem*`, streams, contexts, GPU memory subsystem). NCCL on NVL72 will in fact choose MNNVL fabric pages as its transport when available — the same hardware that NVLinkOneSided uses directly. So in terms of where the bytes ultimately move, all four can hit the same fabric.
 
 What they *don't* share:
 
@@ -196,15 +202,17 @@ What they *don't* share:
 
 Net: same hardware can move bytes through any of these stacks; FT engineering for each is genuinely independent work, with very different existing primitives to build on.
 
+**Backend admission is explicit.** Enabling the feature cannot assume that `CommunicationFactory` selected the intended implementation. Item 1d.1 records and validates the selected backend and fails closed for unsupported DeepEP-family, MegaMoE, static-sharding, launcher, or fabric combinations. A fallback backend must never silently bypass the recovery contract.
+
 ### What the layers don't do
 
 A common confusion is to expect FT at every layer. The three layers cooperate but do not substitute for one another:
 
-- L1 alone (Ray killing one actor while keeping others alive) does not fix a hung AlltoAll kernel — that's an L3 problem.
-- L3 alone (kernel rank masking) does not survive a signal-handler `MPI_Abort` at L1 — that's an L1 problem.
-- A complete FT solution **must address both layers**, because the two failure modes (signal handler abort + kernel hang on dead peer) operate at different layers.
+- L1 alone (Ray killing one actor while keeping others alive) does not fix a Q2 live/silent AlltoAll kernel — that's an L3 problem.
+- L3 alone (kernel rank masking) does not preserve survivors when a handler or launcher terminates the MPI job in Q1/Q3 — that's an L1 problem.
+- A complete FT solution **must address both layers** and the peer-memory readability axis; the Q1–Q4 model in §3 keeps process evidence, kernel progress, and physical containment distinct.
 
-[§3](03-failure-modes-and-gaps.md) makes this explicit by mapping each failure mode to the layer where it lives.
+[§3](03-failure-modes-and-gaps.md) makes this explicit by mapping each quadrant and mechanism to the layer where it lives.
 
 ## 1.3 Why fault tolerance now
 
@@ -236,7 +244,7 @@ When a GPU fails in a WideEP group, the impact is full-cluster:
    - **15+ min, occasionally 30+ min** if the 681 GB checkpoint has to be re-downloaded from registry or object store. Cluster network bandwidth (typically 10 Gbps ≈ 1.25 GB/s aggregate per node) is the bottleneck; retries on flaky storage push this much higher.
    - The 681 GB DS-V3 footprint dominates restart cost; smaller MoEs scale down proportionally.
 
-**Total downtime: 8–20+ minutes per GPU failure** (5 min hang detection + 3–15+ min restart). Worst cases can stretch past 30 minutes when checkpoint download is on the critical path or registry retries compound. [§3](03-failure-modes-and-gaps.md) names these two failure modes (signal-handler abort + kernel hang) explicitly and walks through their gap structure.
+**Total downtime: 8–20+ minutes per GPU failure** (the current 300 s kernel timeout plus 3–15+ min restart on the live/silent path). Worst cases can stretch past 30 minutes when checkpoint download is on the critical path or registry retries compound. [§3](03-failure-modes-and-gaps.md) classifies Q1–Q4 and then maps the handler/launcher, kernel-progress, and peer-memory mechanisms separately.
 
 ### Goodput impact at scale
 
@@ -255,16 +263,16 @@ Sustained even at the low-frequency end, this is a real production headwind. Cus
 | Framework | FT status (May 2026) |
 |:---|:---|
 | **SGLang Elastic EP** | Shipped March 2026. ~6.5s recovery, tolerates up to 50 % rank loss. Built on Mooncake EP's `activeRanks` API. A more sophisticated three-plane FT framework (data / control / decision plane) is proposed in an [RFC on a personal fork](https://github.com/gaidandawang-afk/sglang/issues/1) — not yet on the official `sgl-project/sglang`. |
-| **vLLM** | Three-PR FT framework in flight (Ray + internal LB only): [#34833](https://github.com/vllm-project/vllm/pull/34833) (fault reporting via ZMQ sentinels), [#38534](https://github.com/vllm-project/vllm/pull/38534) (pause-on-error using DeepEP / NIXL-EP "FT-enabled backends" with 100s static kernel timeout), [#40468](https://github.com/vllm-project/vllm/pull/40468) (cleanup + retry: NCCL `commAbort`, DP cpu_group rebuild, prefix-cache-driven retry without replacement rank — operates at N-1 indefinitely). Earlier RFC [#27774](https://github.com/vllm-project/vllm/issues/27774) is the published framing; PRs above are the implementation. |
+| **vLLM** | Three-PR FT framework in flight (Ray + internal LB only): [#34833](https://github.com/vllm-project/vllm/pull/34833) (fault reporting via ZMQ sentinels), [#38534](https://github.com/vllm-project/vllm/pull/38534) (pause-on-error with a DeepEP-specific 100s timeout interim and separate NIXL-EP topology mutation), [#40468](https://github.com/vllm-project/vllm/pull/40468) (cleanup + retry: NCCL `commAbort`, DP cpu_group rebuild, prefix-cache-driven retry without replacement rank — operates at N-1 indefinitely). Earlier RFC [#27774](https://github.com/vllm-project/vllm/issues/27774) is the published framing; PRs above are the implementation. |
 | **Ray 2.55 DP-group FT** | Shipped. Coarse — restarts whole DP groups, not per-rank. |
 | **TRT-LLM** | **Nothing.** Single GPU failure → 8–20+ min downtime, no in-place recovery. |
 
 Three observations from the May 2026 survey:
 
-- **Convergent architecture.** vLLM and SGLang are converging on the same three-phase rollout (report → pause → cleanup/retry) and the same HTTP+ZMQ control surface (`GET /fault_tolerance/status`, `POST /fault_tolerance/apply`). Same data-plane backend choice (Mooncake-EP, NIXL-EP). Worth aligning our `check_health()` (PR 1d.2) and replacement-rank API (PR 2c.1) so deployments using vLLM/SGLang FT tooling can extend to TRT-LLM.
+- **Convergent control shape, different data planes.** vLLM and SGLang are converging on report → pause → cleanup/retry and similar HTTP+ZMQ control surfaces, but not one backend: SGLang uses Mooncake `activeRanks`, while vLLM Elastic-EP documents `allgather_reducescatter` plus optional NIXL-EP and its FT work separately treats DeepEP timeout handling. Aligning `check_health()` (1d.2) and replacement APIs remains useful without claiming backend equivalence.
 - **Both target Ray, not MPI.** vLLM #34833 explicitly: "Elastic EP currently supports only Ray + internal LB." SGLang RFC also Ray-based. Strengthens the long-term Ray-pivot argument; doesn't change our MPI-for-MVP decision (see [§3.3](03-failure-modes-and-gaps.md#33-why-not-just-pivot-to-ray)).
 - **vLLM operates at N-1 indefinitely.** No Phase-2-equivalent (no replacement-rank rebuild). Our Phase 2 is differentiated work, not table stakes.
-- **NIXL-EP is vLLM's FT-enabled backend choice.** PR #38534 lists DeepEP and NIXL-EP as the two FT-enabled backends. The NIXL team has asked TRT-LLM to evaluate NIXL-EP as well. TRT-LLM is launching a bounded 2-week parallel evaluation track ([§9.1 Audit 3](09-risks-and-open-questions.md#audit-3--nixl-ep-evaluation-as-cross-ib-data-plane-backend)) to decide whether NIXL-EP slots into Phase 1 v1 as an additional mask-capable backend (priority 3, between NVLinkTwoSided and AllGatherReduceScatter). Not on the MVP critical path — NVLinkOneSided remains the primary data plane.
+- **NIXL-EP is vLLM's FT-enabled backend choice.** PR #38534 lists DeepEP and NIXL-EP as the two FT-enabled backends, while merged PR #35627 exposes the verified NIXL-EP topology API. TRT-LLM is launching a bounded 2-week parallel evaluation track ([§9.1 Audit 3](09-risks-and-open-questions.md#audit-3--nixl-ep-evaluation-as-cross-ib-data-plane-backend)) to decide whether NIXL-EP slots into Phase 1-IB as a topology-mutable cross-IB backend using `disconnect_ranks` / `connect_ranks`. It is not on the NVL72 MVP critical path.
 
 [§2](02-stack-comparison-and-positioning.md) compares the stacks at the layer level (not just the FT capabilities) and identifies what TRT-LLM's stack uniquely enables.
 

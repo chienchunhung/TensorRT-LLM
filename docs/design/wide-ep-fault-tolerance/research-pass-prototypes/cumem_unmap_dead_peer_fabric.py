@@ -3,7 +3,7 @@
 """Fabric-handle variant of cumem_unmap_dead_peer.py for Audit 1a Day 4-5.
 
 Same shape as the posix-FD variant but uses CU_MEM_HANDLE_TYPE_FABRIC
-(the actual MNNVL handle type). The cross-process IPC carries a 64-byte
+(the Grace/aarch64 NVL72 MNNVL mode, not the current x86_64 mode). The cross-process IPC carries a 64-byte
 CUmemFabricHandle struct instead of a file descriptor.
 
 Question being answered:

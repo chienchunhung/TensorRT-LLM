@@ -17,7 +17,7 @@ each, log to JSONL, exit. Everything is single-file and self-contained.
 | [`nccl_rebuild.py`](nccl_rebuild.py) | Does PyTorch's `torch.distributed` provide a recoverable failure path after a peer SIGKILL? What's the rebuild latency? | ≥ 4 GPUs, NCCL 2.x | PyTorch 2.x |
 | [`mpi_signal_handler.py`](mpi_signal_handler.py) + [`mpi_signal_launcher.py`](mpi_signal_launcher.py) | When one MPI rank dies abnormally, does it take down the world via `MPI_Abort` propagation, or can survivors continue? Does `_exit(N)` in `mpiUtils.cpp` change the answer? | None (CPU-only OK) | OpenMPI + mpi4py |
 | [`cumem_unmap_dead_peer.py`](cumem_unmap_dead_peer.py) | When the process that allocated a `cuMemCreate` region is SIGKILLed, what happens to a peer that has cross-process-imported it via posix-FD? Can it cleanly `cuMemUnmap` / `cuMemRelease` / `cuMemAddressFree`? | 1 GPU (CUDA 12+) | `cuda-python` |
-| [`cumem_unmap_dead_peer_fabric.py`](cumem_unmap_dead_peer_fabric.py) | Same as above but with `CU_MEM_HANDLE_TYPE_FABRIC` (the actual MNNVL handle type). | 1 GPU + active `nvidia-imex` daemon (typically NVL72) | `cuda-python` |
+| [`cumem_unmap_dead_peer_fabric.py`](cumem_unmap_dead_peer_fabric.py) | Same as above but with `CU_MEM_HANDLE_TYPE_FABRIC`, the Grace/aarch64 NVL72 MNNVL mode; it is not the current x86_64 B200/B300 mode. | 1 GPU + active `nvidia-imex` daemon (typically NVL72) | `cuda-python` |
 
 ## Reproduction
 
@@ -73,8 +73,9 @@ the JSON / JSONL shape without having to re-run anything:
   specific machine + invocation timestamp, and re-running the script
   regenerates them.
 - The intra-node MNNVL `MnnvlMemory` rebuild prototype (Days 4–5 in the §9.1
-  plan). Gated on the `nvidia-imex` daemon being active; left to Audit 1b
-  validation.
+  plan). On current x86_64 B200/B300 this uses POSIX-FD sharing and is not
+  IMEX-gated; the separate Grace/aarch64 FABRIC path requires IMEX and remains
+  Audit 1b / 1d.4a validation.
 - DeepEP destructor exercise (Day 3 secondary). Blocked here on a stale
   `tensorrt_llm` package import; needs an NGC container with matching C++
   binary.

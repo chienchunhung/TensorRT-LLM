@@ -2,11 +2,11 @@
 
 [< Back to Overview](README.md)
 
-Phase 3 is the *resilience* phase — preventing failures, adapting capacity, and handling the **soft-failure** cases that Phases 1 and 2 don't address. Phases 1+2 treat failure as binary (alive vs dead, recover from death). In practice, ranks can also be *alive but degraded* — thermal throttling, ECC correctable spikes, NVLink lane retries, sustained routing imbalance — without ever crossing into Mode A or Mode B. At WideEP scale, where AlltoAll is N-way synchronous and tail-latency-dominated, **a single straggler costs every rank, for every MoE layer, for every iteration**. Phase 3 widens the failure model from binary to graded.
+Phase 3 is the *resilience* phase — preventing failures, adapting capacity, and handling the **soft-failure** cases that Phases 1 and 2 don't address. Phases 1+2 classify hard failures by Q1–Q4 and recover only admitted quadrants. In practice, ranks can also be *alive but degraded* — thermal throttling, ECC correctable spikes, NVLink lane retries, sustained routing imbalance — without producing monotonic hard-failure evidence. At WideEP scale, where AlltoAll is N-way synchronous and tail-latency-dominated, **a single straggler costs every rank, for every MoE layer, for every iteration**. Phase 3 adds reversible degradation policy rather than redefining the hard-failure quadrants.
 
 Phase 3 splits into two threads:
 
-- **Hard-failure precursors** (§7.1, §7.2, §7.4) — detect ranks heading toward Mode A/B and mitigate before failure lands. Reuses Phase 1+2 primitives.
+- **Hard-failure precursors** (§7.1, §7.2, §7.4) — observe signals correlated with an eventual Q1–Q4 failure and mitigate before hard-failure evidence lands. Reuses Phase 1+2 primitives without committing a failed rank from telemetry alone.
 - **Soft-failure / straggler mitigation** (§7.5, forward-looking) — rank stays alive indefinitely but slow; the goal is to bound tail latency, not to recover from death. This is genuinely new design surface, sketched at radar level here; detailed design is a follow-up.
 
 Phase 3 is the lowest-priority phase, not staffed for MVP, and treated at discussion level; [§8.3](pr-execution/08-implementation-plan.md#83-phase-3-rough-plan) sizes the work at work-track granularity rather than per-PR detail.
@@ -15,7 +15,7 @@ The capabilities below share one design property: they all reuse primitives buil
 
 ## 7.1 Latency anomaly detection
 
-Most GPU failures aren't instantaneous. ECC memory errors accumulate; thermal throttling starts before a full stall; NVLink link-quality degrades over minutes. If we can detect degradation before the GPU becomes Mode B (silent hang) or Mode A (signal abort), we can act before the failure lands in Phase 1's recovery path.
+Most GPU failures aren't instantaneous. ECC memory errors accumulate; thermal throttling starts before a full stall; NVLink link-quality degrades over minutes. If we can detect degradation before it becomes a Q1–Q4 hard failure, we can mitigate before Phase 1 recovery is required. Degradation telemetry remains reversible and cannot directly author committed membership.
 
 **Mechanism.** Per-rank AlltoAll latency measured via CUDA events, stored in a circular buffer on each rank. Every N iterations, compute the median across all ranks and flag any rank whose local median exceeds `3×` the global median.
 
@@ -35,7 +35,7 @@ Building this telemetry once is ~3–4 weeks; §7.1, §7.4 (predictive failure d
 - **Relative, not absolute.** 3× median adapts to workload — a heavy-traffic iteration and a light-traffic iteration both get flagged on the same relative scale.
 - **Per-rank.** Each rank's timing is independent; a rank that's consistently slow stands out.
 
-**Signal output.** A "rank R is degrading" notification on the FT subcomm. Downstream actions are Phase 3.2 (preemptive migration) and/or orchestrator-level alerting.
+**Signal output.** A "rank R is degrading" policy/telemetry event on a separate control path. It must not enter 1c.3's monotonic failed-rank evidence state unless a future protocol extension explicitly distinguishes reversible degradation from failure. Downstream actions are Phase 3.2 and/or orchestrator alerting.
 
 **What it doesn't catch.** Sudden failures — a GPU that goes from healthy to dead in one iteration triggers Phase 1, not Phase 3. Phase 3 is for the slow-degradation class of failures.
 
@@ -43,13 +43,13 @@ Building this telemetry once is ~3–4 weeks; §7.1, §7.4 (predictive failure d
 
 Once a rank is flagged as degrading (7.1), the natural next step is to move its experts off it before it fails. The work reuses the Phase 1 v1 weight-migration path:
 
-1. Mark rank R as "draining" in a new state on `EPGroupHealth` (between Active and Failed).
+1. Mark rank R as "draining" in policy state that is separate from the committed data-plane mask. `EPGroupHealth`/the committed mask must not change until placement and communicator updates are ready to publish atomically.
 2. For each MoE layer, redistribute R's expert slots to surviving ranks using the same `reconfigure` flow from §5.2 v1. Weight migration runs from R's host-shm segment to the target ranks' GPUs.
-3. Once R's slots are empty of unique experts, mark R as "drained." At this point R can be safely decommissioned — either voluntarily removed (Phase 3.3 scale-down), or left in place until it eventually fails (at which point Phase 1 mask-only recovery is trivially cheap — no zero-replica case).
+3. Once R's slots are empty of unique experts, mark R as "drained." At this point its EPLB placement preparation is cheap because no unique expert depends on it. A later failure still requires the normal failed-epoch, survivor-membership, graph, commit, disposition, and lifecycle transaction.
 
-**Why this is cheaper than Phase 1 recovery.** Phase 1 happens under time pressure (dead peer is hanging the collective). Phase 3.2 happens at iteration boundaries with full control — no 5s detection budget, no consensus problem, no kernel hang.
+**Why this is cheaper than Phase 1 recovery.** Phase 1 happens under emergency failure pressure. Phase 3.2 happens at planned iteration boundaries with full control—no emergency failure-detection deadline, no failed epoch, and no hung kernel.
 
-**Hot-expert prioritization.** During degradation, routing traffic is asymmetric — the degrading rank's slots get less load because their latency signal is already flagged. Preemptive migration should prioritize hot experts (highest replica counts, highest routing traffic) to minimize the load spike on surviving ranks during the transition.
+**Hot-expert prioritization.** During degradation, routing traffic is asymmetric. Preemptive migration should prioritize hot experts (highest routing traffic and useful existing copy coverage) while preserving the 1b.2a admission invariant: every expert must retain at least one usable copy under the admitted failure, and redundant copies intended for FT must occupy distinct failure domains.
 
 **Reuses existing primitives.** `reconfigure` and the `cudaMemcpy2D` path from Phase 1 v1 (PR 1b.6). Phase 3.2's code change is largely policy — deciding when and what to migrate, not how.
 
@@ -73,7 +73,7 @@ Load is lower than capacity; the operator wants to shrink a 72-rank EP group to 
 
 1. Identify the 8 ranks to remove (ideally least loaded, or ones flagged as degrading by §7.1).
 2. **Reuse Phase 3.2 preemptive migration** to drain those ranks' experts.
-3. Mask the drained ranks (Phase 1 primitive).
+3. Quiesce and reuse the coordinated Phase 1 membership transaction to prepare survivor control/data membership and graph policy, then atomically commit placement + `ActiveRankMap` + mask + generation. Because removal is planned, there is no failed epoch to abort.
 4. Release the hardware (orchestrator).
 
 Scale-down is cleanly equivalent to "plan the failures that haven't happened yet" — the ranks are decommissioned in a controlled way using the same primitives that would handle them as failures.
@@ -128,14 +128,14 @@ The work breaks into three interlocking pieces:
 | **A. Latency-aware routing** | EPLB routing kernel reads per-replica latency; biases token dispatch toward fast replicas | Low (kernel + host weight update) | Probabilistic; only helps for replicated experts | Follow-up; lightest first cut |
 | **B. Speculative redundant compute** | Mirror straggler rank's MoE work to a healthy rank; combine takes whichever responds first | High (~1/N extra compute, kernel-level race semantics) | **Strict tail-latency bound** (`min(slow, fast)` instead of `max`) | Follow-up; novel design surface |
 | **C. Shadow rank as performance hot-spare** | Reuse §6.3 shadow-EP-rank lifecycle with a degradation trigger; promote shadow + demote slow rank | Medium (reuses §6.3 infra) | Reset, not bound — trades a slow rank for a fast one | Follow-up; depends on §6.3 |
-| **D. Tail-cutting timeout** | AlltoAll combine treats unresponsive slot as zero-contribution after deadline | Low (reuses §5.1 mask infra) | Strict tail bound at quality cost | Follow-up |
+| **D. Tail-cutting timeout** | Research-only approximation that treats an unresponsive contribution as zero after a deadline | Low mechanically, but changes model semantics | Strict tail bound at explicit quality/correctness cost | Not an FT recovery path; cannot be enabled for normal serving without a separate product-quality contract |
 
-**A + D is the natural lightweight first cut.** Option C arrives "for free" once §6.3 lands. Option B is the most expensive and the most novel — the only one with strict tail-latency guarantees, and the only one without prior straggler-mitigation precedent in inference systems (see Prior art note below).
+**A is the natural lightweight first cut for experts that actually have multiple usable copies.** Option C reuses §6.3 once that work lands. Options B and D require explicit correctness semantics: the MVP recovery path forbids publishing logits from an aborted or partially computed epoch, so its dead-target zero-fill behavior is not permission to serve approximate output.
 
 ### Open design questions (settle before detailed design)
 
 - **EPLB invariant.** Latency-aware routing (Option A) changes EPLB from "balance token load across slots" to "balance load *and* prefer fast replicas." Two axes can fight each other. Does load-balance still get final say, or does latency bias dominate?
-- **Quality vs latency.** Tail-cutting timeout (Option D) accepts quality degradation when it fires (a token's expert contribution is zeroed). With replication ≥ 2 + routing fallback this is mostly invisible; in pathological cases it's measurable. Is per-token p99 token-quality SLA an acceptable framing?
+- **Quality vs latency.** Tail cutting deliberately changes output. The canonical DeepSeek-V3 EP=72 / four-slots-per-rank layout has 288 slots for 256 experts: only 32 extra copies, so at least 224 experts are singletons before any stronger placement policy. A blanket "replication ≥ 2" assumption is false. Any Option D experiment therefore needs an explicit approximate-serving contract and cannot inherit the FT path's correctness claim.
 - **Combine kernel race semantics.** Speculative redundant compute (Option B) requires "first valid response wins" in the AlltoAll combine accumulator. The MNNVL combine zero-fills `dst_idx == -1` (§5.1) — extending to "first valid response wins, ignore the second" is non-trivial bookkeeping at PTX level and is the central technical challenge for B.
 - **Phase 3 priority.** Currently P2. If straggler events at WideEP scale (daily thermal / ECC at 72-rack) cost more goodput than monthly hard failures (the assumption Phase 1's prioritization rests on), parts of §7.5 may justify promotion to P1.
 
@@ -156,9 +156,9 @@ Two reasons. (1) Detailed design needs to settle the open questions above before
 | Cause | Section that responds | Response timescale |
 |:---|:---|:---|
 | **Workload-induced load imbalance** (MoE expert skew) | EPLB rebalance (production) | sub-iteration to seconds |
-| **Topology asymmetry** (intra-tray NVLink vs cross-tray NVSwitch on NVL72; NVLink vs IB on B200 NVL8 — see [§1.1 note on topology symmetry](01-user-journey-and-stack.md#other-deployment-models-summary)) | Topology-aware EPLB placement (forward-looking, coordinated with Peiheng/Dongxu) | minutes to hours |
+| **Topology asymmetry** (local vs cross-tray NVSwitch paths on NVL72; intra-node NVSwitch/NVLink domain vs cross-node IB on B200 NVL8 — see [§1.1 note on topology symmetry](01-user-journey-and-stack.md#other-deployment-models-summary)) | Topology-aware EPLB placement (forward-looking, coordinated with Peiheng/Dongxu) | minutes to hours |
 | **Hardware degradation / soft failures** (thermal, ECC, NVLink lane, DVFS) | §7.1 latency anomaly + §7.2 preemptive migration | seconds to minutes |
-| **Full rank failure** (Phase 1 recovery) | §5 rank masking + EPLB slot remap | < 10 s |
+| **Full rank failure** (Phase 1 recovery) | §5 corrected recovery transaction | Measured by 1d.4/1d.4a; no fixed bound before acceptance |
 | **FT recovery transient state** (right after a rank dies and before Phase 2 restoration) | §6 rebuild + §6.3 shadow rank | < 1 s to minutes |
 | **Software jitter** (GC, OS scheduling, contention) | none (or D's tail-cutting timeout) | µs to ms |
 
@@ -178,13 +178,13 @@ All collapse to the same observable: **elevated per-rank execution time at the A
 | Time pressure | Very high (serving down) | Medium (serving degraded, rebuilding) | Low (operational, no emergency) |
 | Primary primitives | Rank masking, slot remap | PG rebuild, weight load | Reuses Phase 1 + 2 primitives |
 | New code surface | Large (kernels, EPLB, detection, MPI) | Medium (rebuild sequencing per backend) | Small (policy + orchestrator glue) |
-| External dependencies | PR #12718 | Orchestrator + optional MX-GMS | Telemetry (for 7.4) |
+| External dependencies | Merged PR #12718 semantic foundation | Orchestrator + optional MX-GMS | Telemetry (for 7.4) |
 
 Phase 3 is the smallest incremental investment per capability because it reuses what Phases 1 and 2 build. That's also why it's the lowest-priority phase — the first-order availability wins come from Phases 1 and 2; Phase 3 is the polish on top.
 
 ## Scope expectations for MVP / v1
 
-**MVP: nothing from Phase 3.** Phase 3 is explicitly deferred until Phases 1 and 2 are in a stable production state. Timeline guesstimate: post-MVP + post-Phase 2 v1, so at least 6+ months from MVP ship.
+**MVP: nothing from Phase 3.** Phase 3 is explicitly deferred until Phases 1 and 2 are in a stable production state. This is a sequencing constraint, not a fixed month estimate; rebaseline only after the corrected MVP and Phase 2 audits are sized.
 
 **After Phase 2 lands:**
 - 7.1 latency anomaly detection + telemetry foundation is the natural first item (small scope, high value, foundation for everything else in Phase 3).

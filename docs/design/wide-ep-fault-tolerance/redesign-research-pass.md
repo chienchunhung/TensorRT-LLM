@@ -4,6 +4,8 @@
 **Purpose:** Verify factual claims that will anchor the rewritten design doc, before drafting begins. The v1 doc had reviewer-flagged inaccuracies that traced back to memory-based assertions; this pass front-loads source verification so the rewrite doesn't repeat that pattern.
 **Time budget:** ~half a day. Output is a short report (under 500 words) feeding into the per-section diff plan.
 
+> **Historical verification checklist.** The source observations below describe the April 2026 tree. They are retained for provenance, not current status. Subsequent PRs changed several anchors, and the June integration audit promoted 1a.8/1a.11 and added 1b.2a, 1c.3a, 1c.4a, 1c.4b, 1c.4c, 1d.0a, and 1d.4a. Item 1c.4 remains the model-engine hook.
+
 ---
 
 ## Items to verify
@@ -45,9 +47,9 @@
 
 ### 6. Re-verify v1 source-anchored claims
 
-The v1 doc made specific line-level source claims. Reviewer trust depends on these being correct against the current tree. Re-check each before reusing:
+The v1 doc made specific line-level source claims. Reviewer trust depended on checking them against the then-current tree. These entries are a dated checklist; do not reuse the numeric line anchors or "zero uses" claims without checking the current revision:
 
-- `kMaxRanks = 64` in `cpp/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h:31`
+- Historical April snapshot: `kMaxRanks = 64` in `moeAlltoAllKernels.h`; PR #13404 subsequently raised the current limit to 128.
 - 300s in-kernel `check_timeout` → `asm volatile("trap;")` at `moeAlltoAllKernels.cu:156-161`
 - Dispatch release+wait loop locations: `moeAlltoAllKernels.cu:537-584`; combine `:1190-1217`
 - Combine accumulator's `dst_idx = -1` skip + `acc[k].fill(0.0f)` at `:725-729`, `:727`
@@ -92,6 +94,10 @@ That report becomes the input to the per-section diff plan, which gets sign-off 
 ## Out of scope for this pass
 
 - Running benchmarks (Ray vs MPI perf comparison) — that's the named §9 audit, not this pre-drafting pass
-- Building the MNNVL/NVSHMEM teardown prototype — also the named §9 audit
+- Building the baseline MNNVL teardown prototype; DeepEP/NVSHMEM teardown is conditional on selecting that backend
 - Reading module sources end-to-end — only the specific functions/lines that anchor a claim
 - Validating PR #12718 commit details — already documented in v1 doc; trust unless flagged
+
+## Post-pass correction (2026-06-30)
+
+The pass verified isolated primitives but did not test a production-component recovery transaction. It did not show that a host watchdog can release an already-running by-value-mask kernel, that ordinary attention-DP/PyExecutor MPI gathers survive rank loss, or that an aborted epoch's output/request state is safe. Direct detector mutation of committed membership is now explicitly prohibited. The resulting gaps are work items 1a.8, 1c.3a, 1c.4a, 1c.4b, and 1c.4c; poisoned shutdown is 1d.0a and rack FABRIC/IMEX proof is 1d.4a.

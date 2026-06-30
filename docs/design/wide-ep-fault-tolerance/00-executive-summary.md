@@ -2,7 +2,7 @@
 
 [< Back to Overview](README.md)
 
-**Status:** Draft v2 (substantial rewrite of v1) | **Last updated:** 2026-04-23
+**Status:** Draft v2 (corrected MVP contract) | **Last updated:** 2026-06-30
 
 ## The problem
 
@@ -14,7 +14,7 @@ Competitors have shipped: SGLang's Elastic EP (March 2026, ~6.5s recovery), vLLM
 
 Three-phase architecture:
 
-- **Phase 1 (Survive, P0).** Mask the dead rank in the AlltoAll kernel; rewrite EPLB placement so dead-rank slots are unreachable; tokens route to surviving replicas. **No process-group reconstruction.** Target: < 10 s end-to-end (detection-dominated), < 10 ms for the EPLB step. Requires replication ≥ 2, which is the DeepSeek production default.
+- **Phase 1 (Survive, P0).** Detect the failure; abort the failed execution epoch; reconcile evidence; prove every expert still has a copy on an admitted failure domain; quiesce; prepare EPLB placement; rebuild survivor-only MPI/attention-DP and NCCL membership; apply CUDA-graph policy; atomically publish one mask + immutable `ActiveRankMap` + generation; dispose failed-epoch requests; then resume at N-1. The EPLB copy remains one sub-step, not the whole recovery transaction.
 - **Phase 2 (Restore, P1).** A replacement process joins the EP group; communicators are torn down + rebuilt; EPLB rebalances for full N. Survivor processes stay alive throughout — only the dead rank's process is replaced. Sub-second target with MX-GMS-accelerated shadow ranks; minutes-class baseline with disk reload.
 - **Phase 3 (Prevent / Scale, P2).** Latency anomaly detection, preemptive expert migration, elastic scale up/down, predictive failure detection. Reuses Phase 1 + 2 primitives.
 
@@ -22,19 +22,21 @@ Three-phase architecture:
 
 Four structural properties differentiate TRT-LLM's stack:
 
-1. **Kernel ownership.** TRT-LLM's primary AlltoAll backend (`NVLinkOneSided`) is a custom kernel over MNNVL fabric memory — no Mooncake, no DeepEP between us and the hardware. Masking *must* live inside the kernel because there's no library API to call. SGLang and vLLM solve this by integrating with Mooncake's `activeRanks` API; we own the equivalent work.
-2. **EPLB maturity.** Online weight migration via `cudaMemcpy2D`, host-side POSIX shm with all experts mapped node-locally, mature C++ implementation. MVP recovery is a placement-pointer rewrite — no H2D copy at recovery time, because every surviving rank already has every expert's weights mapped.
+1. **Kernel ownership.** TRT-LLM's primary AlltoAll backend (`NVLinkOneSided`) is a custom kernel over MNNVL shared CUDA memory — no third-party backend between us and the hardware. Masking *must* live inside the kernel because there is no library API to call. SGLang's Mooncake path can use `activeRanks`; vLLM's in-flight FT work instead uses backend-specific DeepEP timeout handling or NIXL-EP topology mutation. We own the equivalent MNNVL kernel work.
+2. **EPLB maturity.** Online weight migration via `cudaMemcpy2D`, host-side POSIX shm, and a mature C++ implementation make a no-copy emergency remap possible *when* item 1b.2a proves that every layer/expert has a surviving resident copy on a distinct admitted failure domain. Slot count or average replication is not proof of that invariant.
 3. **MX-GMS roadmap.** Crash-resilient GPU memory + cross-node weight streaming enables shadow EP ranks with sub-second activation. No competitor has the equivalent.
 4. **NVL72-native design.** The fabric, the rank count (72, not 64 or 128), the node-local shm scope are all designed for the rack-scale fabric.
 
-## Two failure modes, both must be addressed
+## Four failure quadrants, all explicitly classified
 
-The reviewer feedback that shaped this rewrite identified that today's stack has *two* distinct failure modes, and FT must close both:
+The canonical model uses two independent axes: whether survivors receive prompt host/process evidence and whether the peer's shared CUDA memory remains readable. Their 2×2 produces four quadrants:
 
-- **Mode A** — signal-handler `MPI_Abort` propagation (Layer 1, MPI-specific). Verified at `mpiUtils.cpp:195–215`. Closes via signal handler replacement (PR 1d.0, in flight as PR #14160) under the FT feature flag.
-- **Mode B** — AlltoAll kernel hangs on a dead peer's completion flag (Layer 3, kernel-level). Verified in `moeAlltoAllKernels.cu`. The launch-time rank-mask foundation landed as PR 1a.2 / #13404; the corrected MVP graph tracks the remaining running-kernel recovery work.
+- **Q1 — prompt evidence, memory readable.** Catchable signals used to call `MPI_Abort`; SIGKILL/OOM/other exits are instead observed by survivors or the launcher. Merged 1d.0 removes handler `MPI_Abort`, but 1d.1 must admit a launcher/runtime mode proven to preserve survivors; 1c.3a/1c.4a rebuild membership and 1d.0a owns poisoned lifecycle.
+- **Q2 — no prompt evidence, memory readable.** On the supported MNNVL route, a live/silent peer can leave AlltoAll spinning on its completion flag. The launch-time rank-mask foundation landed as 1a.2 / #13404; 1a.4 supplies detection-only evidence and promoted 1a.8 supplies running-kernel escape.
+- **Q3 — prompt evidence, memory unreadable.** The same control recovery may be usable only if rack-level 1d.4a testing proves that peer-memory loss does not poison survivor CUDA contexts; otherwise the path fails closed.
+- **Q4 — no prompt evidence, memory unreadable.** In-process detection is not dependable, so external heartbeat and restart remain the baseline.
 
-Pivoting to Ray would close Mode A structurally but doesn't help Mode B. Mode B is orthogonal to orchestrator choice.
+Pivoting to Ray removes the MPI-specific propagation and poisoned-lifecycle risks within Q1/Q3. It does not eliminate process failures, the Q2 live/silent MNNVL hang, or the Q3/Q4 peer-memory containment problem.
 
 ## The orchestrator decision
 
@@ -50,19 +52,20 @@ Ray remains an open future-migration question, gated on a named perf-characteriz
 
 | Phase | Target | Status |
 |:---|:---|:---|
-| Phase 1 MVP | ~7 weeks (AI coding-agent assisted) — 14 PRs | 1a.1 (PR #13302), 1a.2 (PR #13404), and 1d.0 (PR #14160) merged; remaining MVP work tracked in the execution graph |
-| Phase 1 v1 | +6–9 weeks after MVP — 11 PRs | Includes NVLinkTwoSided, full EPLB reconfigure with weight migration, multi-failure consensus, kernel-side `check_timeout` tightening |
+| Phase 1 MVP | Correctness-first execution graph | 1a.1 (#13302), 1a.2 (#13404), 1b.1+1b.2 (#15525), and 1d.0 (#14160) are merged; the corrected graph includes promoted 1a.8/1a.11 and newly discovered integration work |
+| Phase 1 v1 | Re-estimate after corrected MVP | Includes NVLinkTwoSided, full EPLB reconfigure with weight migration, and multi-failure consensus; 1a.8 and 1a.11 are no longer deferred |
 | Phase 1-DS (disagg) | 3–4 weeks, parallelizable with v1 — 6 PRs | After MVP lands |
-| Phase 2 (Restoration) | 10–14 weeks — 16 PRs (sizes provisional pending Audit 1) | After Phase 1 v1 + MNNVL/NVSHMEM audit |
-| Phase 3 (Beyond failover) | ~3 months — work-track sized | After Phase 2 |
-| **Full program** | **7–10 months** with AI assistance, 10–14 months without | |
+| Phase 2 (Restoration) | Rebaseline after teardown audits — 17 plan IDs, several conditional | After Phase 1 v1 + MNNVL audit; DeepEP/NVSHMEM audit is conditional on that backend |
+| Phase 3 (Beyond failover) | Work-track sized; no fixed calendar yet | After Phase 2 |
+| **Full program** | **No credible fixed calendar until corrected MVP and Phase 2 audits are sized** | Sequence is authoritative; the retired month estimate is not |
 
-## Two named audits
+## Three named audit tracks
 
 - **Audit 1 (Phase 2 prerequisite), split by hardware dependency:**
   - **1a — Intra-node, ~1 week, can start immediately on any ≥ 4-GPU NVLink node.** Validates NCCL rebuild, MPI signal-handler replacement, `cuMemUnmap` under owner death, DeepEP destructor mitigation, intra-node MNNVL teardown + rebuild, NVSHMEM teardown. Brings Phase 2 sizing within ±20%.
   - **1b — Rack-fabric validation, ~2–3 days NVL72 time.** Confirms intra-node results extrapolate to rack scale; resolves provisional-sizing caveat. Sequenced after 1a so rack time is targeted validation, not from-scratch prototyping.
 - **Audit 2 (future-migration prerequisite):** Ray-path WideEP perf characterization. Gated on Ray-path CI existing at EP≥32 first. Empirical input for any future Ray pivot.
+- **Audit 3 (cross-IB prerequisite):** NIXL-EP evaluation for deployments where DeepEP-family transport, rather than MNNVL, is selected.
 
 ## What this design changes vs v1
 
@@ -71,12 +74,12 @@ The v1 doc was reviewed and several gaps surfaced. v2 addresses them:
 - **User journey upfront** ([§1](01-user-journey-and-stack.md)): grounds the reader in *the system* before discussing failures.
 - **Layered stack model (L1/L2/L3)** ([§1.2](01-user-journey-and-stack.md#12-the-stack-at-each-layer)): disentangles MPI/Ray (L1), control plane (L2), MNNVL/NVSHMEM/NCCL (L3) so readers don't conflate them.
 - **TRT-LLM uniqueness argument** ([§2](02-stack-comparison-and-positioning.md)): names what the design depends on that competitors don't have, so the FT approach is defensible.
-- **Two failure modes named explicitly** ([§3.1](03-failure-modes-and-gaps.md#31-two-failure-modes-that-todays-stack-does-not-survive)).
+- **Two-axis, four-quadrant failure model made explicit** ([§3.1](03-failure-modes-and-gaps.md#31-failure-modes-the-2x2)).
 - **Ray pivot question decided in writing** ([§3.3](03-failure-modes-and-gaps.md#33-why-not-just-pivot-to-ray)): not deferred, not implied — explicitly answered with cost analysis.
 - **What restarts vs what stays alive** ([§6.1](06-phase-2-full-restoration.md#61-what-restarts-and-what-stays-alive)): clarifies that Phase 2 is per-rank replacement, not whole-group rebuild.
-- **Per-backend PG reconstruction semantics** ([§6.2](06-phase-2-full-restoration.md#62-pg-reconstruction-per-backend)): NCCL works, MNNVL needs audit, NVSHMEM deferred, MPI without ULFM is structurally limited.
+- **Per-backend PG reconstruction semantics** ([§6.2](06-phase-2-full-restoration.md#62-pg-reconstruction)): NCCL works, MNNVL needs audit, direct NVSHMEM rebuild is deferred, and MPI without ULFM is structurally limited.
 - **Phase 3 promoted to its own section** ([§7](07-phase-3-beyond-failover.md)): not just a footnote in implementation plan.
-- **Two audits as named risks** ([§9.1](09-risks-and-open-questions.md#91-named-audits-gating-risks)): not buried in implementation plan; each is a 1–2 week scoped prototype.
+- **Three audit tracks as named risks** ([§9.1](09-risks-and-open-questions.md#91-named-audits-gating-risks)): not buried in the implementation plan and not confused with MVP correctness gates.
 - **Section count: 10 → 10** but with cleaner phase boundaries (one section per phase).
 
 Drafting and source verification are anchored against the [research pass report](redesign-research-pass-report.md).

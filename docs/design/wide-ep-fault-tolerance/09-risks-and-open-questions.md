@@ -4,41 +4,42 @@
 
 ## 9.1 Named audits (gating risks)
 
-Two audits are called out as named risks because they gate downstream work and their outcomes will meaningfully shift the design. Both are scoped bounded — they're 1–2 week prototyping passes, not open-ended research.
+Three audits are called out as named risks because they gate downstream work and their outcomes will meaningfully shift the design. Each is bounded prototyping or characterization, not open-ended research.
 
-### Audit 1 — MNNVL / NVSHMEM teardown capability
+### Audit 1 — Baseline MNNVL teardown and rack containment capability
 
 **Severity × Probability:** High × Medium | **Phase:** 2 | **Residual risk:** Medium (novel work; outcome gates Phase 2 sizing)
 
-**Why it's named.** Phase 2's `< 1 s` recovery target assumes MNNVL fabric-memory teardown + re-allocate + handle re-exchange is achievable in the ~100 ms range. The audit confirms or refutes this empirically. NVSHMEM is a secondary audit target tied to the (deferred) DeepEP scope.
+**Why it's named.** Phase 2's accelerated target assumes MNNVL teardown + reallocation + handle exchange is fast enough, while MVP 1d.4a needs evidence for FABRIC/IMEX peer-memory containment. The audit measures both. NVSHMEM is only a secondary, conditional target when DeepEP is selected.
 
 **Structured in two phases by hardware dependency.** Most of the audit work does not need NVL72 rack access and can start immediately on any ≥ 4-GPU node. A smaller set of items is specifically about rack-fabric behavior and needs NVL72 (or equivalent) time. Splitting this way lets Phase 1a surface most findings on commodity hardware, so Phase 1b rack time is efficient validation rather than from-scratch prototyping.
 
 #### Audit 1a — Intra-node (can start immediately on ≥ 4-GPU node)
 
-**Scope:** ~1 week, one engineer. Any DGX-class node with ≥ 4 NVLink-connected GPUs (H100 / A100 / B200). Does **not** require NVL72 access.
+**Scope:** ~1 week, one engineer. Any supported DGX/HGX-class node with ≥ 4 NVLink-connected GPUs (for example H100 or B200/B300). DGX/HGX B200/B300 uses NVSwitch for intra-node NVLink connectivity, but the current x86_64 TRT-LLM `MnnvlMemory` path selects POSIX-FD shareable handles. It does **not** require NVL72 access and does **not** validate the Grace/aarch64 FABRIC/IMEX path.
 
-**Empirical findings (Days 1–3 complete, Days 4–5 + DeepEP/NVSHMEM gated on IMEX / container / nvshmem unblockers):** see [audit-1a-findings.md](audit-1a-findings.md) for the long-form Day-by-Day write-up, or the condensed version in [`redesign-research-pass-report.md` § Empirical follow-up](redesign-research-pass-report.md#-empirical-follow-up--audit-1a-partial-item-7). Runnable prototypes + 2 sample result files in [`research-pass-prototypes/`](research-pass-prototypes/).
+**Historical empirical findings (isolated Days 1–3 complete; production-component Days 4–5 remain open):** see [audit-1a-findings.md](audit-1a-findings.md) for the corrected evidence boundary, or the condensed historical record in [`redesign-research-pass-report.md`](redesign-research-pass-report.md). Runnable micro-prototypes and sample results live in [`research-pass-prototypes/`](research-pass-prototypes/); they are not MVP E2E evidence.
 
 | Day | Work | Output |
 |:---|:---|:---|
-| 1 | NCCL abort + reinit prototype with SIGKILL fault injection. Measure `ncclCommAbort` + new-comm-init latency on N=4. | Empirical NCCL rebuild latency; confirms PyTorch `destroy_process_group` / `init_process_group` pattern works against our NCCL version. |
-| 2 | MPI signal handler replacement prototype. Test the `_exit(2)` variant from [§5.4](05-phase-1-immediate-survival.md#54-mpi-path-ft-enabling-work). | Mechanism de-risked for PR 1d.0 (in flight as PR #14160). |
-| 3 | `cuMemUnmap` semantics on dead-peer regions. Isolation test: `cuMemCreate` with posix handle type (not fabric), map cross-process, SIGKILL owner, test unmap on survivors. | Core CUDA driver behavior documented independent of fabric specifics. |
+| 1 | NCCL abort + reinit micro-prototype with SIGKILL fault injection. | The high-level PyTorch `destroy_process_group` / re-init attempt did **not** demonstrate recovery after peer death. It motivated 1a.7's lower-level raw-NCCL abort and survivor-only rebuild path. |
+| 2 | MPI signal-handler replacement micro-prototype. Test the `_exit(2)` variant from [§5.4](05-phase-1-immediate-survival.md#54-mpi-path-ft-enabling-work). | Signal-time propagation de-risked for merged 1d.0 / #14160; poisoned world collectives and finalization remain 1d.0a. |
+| 3 | `cuMemUnmap` semantics on dead-peer regions. Isolation test: `cuMemCreate` with POSIX-FD handle type, map cross-process, SIGKILL owner, test unmap on survivors. | Documents only the local POSIX-FD CUDA-driver case; it does not establish FABRIC/IMEX behavior. |
 | 3 | DeepEP destructor behavior. Construct `Buffer`, kill one rank, observe `__del__` → `intranode::barrier` deadlock on gc. Test explicit `destroy()` ordering (proposed in PR 2a.4). | Verified mitigation for known deadlock; sizes PR 2a.4 realistically. |
-| 4–5 | **Intra-node MNNVL teardown + reallocate prototype.** 4-GPU node, `MnnvlMemory` allocated symmetrically, small AlltoAll workload. SIGKILL one process mid-collective. Measure: (a) whether `cuMemUnmap` of dead peer's fabric region segfaults / hangs / succeeds; (b) full teardown latency; (c) rebuild via new fabric-handle exchange on N-1 survivors; (d) correctness AlltoAll on new workspace. | Partial MNNVL rebuild validation. Result generalizes to rack fabric with caveats (see Audit 1b). |
+| 4–5 | **No-mock intra-node production-component recovery prototype.** 4+ GPUs, real `MnnvlMemory`, real AlltoAll/NCCL/MPI/EPLB/PyExecutor paths, real model/workload, and SIGKILL during active serving. Measure running-kernel escape, survivor communicator/membership rebuild, request correctness, teardown, and continued service. On x86_64 this normally exercises POSIX-FD sharing. | 1d.4 intra-node evidence. It does not generalize to rack FABRIC/IMEX; 1d.4a is separate. |
 | 5 | NVSHMEM teardown / `nvshmem_finalize` behavior on shipping version. | Version-specific notes for any future DeepEP / NVSHMEM work. |
-| 5 | Written report: what's validated, what's pending NVL72 access. | Sizes Phase 2 PRs within ±20 % uncertainty; inputs Audit 1b. |
+| 5 | Written report: what's validated, what's pending NVL72 access. | Provisional Phase 2 inputs; confidence is re-estimated only after the no-mock intra-node and rack runs. |
 
-**What Audit 1a definitively answers:**
-- NCCL rebuild latency and correctness.
-- Signal handler replacement mechanism.
-- `cuMemUnmap` behavior under owner death.
-- DeepEP destructor deadlock mitigation.
-- Intra-node MNNVL rebuild latency and mechanism.
-- NVSHMEM teardown semantics on shipping version.
+**What the completed isolated work answers:**
 
-**Output gates Phase 2 sizing** within ±20 %. Precise PR 2a.2 estimate still waits for Audit 1b but Phase 2 v0 planning can proceed against Audit 1a results.
+- The attempted high-level PyTorch NCCL shrink path does not recover from peer death; it does not measure the 1a.7 survivor rebuild.
+- The signal-handler replacement removes explicit handler `MPI_Abort`; the tested default launcher still propagated abnormal exit, leaving 1d.1 launcher admission and 1d.0a lifecycle work.
+- POSIX-FD `cuMemUnmap` under owner death succeeds in the tested micro-case only.
+- The inspected DeepEP destructor contains a peer-dependent cleanup risk; production mitigation remains unproven.
+
+The isolated work does **not** answer real MNNVL recovery, NVSHMEM teardown under the target workload, request correctness, scale independence, or FABRIC/IMEX behavior. Those claims require the no-mock 1d.4 and 1d.4a paths.
+
+**Output informs Phase 2 sizing.** The production-component 2a.0a intra-node run supplies provisional Phase 2 sizing within ±20%; Audit 1b/2a.0b validates rack-fabric extrapolation and supplies the final 2a.2 ship decision.
 
 #### Audit 1b — Rack-fabric validation (pending NVL72 access)
 
@@ -51,11 +52,12 @@ Two audits are called out as named risks because they gate downstream work and t
 - Scale-specific issues at 72 ranks (e.g., `kMaxRanks=128` layout, 72×72 completion-flag table interaction with fabric-page caching).
 
 **What Audit 1b must confirm:**
-1. Intra-node MNNVL teardown results from Audit 1a still hold when peers are across the fabric, not just across a local NVLink.
+1. The production-component intra-node recovery/teardown results, once completed, still hold when peers are across the fabric rather than only inside one node.
 2. Rebuild latency at 72-rank scale matches the intra-node 4-rank extrapolation (or doesn't — flag scaling artifacts).
-3. No rack-fabric-specific failure mode is surfaced (e.g., fabric manager retrying on a dead member indefinitely).
+3. Under ordinary process death, FABRIC/IMEX membership and recovery behave correctly.
+4. Under a lab-approved IMEX-grant revocation, GPU reset/isolation, or equivalent inaccessible-peer-memory injection, survivor CUDA contexts remain contained and recover—or Q3 is explicitly recorded as fail-closed/restart.
 
-**Deliverable:** single empirical number for Phase 2 sizing: "MNNVL rebuild on NVL72 with 1 rank failed completes in X ms in the median, Y ms in the tail." This resolves the provisional-sizing caveat on PR 2a.2.
+**Deliverables:** (a) median/tail MNNVL rebuild latency for Phase 2 sizing, and (b) a 1d.4a containment verdict for both process death and inaccessible-peer-memory/device loss. A process-death timing number alone cannot close Q3.
 
 #### Combined deliverable
 
@@ -118,7 +120,7 @@ Key properties:
 | E5 | Write-up + go/no-go recommendation — integrate as Phase 1-IB primary path (PRs 1a.9/1a.10), defer (stay on DeepEP 100s-timeout interim IB.1), or decline. | Decision document |
 | E6 | **(new)** Phase 2 impact assessment — confirm that topology mutation collapses Phase 1 + Phase 2 for this transport. What does "Phase 2 = scale-up via `connect_ranks(replacement)`" mean for our §6 design? | Phase-2 design delta |
 
-**Integration scope if E5 is positive.** Two new PRs land Phase 1-IB's primary path: **1a.9** (NIXL-EP `CommunicationFactory` strategy + factory registration) and **1a.10** (NIXL-EP `EPGroupHealth` integration + scale-down/scale-up wrapper). Sizes M + M; both depend on PR 1a.1 (EPGroupHealth) and the NIXL-EP version selected in E2, plus the TCPStore-alongside-MPI or Ray-pivot decision from E1.
+**Integration scope if E5 is positive.** Two new PRs land Phase 1-IB's primary path: **1a.9** (NIXL-EP `CommunicationFactory` strategy + factory registration) and **1a.10** (NIXL-EP topology-mutation + FT coordinator integration). Sizes M + M; both depend on PR 1a.1 (committed membership), the NIXL-EP version selected in E2, and the TCPStore-alongside-MPI or Ray-pivot decision from E1.
 
 **Strategic value if E5 is positive.** Phase 1-IB ships on NIXL-EP with `disconnect_ranks` + EPLB redistribute as the recovery mechanism. The DeepEP FT gap stops being "blocking for multi-node B200+IB" because NIXL-EP replaces DeepEP for that transport. Backend priority order for cross-IB deployments becomes: 1) NIXL-EP (preferred for new FT-aware cross-IB deployments), 2) DeepEPLowLatency (legacy / NCCL-domain), 3) AllGatherReduceScatter (safety net).
 
@@ -128,22 +130,63 @@ Key properties:
 
 ### Risk — NVLink kernel modification complexity
 
-**Severity × Probability:** High × Medium | **Phase:** 1a (MVP) | **Residual:** **Low** — absorbed by PR 1a.2; kernel is in-repo, fully in our control
+**Severity × Probability:** High × High | **Phase:** 1a (MVP) | **Residual:** **High** until 1a.8 — merged 1a.2 supplies a launch-time mask, not a running-kernel recovery path
 
-The kernel mask change touches performance-critical CUDA synchronization. Potential issues: thread divergence, memory ordering interactions with MNNVL symmetric memory, races on mask read. Mitigated by:
+The kernel mask change touches performance-critical CUDA synchronization. Merged 1a.2 / #13404 copies the rank mask into launch parameters, so a kernel already polling a failed peer does not observe a later host-side mask update; its remaining escape is the roughly 300-second `trap;` path, which can poison the CUDA context. Potential issues include thread divergence, memory ordering interactions with MNNVL symmetric memory, races on abort/generation reads, and partial output from an aborted epoch. Mitigations are:
 
-- Minimal kernel change (one bit-test per rank, in an outer loop already iterating over ranks).
-- Correctness tests before performance tests.
+- Keep the merged launch-time bit test as the next-launch foundation.
+- Implement 1a.8: a stable device/host-visible abort or generation primitive observed inside every running polling loop, with a bounded recoverable return and no `trap;`.
+- Suppress the entire failed epoch through 1c.4c; a recoverable kernel return is not valid model output.
+- Correctness and destructive process-death tests before performance tests.
 - < 0.1 % steady-state overhead gate with all ranks active.
-- Kernel source already reviewed; `kMaxRanks` bump is single-line; mask plumbing is additive.
+
+### Risk — Detection state can race committed data-plane membership
+
+**Severity × Probability:** Critical × High | **Phase:** 1c (MVP) | **Residual:** **High** until 1c.4b
+
+If watchdog, MPI, or NCCL callbacks mutate `EPGroupHealth` independently, survivors can launch with different masks/generations or update placement before their control/data communicators are ready. The historical mock's direct watchdog → `mark_failed` path is explicitly invalid. Detection/suspicion state remains separate from committed communication state.
+
+**Mitigation:** 1c.4b is the only committed-membership writer and owns `detect → abort failed epoch → reconcile evidence → validate admission → quiesce → prepare EPLB → rebuild survivor control/NCCL → apply graph policy → commit mask + ActiveRankMap + generation`; 1c.4c applies request disposition before resume. Readiness and common-generation assertions are required in 1d.4/1d.4a.
+
+### Risk — Aggregate expert slots do not guarantee a survivable placement
+
+**Severity × Probability:** Critical × High | **Phase:** 1b (MVP) | **Residual:** **High** until 1b.2a
+
+For the canonical DeepSeek-V3 shape, 256 experts with EP=72 and four slots per rank provide 288 slots—only 32 extra copies—so at least 224 experts can be singletons. Even multiple copies do not provide FT if they share the same admitted failure domain. Mask-only reconfiguration cannot serve an expert that has no surviving resident copy.
+
+**Mitigation:** 1b.2a validates every layer/expert against every admitted single-rank failure, enforces distinct failure-domain placement for FT copies, and fails closed at startup and recovery when the invariant is absent. Memory/capacity estimates are evaluated only after admission succeeds.
+
+### Risk — Ordinary control and attention-DP collectives still include the dead rank
+
+**Severity × Probability:** Critical × High | **Phase:** 1c (MVP) | **Residual:** **High** until 1c.3a and 1c.4a
+
+A dedicated failure-notification thread does not repair the normal rank-state, request, batch-size, token-count, or model-input gathers. Any such collective over the original membership can hang after the next iteration begins, even when the MoE data-plane mask is correct.
+
+**Mitigation:** 1c.3a creates a survivor-only control communicator and immutable logical-to-physical `ActiveRankMap`; 1c.4a applies it to attention-DP/PyExecutor management collectives. 1d.4 asserts that no post-failure collective addresses the dead rank.
+
+### Risk — Failed-epoch output can leak to clients
+
+**Severity × Probability:** Critical × Medium | **Phase:** 1c (MVP) | **Residual:** **High** until 1c.4c
+
+A timeout, early-returning kernel, or zero-filled rank contribution may let a partially computed batch enter postprocessing. Restarting on the next iteration does not define what happens to queued and in-flight requests, and a completed HTTP response can silently carry corrupt logits.
+
+**Mitigation:** 1c.4c marks the epoch aborted before recovery, guarantees no failed-epoch output becomes externally visible, preserves queued work only when safe, and records explicit retry/reroute/error disposition for every in-flight request using the #12718/#13119 contracts.
+
+### Risk — CUDA graphs retain stale pointers and membership
+
+**Severity × Probability:** Critical × Medium | **Phase:** 1a (MVP) | **Residual:** **High** until 1a.11
+
+Captured graphs can retain old communicator, workspace, mask, and rank-map assumptions. Replaying a graph after recovery may use stale pointers even when host-side state shows the new generation.
+
+**Mitigation:** 1a.11 makes recovery enter eager mode, invalidates every graph bound to the old generation, and recaptures only after the new membership and communicators are committed. The first no-mock prototype may force eager mode but production acceptance must exercise the final graph policy.
 
 ### Risk — NIXL-EP integration timing
 
-**Severity × Probability:** Medium × Medium | **Phase:** v1 | **Residual:** **Medium** — gated on Audit 3 outcome
+**Severity × Probability:** Medium × Medium | **Phase:** Phase 1-IB | **Residual:** **Medium** — gated on Audit 3 outcome
 
-The NIXL team has built NIXL-EP and vLLM already uses it as an FT-enabled backend (PR #38534). For TRT-LLM, the open question is whether NIXL-EP fits cleanly into `CommunicationFactory` and whether its FT primitives (`activeRanks`-style masking + abort) are mature enough to integrate as a v1 backend. Two failure modes: (a) **integration is harder than estimated** — version skew, API mismatch, or perf regression vs NVLinkOneSided pushes the two new PRs (1a.9, 1a.10) past v1's window; (b) **deferring too long lets vLLM's NIXL-EP stack become the de-facto standard before we ship** — a coverage gap that's harder to close later.
+The NIXL team has built NIXL-EP and vLLM already uses it as an FT-enabled backend. For TRT-LLM, the open question is whether its verified incremental `disconnect_ranks` / `connect_ranks` topology mutation fits cleanly into `CommunicationFactory`, the coordinator, and EPLB for the Phase 1-IB cross-IB path. It is not `activeRanks` masking and it is not an NVL72 replacement. Two risks remain: integration/version/performance complexity, and letting the cross-IB coverage gap persist if the evaluation is deferred.
 
-**Mitigation:** Audit 3 ([§9.1](#audit-3--nixl-ep-evaluation-as-cross-ib-data-plane-backend)) is a bounded 2-week parallel evaluation that produces a go/no-go for v1. If go, the two integration PRs slot into Phase 1 v1 alongside 1a.5–1a.6. If no-go, no schedule impact — MVP and v1 ship unchanged. Either way, NIXL-EP doesn't gate MVP.
+**Mitigation:** Audit 3 ([§9.1](#audit-3--nixl-ep-evaluation-as-cross-ib-data-plane-backend)) is a bounded two-week parallel evaluation that produces a go/no-go for Phase 1-IB. If positive, the conditional 1a.9/1a.10 work implements that transport track; if negative, the NVL72 corrected-MVP path is unchanged. NIXL-EP does not gate the NVL72 MVP.
 
 ### Risk — DeepEP backend limitations (applies to cross-IB transport deployments only)
 
@@ -151,28 +194,28 @@ The NIXL team has built NIXL-EP and vLLM already uses it as an FT-enabled backen
 
 DeepEP only supports specific EP sizes ({2,4,8} intra-node, {16,32,...,128} inter-node); post-failure EP=71 isn't supported. The `mask_buffer_ptr` parameter referenced in vLLM's RFC #27774 is not in DeepEP's public API. `Buffer.__del__` → `intranode::barrier` deadlock is a known issue (acknowledged at `deep_ep.py:86`).
 
-**Not a blocker for MVP.** The MVP closes the FT gap for the entire NVLink-substrate footprint (single-node NVL boxes through NVL72 rack — wherever `MnnvlMemory.supports_mnnvl()` returns True) via PR 1a.2 kernel mask, plus the NCCL fallback via PR 1a.7. The DeepEP-family transport is only selected when MNNVL is *not* available — cross-IB / cross-fabric peers. Feature flag ([PR 1d.1](pr-execution/08-implementation-plan.md)) warns if DeepEP is the selected backend when FT is enabled.
+**Not a blocker for the NVL72 MVP only because that release fails closed on unsupported DeepEP-family routes.** The corrected NVLink-substrate path requires the full MVP recovery transaction—not just 1a.2 and 1a.7—including 1a.8/1a.11, admitted EPLB placement, survivor control/ADP membership, atomic commit, request disposition, poisoned-MPI lifecycle, and 1d.4/1d.4a. The DeepEP-family transport applies when MNNVL is unavailable (cross-IB/cross-fabric peers) and remains Phase 1-IB scope. Item 1d.1 must reject or explicitly divert that backend when the NVL72 FT mode is enabled.
 
 **Applies to [Phase 1-IB](pr-execution/08-implementation-plan.md#phase-1-ib--cross-ib-transport-coverage-nixl-ep-track) deployments** (multi-node B200+IB, multi-rack non-NVLink-fabric, anything where `CommunicationFactory` falls through to DeepEP-family). Two mitigation paths:
 
 - **IB.1 (interim).** Host-side static kernel timeout (vLLM PR #38534's 100s "FT-enabled backend" pattern). Softer than `trap;`; doesn't require NVSHMEM-side changes; doesn't bound recovery latency tightly.
-- **IB.2 (preferred if Audit 3 positive).** Substitute NIXL-EP for DeepEP. NIXL-EP exposes `connect_ranks` / `disconnect_ranks` for incremental topology mutation; gets a tighter recovery bound (~3s per vLLM Elastic EP claims).
+- **IB.2 (preferred if Audit 3 positive).** Substitute NIXL-EP for DeepEP. NIXL-EP exposes `connect_ranks` / `disconnect_ranks` for incremental topology mutation; Audit 3 must measure our recovery bound rather than inheriting the external ~3-second claim.
 
 The IB.2 path is preferred when Audit 3 outcome is positive; IB.1 is the fallback when it isn't.
 
 ### Risk — Process-group reconstruction deadlocks
 
-**Severity × Probability:** High × Medium | **Phase:** 2a | **Residual:** **Medium** — novel work; execution risk realizes in Phase 2, not MVP
+**Severity × Probability:** High × Medium | **Phase:** MVP + 2a | **Residual:** **Medium** — survivor-only rebuild is MVP; replacement-inclusive rebuild extends it in Phase 2
 
-Per-layer cleanup paths can deadlock on dead peers. DeepEP's `Buffer.__del__` calls `intranode::barrier`; NCCL abort cleanup is best-effort; MPI `MPI_Comm_split` is collective. Mitigated by coordinated teardown (all survivors agree before any starts), explicit `destroy()` sequencing on DeepEP, `MPI_ERRORS_RETURN` on MPI, and opportunistic ULFM. The MNNVL audit above (Audit 1) covers the MNNVL-specific variant. The next three risks call out the largest sub-concerns folded into this one separately, since they have distinct external owners and distinct mitigation paths.
+The MVP already risks deadlock while 1c.3a/1c.4a build survivor control membership and 1a.7 aborts/reinitializes supported raw NCCL communicators; those operations must be coordinator-ordered and fail closed. Phase 2 extends the risk to replacement-inclusive MNNVL/NCCL/bootstrap work. DeepEP `Buffer.__del__`/NVSHMEM teardown is conditional on selecting that backend, not a baseline MVP dependency. Use `MPI_ERRORS_RETURN`, bounded operations, the last valid control path, and opportunistic ULFM where available. Audit 1 sizes MNNVL reconstruction; 1d.4 validates the survivor path.
 
 ### Risk — NVSwitch fabric manager behavior under mid-collective rank death
 
-**Severity × Probability:** High × Medium | **Phase:** 2a | **Residual:** **Medium** — gated on cross-team engagement and Audit 1b outcome
+**Severity × Probability:** High × Medium | **Phase:** MVP 1d.4a + Phase 2a | **Residual:** **Medium** — gated on destructive rack acceptance, cross-team engagement, and Audit 1b
 
 When an MNNVL domain member disappears, the NVSwitch fabric manager's reaction is unspecified from outside the fabric-manager team. Possible behaviors: cleanly invalidate routes (good); retry communication with the dead rank indefinitely (bad — can mark survivors' fabric mappings as suspect); suspend the whole domain temporarily (worst). Whichever it does, it directly affects whether mid-flight `cuMemUnmap` on dead-peer regions completes cleanly and whether survivors can re-allocate fabric memory in a smaller-N topology.
 
-**Mitigation:** named cross-team dependency in [§9.5](#95-cross-team-dependencies-nvidia-internal); engage NVSwitch fabric manager team before Audit 1b runs so audit findings can be cross-checked against their expectations. Audit 1b empirically characterizes the behavior on NVL72.
+**Mitigation:** named cross-team dependency in [§9.5](#95-cross-team-dependencies-nvidia-internal); engage the fabric-manager/driver owners before Audit 1b. MVP item 1d.4a must pair process death with a lab-approved inaccessible-peer-memory/device-loss injection and either prove survivor-context containment or retain Q3 fail-closed. Audit 1b also characterizes replacement-era teardown/reallocation for Phase 2.
 
 ### Risk — IMEX dynamic re-grant support
 
@@ -186,39 +229,39 @@ For MNNVL on NVL72, fabric memory grants are managed by the `nvidia-imex` daemon
 
 **Severity × Probability:** Medium × Medium | **Phase:** 2c | **Residual:** **Medium** — architectural decision pending PR 2c.2 design
 
-Default `mpirun` doesn't natively support adding a rank to a running job. `MPI_Comm_spawn` exists but is complex to wire. The current [§6.2](06-phase-2-full-restoration.md#62-pg-reconstruction) design states "the replacement joins via the FT subcomm + a new sub-communicator that excludes the dead rank, and operates over that sub-comm thereafter," but the *actual mechanism* is undefined: does the replacement become an MPI peer (via `MPI_Comm_spawn`, complex), or bypass MPI entirely (start as non-MPI process, join NCCL + MNNVL groups via FT subcomm bootstrap, never enter `COMM_WORLD`)?
+Default `mpirun` doesn't natively support adding a rank to a running job. `MPI_Comm_spawn` exists but is complex to wire, and the existing 1c.3 signaling / 1c.3a survivor communicator cannot contain a process that was not already a member. The [§6.2](06-phase-2-full-restoration.md#62-pg-reconstruction) design therefore leaves the mechanism explicit: does the replacement become an MPI peer via `MPI_Comm_spawn`, enter through a pre-staged bootstrap group, or bypass MPI entirely and join NCCL + MNNVL through an external control channel?
 
 **Mitigation:** explicit open design question for PR 2c.2 (Join protocol for new rank entering EP group). Both options are viable; the choice has follow-on implications for how the replacement coordinates with surviving ranks (which collectives go through MPI vs which go directly through NCCL/MNNVL). Settle before PR 2c.2 design freeze.
 
 ### Risk — Failure broadcast consensus (false positives)
 
-**Severity × Probability:** Medium × Medium | **Phase:** 1c | **Residual:** **Low–Medium** — tuning reduces but does not eliminate; monotonic-failure means a false positive permanently masks a live rank until Phase 2
+**Severity × Probability:** Critical × Medium | **Phase:** 1c | **Residual:** **High** until reconciliation and atomic commit are implemented
 
-Split-brain scenarios (rank A thinks rank B is dead, rank B is still running) could corrupt routing. Mitigated by conservative detection (both timeout AND MPI-worker-death confirmation before marking failed), two-phase suspect → confirm for v1 multi-failure, monotonic failure policy.
+Split-brain scenarios (rank A thinks rank B is dead, rank B is still running) can corrupt routing. Requiring “timeout AND MPI-worker-death” is not a universal rule: an alive-but-hung rank may never produce worker-death evidence, while an immediate-fatal CUDA/NCCL signal may be authoritative. Detector-specific evidence enters 1c.3 reconciliation; no detector independently commits membership. Item 1c.4b publishes a monotonic common mask + immutable `ActiveRankMap` + generation only after placement, survivor communicators, and graph policy are ready.
 
 ### Risk — EPLB reconfigure during active serving
 
-**Severity × Probability:** Medium × Low | **Phase:** 1b | **Residual:** **Low** — design constraint enforced by model-engine hook
+**Severity × Probability:** High × Medium | **Phase:** 1b, 1c | **Residual:** **Medium–High** until 1c.4b coordinates the safe point
 
-`reconfigure_mask_only` pauses EPLB worker + compute threads. If the pause lands at the wrong time (mid-weight-migration for a different layer), GPU memory could be inconsistent. Mitigated by iteration-boundary-only invocation + safe-point polling in worker threads.
+`reconfigure_mask_only` pauses EPLB worker + compute threads. If the pause lands at the wrong time (mid-weight-migration for a different layer), GPU memory could be inconsistent. A local iteration-boundary callback is not sufficient if other ranks, NCCL, control membership, or CUDA graphs are still on the previous generation. Item 1c.4b owns the common quiesce and placement/communicator readiness sequence; the existing 1c.4 hook is its model-engine integration point.
 
-### Risk — MPI `COMM_WORLD` failure-poisoning (Mode A persistence)
+### Risk — MPI `COMM_WORLD` poisoning after Q1/Q3 prompt evidence
 
-**Severity × Probability:** High × High | **Phase:** 1c, 1d.0 | **Residual:** **Low–Medium** — ULFM availability depends on MPI build; single-failure MVP survives without ULFM
+**Severity × Probability:** High × High | **Phase:** 1c, 1d.0/1d.1/1d.0a | **Residual:** **High** until launcher admission and poisoned-world lifecycle are destructively tested
 
-Already mitigated in the design via 1d.0 (signal handler replacement) and 1c.3 (FT subcomm). ULFM is a further mitigation for multi-failure; its availability depends on the MPI build (opt-in in OpenMPI, patchy in MVAPICH). For single-failure MVP, non-ULFM path is sufficient.
+Merged 1d.0 removes the old handler's explicit `MPI_Abort`, but a launcher/runtime may still terminate the job on abnormal exit; 1d.1 must admit a survivor-preserving mode. Item 1c.3 supplies failure evidence, while neither component makes `COMM_WORLD`, implicit world collectives, or `MPI_Finalize` safe. Item 1d.0a owns poisoned-world policy and deterministic shutdown. ULFM is optional; the non-ULFM path is acceptable only after 1d.0a/1d.4 proof.
 
 ### Risk — NCCL fault-tolerance not wired in custom ops
 
-**Severity × Probability:** Medium × High | **Phase:** 1a (v1) | **Residual:** **Low** — fully in our control; v1 scope
+**Severity × Probability:** High × High | **Phase:** 1a (MVP) | **Residual:** **High** until 1a.7 and the common survivor-map integration are complete
 
-Zero non-test uses of `ncclCommAbort` in TRT-LLM. PR 1a.7 wires it before AllGatherReduceScatter becomes a mask-capable fallback path. `torch.distributed`'s PyTorch-inherited abort path is unaffected.
+The historical audit did not show that a peer-death-poisoned PyTorch process group can be destroyed and reinitialized. Item 1a.7 therefore owns lower-level communicator abort and survivor-only raw-NCCL rebuild for the corrected MVP. It must consume exactly the 1c.3a `ActiveRankMap` committed by 1c.4b; a second independent rank list recreates split-brain risk. `torch.distributed` behavior outside the owned wrapper still requires audit at every call site used after recovery.
 
 ### Risk — PR #12718 sequencing dependency
 
-**Severity × Probability:** Medium × High | **Phase:** 1c | **Residual:** **Medium** — external dependency on #12718 merge cadence
+**Severity × Probability:** Medium × Low | **Phase:** 1c | **Residual:** **Low–Medium** — #12718 is merged; integration semantics remain
 
-PRs 1c.1–1c.4 import from `tensorrt_llm/_torch/pyexecutor/error_classification.py` which #12718 introduces. Mitigated by: (a) rebasing #12718 into the FT implementation base branch, or (b) a drop-in `ErrorBudget` + `classify_error()` shim that gets reconciled when #12718 lands. Tracked weekly during MVP execution.
+PR #12718 provides the classification foundation in `tensorrt_llm/_torch/pyexecutor/error_classification.py`. The remaining risk is semantic integration: rank/engine failures must enter failure evidence without charging request-scoped errors, and 1c.4c must preserve that boundary when it disposes the failed epoch. No temporary classification shim should become a second source of truth.
 
 ### Risk — PR #13119 error-propagation dependency
 
@@ -230,19 +273,19 @@ PR #13119 makes request-scoped failures observable (`GenerationResultBase.error`
 
 **Severity × Probability:** High × Medium | **Phase:** 1c | **Residual:** **Medium** — Layer 1 watchdog is mandatory for this deployment shape
 
-`trtllm-llmapi-launch` / `mgmn_leader_node` uses `RemoteMpiCommSessionClient`, whose `submit()` returns `[]` because workers are managed in a separate process. PR #12718's `_check_mpi_futures()` has no local future handles to inspect in that path. The bench-shutdown regression exposed this empty-list behavior: the sentinel must still be sent even when `mpi_futures` is empty. For WideEP FT, Layer 2 worker-death detection is inert in this path; Layer 1 AlltoAll watchdog and explicit health broadcast are mandatory.
+`trtllm-llmapi-launch` / `mgmn_leader_node` uses `RemoteMpiCommSessionClient`, whose `submit()` returns `[]` because workers are managed in a separate process. PR #12718's `_check_mpi_futures()` has no local future handles to inspect in that path. The bench-shutdown regression exposed this empty-list behavior: the sentinel must still be sent even when `mpi_futures` is empty. For WideEP FT, that future-based detector is inert in this path; zero-collective AlltoAll evidence and the dedicated 1c.3 notification/reconciliation thread are mandatory, followed by 1c.3a/1c.4b—not a direct health broadcast-to-mask shortcut.
 
 ### Risk — hung-rank detection without process exit
 
-**Severity × Probability:** High × High | **Phase:** 1a, 1c | **Residual:** **Medium** — covered by Layer 1 watchdog, not by PR #12718 alone
+**Severity × Probability:** Critical × High | **Phase:** 1a, 1c | **Residual:** **High** — detection alone cannot release a running kernel
 
-PR #12718 detects completed MPI futures and queued background errors. It does not detect a rank that is alive but stuck in a CUDA/NCCL/MPI collective. This is the exact Mode B risk: kernels can spin indefinitely waiting for a dead peer's flag. Mitigations: host-side AlltoAll watchdog with bounded polling (§5.3 Layer 1), per-step timing markers around `EPGroupHealth.mark_failed()` / broadcast / `reconfigure_mask_only`, and eventual main-thread polling for NCCL/torch distributed operations (Audit 1a showed watchdog modes either terminate or hang in PyTorch 2.11).
+PR #12718 detects completed MPI futures and queued background errors. It does not detect a rank that is alive but stuck in a CUDA/NCCL/MPI collective. A host-side AlltoAll watchdog can detect lack of progress, but merged 1a.2's launch-time mask cannot change an already-running kernel's polling set. Mitigations: 1a.4 publishes evidence, 1a.8 supplies the running-kernel-visible abort/generation and recoverable return, 1c.4c discards the failed epoch, and 1d.4/1d.4a measure the bounded escape on real hardware.
 
 ### Risk — Memory pressure in degraded mode
 
-**Severity × Probability:** Low × Low | **Phase:** 1d | **Residual:** **Low** — headroom is ample on GB200
+**Severity × Probability:** High × Medium | **Phase:** 1b, 1d | **Residual:** **Medium** after placement admission and workload measurement
 
-Surviving ranks absorb extra tokens per AlltoAll. For DS-V3 / EP=72 losing 1 rank: ~1.4 % extra compute per rank, small memory impact. On 192 GB HBM GB200, headroom is comfortable.
+Survivors absorb extra tokens and may need additional resident expert copies. An average `(N-1)/N` load estimate does not establish per-rank HBM, hot-expert capacity, or placement survivability. Item 1b.2a first proves per-layer/per-expert coverage and failure-domain separation; 1d.4/1d.4a then measure worst-survivor memory and throughput on the admitted realistic workload. FT must fail closed rather than rely on nominal GB200 capacity.
 
 ### Risk — Second failure during Phase 2 rebuild window
 
@@ -270,36 +313,35 @@ Verified: explicit waive at `tests/integration/defs/disaggregated/test_disaggreg
 
 ## 9.3 Open design questions
 
-### Q1 — Kernel-side vs host-side timeout
+### Q1 — Kernel-side versus host-side escape
 
-Chosen: **host-side watchdog** for MVP. Simpler, runtime-configurable, easier to debug. Kernel-side `clock64()` timeout is an optimization candidate for v1 if host watchdog latency is unacceptable.
+Chosen: **both are required, with separate responsibilities.** The 1a.4 host watchdog detects lack of progress and publishes failure evidence. Item 1a.8 supplies a device/host-visible abort or generation that an already-running kernel can observe and return through in bounded time. A fixed 300-second `clock64()` path ending in `trap;` is neither the recovery mechanism nor a v1-only optimization. Detection still does not authorize mask commit; 1c.4b does.
 
 ### Q2 — Policy for in-flight requests during Phase 1 recovery
 
-Chosen: **Option A — fail the current batch, retry on next iteration.** The batch is already in inconsistent state; failing and restarting with new mask is simplest. Latency impact is one batch of requests. Option B (partial-batch completion, fail only tokens routed to dead rank) is more complex and has consistency risks; not worth it for MVP.
+Required invariant: **no output from the failed epoch reaches a client.** Item 1c.4c defines the exact policy rather than assuming every request can simply retry on the next iteration. It must distinguish queued requests that remain safe, in-flight requests that can be retried or rerouted without violating API semantics, and requests that must return an explicit error. Partial-batch completion is out of MVP unless it can prove the same invariant. The policy and every request disposition are tested through the normal serving interface.
 
 ### Q3 — Failure timeout tuning
 
-Configurable per deployment via `TRTLLM_EP_FT_TIMEOUT_SEC` env or config field:
+Configurable per deployment through the unified WideEP FT configuration owned by 1d.1; avoid creating a second undocumented environment-variable source of truth. Initial values are hypotheses, not release defaults:
 
 | Deployment | Recommended | Rationale |
 |:---|:---|:---|
-| NVL72 single rack | 2–3 s | NVLink latency is microseconds |
-| Multi-node + RDMA | 5–10 s | RDMA tail latencies are real |
-| Dev / CI | 1 s | Iterate fast |
+| NVL72 single rack | Measure in 1d.4a | NVLink latency alone does not bound scheduling, kernel, or fabric-manager stalls |
+| Multi-node + RDMA | Measure in Phase 1-IB acceptance | Transport and workload tails differ from NVL72 |
+| Dev / CI | Short, test-specific value | Fast deterministic injection is useful but is not a production recommendation |
+
+The selected value must balance false positives against the full recovery SLO. It does not replace a bounded 1a.8 kernel escape.
 
 ### Q4 — DeepEP support
 
-Chosen: **NVLink-only for MVP.** DeepEP requires `mask_buffer_ptr` in public NVSHMEM API; not available. If NVIDIA exposes the API, DeepEP masking becomes a v1 or post-v1 item.
+Chosen: **NVLinkOneSided plus supported NCCL for MVP.** Direct DeepEP masking/rebuild requires an upstream NVSHMEM/DeepEP primitive that is not available. Cross-IB deployments are not silently dropped: the conditional Phase 1-IB track evaluates NIXL-EP topology mutation as the preferred path and a limited DeepEP timeout interim as fallback evidence. Full direct DeepEP FT remains conditional on upstream support.
 
 ### Q5 — Maximum simultaneous failures
 
-Depends on replication factor:
-- 0 redundant experts: **0 failures** tolerable.
-- 32 redundant experts (DeepSeek production): ~4 failures tolerable, depending on replica distribution.
-- 256 redundant experts (SGLang benchmark config): up to 16 failures (50 % cluster loss).
+MVP admits **one rank failure only when 1b.2a proves it for every layer and expert**. Aggregate redundancy is not a failure-tolerance calculation. For DeepSeek-V3 with 256 experts, EP=72, and four slots/rank, 288 total slots provide only 32 extra copies, leaving at least 224 singleton experts unless the configured placement/model differs. Even duplicated experts are not protected if their copies share the failed rank or failure domain.
 
-Bitmask supports up to 128 ranks; actual tolerance is determined by `num_redundant_experts` at deployment time. Relationship between replication factor and failure tolerance documented in the feature's user-facing docs.
+The 128-rank bitmask capacity is merely an encoding bound. Actual failure tolerance comes from the per-layer placement, failure-domain anti-affinity, available survivor memory/capacity, communicator support, and the admitted failure set. Multi-failure admission is post-MVP work and requires an explicit proof, not a replica-count estimate.
 
 ### Q6 — WideEP + pipeline parallelism interaction
 
@@ -326,9 +368,9 @@ Chosen: **request-scoped errors stay request-scoped; rank / engine failures trig
 PR #13119 intentionally improves request-level propagation: context-server errors, postprocessing exceptions, malformed disaggregated responses, and HTTP error bodies should flow back to the caller with the original reason. PR #12718 intentionally filters `RequestError` / `str` and adds `_handle_errors(charge_budget=False)` for request-scoped paths so those same errors do not consume the process-fatal budget. WideEP FT inherits that boundary:
 
 - If the request is bad or the context response is invalid, fail the request and keep the EP group healthy.
-- If the worker process dies, CUDA/NCCL reports an immediate-fatal condition, or the AlltoAll watchdog times out a rank, mark the rank failed and enter Phase 1 recovery.
+- If the worker process dies, CUDA/NCCL reports an immediate-fatal condition, or the AlltoAll watchdog times out a rank, publish failure evidence and enter reconciliation. Only 1c.4b commits the failed rank after admission and survivor readiness.
 
-Open item: streaming SSE helpers must be audited so they follow the same boundary (structured error event + `[DONE]`, not a process-fatal path).
+Item 1c.4c owns failed-epoch disposition and the streaming SSE audit so the same boundary holds for structured error events and stream completion, without turning a request error into process failure or leaking partial failed-epoch output.
 
 ## 9.4 Risk summary matrix
 
@@ -338,19 +380,23 @@ Open item: streaming SSE helpers must be audited so they follow the same boundar
 | Ray-path perf uncharacterized | Medium | High | Future migration | Audit 2 | **Medium–High** — covered when Audit 2 runs |
 | **NIXL-EP integration timing (cross-IB transport)** | Medium | Medium | Phase 1-IB | Audit 3 (bounded 2-week parallel evaluation); go/no-go decides Phase 1-IB primary path (IB.2) vs interim (IB.1) | **Medium** — applies only to cross-IB deployments; NVL72 path unaffected |
 | Ray + disagg + NIXL unsupported | Medium | High | Phase 1-DS / future | Close gap upstream; ship on MPI first | **Medium** — hard gap, closes with upstream fix |
-| NVLink kernel modification | High | Medium | 1a | PR 1a.2 minimal change; correctness-first | **Low** |
+| **Running-kernel escape after merged launch mask** | Critical | High | 1a MVP | 1a.8 recoverable abort/generation; 1c.4c epoch suppression; destructive E2E | **High** until implemented |
+| **Detection/commit split-brain** | Critical | High | 1c MVP | 1c.4b sole writer and atomic common generation | **High** until implemented |
+| **Expert placement not survivable** | Critical | High | 1b MVP | 1b.2a per-layer/per-expert admission and failure-domain anti-affinity | **High** until implemented |
+| **Dead rank retained in control/ADP collectives** | Critical | High | 1c MVP | 1c.3a `ActiveRankMap`; 1c.4a survivor-aware gathers | **High** until implemented |
+| **Failed-epoch output reaches client** | Critical | Medium | 1c MVP | 1c.4c explicit request disposition and no-partial-output assertion | **High** until implemented |
+| **Stale CUDA graph crosses generation** | Critical | Medium | 1a MVP | 1a.11 eager fallback, invalidate, recapture | **High** until implemented |
 | DeepEP limitations (cross-IB transport only) | Medium | High | Phase 1-IB | NIXL-EP via Audit 3 (preferred) or 100s static kernel timeout interim | **Medium–High** — applies only when DeepEP-family is selected transport |
 | PG reconstruction deadlocks | High | Medium | 2a | Coordinated teardown; explicit destroy(); ULFM | **Medium** |
-| Failure broadcast consensus | Medium | Medium | 1c | Two-phase suspect/confirm; monotonic failure | **Low** |
-| EPLB reconfigure timing | Medium | Low | 1b | Iteration-boundary only | **Low** |
-| **MPI `COMM_WORLD` poisoning (Mode A)** | High | High | 1c, 1d.0 | Signal handler replacement + FT subcomm | **Low–Medium** |
-| NCCL FT not wired | Medium | High | 1a (v1) | PR 1a.7 | **Low** |
-| PR #12718 sequencing | Medium | High | 1c | Rebase or shim | **Medium** |
+| Failure-evidence reconciliation / false positive | Critical | Medium | 1c MVP | 1c.3 reconciliation; 1c.4b commit after admission/readiness | **Medium–High** |
+| EPLB reconfigure timing | High | Medium | 1b/1c MVP | 1c.4b common quiesce and readiness; existing 1c.4 hook | **Medium–High** |
+| **MPI launcher propagation + `COMM_WORLD` poisoning after Q1/Q3 evidence** | High | High | 1c, 1d.0/1d.1/1d.0a MVP | 1d.0 removes handler abort; 1d.1 admits survivor-preserving runtime; 1c.3 evidence; 1d.0a lifecycle/shutdown | **High** until destructively tested |
+| **NCCL survivor communicator not wired** | High | High | 1a MVP | 1a.7 consumes the common 1c.3a survivor map under 1c.4b | **High** until implemented |
+| PR #12718 semantic integration | Medium | Low | 1c | Reuse merged classifier; preserve request-vs-rank boundary | **Low–Medium** |
 | PR #13119 error propagation | Medium | Medium | 1c / Phase 1-DS | Preserve request-vs-fatal boundary; add disagg e2e tests | **Low–Medium** |
-| RemoteMpiCommSessionClient detection visibility | High | Medium | 1c | Layer 1 watchdog mandatory; explicit empty-futures handling | **Medium** |
-| Hung rank without process exit | High | High | 1a / 1c | AlltoAll watchdog + bounded polling | **Medium** |
-| Memory pressure (degraded) | Low | Low | 1d | Small impact; ample GB200 headroom | **Low** |
-| False positive detection | Medium | Medium | 1c | Conservative timeouts + confirmation | **Low–Medium** |
+| RemoteMpiCommSessionClient detection visibility | High | Medium | 1c | Zero-collective detector + 1c.3 notification; explicit empty-futures handling | **Medium** |
+| Hung rank without process exit | Critical | High | 1a / 1c MVP | 1a.4 evidence + 1a.8 release + 1c.4c suppression | **High** until 1a.8 |
+| Memory/capacity pressure in degraded mode | High | Medium | 1b / 1d MVP | 1b.2a admission + realistic 1d.4/1d.4a measurements | **Medium** |
 | Second failure during rebuild | Medium | Medium | 2a.8 | Abandon rebuild, re-mask, retry | **Medium** |
 | HostMoeTensorSharer MPI hard-bake | Medium | High | Future migration | Refactor before Ray pivot | **Medium** |
 | PP + WideEP interaction | Medium | Low | 2+ | Defer to Phase 2 | **Medium (deferred)** |
@@ -359,7 +405,7 @@ Open item: streaming SSE helpers must be audited so they follow the same boundar
 | **IMEX dynamic re-grant support** | High | Medium | 2a, 2b | Cross-team engagement (§9.5); MX P2P RDMA fallback if IMEX answer is "no" | **Medium** — fundamentally changes sub-second feasibility |
 | **MPI rank-add architecture undefined** | Medium | Medium | 2c | Settle in PR 2c.2 design (Comm_spawn vs bypass MPI) | **Medium** — architectural decision pending |
 
-Bolded rows are the ones warranting active tracking during MVP execution.
+Bolded corrected-MVP rows are immediate ship risks. Their residual risk is intentionally not shown as low merely because the code is owned in-repo; each remains open until its implementation and physical acceptance evidence exist.
 
 ## 9.5 Cross-team dependencies (NVIDIA-internal)
 
@@ -378,17 +424,17 @@ Phase 2 (PG reconstruction over MNNVL) and [§7.5](07-phase-3-beyond-failover.md
 
 ### Dependencies by phase
 
-**Phase 1 (MVP + v1).** No cross-team dependency. Wholly owned by TRT-LLM. We can ship on our own schedule.
+**Phase 1 (MVP + v1).** The implementation is primarily owned by TRT-LLM, but the 1d.4a production acceptance gate depends on access to NVL72/equivalent hardware plus a working driver, fabric-manager, and IMEX environment. That operational/resource dependency can block release evidence even when the source changes are complete. The x86_64 intra-node 1d.4 path normally uses POSIX-FD sharing and cannot substitute for it.
 
 **Phase 2 (Restoration).** Three cross-team engagements:
 
-- **CUDA driver team** — fabric handle teardown semantics under peer death. [Audit 1a Day 3](audit-1a-findings.md) (posix-FD variant) showed `cuMemUnmap` of a dead-peer region completes in ~0.25 ms with no fault. Need explicit confirmation that the fabric-handle path matches and that future driver versions preserve the behavior. Engage when [Audit 1b](#audit-1--mnnvl--nvshmem-teardown-capability) is being planned.
+- **CUDA driver team** — fabric handle teardown semantics under peer death. [Audit 1a Day 3](audit-1a-findings.md) (posix-FD variant) showed `cuMemUnmap` of a dead-peer region completes in ~0.25 ms with no fault. Need explicit confirmation that the fabric-handle path matches and that future driver versions preserve the behavior. Engage when [Audit 1b](#audit-1--baseline-mnnvl-teardown-and-rack-containment-capability) is being planned.
 - **NVSwitch fabric manager team** — what does the fabric manager do when an MNNVL domain member disappears? Does it interfere with rank-masked AlltoAll, or with our rebuild flow? Audit 1b is partly about answering this empirically; their team's expectations should be cross-checked beforehand. Engage early.
 - **IMEX team** — does IMEX support re-exchanging memory grants among surviving members without daemon restart? Engage when planning [PR 2a.2](pr-execution/08-implementation-plan.md#2a--process-group-reconstruction) (MNNVL teardown + reallocate).
 
 **§7.5 (Forward-looking straggler / resize work).** Same MNNVL stack as Phase 2, plus dynamic-resize requirements (adding a rank to a live fabric domain). Higher bar than Phase 2's "rebuild after death."
 
-**DeepEP-related (deferred indefinitely).** Two-sided dependency:
+**Direct DeepEP/NVSHMEM masking (conditional upstream dependency).** Two-sided dependency:
 
 - **NVSHMEM team (NVIDIA)** — `mask_buffer_ptr` public API. Referenced in vLLM's RFC #27774 since 2024 but not yet shipped in public NVSHMEM. NVSHMEM team's roadmap decision.
 - **DeepEP team (DeepSeek-AI; external)** — wiring of any new NVSHMEM masking primitive into DeepEP's public API. NVIDIA-DeepSeek collaboration channel.
@@ -416,6 +462,6 @@ Three tiered actions:
 
 Net implication:
 
-- **Anything purely in TRT-LLM source** (Phase 1, most of §5, §6.1, §6.4) — we own and ship on our schedule.
+- **Anything purely in TRT-LLM source** (most Phase 1 implementation, §5, §6.1, §6.4) — we own the code schedule, but corrected-MVP completion still depends on physical 1d.4/1d.4a evidence and the rack environment for the latter.
 - **Anything that touches MNNVL fabric semantics** (Phase 2, §7.5) — needs early external engagement. Worth opening conversations *now*, not when we hit the audit.
 - **Anything requiring NVSHMEM API extensions** (DeepEP FT) — soft dependency on someone else's timeline. Treat as out-of-scope until that timeline is established by upstream.
