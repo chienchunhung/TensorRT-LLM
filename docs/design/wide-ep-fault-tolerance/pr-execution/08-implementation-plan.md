@@ -36,12 +36,12 @@ This section breaks the design into named PRs. Phase 1 PRs are detailed (they're
 - **1a.1 is merged as PR #13302** — `EPGroupHealth` thread-safe rank mask landed on 2026-06-17 PDT.
 - **1d.0 is merged as PR #14160** — MPI signal handler replacement landed on 2026-06-22 PDT.
 - **1b.1 + 1b.2 are merged as PR #15525** — C++ and Python mask-only reconfigure APIs landed on 2026-06-29 PDT.
-- **1a.2 is approved as PR #13404** — NVLinkOneSided kernel mask; blocked on pending `blossom-ci`.
-- **1a.3 + 1a.4 are open as PR #15524** — Python rank-mask wiring plus `AlltoAllWatchdog`; review required and `blossom-ci` pending.
+- **1a.2 is merged as PR #13404** — NVLinkOneSided kernel mask landed on 2026-06-30 PDT.
+- **1a.3 + 1a.4 are open as PR #15524** — Python rank-mask wiring plus `AlltoAllWatchdog`; review required, base is dirty after #13404 merged, and `blossom-ci` is failing.
 - **1c.1 is open as PR #15677** — EP-specific error classification patterns; review required and `blossom-ci` pending.
-- **1a.7 is draft PR #15789** — NCCL fault-tolerance wrapper; dependency-ready, with a merge conflict and DCO action required before review.
+- **1a.7 is draft PR #15789** — NCCL fault-tolerance wrapper; dependency-ready with `blossom-ci` failing.
 - **1c.3 is draft PR #15785** — MPI FT subcommunicator and broadcast thread; dependency-ready with `blossom-ci` pending.
-- **1d.3 is draft PR #15788** — rank-health telemetry; dependency-ready with DCO action required.
+- **1d.3 is draft PR #15788** — rank-health telemetry; dependency-ready with DCO action required and `blossom-ci` pending.
 
 **Per-PR notes:**
 
@@ -114,11 +114,11 @@ gantt
     axisFormat %b %d
 
     section CUDA track
-    1a.2 NVLinkOneSided kernel mask (approved, PR #13404) :crit, active, a3, 2026-04-22, 21d
+    1a.2 NVLinkOneSided kernel mask (merged, PR #13404) :done, a3, 2026-04-22, 21d
 
     section Python track
     1a.1 EPGroupHealth (merged, PR #13302)      :done, a1, 2026-04-18, 12d
-    1a.3-4 Binding + watchdog (open, PR #15524) :active, a2, after a3, 5d
+    1a.3-4 Binding + watchdog (dirty/CI failing, PR #15524) :active, a2, after a3, 5d
     1c.1-2 Error cls + tracker (1c.1 open, PR #15677) :active, a6, after a2, 7d
 
     section NCCL track
@@ -139,7 +139,7 @@ gantt
     1d.5 Overhead regression                    :a10, after a9, 5d
 ```
 
-Three critical-path items: **1a.2** (kernel mask, approved with CI pending), **1c.3** (MPI FT subcomm, draft PR #15785), **1d.4** (harness, net-new). Each gates end-to-end demonstration of one capability; they can't be parallelized away.
+Three critical-path items: **1a.2** (kernel mask, now merged), **1c.3** (MPI FT subcomm, draft PR #15785), **1d.4** (harness, net-new). The #13404 merge satisfies the kernel prerequisite but does not remove the remaining control-plane and end-to-end gates.
 
 **MVP de-risking via end-to-end prototype.** Running parallel with the production PR tracks is a bounded **3–5 day end-to-end prototype** on a 4 or 8-GPU node that validates the integration seams between tracks (kernel mask ↔ EPLB ↔ watchdog ↔ broadcast ↔ engine hook) ahead of the production PRs. The prototype reuses PR 1a.1 (`EPGroupHealth`, PR #13302) and PR 1d.0 (signal-handler replacement) as-is; everything else is stubbed down to the minimum that exercises the seam. See [MVP prototype plan](../mvp-prototype-plan.md) for the vertical-slice component table, hardware options, IMEX setup (for GB200/GB300 trays), and kill-and-survive test recipe. The prototype produces a per-event timing baseline that PR 1d.4 reuses as the harness's reference; it does **not** replace any production PR or substitute for Audit 1b.
 

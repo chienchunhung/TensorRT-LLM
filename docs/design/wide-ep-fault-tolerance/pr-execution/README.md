@@ -11,6 +11,7 @@ This folder is the single workspace for implementation sequencing, dependency st
 | [V1 dependency graph](v1-dependency-graph.md) | Core V1 plus parallel Phase 1-DS and conditional Phase 1-IB execution paths. |
 | [V2 dependency graph](v2-dependency-graph.md) | Phase 2 restoration sequencing, audits, external gates, and candidate actions. |
 | [JIRA work-item ledger](jira-work-item-ledger.md) | User-supplied JIRA workflow, assignee, graph-node, milestone, and PR mapping. |
+| [Source-of-truth correction checklist](source-of-truth-correction-checklist.md) | Control record for the 2026-06-30 MVP contract, graph, PR, and validation corrections. |
 
 ## State ownership
 

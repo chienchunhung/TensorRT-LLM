@@ -48,5 +48,5 @@ No JIRA mapping was supplied for 1a.9–1a.11, 1b.4–1b.7, 1c.5–1c.6, 1d.6–
 
 - TRTLLM-12556 / 1a.3 is `To Do`, but its implementation is carried in in-review PR #15524 with 1a.4.
 - TRTLLM-13543 / 1b.1 remains `In Progress` and TRTLLM-13544 / 1b.2 remains `To Do`, but their shared implementation PR #15525 is merged.
-- TRTLLM-12200 / 1a.2 is `In Review`, while PR #13404 is already approved and waiting on CI.
+- TRTLLM-12200 / 1a.2 is `In Review` in the supplied JIRA snapshot, while PR #13404 is merged.
 - TRTLLM-12560 / 1a.7, TRTLLM-13548 / 1c.3, and TRTLLM-13553 / 1d.3 remain `To Do` and unassigned in the supplied JIRA snapshot, but draft PRs #15789, #15785, and #15788 now carry their implementation.

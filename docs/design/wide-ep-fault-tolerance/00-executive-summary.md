@@ -32,7 +32,7 @@ Four structural properties differentiate TRT-LLM's stack:
 The reviewer feedback that shaped this rewrite identified that today's stack has *two* distinct failure modes, and FT must close both:
 
 - **Mode A** — signal-handler `MPI_Abort` propagation (Layer 1, MPI-specific). Verified at `mpiUtils.cpp:195–215`. Closes via signal handler replacement (PR 1d.0, in flight as PR #14160) under the FT feature flag.
-- **Mode B** — AlltoAll kernel hangs on a dead peer's completion flag (Layer 3, kernel-level). Verified in `moeAlltoAllKernels.cu`. Closes via in-kernel rank masking (PR 1a.2, in flight as PR #13404).
+- **Mode B** — AlltoAll kernel hangs on a dead peer's completion flag (Layer 3, kernel-level). Verified in `moeAlltoAllKernels.cu`. The launch-time rank-mask foundation landed as PR 1a.2 / #13404; the corrected MVP graph tracks the remaining running-kernel recovery work.
 
 Pivoting to Ray would close Mode A structurally but doesn't help Mode B. Mode B is orthogonal to orchestrator choice.
 
@@ -50,7 +50,7 @@ Ray remains an open future-migration question, gated on a named perf-characteriz
 
 | Phase | Target | Status |
 |:---|:---|:---|
-| Phase 1 MVP | ~7 weeks (AI coding-agent assisted) — 14 PRs | 1a.1 (PR #13302), 1a.2 (PR #13404), and 1d.0 (PR #14160) in flight |
+| Phase 1 MVP | ~7 weeks (AI coding-agent assisted) — 14 PRs | 1a.1 (PR #13302), 1a.2 (PR #13404), and 1d.0 (PR #14160) merged; remaining MVP work tracked in the execution graph |
 | Phase 1 v1 | +6–9 weeks after MVP — 11 PRs | Includes NVLinkTwoSided, full EPLB reconfigure with weight migration, multi-failure consensus, kernel-side `check_timeout` tightening |
 | Phase 1-DS (disagg) | 3–4 weeks, parallelizable with v1 — 6 PRs | After MVP lands |
 | Phase 2 (Restoration) | 10–14 weeks — 16 PRs (sizes provisional pending Audit 1) | After Phase 1 v1 + MNNVL/NVSHMEM audit |

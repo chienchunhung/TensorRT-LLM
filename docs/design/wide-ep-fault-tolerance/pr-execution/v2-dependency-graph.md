@@ -2,7 +2,7 @@
 
 [< Back to WideEP Fault Tolerance](../README.md) · [Implementation plan](08-implementation-plan.md)
 
-**Status snapshot:** 2026-06-30 10:40 PDT
+**Status snapshot:** 2026-06-30 12:15 PDT
 
 **Scope mapping:** The roadmap does not define a product milestone named “V2.” In this graph, **V2 means §8.2 Phase 2 Restoration**: replacing the dead rank, rebuilding process groups, and restoring full N-rank capacity. It does not mean the “Draft v2” revision of the design document itself.
 
@@ -37,7 +37,7 @@ White, heavy-border nodes are milestone, hardware, or external-project gates rat
 ```mermaid
 flowchart LR
     V1_GATE["Phase 1 V1 complete<br/>release gate · not satisfied"]
-    M_A7["Phase 1 1a.7 · NCCL FT wrapper<br/>PR: #15789 · draft · merge conflict · DCO action required<br/>JIRA: TRTLLM-12560<br/>★ dependency-ready MVP action"]
+    M_A7["Phase 1 1a.7 · NCCL FT wrapper<br/>PR: #15789 · draft · blossom-ci failed<br/>JIRA: TRTLLM-12560<br/>★ dependency-ready MVP action"]
     M_B5["Phase 1 V1 1b.5 · full EPLB reconfigure<br/>PR: not opened · planned<br/>JIRA: not mapped"]
     NVL_NODE["≥4-GPU NVLink-connected node<br/>audit hardware"]
     NVL72["NVL72 or equivalent<br/>hardware access"]
