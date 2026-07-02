@@ -5,7 +5,7 @@ Core staging through PR #15288 and the fixture fix in PR #15471 are merged; rema
 **Created:** 2026-05-19
 **Last updated:** 2026-06-30
 
-> [§18](18-gms-integration-gaps-and-pr-plan.md) is the current source for GMS loader blockers, reversible lifecycle,
+> [§18](18-dynamo-pr11000-gaps.md) is the current source for GMS loader blockers, reversible lifecycle,
 > and follow-up PR ordering. This section remains the detailed rationale for staged post-load hooks.
 
 ## Reader Summary

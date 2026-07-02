@@ -2,7 +2,7 @@
 
 [< Back to Overview](README.md)
 
-> **Superseded lifecycle diagrams:** See [§18](18-gms-integration-gaps-and-pr-plan.md) for the current architecture.
+> **Superseded lifecycle diagrams:** See [§18](18-dynamo-pr11000-gaps.md) for the current architecture.
 > In particular, promotion does not upgrade immutable weights RO-to-RW, and scratch/full KV backing is owned by
 > TensorRT-LLM's native VMM rather than shared as failed-primary state through GMS.
 

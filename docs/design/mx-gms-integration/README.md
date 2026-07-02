@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# TensorRT-LLM GMS Integration and Fast Startup
+# TensorRT-LLM Integration with ModelExpress and GPU Memory Service
 
 **Status:** Draft — current implementation source of truth is §18; the
 [combined MX/GMS prototype](https://github.com/chienchunhung/TensorRT-LLM/tree/dynamo-integration-prototype) is
@@ -15,8 +15,8 @@ historical
 
 ## Executive Summary
 
-This proposal centers the TensorRT-LLM integration with GPU Memory Service and covers the supporting fast-start
-mechanisms needed to make it operational:
+This proposal covers the complementary TensorRT-LLM integrations with ModelExpress and GPU Memory Service, plus the
+supporting fast-start mechanisms needed to make them operational:
 
 - **GPU Memory Service (GMS)**: Out-of-process GPU memory management for zero-copy sharing and crash-resilient failover within nodes
 - **ModelExpress (MX)**: An optional GPU-to-GPU weight source via NIXL/RDMA for fast cold-start across nodes
@@ -27,7 +27,7 @@ crash recovery through parked GMS shadow workers that preserve pre-captured grap
 operations through promotion and shadow replenishment. Serialized compile caches support cold and replacement-shadow
 startup; they are not work to perform on the promotion path.
 
-> [§18 GMS Integration Gaps and Concrete PR Plan](18-gms-integration-gaps-and-pr-plan.md) is the current source of
+> [§18 GMS Integration Gaps and Concrete PR Plan](18-dynamo-pr11000-gaps.md) is the current source of
 > truth for the GMS lifecycle, ownership boundary, and implementation order. It supersedes older RO-to-RW promotion
 > and executor-state assumptions retained in earlier sections for historical context.
 
@@ -71,7 +71,7 @@ startup; they are not work to perform on the promotion path.
 15. [Prototype Validation Plan](15-prototype-validation-plan.md) — Historical validation plan for the closed, unmerged PR #13045 prototype
 16. [Staged Post-Load Hooks](16-staged-post-load-hooks.md) — Holistic fix for the conflated `post_load_weights()` semantics surfaced by PR #13926 (GMS RO ordering) and PR #14151 (MX publish-pre vs publish-post-transform). Decomposes into `setup_aliases` / `transform_weights` / `cache_derived_state` stages; tiny prep PR scope + family-PR migration sequence.
 17. [Snapshot Integration Assessment](17-snapshot-assessment.md) — Assesses how Dynamo Snapshot, MX, and GMS fit together for TRT-LLM fast startup, including standalone `trtllm-serve` ownership versus Dynamo orchestration.
-18. [GMS Integration Gaps and Concrete PR Plan](18-gms-integration-gaps-and-pr-plan.md) — Clarifies the existing SourceIdentity versus the missing GMS transport, explains PR #15432's staged-layout implications, and records the sleep/wake contract, ownership boundary, dependency-ordered PR stack, and acceptance gates.
+18. [GMS Integration Gaps and Concrete PR Plan](18-dynamo-pr11000-gaps.md) — Clarifies the existing SourceIdentity versus the missing GMS transport, explains PR #15432's staged-layout implications, and records the sleep/wake contract, ownership boundary, dependency-ordered PR stack, and acceptance gates.
 
 ---
 
@@ -84,5 +84,5 @@ startup; they are not work to perform on the promotion path.
 | M2 — Replenishable redundancy | **P1** | Add scratch-backed stable-VA KV and provision a replacement shadow beside the live primary. |
 | M3 — Supported SLO/product path | **P1** | Optimize GMS remap, meet the p95 target, and publish supported packages, diagnostics, and recipes. |
 
-See [§18](18-gms-integration-gaps-and-pr-plan.md#delivery-gates) for the exact cumulative gates and dependency-ordered
+See [§18](18-dynamo-pr11000-gaps.md#delivery-gates) for the exact cumulative gates and dependency-ordered
 PR stack. MX remains an optional weight-source track rather than a prerequisite for the GMS lifecycle.

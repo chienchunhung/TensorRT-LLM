@@ -2,7 +2,7 @@
 
 [< Back to Overview](README.md)
 
-> **Status note:** [§18](18-gms-integration-gaps-and-pr-plan.md) resolves the current GMS lifecycle, ownership, and PR
+> **Status note:** [§18](18-dynamo-pr11000-gaps.md) resolves the current GMS lifecycle, ownership, and PR
 > ordering. GMS API names and lock-upgrade questions below predate the pinned contract and should be treated as
 > historical unless §18 still lists them as open.
 

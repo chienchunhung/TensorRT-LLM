@@ -2,7 +2,7 @@
 
 [< Back to Overview](README.md)
 
-> **Lifecycle note:** [§18](18-gms-integration-gaps-and-pr-plan.md) supersedes the activation mechanism and delivery
+> **Lifecycle note:** [§18](18-dynamo-pr11000-gaps.md) supersedes the activation mechanism and delivery
 > status below. Weights remain RO; a separate `flock` elects the active group; warm promotion preserves in-process
 > graphs/caches rather than running compile-cache restoration on the hot path.
 

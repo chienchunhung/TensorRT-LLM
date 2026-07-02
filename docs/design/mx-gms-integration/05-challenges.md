@@ -2,7 +2,7 @@
 
 [< Back to Overview](README.md)
 
-> **Status note:** [§18](18-gms-integration-gaps-and-pr-plan.md) is authoritative for current GMS API, packaging, and
+> **Status note:** [§18](18-dynamo-pr11000-gaps.md) is authoritative for current GMS API, packaging, and
 > readiness. In particular, the pinned `finalize_gms_write()` returns a stats object, native RO attach is blocked on
 > SourceIdentity, and no supported `tensorrt_llm[gms]` extra should be claimed yet.
 
