@@ -1,8 +1,12 @@
 # 16. Staged Post-Load Hooks for MX / GMS Weight Sharing
 
-**Status:** Active migration plan tracked under [TRTLLM-11901](https://jirasw.nvidia.com/browse/TRTLLM-11901). Prep infrastructure and SourceIdentity are merged; Wave 1 and Wave 2 are in flight.
+**Status:** Historical migration plan tracked under [TRTLLM-11901](https://jirasw.nvidia.com/browse/TRTLLM-11901).
+Core staging through PR #15288 and the fixture fix in PR #15471 are merged; remaining model-family/MX work is separate.
 **Created:** 2026-05-19
-**Last updated:** 2026-06-15
+**Last updated:** 2026-06-30
+
+> [§18](18-gms-integration-gaps-and-pr-plan.md) is the current source for GMS loader blockers, reversible lifecycle,
+> and follow-up PR ordering. This section remains the detailed rationale for staged post-load hooks.
 
 ## Reader Summary
 

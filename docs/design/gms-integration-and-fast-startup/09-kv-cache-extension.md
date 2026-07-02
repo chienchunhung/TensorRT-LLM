@@ -2,6 +2,10 @@
 
 [< Back to Overview](README.md)
 
+> **Scope clarification:** KV persistence, sharing, and migration remain KVBM concerns. However,
+> [§18](18-gms-integration-gaps-and-pr-plan.md) requires TensorRT-LLM-owned scratch/full KV backing at stable virtual
+> addresses so a warm shadow can capture graphs and later wake without preserving the failed primary's KV contents.
+
 > **Scope change (2026-04-19).** Earlier drafts explored routing KV cache through GMS directly (GMS-backed allocator, KV Cache Connector + GMS). We've since concluded that **KV cache is out of GMS's scope** — Dynamo's [KV Block Manager (KVBM)](https://github.com/ai-dynamo/dynamo) already covers tiered KV cache storage (HBM → DRAM → NVMe → object store) with NIXL-based transport and intra/inter-node coordination. GMS and KVBM have clean, non-overlapping mandates; the extension path for KV cache is **KVBM integration**, not GMS. This section documents that division of labor and the deferred integration plan.
 
 ## Division of Labor: GMS vs. KVBM

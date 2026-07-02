@@ -2,6 +2,10 @@
 
 [< Back to Overview](README.md)
 
+> **Superseded design:** Use [§18](18-gms-integration-gaps-and-pr-plan.md) for implementation. Do not implement the
+> public `SHADOW`/`ACTIVATING` state machine or an RO-to-RW weight upgrade described below. TensorRT-LLM extends its
+> existing sleep/wake and admission control; Dynamo or a launcher owns `flock`, discovery, and supervision.
+
 > **This section is new** — the original proposal underspecified how shadow failover interacts with TRT-LLM's executor loop. This is the hardest part of the integration and requires careful design. Unlike the weight loading integration where much of the functionality is provided by MX/GMS libraries, **the executor integration is almost entirely new TRT-LLM code** — the GMS library only provides the lock primitives (`GMSClientMemoryManager.connect(lock_type=...)` to acquire RO/RW; `mgr.unmap_all_vas()` + `mgr.abort()` + reconnect-RW + `remap_all_vas()` to upgrade RO→RW); all shadow lifecycle management, health checking, and executor state transitions are TRT-LLM responsibilities.
 
 ## The Challenge

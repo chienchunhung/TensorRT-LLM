@@ -2,6 +2,10 @@
 
 [< Back to Overview](README.md)
 
+> **Lifecycle note:** [§18](18-gms-integration-gaps-and-pr-plan.md) is the current source of truth. Promotion keeps
+> immutable weights RO, uses existing sleep/wake, and does not claim the <5-second SLO until M3. Conflicting lifecycle
+> or timing statements below are historical context.
+
 ## ModelExpress (MX)
 
 ModelExpress is a Rust-based service from the Dynamo ecosystem that coordinates GPU-to-GPU model weight transfers across a cluster:

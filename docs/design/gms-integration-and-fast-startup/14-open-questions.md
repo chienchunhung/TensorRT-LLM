@@ -2,6 +2,10 @@
 
 [< Back to Overview](README.md)
 
+> **Status note:** [§18](18-gms-integration-gaps-and-pr-plan.md) resolves the current GMS lifecycle, ownership, and PR
+> ordering. GMS API names and lock-upgrade questions below predate the pinned contract and should be treated as
+> historical unless §18 still lists them as open.
+
 Consolidated list of open questions, pending verifications, and discussion items surfaced across the design. Each item notes the section it connects back to and what it blocks or would change.
 
 ---

@@ -2,6 +2,10 @@
 
 [< Back to Overview](README.md)
 
+> **Status note:** [§18](18-gms-integration-gaps-and-pr-plan.md) is authoritative for current GMS API, packaging, and
+> readiness. In particular, the pinned `finalize_gms_write()` returns a stats object, native RO attach is blocked on
+> SourceIdentity, and no supported `tensorrt_llm[gms]` extra should be claimed yet.
+
 ## 1. FP8/Quantization Compatibility
 
 **Challenge:** Source and target must produce identical tensor layouts after post-processing. FP8 quantization, AWQ, and other quant schemes transform weight tensors during `post_load_weights()`. If source and target have different quantization configs, P2P-transferred weights will produce wrong results silently.

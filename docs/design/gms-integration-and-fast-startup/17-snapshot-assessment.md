@@ -4,7 +4,11 @@
 
 **Status:** Draft
 **Created:** 2026-06-09
-**Last updated:** 2026-06-09
+**Last updated:** 2026-06-30
+
+> **GMS readiness note:** The native loading structure from PR #13926 is merged, but real RW/RO reuse remains blocked
+> on the exact API and SourceIdentity issues in [§18](18-gms-integration-gaps-and-pr-plan.md). Dynamo #7575 provides
+> wrapper-level pause/resume evidence, not a complete native failover path.
 
 ## TL;DR
 

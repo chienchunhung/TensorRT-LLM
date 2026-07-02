@@ -2,6 +2,10 @@
 
 [< Back to Overview](README.md)
 
+> **Current implementation plan:** [§18](18-gms-integration-gaps-and-pr-plan.md) supersedes GMS lifecycle, role,
+> source-identity, and failover-lock decisions in this earlier API proposal. The two-axis loader discussion remains
+> useful background.
+
 **Last Updated:** 2026-04-14
 
 ---

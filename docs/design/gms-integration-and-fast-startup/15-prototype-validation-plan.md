@@ -2,10 +2,15 @@
 
 [< Back to README](README.md)
 
-**Status:** Phase A complete; prototype API aligned with merged GMS + MX (v0.9.0 / v0.3.0); Phase B ready once MX server + GMS daemon are reachable on a test node  •  **Last Updated:** 2026-04-20
+> **Archived plan:** PR #13045 closed without merge. Use
+> [§18 GMS Integration Gaps and Concrete PR Plan](18-gms-integration-gaps-and-pr-plan.md) for current implementation
+> and validation gates. This file is retained as historical prototype methodology.
+
+**Status:** Archived; no further execution planned  •  **Last Updated:** 2026-06-30
 **Scope:** Validation strategy for the [PR #13045 prototype](https://github.com/NVIDIA/TensorRT-LLM/pull/13045) (MX + GMS integration) using the §10/§11 benchmark infrastructure.
 
-> This file is a working plan. Once validation is executed, results will be folded into [§11 Results & Analysis](11-results-analysis.md) and this file can be retired or moved to a "completed plans" archive.
+> This file was the working validation plan for the unmerged prototype. Its results were not used to qualify the
+> current native GMS path.
 
 > **Skip to current state:** [Execution Status](#execution-status) (what's done, what's blocked, what's next).
 
