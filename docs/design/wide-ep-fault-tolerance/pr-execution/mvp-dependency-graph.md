@@ -2,7 +2,7 @@
 
 [< Back to WideEP Fault Tolerance](../README.md) · [Implementation plan](08-implementation-plan.md) · [Correction checklist](source-of-truth-correction-checklist.md)
 
-**Status snapshot:** 2026-07-02 14:32 PDT
+**Status snapshot:** 2026-07-02 16:34 PDT
 
 **Scope:** corrected Phase 1 MVP merge units and acceptance gates.
 
@@ -45,7 +45,7 @@ flowchart TB
         A12_C["1a.2 · #13404<br/>MERGED"]
         A134["★ 1a.3 + 1a.4 · #15524<br/>DRAFT"]
         A17["★ 1a.7 · #15789<br/>DRAFT"]
-        A18["★ 1a.8<br/>PLANNED"]
+        A18["★ 1a.8 · #15895<br/>DRAFT"]
         A11_C --> A134
         A12_C --> A134
         A11_C --> A17
@@ -89,8 +89,8 @@ flowchart TB
     classDef candidate stroke:#d97706,stroke-width:5px,stroke-dasharray:0;
 
     class A11_C,A12_C,B112_P,A11_C2,D10_C,C11,A11_D merged;
-    class A134,A17,C13,D13 draft;
-    class A18,B12A,B13,C12 planned;
+    class A134,A17,A18,C13,D13 draft;
+    class B12A,B13,C12 planned;
     class A134,A17,A18,B12A,B13,C12,C13,D13 candidate;
 ```
 
@@ -109,7 +109,7 @@ flowchart TB
 
     A1_34["★ 1a.3 + 1a.4 · #15524<br/>DRAFT"]
     A1_7["★ 1a.7 · #15789<br/>DRAFT"]
-    A1_8["★ 1a.8<br/>PLANNED"]
+    A1_8["★ 1a.8 · #15895<br/>DRAFT"]
     B1_2A["★ 1b.2a<br/>PLANNED"]
     B1_3["★ 1b.3<br/>PLANNED"]
     C1_1["1c.1 · #15677<br/>MERGED"]
@@ -220,8 +220,8 @@ flowchart TB
     classDef candidate stroke:#d97706,stroke-width:5px,stroke-dasharray:0;
 
     class P12718,P13119,A1_1,A1_2,B1_12,C1_1,D1_0 merged;
-    class A1_34,A1_7,C1_3,D1_3 draft;
-    class A1_8,A1_11,B1_2A,B1_3,C1_2,C1_3A,C1_4,C1_4A,C1_4B,C1_4C,D1_0A,D1_1,D1_2,D1_4,D1_4A,D1_5 planned;
+    class A1_34,A1_7,A1_8,C1_3,D1_3 draft;
+    class A1_11,B1_2A,B1_3,C1_2,C1_3A,C1_4,C1_4A,C1_4B,C1_4C,D1_0A,D1_1,D1_2,D1_4,D1_4A,D1_5 planned;
     class OLD_PROTO,NEW_PROTO,NVL72_RESOURCE,APPROVED_FAULT_METHOD context;
     class MVP_EXIT gate;
     class A1_34,A1_7,A1_8,B1_2A,B1_3,C1_2,C1_3,D1_3 candidate;
@@ -238,7 +238,7 @@ This table expands the combined merge nodes so all 27 MVP work-item identities r
 | **1a.3** | Committed-mask NVLinkOneSided Python binding | [TRTLLM-12556](https://jirasw.nvidia.com/browse/TRTLLM-12556) | `A1_34`; [#15524](https://github.com/NVIDIA/TensorRT-LLM/pull/15524), shared with 1a.4 | Draft | 1a.1, 1a.2 |
 | **1a.4** | Detection-only `AlltoAllWatchdog` host thread | [TRTLLM-12557](https://jirasw.nvidia.com/browse/TRTLLM-12557) | `A1_34`; [#15524](https://github.com/NVIDIA/TensorRT-LLM/pull/15524), shared with 1a.3 | Draft | 1a.1, 1a.2 |
 | **1a.7** | Coordinator-driven NCCL abort/rebuild + AllGatherReduceScatter wiring | [TRTLLM-12560](https://jirasw.nvidia.com/browse/TRTLLM-12560) | `A1_7`; [#15789](https://github.com/NVIDIA/TensorRT-LLM/pull/15789) | Draft | 1a.1 |
-| **1a.8** | Running-kernel abort + mask-generation primitive | [TRTLLM-12561](https://jirasw.nvidia.com/browse/TRTLLM-12561) | `A1_8`; PR TBD | Planned | 1a.2 |
+| **1a.8** | Running-kernel abort + execution-epoch control | [TRTLLM-12561](https://jirasw.nvidia.com/browse/TRTLLM-12561) | `A1_8`; [#15895](https://github.com/NVIDIA/TensorRT-LLM/pull/15895) | Draft | 1a.2 |
 | **1a.11** | Eager fallback + generation-scoped CUDA-graph invalidation/recapture | JIRA: TBD | `A1_11`; PR TBD | Planned | 1a.7, 1a.8 |
 | **1b.1** | `reconfigure_mask_only` C++ entry point | [TRTLLM-13543](https://jirasw.nvidia.com/browse/TRTLLM-13543) | `B1_12`; [#15525](https://github.com/NVIDIA/TensorRT-LLM/pull/15525), shared with 1b.2 | Merged | None |
 | **1b.2** | Python wrapper for mask-only reconfigure | [TRTLLM-13544](https://jirasw.nvidia.com/browse/TRTLLM-13544) | `B1_12`; [#15525](https://github.com/NVIDIA/TensorRT-LLM/pull/15525), shared with 1b.1 | Merged | 1b.1 (same `B1_12` merge unit; no external merge parent) |
@@ -273,7 +273,7 @@ flowchart TB
     A1_2["1a.2 · #13404<br/>MERGED"]
     A1_34["★ 1a.3 + 1a.4 · #15524<br/>DRAFT"]
     A1_7["★ 1a.7 · #15789<br/>DRAFT"]
-    A1_8["★ 1a.8<br/>PLANNED"]
+    A1_8["★ 1a.8 · #15895<br/>DRAFT"]
     A1_11["1a.11<br/>PLANNED"]
     B1_12["1b.1 + 1b.2 · #15525<br/>MERGED"]
     B1_2A["★ 1b.2a<br/>PLANNED"]
@@ -298,8 +298,8 @@ flowchart TB
     classDef candidate stroke:#d97706,stroke-width:5px,stroke-dasharray:0;
 
     class A1_1,A1_2,B1_12 merged;
-    class A1_34,A1_7 draft;
-    class A1_8,A1_11,B1_2A,B1_3 planned;
+    class A1_34,A1_7,A1_8 draft;
+    class A1_11,B1_2A,B1_3 planned;
     class A1_34,A1_7,A1_8,B1_2A,B1_3 candidate;
 ```
 
@@ -352,7 +352,7 @@ flowchart TB
     P12718["Foundation · #12718<br/>MERGED"]
     P13119["Supporting · #13119<br/>MERGED"]
     A1_7["★ 1a.7 · #15789<br/>DRAFT"]
-    A1_8["★ 1a.8<br/>PLANNED"]
+    A1_8["★ 1a.8 · #15895<br/>DRAFT"]
     A1_11["1a.11<br/>PLANNED"]
     B1_2A["★ 1b.2a<br/>PLANNED"]
     C1_4["1c.4 · engine recovery hook<br/>PLANNED"]
@@ -379,8 +379,8 @@ flowchart TB
     classDef candidate stroke:#d97706,stroke-width:5px,stroke-dasharray:0;
 
     class P12718,P13119 merged;
-    class A1_7 draft;
-    class A1_8,A1_11,B1_2A,C1_4,C1_4A,C1_4B,C1_4C planned;
+    class A1_7,A1_8 draft;
+    class A1_11,B1_2A,C1_4,C1_4A,C1_4B,C1_4C planned;
     class A1_7,A1_8,B1_2A candidate;
 ```
 
@@ -432,7 +432,7 @@ flowchart TB
     D1_4["1d.4 · real-component E2E<br/>PLANNED"]
     D1_4A["1d.4a · rack FABRIC/IMEX + Q3 containment<br/>PLANNED"]
     A1_34["★ 1a.3 + 1a.4 · #15524<br/>DRAFT"]
-    A1_8["★ 1a.8<br/>PLANNED"]
+    A1_8["★ 1a.8 · #15895<br/>DRAFT"]
     A1_11["1a.11<br/>PLANNED"]
     D1_5["1d.5 · overhead regression<br/>PLANNED"]
     MVP_EXIT["MVP EXIT<br/>correct survivor serving on hardware"]
@@ -461,8 +461,8 @@ flowchart TB
     classDef gate fill:#ffffff,stroke:#111827,color:#111827,stroke-width:3px;
     classDef candidate stroke:#d97706,stroke-width:5px,stroke-dasharray:0;
 
-    class D1_3,A1_34 draft;
-    class C1_4C,D1_0A,D1_1,D1_2,D1_4,D1_4A,A1_8,A1_11,D1_5 planned;
+    class D1_3,A1_34,A1_8 draft;
+    class C1_4C,D1_0A,D1_1,D1_2,D1_4,D1_4A,A1_11,D1_5 planned;
     class MVP_EXIT gate;
     class D1_3,A1_34,A1_8 candidate;
 ```
@@ -528,7 +528,7 @@ The holistic graph contains all **49 hard merge-unit dependencies** and **14 das
 |:---|:---|:---|:---|
 | **1a.3 + 1a.4 / #15524** | Draft; corrected head `d19aadea`; DCO/pre-commit green; `blossom-ci` pending | 1a.1 / #13302 and 1a.2 / #13404 are merged | Review the detection-only, generation-bound correction; finish CI, then re-request review. |
 | **1a.7 / #15789** | Draft; `blossom-ci` pending | 1a.1 / #13302 is merged | Finish CI and review of the coordinator/generation contract, then mark ready. |
-| **1a.8** | Planned; promoted to MVP | 1a.2 / #13404 is merged | Implement a running-kernel-observable abort/generation primitive and recoverable return path. |
+| **1a.8 / #15895** | Draft; head `ff2c92cd`; DCO/pre-commit green; `blossom-ci` pending | 1a.2 / #13404 is merged | Finish native GPU/CI validation and review of the recoverable execution-epoch abort/control contract. |
 | **1b.2a** | Planned; new MVP item | 1b.1 + 1b.2 / #15525 is merged | Implement per-layer/per-expert survivor admission and distinct-failure-domain validation. |
 | **1b.3** | Planned | 1b.1 + 1b.2 / #15525 is merged | Implement iteration-boundary EPLB prepare/commit integration under coordinator ownership. |
 | **1c.2** | Planned; no upstream PR opened | 1c.1 / #15677 is merged | Implement `EPRankHealthTracker` per-rank budgets and validation. |
@@ -550,6 +550,7 @@ An action can be dependency-ready while still blocked by code correctness, revie
 | 1c.1 | [#15677](https://github.com/NVIDIA/TensorRT-LLM/pull/15677) | **Merged 2026-07-02 14:32 PDT; all reported checks green** | Pattern-only classifier slice. |
 | 1c.3 | [#15785](https://github.com/NVIDIA/TensorRT-LLM/pull/15785) | Draft; corrected head `ee9aa0a4`; DCO/pre-commit green; `blossom-ci` pending | Distinct monotonic detected-state evidence/broadcast; committed membership and normal survivor collectives remain separate. |
 | 1a.7 | [#15789](https://github.com/NVIDIA/TensorRT-LLM/pull/15789) | Draft; `blossom-ci` pending | Manual NCCL abort/rebuild primitive; coordinator and graph recovery remain separate items. |
+| 1a.8 | [#15895](https://github.com/NVIDIA/TensorRT-LLM/pull/15895) | Draft; head `ff2c92cd`; DCO/pre-commit green; `blossom-ci` pending; base freshness skipped for draft | Recoverable running-kernel abort and per-workspace execution-epoch control; committed membership remains coordinator-owned. |
 | 1d.3 | [#15788](https://github.com/NVIDIA/TensorRT-LLM/pull/15788) | Draft; corrected head `94274a3f`; DCO/pre-commit green; `blossom-ci` pending | Passive committed-membership telemetry; it must not drive recovery. |
 | MVP integration prototype / [TRTLLM-12728](https://jirasw.nvidia.com/browse/TRTLLM-12728) | [#15801](https://github.com/NVIDIA/TensorRT-LLM/pull/15801) | Draft; head `5a76856e`; mergeable; all initial checks green (base freshness skipped for draft) | Aggregate no-mock integration/hardware-test vehicle. Context only; not a substitute merge unit and not E2E-complete yet. |
 | Historical prototype | [#14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198) | Draft, paused, `DO NOT SUBMIT` | Mock-heavy seam-finding evidence only; not an MVP implementation dependency. |

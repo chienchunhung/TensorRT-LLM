@@ -2,7 +2,7 @@
 
 [< Back to WideEP Fault Tolerance](../README.md) · [Implementation plan](08-implementation-plan.md)
 
-**Status snapshot:** 2026-07-02 14:32 PDT
+**Status snapshot:** 2026-07-02 16:34 PDT
 
 **Scope:** Phase 1 v1 plus the two post-MVP parallel tracks, Phase 1-DS and conditional Phase 1-IB.
 
@@ -38,10 +38,11 @@ The global prerequisite for every node is the **corrected MVP**: it includes the
 promoted 1a.8 in-flight-kernel escape, promoted 1a.11 graph-safe recovery,
 survivor control-plane rebuild, the atomic recovery coordinator,
 poisoned-MPI shutdown, and real-model E2E acceptance. The graph expands only
-the more specific MVP merge unit each V1 PR consumes. The 1a.7 delivery PR
-[#15789](https://github.com/NVIDIA/TensorRT-LLM/pull/15789) remains draft with
-`blossom-ci` pending; that state is folded into the unsatisfied global gate
-rather than represented as an otherwise-unconnected V1 anchor.
+the more specific MVP merge unit each V1 PR consumes. The 1a.7 and 1a.8
+delivery PRs [#15789](https://github.com/NVIDIA/TensorRT-LLM/pull/15789) and
+[#15895](https://github.com/NVIDIA/TensorRT-LLM/pull/15895) remain draft with
+`blossom-ci` pending; those states are folded into the unsatisfied global gate
+rather than represented as otherwise-unconnected V1 anchors.
 
 ```mermaid
 flowchart LR
@@ -225,7 +226,7 @@ See the [canonical JIRA work-item ledger](jira-work-item-ledger.md) for the supp
 ## Tracking decisions
 
 - Core V1 contains **10 unconditional plan IDs plus 2 Audit-3-conditional NIXL-EP IDs**. Promoted items 1a.8 and 1a.11 belong to corrected MVP and must not be counted or rendered as V1 work.
-- Reused MVP anchors reflect the live delivery state: #13404, #15525, and #15677 are merged, while #15785 is draft. The corrected-MVP gate also includes #15789 (draft, `blossom-ci` pending), promoted 1a.8/1a.11, and the new survivor/recovery contracts. Only merged anchors turn their outgoing component edge green.
+- Reused MVP anchors reflect the live delivery state: #13404, #15525, and #15677 are merged, while #15785 is draft. The corrected-MVP gate also includes #15789 and #15895 (both draft with `blossom-ci` pending), 1a.11, and the new survivor/recovery contracts. Only merged anchors turn their outgoing component edge green.
 - `1d.6` requires multi-failure consensus and the completed full-EPLB branch. The graph shows terminal dependencies 1c.6, 1b.6, and 1b.7; 1b.4 and 1b.5 are satisfied transitively.
 - Phase 1-DS and Phase 1-IB are visible here because both are scheduled after MVP and parallel to V1, but neither silently expands the core V1 ship gate.
 - IB.2 is an umbrella alias for core PR units 1a.9 and 1a.10, not an additional implementation PR.

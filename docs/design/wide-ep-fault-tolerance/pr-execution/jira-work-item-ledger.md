@@ -24,7 +24,7 @@ JIRA status never changes a graph's PR color or dependency-readiness calculation
 | 1a.5 | V1 | NVLinkTwoSided kernel mask (CUDA) | [TRTLLM-12558](https://jirasw.nvidia.com/browse/TRTLLM-12558) | To Do | Unassigned | `A1_5`; no upstream PR mapped |
 | 1a.6 | V1 | NVLinkTwoSided Python binding update | [TRTLLM-12559](https://jirasw.nvidia.com/browse/TRTLLM-12559) | To Do | Unassigned | `A1_6`; no upstream PR mapped |
 | 1a.7 | MVP | Coordinator-driven NCCL abort/rebuild primitive + AllGatherReduceScatter wiring | [TRTLLM-12560](https://jirasw.nvidia.com/browse/TRTLLM-12560) | To Do | Unassigned | `A1_7`; [#15789](https://github.com/NVIDIA/TensorRT-LLM/pull/15789) |
-| 1a.8 | **MVP (promoted)** | Running-kernel abort + mask-generation primitive; recoverable return replaces `trap;` | [TRTLLM-12561](https://jirasw.nvidia.com/browse/TRTLLM-12561) | To Do | Unassigned | `A1_8`; no upstream PR mapped |
+| 1a.8 | **MVP (promoted)** | Running-kernel abort + execution-epoch control; recoverable return replaces `trap;` | [TRTLLM-12561](https://jirasw.nvidia.com/browse/TRTLLM-12561) | To Do | Unassigned | `A1_8`; draft [#15895](https://github.com/NVIDIA/TensorRT-LLM/pull/15895) |
 | 1a.11 | **MVP (promoted)** | Eager fallback + generation-scoped CUDA graph invalidation/recapture | JIRA: TBD | Not created | Unassigned | `A1_11`; no upstream PR mapped |
 | MVP integration prototype | MVP validation aid | No-mock production-component vertical slice on physical hardware | [TRTLLM-12728](https://jirasw.nvidia.com/browse/TRTLLM-12728) | To Do | Unassigned | `NEW_PROTO`; draft [#15801](https://github.com/NVIDIA/TensorRT-LLM/pull/15801), branch `WideEP-FT/e2e-mvp-prototype`. [#14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198) is the historical mock-heavy predecessor. |
 | 1b.1 | MVP | `reconfigure_mask_only` C++ entry point | [TRTLLM-13543](https://jirasw.nvidia.com/browse/TRTLLM-13543) | In Progress | [Chien-Chun Hung](https://jirasw.nvidia.com/secure/ViewProfile.jspa?name=chienchunh) | `B1_12`; [#15525](https://github.com/NVIDIA/TensorRT-LLM/pull/15525) |
@@ -58,4 +58,4 @@ JIRA keys are required for the eight corrected-MVP items currently marked `TBD`:
 - TRTLLM-13543 / 1b.1 remains `In Progress` and TRTLLM-13544 / 1b.2 remains `To Do`, but their shared implementation PR #15525 is merged.
 - TRTLLM-12200 / 1a.2 is `In Review` in the supplied JIRA snapshot, while PR #13404 is merged.
 - TRTLLM-13546 / 1c.1 is `In Progress` in the supplied JIRA snapshot, while PR #15677 is merged.
-- TRTLLM-12560 / 1a.7, TRTLLM-13548 / 1c.3, and TRTLLM-13553 / 1d.3 remain `To Do` and unassigned in the supplied JIRA snapshot, but draft PRs #15789, #15785, and #15788 now carry their implementation.
+- TRTLLM-12560 / 1a.7, TRTLLM-12561 / 1a.8, TRTLLM-13548 / 1c.3, and TRTLLM-13553 / 1d.3 remain `To Do` and unassigned in the supplied JIRA snapshot, but draft PRs #15789, #15895, #15785, and #15788 now carry their implementation.

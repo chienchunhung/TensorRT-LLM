@@ -130,12 +130,12 @@ Key properties:
 
 ### Risk — NVLink kernel modification complexity
 
-**Severity × Probability:** High × High | **Phase:** 1a (MVP) | **Residual:** **High** until 1a.8 — merged 1a.2 supplies a launch-time mask, not a running-kernel recovery path
+**Severity × Probability:** High × High | **Phase:** 1a (MVP) | **Residual:** **High** until draft 1a.8 / #15895 is validated and merged — merged 1a.2 supplies a launch-time mask, not a running-kernel recovery path
 
 The kernel mask change touches performance-critical CUDA synchronization. Merged 1a.2 / #13404 copies the rank mask into launch parameters, so a kernel already polling a failed peer does not observe a later host-side mask update; its remaining escape is the roughly 300-second `trap;` path, which can poison the CUDA context. Potential issues include thread divergence, memory ordering interactions with MNNVL symmetric memory, races on abort/generation reads, and partial output from an aborted epoch. Mitigations are:
 
 - Keep the merged launch-time bit test as the next-launch foundation.
-- Implement 1a.8: a stable device/host-visible abort or generation primitive observed inside every running polling loop, with a bounded recoverable return and no `trap;`.
+- Validate and merge draft #15895: its stable host/device-visible execution-epoch control must be observed inside every running polling loop, expose sticky completion status to the host, return recoverably within a bounded interval, and avoid `trap;`.
 - Suppress the entire failed epoch through 1c.4c; a recoverable kernel return is not valid model output.
 - Correctness and destructive process-death tests before performance tests.
 - < 0.1 % steady-state overhead gate with all ranks active.
@@ -380,7 +380,7 @@ Item 1c.4c owns failed-epoch disposition and the streaming SSE audit so the same
 | Ray-path perf uncharacterized | Medium | High | Future migration | Audit 2 | **Medium–High** — covered when Audit 2 runs |
 | **NIXL-EP integration timing (cross-IB transport)** | Medium | Medium | Phase 1-IB | Audit 3 (bounded 2-week parallel evaluation); go/no-go decides Phase 1-IB primary path (IB.2) vs interim (IB.1) | **Medium** — applies only to cross-IB deployments; NVL72 path unaffected |
 | Ray + disagg + NIXL unsupported | Medium | High | Phase 1-DS / future | Close gap upstream; ship on MPI first | **Medium** — hard gap, closes with upstream fix |
-| **Running-kernel escape after merged launch mask** | Critical | High | 1a MVP | 1a.8 recoverable abort/generation; 1c.4c epoch suppression; destructive E2E | **High** until implemented |
+| **Running-kernel escape after merged launch mask** | Critical | High | 1a MVP | 1a.8 / [#15895](https://github.com/NVIDIA/TensorRT-LLM/pull/15895) recoverable execution-epoch abort/control; 1c.4c epoch suppression; destructive E2E | **High** until #15895 is validated and merged |
 | **Detection/commit split-brain** | Critical | High | 1c MVP | 1c.4b sole writer and atomic common generation | **High** until implemented |
 | **Expert placement not survivable** | Critical | High | 1b MVP | 1b.2a per-layer/per-expert admission and failure-domain anti-affinity | **High** until implemented |
 | **Dead rank retained in control/ADP collectives** | Critical | High | 1c MVP | 1c.3a `ActiveRankMap`; 1c.4a survivor-aware gathers | **High** until implemented |
@@ -395,7 +395,7 @@ Item 1c.4c owns failed-epoch disposition and the streaming SSE audit so the same
 | PR #12718 semantic integration | Medium | Low | 1c | Reuse merged classifier; preserve request-vs-rank boundary | **Low–Medium** |
 | PR #13119 error propagation | Medium | Medium | 1c / Phase 1-DS | Preserve request-vs-fatal boundary; add disagg e2e tests | **Low–Medium** |
 | RemoteMpiCommSessionClient detection visibility | High | Medium | 1c | Zero-collective detector + 1c.3 notification; explicit empty-futures handling | **Medium** |
-| Hung rank without process exit | Critical | High | 1a / 1c MVP | 1a.4 evidence + 1a.8 release + 1c.4c suppression | **High** until 1a.8 |
+| Hung rank without process exit | Critical | High | 1a / 1c MVP | 1a.4 evidence + 1a.8 / [#15895](https://github.com/NVIDIA/TensorRT-LLM/pull/15895) release + 1c.4c suppression | **High** until #15895 is validated and merged |
 | Memory/capacity pressure in degraded mode | High | Medium | 1b / 1d MVP | 1b.2a admission + realistic 1d.4/1d.4a measurements | **Medium** |
 | Second failure during rebuild | Medium | Medium | 2a.8 | Abandon rebuild, re-mask, retry | **Medium** |
 | HostMoeTensorSharer MPI hard-bake | Medium | High | Future migration | Refactor before Ray pivot | **Medium** |

@@ -30,7 +30,7 @@ The earlier seven-week estimate predated the running-kernel, placement-admission
 | **1a.5** | NVLinkTwoSided kernel mask | v1 | `cpp/tensorrt_llm/kernels/fusedMoeCommKernels.cu`, `thop/moeCommOp.cpp` | M | 1a.2 pattern |
 | **1a.6** | NVLinkTwoSided Python binding | v1 | `_torch/modules/fused_moe/communication/nvlink_two_sided.py`, `nvlink_two_sided_flashinfer.py` | S | 1a.5 |
 | **1a.7** | Coordinator-driven NCCL abort/rebuild primitive | **MVP** | raw communicators, PP communicator, CP/TP paths, `AllGatherReduceScatter` | **L** | 1a.1 |
-| **1a.8** | Running-kernel abort + mask-generation primitive | **MVP (promoted)** | `moeAlltoAllKernels.{cu,h}`, launch/workspace status, host integration | **L** | 1a.2 |
+| **1a.8** | Running-kernel abort + execution-epoch control | **MVP (promoted)** | `moeAlltoAllKernels.{cu,h}`, launch/workspace status, host integration | **L** | 1a.2 |
 | **1a.9** | NIXL-EP communication strategy + factory registration | v1 (conditional on Audit 3) | `_torch/modules/fused_moe/communication/nixl_ep.py` (new), `communication_factory.py` | M | 1a.1, Audit 3 positive |
 | **1a.10** | NIXL-EP topology-mutation + FT coordinator integration | v1 (conditional on Audit 3) | `_torch/modules/fused_moe/communication/nixl_ep.py` | M | 1a.9 |
 | **1a.11** | Eager fallback + generation-scoped graph invalidation/recapture | **MVP (promoted)** | `_torch/pyexecutor/py_executor.py`, `_torch/pyexecutor/model_engine.py`, CUDA graph cache | M | 1a.7, 1a.8 |
@@ -43,6 +43,7 @@ The earlier seven-week estimate predated the running-kernel, placement-admission
 - **1a.3 + 1a.4 are draft PR #15524** — Python rank-mask wiring plus a detection-only `AlltoAllWatchdog`; corrected head `d19aadea` is rebased on merged #13404, binds dispatch/combine to one committed generation, has green DCO/pre-commit, and has `blossom-ci` pending.
 - **1c.1 is merged as PR #15677** — EP-specific error classification patterns landed on 2026-07-02 14:32 PDT with all reported checks green.
 - **1a.7 is draft PR #15789** — NCCL fault-tolerance wrapper; dependency-ready with `blossom-ci` pending.
+- **1a.8 is draft PR #15895** — recoverable MoE A2A execution abort/control; dependency-ready at head `ff2c92cd`, with green DCO/pre-commit and `blossom-ci` pending. Native CUDA/GPU validation is delegated to CI.
 - **1c.3 is draft PR #15785** — detection-only MPI FT subcommunicator and broadcast thread; corrected head `ee9aa0a4` uses a distinct monotonic `DetectedRankState`, is dependency-ready, has green DCO/pre-commit, and has `blossom-ci` pending.
 - **1d.3 is draft PR #15788** — passive committed-membership telemetry; corrected head `94274a3f` is dependency-ready, has green DCO/pre-commit, and has `blossom-ci` pending.
 
@@ -133,7 +134,7 @@ Item 1c.4c guarantees that no partial or zero-filled logits from the failed epoc
 ```mermaid
 flowchart LR
     MERGED["Merged foundations<br/>1a.1 · 1a.2 · 1b.1/1b.2 · 1c.1 · 1d.0"]
-    FRONTIER["Current dependency frontier<br/>#15524 · 1a.7 · 1a.8 · 1b.2a · 1b.3<br/>1c.2 · 1c.3 · 1d.3"]
+    FRONTIER["Current dependency frontier<br/>#15524 · 1a.7 · 1a.8/#15895 · 1b.2a · 1b.3<br/>1c.2 · 1c.3 · 1d.3"]
     MEMBERSHIP["Survivor membership<br/>1c.3a · 1c.4a · 1d.0a"]
     COORD["Atomic recovery<br/>1c.4 · 1c.4b · 1c.4c<br/>1a.11 graph policy"]
     GATE["Admission + public surface<br/>1d.1 · 1d.2"]
@@ -142,13 +143,13 @@ flowchart LR
     MERGED --> FRONTIER --> MEMBERSHIP --> COORD --> GATE --> E2E
 ```
 
-The exact action frontier, edge state, and live PR qualifiers are maintained in the [MVP dependency graph](mvp-dependency-graph.md). As of this snapshot, merged #13404 makes 1a.8 and #15524 dependency-ready, while merged #15677 makes 1c.2 dependency-ready. The remaining schedule is driven by the running-kernel escape, survivor control/ADP membership, the recovery coordinator, and two physical-hardware acceptance gates—not by either merged PR alone.
+The exact action frontier, edge state, and live PR qualifiers are maintained in the [MVP dependency graph](mvp-dependency-graph.md). As of this snapshot, merged #13404 makes draft #15895 / 1a.8 and #15524 dependency-ready, while merged #15677 makes 1c.2 dependency-ready. The remaining schedule is driven by validating and merging the running-kernel escape, survivor control/ADP membership, the recovery coordinator, and two physical-hardware acceptance gates—not by either merged foundation alone.
 
 ### No-mock end-to-end prototype
 
 [TRTLLM-12728](https://jirasw.nvidia.com/browse/TRTLLM-12728) is tracked by draft [PR #15801](https://github.com/NVIDIA/TensorRT-LLM/pull/15801), branch `WideEP-FT/e2e-mvp-prototype`. The branch starts from upstream `main` (which contains merged #13404 and #15525) and stacks the published heads of #15524, #15677, #15785, #15789, and #15788. Published head `5a76856e` contains 14 DCO-signed integration commits and was merge-tree-clean against `upstream/main` at PR creation. It is a reference implementation and hardware test vehicle, not a substitute production merge unit. Corrections land in their owning PRs first and are then restacked into this branch.
 
-Unlike historical draft [#14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198), the new prototype must use real worker processes, real communication and load-balancing components, a realistic model/workload, and physical GPU fault injection. Its first runnable policy may force eager mode. Missing 1a.8, 1b.2a, 1c.3a, 1c.4a–1c.4c, and 1d.0a are implemented as production-shaped slices that guide their owning PRs, not replaced by mocks. See the [prototype plan](../mvp-prototype-plan.md).
+Unlike historical draft [#14198](https://github.com/NVIDIA/TensorRT-LLM/pull/14198), the new prototype must use real worker processes, real communication and load-balancing components, a realistic model/workload, and physical GPU fault injection. Its first runnable policy may force eager mode. Draft [#15895](https://github.com/NVIDIA/TensorRT-LLM/pull/15895) now owns the production 1a.8 implementation but is not yet included in published prototype head `5a76856e`; remaining missing slices 1b.2a, 1c.3a, 1c.4a–1c.4c, and 1d.0a are implemented as production-shaped slices that guide their owning PRs, not replaced by mocks. See the [prototype plan](../mvp-prototype-plan.md).
 
 The prototype can expose integration defects and provide timing evidence, but only merged production items plus 1d.4/1d.4a acceptance satisfy MVP completion.
 
@@ -274,6 +275,6 @@ The 2026-06-30 correction invalidated the old MVP item count and calendar estima
 ### Caveats & honest risk framing
 
 - **PR #12718 is merged.** It is no longer an external blocker; it remains a semantic dependency for classification and request disposition.
-- **Largest remaining MVP risks** are 1a.8 running-kernel escape, 1c.3a/1c.4a survivor collectives, 1c.4b atomic coordination, 1d.0a poisoned shutdown, and the 1d.4/1d.4a physical tests. PR #13404 reduces but does not close the kernel risk.
+- **Largest remaining MVP risks** are validating and merging the #15895 running-kernel escape, 1c.3a/1c.4a survivor collectives, 1c.4b atomic coordination, 1d.0a poisoned shutdown, and the 1d.4/1d.4a physical tests. PR #13404 reduces but does not close the kernel risk.
 - **Phase 2 estimates are provisional** pending 2a.0 audit. The audit is now split: **2a.0a (intra-node) can start immediately on a ≥ 4-GPU node and brings Phase 2 sizing to within ±20%**; 2a.0b (rack-fabric) needs NVL72 access to gate definitive ship sizing. If MNNVL teardown latency is worse than assumed, 2a.2 grows from L to L+ and the Phase 2 total stretches.
 - **External/resource blockers** include DeepEP/NVSHMEM support for the separate IB track, NVL72/IMEX access for 1d.4a and 2a.0b, and MX-GMS availability for optional accelerated restoration.

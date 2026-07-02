@@ -269,7 +269,7 @@ We treat the pivot as a **deferred architectural question**, not an MVP decision
 | `MPIPoolExecutor` has static full-world membership | L1 | Q1/Q3 | Blocks survivor operation after prompt process evidence | 1c.3a, 1c.4a / §5.4 |
 | No survivor control communicator | L2 | Q1–Q3 | Blocks survivor-only coordination | 1c.3a / §5.4 |
 | Failure-notification broadcast not yet merged | L2 | Q1–Q3 | Blocks evidence reconciliation | Draft 1c.3 / §5.3 |
-| MNNVL launch mask and 128-rank capacity are merged, but no running-kernel escape exists | L3 | Q2 and recoverable Q3 | Blocks bounded failed-epoch abort | 1a.8 / §5.1 |
+| MNNVL launch mask and 128-rank capacity are merged, but the running-kernel escape is only a draft and is not yet validated or merged | L3 | Q2 and recoverable Q3 | Blocks bounded failed-epoch abort | Draft 1a.8 / [#15895](https://github.com/NVIDIA/TensorRT-LLM/pull/15895) / §5.1 |
 | NCCL survivor abort/rebuild is not merged | L3 | Q1–Q3 | Blocks supported NCCL non-MoE/fallback paths | Draft 1a.7 / §5.1 |
 | DeepEP destructor deadlock | L3 | Q1–Q4, mechanism-dependent | Can hang the conditional DeepEP path during failure or cleanup | §6.2 (deferred) |
 | EPLB static topology | — | Q1–Q3 | Blocks coherent N-1 recovery | §5.2 |

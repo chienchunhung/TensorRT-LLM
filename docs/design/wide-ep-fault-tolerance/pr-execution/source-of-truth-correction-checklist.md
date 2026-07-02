@@ -23,7 +23,7 @@ This checklist is the control record for the 2026-06-30 design correction. A che
 
 ### Promoted from V1 to MVP
 
-- [ ] **C10 / 1a.8 — In-flight kernel abort and generation primitive:** replace the 300-second `trap;` escape with a stable device/host-visible abort or generation mechanism that a running kernel can observe and return through without poisoning the CUDA context. PR #13404 remains the pre-launch/next-launch rank-mask foundation; it does not by itself satisfy 1a.8.
+- [ ] **C10 / 1a.8 — In-flight kernel abort and execution-epoch control:** draft [PR #15895](https://github.com/NVIDIA/TensorRT-LLM/pull/15895) implements the proposed replacement for the 300-second `trap;` escape with a stable host/device-visible abort and recoverable return path. PR #13404 remains the pre-launch/next-launch rank-mask foundation; #15895 remains unchecked here until CI, native-GPU validation, review, and merge complete.
 - [ ] **C11 / 1a.11 — CUDA graph recovery policy:** ship an eager-mode recovery path plus graph invalidation/recapture after communicator or membership generation changes. The prototype may force eager mode; production MVP must define and test graph recovery.
 
 ### New MVP items
