@@ -2,7 +2,7 @@
 
 [< Back to Overview](README.md)
 
-> **Superseded design:** Use [§18](18-dynamo-pr11000-gaps.md) for implementation. Do not implement the
+> **Superseded design:** Use [§18](18-gms-integration-gaps-and-concrete-pr-plan.md) for implementation. Do not implement the
 > public `SHADOW`/`ACTIVATING` state machine or an RO-to-RW weight upgrade described below. TensorRT-LLM extends its
 > existing sleep/wake and admission control; Dynamo or a launcher owns `flock`, discovery, and supervision.
 

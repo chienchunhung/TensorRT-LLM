@@ -3,7 +3,7 @@
 [< Back to README](README.md)
 
 > **Archived plan:** PR #13045 closed without merge. Use
-> [§18 GMS Integration Gaps and Concrete PR Plan](18-dynamo-pr11000-gaps.md) for current implementation
+> [§18 GMS Integration Gaps and Concrete PR Plan](18-gms-integration-gaps-and-concrete-pr-plan.md) for current implementation
 > and validation gates. This file is retained as historical prototype methodology.
 
 **Status:** Archived; no further execution planned  •  **Last Updated:** 2026-06-30

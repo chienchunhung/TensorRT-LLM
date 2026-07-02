@@ -2,7 +2,7 @@
 
 [< Back to Overview](README.md)
 
-> **Current implementation plan:** [§18](18-dynamo-pr11000-gaps.md) supersedes GMS lifecycle, role,
+> **Current implementation plan:** [§18](18-gms-integration-gaps-and-concrete-pr-plan.md) supersedes GMS lifecycle, role,
 > source-identity, and failover-lock decisions in this earlier API proposal. The two-axis loader discussion remains
 > useful background.
 
