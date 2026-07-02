@@ -57,4 +57,5 @@ JIRA keys are required for the eight corrected-MVP items currently marked `TBD`:
 - TRTLLM-12556 / 1a.3 is `To Do`, but its implementation is carried in draft PR #15524 with 1a.4.
 - TRTLLM-13543 / 1b.1 remains `In Progress` and TRTLLM-13544 / 1b.2 remains `To Do`, but their shared implementation PR #15525 is merged.
 - TRTLLM-12200 / 1a.2 is `In Review` in the supplied JIRA snapshot, while PR #13404 is merged.
+- TRTLLM-13546 / 1c.1 is `In Progress` in the supplied JIRA snapshot, while PR #15677 is merged.
 - TRTLLM-12560 / 1a.7, TRTLLM-13548 / 1c.3, and TRTLLM-13553 / 1d.3 remain `To Do` and unassigned in the supplied JIRA snapshot, but draft PRs #15789, #15785, and #15788 now carry their implementation.

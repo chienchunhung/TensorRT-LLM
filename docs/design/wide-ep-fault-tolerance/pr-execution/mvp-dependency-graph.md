@@ -2,7 +2,7 @@
 
 [< Back to WideEP Fault Tolerance](../README.md) · [Implementation plan](08-implementation-plan.md) · [Correction checklist](source-of-truth-correction-checklist.md)
 
-**Status snapshot:** 2026-06-30 14:38 PDT
+**Status snapshot:** 2026-07-02 14:32 PDT
 
 **Scope:** corrected Phase 1 MVP merge units and acceptance gates.
 
@@ -63,12 +63,12 @@ flowchart TB
 
     subgraph ACTION_CONTROL["1c · Detection and membership"]
         direction TB
-        P12718_C["Foundation · #12718<br/>MERGED"]
         A11_C2["1a.1 · #13302<br/>MERGED"]
         D10_C["1d.0 · #14160<br/>MERGED"]
-        C11["★ 1c.1 · #15677<br/>REVIEW"]
+        C11["1c.1 · #15677<br/>MERGED"]
+        C12["★ 1c.2<br/>PLANNED"]
         C13["★ 1c.3 · #15785<br/>DRAFT"]
-        P12718_C --> C11
+        C11 --> C12
         A11_C2 --> C13
         D10_C --> C13
     end
@@ -88,11 +88,10 @@ flowchart TB
     classDef planned fill:#f3f4f6,stroke:#6b7280,color:#374151,stroke-dasharray:5 5;
     classDef candidate stroke:#d97706,stroke-width:5px,stroke-dasharray:0;
 
-    class A11_C,A12_C,B112_P,P12718_C,A11_C2,D10_C,A11_D merged;
+    class A11_C,A12_C,B112_P,A11_C2,D10_C,C11,A11_D merged;
     class A134,A17,C13,D13 draft;
-    class C11 reviewing;
-    class A18,B12A,B13 planned;
-    class A134,A17,A18,B12A,B13,C11,C13,D13 candidate;
+    class A18,B12A,B13,C12 planned;
+    class A134,A17,A18,B12A,B13,C12,C13,D13 candidate;
 ```
 
 ## Holistic MVP dependency graph
@@ -113,12 +112,12 @@ flowchart TB
     A1_8["★ 1a.8<br/>PLANNED"]
     B1_2A["★ 1b.2a<br/>PLANNED"]
     B1_3["★ 1b.3<br/>PLANNED"]
-    C1_1["★ 1c.1 · #15677<br/>REVIEW"]
+    C1_1["1c.1 · #15677<br/>MERGED"]
     C1_3["★ 1c.3 · #15785<br/>DRAFT"]
     D1_3["★ 1d.3 · #15788<br/>DRAFT"]
 
     A1_11["1a.11 · graph recovery<br/>PLANNED"]
-    C1_2["1c.2 · health budgets<br/>PLANNED"]
+    C1_2["★ 1c.2 · health budgets<br/>PLANNED"]
     C1_3A["1c.3a · survivor control<br/>PLANNED"]
     D1_0A["1d.0a · poisoned-MPI lifecycle<br/>PLANNED"]
 
@@ -139,7 +138,7 @@ flowchart TB
     NVL72_RESOURCE["NVL72 rack resource<br/>CONTEXT"]
     APPROVED_FAULT_METHOD["Approved destructive-fault method<br/>EXTERNAL ACCEPTANCE GATE"]
 
-    %% Satisfied hard dependencies: edges 0–12
+    %% Satisfied hard dependencies: edges 0–13
     A1_1 --> A1_34
     A1_2 -->|merged stack base| A1_34
     A1_1 --> A1_7
@@ -147,6 +146,7 @@ flowchart TB
     B1_12 --> B1_2A
     B1_12 --> B1_3
     P12718 --> C1_1
+    C1_1 --> C1_2
     A1_1 --> C1_3
     D1_0 --> C1_3
     P12718 --> C1_4C
@@ -154,10 +154,9 @@ flowchart TB
     D1_0 --> D1_0A
     A1_1 --> D1_3
 
-    %% Blocking hard dependencies: edges 13–48
+    %% Blocking hard dependencies: edges 14–48
     A1_7 --> A1_11
     A1_8 --> A1_11
-    C1_1 --> C1_2
     C1_3 --> C1_3A
     A1_34 --> C1_4
     B1_3 --> C1_4
@@ -209,7 +208,7 @@ flowchart TB
     APPROVED_FAULT_METHOD -.->|accepted injection| D1_4A
 
     linkStyle default stroke:#dc2626,stroke-width:3px;
-    linkStyle 0,1,2,3,4,5,6,7,8,9,10,11,12 stroke:#16a34a,stroke-width:3px;
+    linkStyle 0,1,2,3,4,5,6,7,8,9,10,11,12,13 stroke:#16a34a,stroke-width:3px;
     linkStyle 49,50,51,52,53,54,55,56,57,58,59,60,61,62 stroke:#6b7280,stroke-width:2px,stroke-dasharray:6 4;
 
     classDef merged fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px;
@@ -220,13 +219,12 @@ flowchart TB
     classDef gate fill:#ffffff,stroke:#111827,color:#111827,stroke-width:3px;
     classDef candidate stroke:#d97706,stroke-width:5px,stroke-dasharray:0;
 
-    class P12718,P13119,A1_1,A1_2,B1_12,D1_0 merged;
+    class P12718,P13119,A1_1,A1_2,B1_12,C1_1,D1_0 merged;
     class A1_34,A1_7,C1_3,D1_3 draft;
-    class C1_1 reviewing;
     class A1_8,A1_11,B1_2A,B1_3,C1_2,C1_3A,C1_4,C1_4A,C1_4B,C1_4C,D1_0A,D1_1,D1_2,D1_4,D1_4A,D1_5 planned;
     class OLD_PROTO,NEW_PROTO,NVL72_RESOURCE,APPROVED_FAULT_METHOD context;
     class MVP_EXIT gate;
-    class A1_34,A1_7,A1_8,B1_2A,B1_3,C1_1,C1_3,D1_3 candidate;
+    class A1_34,A1_7,A1_8,B1_2A,B1_3,C1_2,C1_3,D1_3 candidate;
 ```
 
 ## MVP item mapping and parent proof
@@ -246,7 +244,7 @@ This table expands the combined merge nodes so all 27 MVP work-item identities r
 | **1b.2** | Python wrapper for mask-only reconfigure | [TRTLLM-13544](https://jirasw.nvidia.com/browse/TRTLLM-13544) | `B1_12`; [#15525](https://github.com/NVIDIA/TensorRT-LLM/pull/15525), shared with 1b.1 | Merged | 1b.1 (same `B1_12` merge unit; no external merge parent) |
 | **1b.2a** | Per-layer/per-expert FT placement invariant + admission | JIRA: TBD | `B1_2A`; PR TBD | Planned | 1b.1 + 1b.2 |
 | **1b.3** | Iteration-boundary EPLB prepare/commit integration | [TRTLLM-13545](https://jirasw.nvidia.com/browse/TRTLLM-13545) | `B1_3`; PR TBD | Planned | 1b.1 + 1b.2 |
-| **1c.1** | EP-specific error classification patterns | [TRTLLM-13546](https://jirasw.nvidia.com/browse/TRTLLM-13546) | `C1_1`; [#15677](https://github.com/NVIDIA/TensorRT-LLM/pull/15677) | Inflight — review required | Foundation [#12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718) |
+| **1c.1** | EP-specific error classification patterns | [TRTLLM-13546](https://jirasw.nvidia.com/browse/TRTLLM-13546) | `C1_1`; [#15677](https://github.com/NVIDIA/TensorRT-LLM/pull/15677) | Merged | Foundation [#12718](https://github.com/NVIDIA/TensorRT-LLM/pull/12718) |
 | **1c.2** | `EPRankHealthTracker` per-rank budgets | [TRTLLM-13547](https://jirasw.nvidia.com/browse/TRTLLM-13547) | `C1_2`; PR TBD | Planned | 1c.1 |
 | **1c.3** | Failure-notification MPI subcommunicator + broadcast thread | [TRTLLM-13548](https://jirasw.nvidia.com/browse/TRTLLM-13548) | `C1_3`; [#15785](https://github.com/NVIDIA/TensorRT-LLM/pull/15785) | Draft | 1a.1, 1d.0 |
 | **1c.3a** | Survivor control communicator + immutable `ActiveRankMap` | JIRA: TBD | `C1_3A`; PR TBD | Planned | 1c.3 |
@@ -312,8 +310,8 @@ flowchart TB
     P12718["Foundation · #12718<br/>MERGED"]
     A1_1["1a.1 · #13302<br/>MERGED"]
     D1_0["1d.0 · #14160<br/>MERGED"]
-    C1_1["★ 1c.1 · #15677<br/>REVIEW"]
-    C1_2["1c.2<br/>PLANNED"]
+    C1_1["1c.1 · #15677<br/>MERGED"]
+    C1_2["★ 1c.2<br/>PLANNED"]
     C1_3["★ 1c.3 · #15785<br/>DRAFT"]
     C1_3A["1c.3a · survivor control<br/>PLANNED"]
     A1_34["★ 1a.3 + 1a.4 · #15524<br/>DRAFT"]
@@ -333,7 +331,7 @@ flowchart TB
     C1_3A --> C1_4A
 
     linkStyle default stroke:#dc2626,stroke-width:3px;
-    linkStyle 0,1,2 stroke:#16a34a,stroke-width:3px;
+    linkStyle 0,1,2,3 stroke:#16a34a,stroke-width:3px;
 
     classDef merged fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px;
     classDef draft fill:#ffedd5,stroke:#f97316,color:#7c2d12,stroke-width:2px;
@@ -341,11 +339,10 @@ flowchart TB
     classDef planned fill:#f3f4f6,stroke:#6b7280,color:#374151,stroke-dasharray:5 5;
     classDef candidate stroke:#d97706,stroke-width:5px,stroke-dasharray:0;
 
-    class P12718,A1_1,D1_0 merged;
+    class P12718,A1_1,D1_0,C1_1 merged;
     class C1_3,A1_34 draft;
-    class C1_1 reviewing;
     class C1_2,C1_3A,B1_3,C1_4,C1_4A planned;
-    class C1_1,C1_3,A1_34,B1_3 candidate;
+    class C1_2,C1_3,A1_34,B1_3 candidate;
 ```
 
 ### 3. Atomic recovery and failed-request disposition
@@ -534,7 +531,7 @@ The holistic graph contains all **49 hard merge-unit dependencies** and **14 das
 | **1a.8** | Planned; promoted to MVP | 1a.2 / #13404 is merged | Implement a running-kernel-observable abort/generation primitive and recoverable return path. |
 | **1b.2a** | Planned; new MVP item | 1b.1 + 1b.2 / #15525 is merged | Implement per-layer/per-expert survivor admission and distinct-failure-domain validation. |
 | **1b.3** | Planned | 1b.1 + 1b.2 / #15525 is merged | Implement iteration-boundary EPLB prepare/commit integration under coordinator ownership. |
-| **1c.1 / #15677** | Review required; `blossom-ci` pending | #12718 is merged | Complete review and CI; keep scope limited to classification patterns. |
+| **1c.2** | Planned; no upstream PR opened | 1c.1 / #15677 is merged | Implement `EPRankHealthTracker` per-rank budgets and validation. |
 | **1c.3 / #15785** | Draft; corrected head `ee9aa0a4`; DCO/pre-commit green; `blossom-ci` pending | 1a.1 / #13302 and 1d.0 / #14160 are merged | Review the distinct detected-state correction and finish CI/hardware validation. |
 | **1d.3 / #15788** | Draft; corrected head `94274a3f`; DCO/pre-commit green; `blossom-ci` pending | 1a.1 / #13302 is merged | Review the passive committed-membership telemetry contract and finish CI. |
 
@@ -550,7 +547,7 @@ An action can be dependency-ready while still blocked by code correctness, revie
 | 1a.2 | [#13404](https://github.com/NVIDIA/TensorRT-LLM/pull/13404) | **Merged 2026-06-30 PDT** | Launch-time/next-launch rank mask. A running kernel still requires 1a.8. |
 | 1a.3 + 1a.4 | [#15524](https://github.com/NVIDIA/TensorRT-LLM/pull/15524) | Draft; corrected head `d19aadea`; DCO/pre-commit green; `blossom-ci` pending | Python mask wiring plus detection-only watchdog; dispatch/combine fail closed across committed-generation changes. |
 | 1b.1 + 1b.2 | [#15525](https://github.com/NVIDIA/TensorRT-LLM/pull/15525) | Merged 2026-06-29 PDT | Mask-only APIs; they fail closed on a zero-survivor expert but do not prove admission. |
-| 1c.1 | [#15677](https://github.com/NVIDIA/TensorRT-LLM/pull/15677) | Review required; `blossom-ci` pending | Pattern-only classifier slice. |
+| 1c.1 | [#15677](https://github.com/NVIDIA/TensorRT-LLM/pull/15677) | **Merged 2026-07-02 14:32 PDT; all reported checks green** | Pattern-only classifier slice. |
 | 1c.3 | [#15785](https://github.com/NVIDIA/TensorRT-LLM/pull/15785) | Draft; corrected head `ee9aa0a4`; DCO/pre-commit green; `blossom-ci` pending | Distinct monotonic detected-state evidence/broadcast; committed membership and normal survivor collectives remain separate. |
 | 1a.7 | [#15789](https://github.com/NVIDIA/TensorRT-LLM/pull/15789) | Draft; `blossom-ci` pending | Manual NCCL abort/rebuild primitive; coordinator and graph recovery remain separate items. |
 | 1d.3 | [#15788](https://github.com/NVIDIA/TensorRT-LLM/pull/15788) | Draft; corrected head `94274a3f`; DCO/pre-commit green; `blossom-ci` pending | Passive committed-membership telemetry; it must not drive recovery. |

@@ -48,7 +48,7 @@ The [JIRA work-item ledger](pr-execution/jira-work-item-ledger.md) preserves all
 
 ## Tracked MVP PRs
 
-Status snapshot: 2026-06-30 14:38 PDT. The [MVP dependency graph](pr-execution/mvp-dependency-graph.md) is authoritative for live PR status, blocked/unblocked edges, the dependency-ready action frontier, and corrected scope. This table is a delivery map, not a substitute for the graph.
+Status snapshot: 2026-07-02 14:32 PDT. The [MVP dependency graph](pr-execution/mvp-dependency-graph.md) is authoritative for live PR status, blocked/unblocked edges, the dependency-ready action frontier, and corrected scope. This table is a delivery map, not a substitute for the graph.
 
 | Plan ID | PR | JIRA work item(s) | Title | PR status | Section |
 |:---|:---|:---|:---|:---|:---|
@@ -57,7 +57,7 @@ Status snapshot: 2026-06-30 14:38 PDT. The [MVP dependency graph](pr-execution/m
 | 1a.2 | [#13404](https://github.com/NVIDIA/TensorRT-LLM/pull/13404) | [TRTLLM-12200](https://jirasw.nvidia.com/browse/TRTLLM-12200) | WideEP FT: NVLinkOneSided kernel mask | Merged 2026-06-30 PDT | §5.1 |
 | 1a.3 + 1a.4 | [#15524](https://github.com/NVIDIA/TensorRT-LLM/pull/15524) | [TRTLLM-12556](https://jirasw.nvidia.com/browse/TRTLLM-12556), [TRTLLM-12557](https://jirasw.nvidia.com/browse/TRTLLM-12557) | WideEP FT: add Python rank-mask wiring and AlltoAll watchdog | Draft; corrected head `d19aadea`; DCO/pre-commit green; `blossom-ci` pending | §5.1 |
 | 1b.1 + 1b.2 | [#15525](https://github.com/NVIDIA/TensorRT-LLM/pull/15525) | [TRTLLM-13543](https://jirasw.nvidia.com/browse/TRTLLM-13543), [TRTLLM-13544](https://jirasw.nvidia.com/browse/TRTLLM-13544) | WideEP FT: add EPLB mask-only reconfigure | Merged 2026-06-29 PDT | §5.2 |
-| 1c.1 | [#15677](https://github.com/NVIDIA/TensorRT-LLM/pull/15677) | [TRTLLM-13546](https://jirasw.nvidia.com/browse/TRTLLM-13546) | Add WideEP FT error-classification patterns | Review required; `blossom-ci` pending | §5.3 |
+| 1c.1 | [#15677](https://github.com/NVIDIA/TensorRT-LLM/pull/15677) | [TRTLLM-13546](https://jirasw.nvidia.com/browse/TRTLLM-13546) | Add WideEP FT error-classification patterns | Merged 2026-07-02 14:32 PDT; all reported checks green | §5.3 |
 | 1a.7 | [#15789](https://github.com/NVIDIA/TensorRT-LLM/pull/15789) | [TRTLLM-12560](https://jirasw.nvidia.com/browse/TRTLLM-12560) | Add NCCL fault-tolerance wrapper for WideEP | Draft; `blossom-ci` pending | §5.1 |
 | 1c.3 | [#15785](https://github.com/NVIDIA/TensorRT-LLM/pull/15785) | [TRTLLM-13548](https://jirasw.nvidia.com/browse/TRTLLM-13548) | Add MPI FT subcommunicator and broadcast thread | Draft; corrected head `ee9aa0a4`; DCO/pre-commit green; `blossom-ci` pending | §5.3 |
 | 1d.3 | [#15788](https://github.com/NVIDIA/TensorRT-LLM/pull/15788) | [TRTLLM-13553](https://jirasw.nvidia.com/browse/TRTLLM-13553) | Add WideEP rank-health telemetry | Draft; corrected head `94274a3f`; DCO/pre-commit green; `blossom-ci` pending | §5.5 |

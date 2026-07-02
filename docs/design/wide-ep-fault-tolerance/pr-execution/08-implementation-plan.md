@@ -35,13 +35,13 @@ The earlier seven-week estimate predated the running-kernel, placement-admission
 | **1a.10** | NIXL-EP topology-mutation + FT coordinator integration | v1 (conditional on Audit 3) | `_torch/modules/fused_moe/communication/nixl_ep.py` | M | 1a.9 |
 | **1a.11** | Eager fallback + generation-scoped graph invalidation/recapture | **MVP (promoted)** | `_torch/pyexecutor/py_executor.py`, `_torch/pyexecutor/model_engine.py`, CUDA graph cache | M | 1a.7, 1a.8 |
 
-**Status (June 30, 2026):**
+**Status (July 2, 2026):**
 - **1a.1 is merged as PR #13302** — `EPGroupHealth` thread-safe rank mask landed on 2026-06-17 PDT.
 - **1d.0 is merged as PR #14160** — MPI signal handler replacement landed on 2026-06-22 PDT.
 - **1b.1 + 1b.2 are merged as PR #15525** — C++ and Python mask-only reconfigure APIs landed on 2026-06-29 PDT.
 - **1a.2 is merged as PR #13404** — NVLinkOneSided kernel mask landed on 2026-06-30 PDT.
 - **1a.3 + 1a.4 are draft PR #15524** — Python rank-mask wiring plus a detection-only `AlltoAllWatchdog`; corrected head `d19aadea` is rebased on merged #13404, binds dispatch/combine to one committed generation, has green DCO/pre-commit, and has `blossom-ci` pending.
-- **1c.1 is open as PR #15677** — EP-specific error classification patterns; review required and `blossom-ci` pending.
+- **1c.1 is merged as PR #15677** — EP-specific error classification patterns landed on 2026-07-02 14:32 PDT with all reported checks green.
 - **1a.7 is draft PR #15789** — NCCL fault-tolerance wrapper; dependency-ready with `blossom-ci` pending.
 - **1c.3 is draft PR #15785** — detection-only MPI FT subcommunicator and broadcast thread; corrected head `ee9aa0a4` uses a distinct monotonic `DetectedRankState`, is dependency-ready, has green DCO/pre-commit, and has `blossom-ci` pending.
 - **1d.3 is draft PR #15788** — passive committed-membership telemetry; corrected head `94274a3f` is dependency-ready, has green DCO/pre-commit, and has `blossom-ci` pending.
@@ -132,8 +132,8 @@ Item 1c.4c guarantees that no partial or zero-filled logits from the failed epoc
 
 ```mermaid
 flowchart LR
-    MERGED["Merged foundations<br/>1a.1 · 1a.2 · 1b.1/1b.2 · 1d.0"]
-    FRONTIER["Current dependency frontier<br/>#15524 · 1a.7 · 1a.8 · 1b.2a · 1b.3<br/>1c.1 · 1c.3 · 1d.3"]
+    MERGED["Merged foundations<br/>1a.1 · 1a.2 · 1b.1/1b.2 · 1c.1 · 1d.0"]
+    FRONTIER["Current dependency frontier<br/>#15524 · 1a.7 · 1a.8 · 1b.2a · 1b.3<br/>1c.2 · 1c.3 · 1d.3"]
     MEMBERSHIP["Survivor membership<br/>1c.3a · 1c.4a · 1d.0a"]
     COORD["Atomic recovery<br/>1c.4 · 1c.4b · 1c.4c<br/>1a.11 graph policy"]
     GATE["Admission + public surface<br/>1d.1 · 1d.2"]
@@ -142,7 +142,7 @@ flowchart LR
     MERGED --> FRONTIER --> MEMBERSHIP --> COORD --> GATE --> E2E
 ```
 
-The exact action frontier, edge state, and live PR qualifiers are maintained in the [MVP dependency graph](mvp-dependency-graph.md). As of this snapshot, #13404 is merged and makes 1a.8 and #15524 dependency-ready. The remaining schedule is driven by the running-kernel escape, survivor control/ADP membership, the recovery coordinator, and two physical-hardware acceptance gates—not by #13404 alone.
+The exact action frontier, edge state, and live PR qualifiers are maintained in the [MVP dependency graph](mvp-dependency-graph.md). As of this snapshot, merged #13404 makes 1a.8 and #15524 dependency-ready, while merged #15677 makes 1c.2 dependency-ready. The remaining schedule is driven by the running-kernel escape, survivor control/ADP membership, the recovery coordinator, and two physical-hardware acceptance gates—not by either merged PR alone.
 
 ### No-mock end-to-end prototype
 
