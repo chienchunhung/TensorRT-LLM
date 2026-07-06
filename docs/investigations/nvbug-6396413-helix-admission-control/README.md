@@ -7,10 +7,16 @@ SPDX-License-Identifier: Apache-2.0
 
 - **Status:** Experiment plan; root cause not confirmed
 - **Created:** 2026-07-06
+- **Updated:** 2026-07-06 with an executable eight-GPU B300 runbook
 - **Component:** PyTorch backend, disaggregated serving, Helix context parallelism
-- **Hardware:** One DGX B200 with eight GPUs
+- **Execution hardware:** One exclusive eight-GPU B300 node; original incident hardware was B200
 - **Related change:** [PR #15356](https://github.com/NVIDIA/TensorRT-LLM/pull/15356)
 - **Incident job:** [LLM/main/L0_MergeRequest_PR #45198](http://tensorrt-llm.tensorrt-llm-ci-report.sc2-paas.nvidia.com/?job=LLM%2Fmain%2FL0_MergeRequest_PR&build=45198)
+
+> **Agent execution entry point:** Follow [`B300_AGENT_RUNBOOK.md`](B300_AGENT_RUNBOOK.md) from top to bottom. It
+> contains the pinned-image build, exact test node, required diagnostic changes, B300 preflight, run order, artifact
+> contract, and comparison command. The remainder of this README is the investigation rationale and B200 incident/CI
+> background; do not substitute its older snippets for the B300 runbook.
 
 ## Executive summary
 
@@ -53,7 +59,7 @@ git switch -c nvbug-6396413-admission-ab
 At the time this plan was written, the verified upstream snapshot was:
 
 ```text
-011e8490c14541889ae0412b75ce16c25d762eda
+7c8dde830bac813e23605d47a1d27c92d5437a92
 ```
 
 Always record the actual base SHA used by the experiment. Pinned links in this document describe the verified snapshot;
@@ -95,7 +101,7 @@ The test currently resolves to:
 | Block and partial reuse | Disabled |
 
 The context and generation servers consume four GPUs each. The source configuration is in
-[`test_disaggregated_serving.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/011e8490c14541889ae0412b75ce16c25d762eda/tests/integration/defs/accuracy/test_disaggregated_serving.py#L1675-L1839).
+[`test_disaggregated_serving.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/7c8dde830bac813e23605d47a1d27c92d5437a92/tests/integration/defs/accuracy/test_disaggregated_serving.py#L1675-L1839).
 
 Before each experiment, verify that current `main` still resolves to these settings. Record configuration drift rather
 than silently treating a changed test as equivalent to the incident test.
@@ -103,7 +109,7 @@ than silently treating a changed test as equivalent to the incident test.
 ## Current waiver and CI assignment
 
 The exact test is currently waived by NVBug 6396413 in
-[`tests/integration/test_lists/waives.txt`](https://github.com/NVIDIA/TensorRT-LLM/blob/011e8490c14541889ae0412b75ce16c25d762eda/tests/integration/test_lists/waives.txt#L2).
+[`tests/integration/test_lists/waives.txt`](https://github.com/NVIDIA/TensorRT-LLM/blob/7c8dde830bac813e23605d47a1d27c92d5437a92/tests/integration/test_lists/waives.txt#L2).
 
 - A direct pytest invocation does not apply `waives.txt` unless `--waives-file` is supplied.
 - Jenkins supplies the waiver file, so a diagnostic CI branch must remove only the exact NVBug 6396413 line.
@@ -111,6 +117,10 @@ The exact test is currently waived by NVBug 6396413 in
 
 The test is in the eight-GPU B200, pre-merge, PyTorch/MPI pool. Recent CI assigned it to
 `DGX_B200-8_GPUs-PyTorch-3`, but the concrete `-{1,2,3,4}` shard is load-split and is not a stable property of the test.
+
+There is currently no eight-GPU B300 functional stage, and this exact node is absent from the four-GPU B300 test list.
+The B300 experiment must therefore use direct pytest as documented in [`B300_AGENT_RUNBOOK.md`](B300_AGENT_RUNBOOK.md).
+It is an out-of-matrix mechanism test and does not replace final B200 CI validation.
 
 Run the repository mapping helper on the pinned experiment SHA:
 
@@ -231,7 +241,7 @@ The following are mandatory:
 - one pinned `upstream/main` base SHA;
 - one diagnostic commit containing both the toggle and telemetry;
 - one immutable container image digest;
-- one physical B200 node and one uninterrupted eight-GPU allocation per experiment block;
+- one physical B300 node and one uninterrupted eight-GPU allocation per experiment block;
 - one model snapshot and `LLM_MODELS_ROOT`;
 - one CUDA-visible GPU order;
 - one test node ID and timeout;
@@ -389,12 +399,12 @@ generation topology should produce four distinct startup-rank records.
 Current code already emits a DEBUG line when requests are deferred. It reports deferred requests, active blocks,
 admitted blocks, and budget. It does not report total candidates, cumulative deferral, or bounded-wait duration.
 
-Add a unique marker such as `NVBUG6396413_ADMISSION` and record:
+Emit parseable single-line JSON after the marker `NVBUG6396413_JSON ` and record:
 
 | Field | Meaning |
 | --- | --- |
 | `monotonic_ns` | Monotonic event timestamp |
-| `rank` | Distributed rank; controller-decision records originate on scheduler rank 0 |
+| `rank` | Generation CP rank; all four ranks independently execute admission for this PP1 topology |
 | `iteration` | Executor iteration |
 | `arm` | `A` or `B` |
 | `candidate_count` / `candidate_blocks` | Full generation-init candidate set |
@@ -413,10 +423,10 @@ Measure blocked-poll time around `_check_disagg_gen_cache_transfer_status(1)` us
 a `WAIT_BEGIN` record before the call and `WAIT_END` after it so a verbose run in which the call never returns remains
 diagnosable.
 
-The controller runs on scheduler rank 0 before the schedule is serialized and broadcast. Emit controller-decision
-records there only. Separately, after the existing broadcast/deserialization boundary, emit an effective admitted-ID
-SHA-256 on every CP rank. Compare those post-broadcast fingerprints offline to detect rank divergence; do not add
-runtime communication to calculate a mismatch counter. Never use Python's process-randomized `hash()` for cross-process
+This exact generation topology is PP1/TP1/CP4, so all four CP ranks independently run the normal executor loop and
+admission selection. The PP schedule-broadcast path does not apply. Emit candidate, shadow-admitted, and
+effective-admitted SHA-256 values on every generation rank, then compare them offline by iteration. Do not add runtime
+communication to calculate a mismatch counter. Never use Python's process-randomized `hash()` for cross-process
 comparison.
 
 Accumulate and periodically/finally emit:
@@ -427,7 +437,7 @@ Accumulate and periodically/finally emit:
 - blocked-poll count and total time;
 - admission-decision CPU time;
 - maximum effective request deferral time; and
-- post-broadcast fingerprints for offline rank-consistency analysis.
+- per-rank decision fingerprints for offline consistency analysis.
 
 Do not add synchronization or collectives for telemetry. Observe existing state only. Keep per-decision and per-wait
 records at DEBUG. Avoid INFO logging for every iteration; high-volume logging can change the timing under investigation.
@@ -462,7 +472,7 @@ Add cases proving:
 - wait timing emits BEGIN and END records and accumulates duration;
 - all generation child processes inherit the selected arm while context/router processes do not receive the product
   diagnostic variables; and
-- post-broadcast fingerprints match on all CP ranks in a synthetic schedule.
+- decision fingerprints match on all CP ranks in a synthetic schedule.
 
 Commit the diagnostic revision with DCO sign-off:
 
@@ -480,15 +490,18 @@ git status --short
 
 Both arms must use `EXPERIMENT_SHA`. Do not edit source between arms.
 
-## Phase 2: Prepare one B200 environment
+## Phase 2: Prepare one B300 environment
+
+This section is retained as background for the original plan. The executable B300 build and preflight are maintained in
+[`B300_AGENT_RUNBOOK.md`](B300_AGENT_RUNBOOK.md); an agent should use that runbook instead of the snippets below.
 
 ### 1. Reserve one persistent node
 
-Use one exclusive DGX B200 allocation with all eight GPUs for the entire experiment block. Separate bot/Jenkins reruns
+Use one exclusive B300 allocation with all eight GPUs for the entire experiment block. Separate bot/Jenkins reruns
 cannot guarantee the same physical host and may reuse successful test results, so they are unsuitable for the primary
 same-node A/B.
 
-Use the team's approved B200 allocation and container launcher. A site-specific Slurm shape is:
+Use the team's approved B300 allocation and container launcher. A site-specific Slurm shape is:
 
 ```bash
 salloc \
@@ -496,7 +509,7 @@ salloc \
   --gres=gpu:8 \
   --exclusive \
   --time='REPLACE_WITH_LONG_ENOUGH_DURATION' \
-  --partition='REPLACE_WITH_B200_PARTITION' \
+  --partition='REPLACE_WITH_B300_PARTITION' \
   --account='REPLACE_WITH_ACCOUNT'
 
 srun \
@@ -872,7 +885,7 @@ markers, and hang-detector stacks. Do not treat hangs as very slow completed run
 Create `results.csv` with:
 
 ```csv
-run_id,arm,host,base_sha,experiment_sha,image_digest,exit_code,outcome,duration_s,accuracy_score,first_context_response_s,first_generation_forward_s,admission_decisions,limited_decisions,unique_deferred_requests,total_request_deferral_ms,max_request_deferral_ms,blocked_poll_count,blocked_poll_total_ms,decision_total_ms,post_broadcast_rank_consistent,notes
+run_id,arm,host,base_sha,experiment_sha,image_digest,exit_code,outcome,duration_s,accuracy_score,first_context_response_s,first_generation_forward_s,admission_decisions,limited_decisions,unique_deferred_requests,total_request_deferral_ms,max_request_deferral_ms,blocked_poll_count,blocked_poll_total_ms,decision_total_ms,decision_rank_consistent,notes
 ```
 
 Report separately for each arm:
@@ -946,7 +959,8 @@ smallest possible toggle on the first classifiable failing descendant with its o
 ### Regression-window PR isolation
 
 If both admission arms behave alike, test the PR boundaries that align with the observed signatures. Use the same
-physical B200 node, incident-compatible image digest, model snapshot, test node, timeout, and result schema. Do not
+physical experiment node (B300 for screening, or B200 for historical attribution), compatible image digest, model
+snapshot, test node, timeout, and result schema. Do not
 compare CI runs from arbitrary hosts as if they were a controlled bisect.
 
 | Candidate | Parent/control | Merge/treatment |
@@ -1107,6 +1121,9 @@ Pending experiment execution.
 
 ## References
 
+- [Eight-GPU B300 agent runbook](B300_AGENT_RUNBOOK.md)
+- [B300 run-artifact extractor](extract_results.py)
+- [B300 A/B result comparator](compare_results.py)
 - [NVBug 6396413](https://nvbugs/6396413)
 - [PR #15356](https://github.com/NVIDIA/TensorRT-LLM/pull/15356)
 - [PR #15409](https://github.com/NVIDIA/TensorRT-LLM/pull/15409)
@@ -1115,8 +1132,8 @@ Pending experiment execution.
 - [PR #15356 merged commit](https://github.com/NVIDIA/TensorRT-LLM/commit/b6eacd1f725d0fbeb888e09ff2585e5ab23b0856)
 - [Rank-consistency fix](https://github.com/NVIDIA/TensorRT-LLM/commit/d636503484ad87d9d17270ed110ef0e6dcf136b8)
 - [Incident CI report](http://tensorrt-llm.tensorrt-llm-ci-report.sc2-paas.nvidia.com/?job=LLM%2Fmain%2FL0_MergeRequest_PR&build=45198)
-- [Exact test at verified current-main snapshot](https://github.com/NVIDIA/TensorRT-LLM/blob/011e8490c14541889ae0412b75ce16c25d762eda/tests/integration/defs/accuracy/test_disaggregated_serving.py#L1675-L1839)
-- [Admission controller at verified snapshot](https://github.com/NVIDIA/TensorRT-LLM/blob/011e8490c14541889ae0412b75ce16c25d762eda/tensorrt_llm/_torch/pyexecutor/py_executor.py#L163-L262)
-- [Admission call and progress path at verified snapshot](https://github.com/NVIDIA/TensorRT-LLM/blob/011e8490c14541889ae0412b75ce16c25d762eda/tensorrt_llm/_torch/pyexecutor/py_executor.py#L2823-L2919)
-- [Current waiver at verified snapshot](https://github.com/NVIDIA/TensorRT-LLM/blob/011e8490c14541889ae0412b75ce16c25d762eda/tests/integration/test_lists/waives.txt#L2)
+- [Exact test at verified current-main snapshot](https://github.com/NVIDIA/TensorRT-LLM/blob/7c8dde830bac813e23605d47a1d27c92d5437a92/tests/integration/defs/accuracy/test_disaggregated_serving.py#L1675-L1839)
+- [Admission controller at verified snapshot](https://github.com/NVIDIA/TensorRT-LLM/blob/7c8dde830bac813e23605d47a1d27c92d5437a92/tensorrt_llm/_torch/pyexecutor/py_executor.py#L163-L262)
+- [Admission call and progress path at verified snapshot](https://github.com/NVIDIA/TensorRT-LLM/blob/7c8dde830bac813e23605d47a1d27c92d5437a92/tensorrt_llm/_torch/pyexecutor/py_executor.py#L2823-L2919)
+- [Current waiver at verified snapshot](https://github.com/NVIDIA/TensorRT-LLM/blob/7c8dde830bac813e23605d47a1d27c92d5437a92/tests/integration/test_lists/waives.txt#L2)
 - [TRT-LLM Test Case Detail dashboard](https://gpuwa.nvidia.com/os-dashboards/app/dashboards?security_tenant=TRT-LLM-Infra#/view/15f841f0-7f4f-11ef-979e-b7e76100ed73)
