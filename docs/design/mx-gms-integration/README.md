@@ -9,7 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 [combined MX/GMS prototype](https://github.com/chienchunhung/TensorRT-LLM/tree/dynamo-integration-prototype) is
 historical
 **Created:** 2026-04-01
-**Last Updated:** 2026-07-02
+**Last Updated:** 2026-07-08
 
 ---
 
@@ -18,8 +18,11 @@ historical
 This proposal covers the complementary TensorRT-LLM integrations with ModelExpress and GPU Memory Service, plus the
 supporting fast-start mechanisms needed to make them operational:
 
-- **GPU Memory Service (GMS)**: Out-of-process GPU memory management for zero-copy sharing and crash-resilient failover within nodes
+- **GPU Memory Service (GMS)**: Out-of-process GPU memory management for zero-copy sharing and crash-resilient
+  failover within nodes
 - **ModelExpress (MX)**: An optional GPU-to-GPU weight source via NIXL/RDMA for fast cold-start across nodes
+- **Run:ai Model Streamer**: An optional high-throughput source for first-replica SafeTensors loading from local or
+  object storage
 - **Compile and graph reuse**: Process-local and serialized startup state needed to keep promotion off the warmup path
 
 The integration targets three critical production pain points simultaneously: slow cold-start through optional MX P2P,
@@ -65,13 +68,16 @@ startup; they are not work to perform on the promotion path.
 12. [Risk Assessment](12-risks.md) — Technical risks, strategic concerns, GMS API stability, vLLM comparison
 13. [Strategic Alignment](13-strategic-alignment.md) — How this fits into the TRT-LLM opportunity roadmap
 
-### Part VI: Open Questions & Working Plans
+### Part VI: Assessments, Open Questions & Working Plans
 
 14. [Open Questions & Discussion](14-open-questions.md) — Performance follow-ups, compile cache design, API stability, operational questions, deferred items
 15. [Prototype Validation Plan](15-prototype-validation-plan.md) — Historical validation plan for the closed, unmerged PR #13045 prototype
 16. [Staged Post-Load Hooks](16-staged-post-load-hooks.md) — Holistic fix for the conflated `post_load_weights()` semantics surfaced by PR #13926 (GMS RO ordering) and PR #14151 (MX publish-pre vs publish-post-transform). Decomposes into `setup_aliases` / `transform_weights` / `cache_derived_state` stages; tiny prep PR scope + family-PR migration sequence.
 17. [Snapshot Integration Assessment](17-snapshot-assessment.md) — Assesses how Dynamo Snapshot, MX, and GMS fit together for TRT-LLM fast startup, including standalone `trtllm-serve` ownership versus Dynamo orchestration.
 18. [GMS Integration Gaps and Concrete PR Plan](18-gms-integration-gaps-and-concrete-pr-plan.md) — Clarifies the existing SourceIdentity versus the missing GMS transport, explains PR #15432's staged-layout implications, and records the sleep/wake contract, ownership boundary, dependency-ordered PR stack, and acceptance gates.
+19. [ModelStreamer and Weight-Loading Integration Assessment](19-model-streamer-weight-loading-assessment.md) —
+    Assesses Run:ai Model Streamer against MX, GMS, GMS storage snapshots, Dynamo process Snapshot, and the TRT-LLM
+    weight-loading proposals; defines the recommended ownership boundaries, shared contracts, and phased delivery plan.
 
 ---
 
@@ -85,4 +91,5 @@ startup; they are not work to perform on the promotion path.
 | M3 — Supported SLO/product path | **P1** | Optimize GMS remap, meet the p95 target, and publish supported packages, diagnostics, and recipes. |
 
 See [§18](18-gms-integration-gaps-and-concrete-pr-plan.md#delivery-gates) for the exact cumulative gates and dependency-ordered
-PR stack. MX remains an optional weight-source track rather than a prerequisite for the GMS lifecycle.
+PR stack. MX remains an optional weight-source track rather than a prerequisite for the GMS lifecycle. ModelStreamer is
+an optional cold-storage fallback and first-writer seed; it does not add a GMS delivery gate.
