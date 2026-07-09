@@ -5,9 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # NVBug 6396413: DeepSeek V3.2 Helix Admission-Control Investigation
 
-- **Status:** Admission deprioritized for the hang (warm-up A≈B); pivot to MoE/DSA model-forward follow-ups; root cause not confirmed
+- **Status:** Admission deprioritized (warm-up A≈B); MoE Phase 1 (`cudagraph:none`) in progress on B300; root cause not confirmed
 - **Created:** 2026-07-06
-- **Updated:** 2026-07-08 with Arm-A/Arm-B B300 warm-up comparison and early pivot off admission
+- **Updated:** 2026-07-08/09 with complete Arm-B warm-up findings and MoE Phase 1 start
 - **Component:** PyTorch backend, disaggregated serving, Helix context parallelism
 - **Execution hardware:** One exclusive eight-GPU B300 node; original incident hardware was B200
 - **Related change:** [PR #15356](https://github.com/NVIDIA/TensorRT-LLM/pull/15356) (admission hypothesis; now deprioritized for hang)
@@ -1156,7 +1156,7 @@ Last per-rank aggregate telemetry before the hang (cadence summary at `admission
 | Outcome class | **`model_forward_hang`** — same class as Arm A |
 | Hang detector | All four generation ranks: `Hang detected after 300 seconds` at `2026-07-08 18:11:11` (~22.8 min after test start) |
 | Hang stack family | Same as Arm A: DeepSeek V3 `forward_MoE` → `fp4_block_scale_moe_runner` (not DSA projection; not admission wait) |
-| Cleanup note | Pytest/serve still tearing down after the hang (etcd expire noise / `threads can only be started once`); product hang outcome is already decisive |
+| Cleanup | Hang at 18:11:11; harness never wrote `status.txt` / `ONE_RUN_DONE` because post-hang teardown stalled (etcd expire loop / `threads can only be started once`). Log last touched ~21:33. By 2026-07-09 05:42 UTC the node was clean again (8 idle GPUs, no serve/pytest). Product hang outcome remains decisive. |
 
 Last per-rank aggregate telemetry before the hang (cadence summary at `admission_decisions=600`; ranks agree):
 
@@ -1201,6 +1201,23 @@ Owner decision on 2026-07-08:
    - Keep **DSA** ([PR #15409](https://github.com/NVIDIA/TensorRT-LLM/pull/15409), [PR #15414](https://github.com/NVIDIA/TensorRT-LLM/pull/15414)) in the next screen because historical CI hang samples were in DSA projection and those PRs touch shared attention / model-engine code in the same window — but do **not** claim the B300 warm-up stacks were DSA.
    - Prefer same-node parent/merge isolation from Phase 5 (`#15409` then `#15414`, then `#15626` if needed), plus focused MoE ablations (CUDA graph on/off, concurrency) once a separating boundary appears.
 4. Re-open measured admission A/B only if a later signature looks admission-specific, or if completed-accuracy failures need a separate admission screen.
+
+### MoE Phase 1 plan (same SHA, no rebuild)
+
+Cheap ablation on `EXPERIMENT_SHA=9f82ceda7dee...` / host `umb-b300-dp-217`, default admission (Arm A), same image/model/caches/timeouts as the warm-ups. Only the pytest node changes:
+
+| Step | Node ID | Role |
+| --- | --- | --- |
+| Control (done) | `fifo-cudagraph:with_padding-pp1tp1cp4` | Arm-A/B warm-ups: hang in FP4 MoE |
+| Phase 1 | `fifo-cudagraph:none-pp1tp1cp4` | 1 warm-up + 2–3 reps; isolate CUDA-graph vs eager MoE |
+
+Stop rules:
+
+- `cudagraph:none` passes repeatedly → hang is CUDA-graph / MoE-load interaction; dig that path before PR bisect.
+- Still hangs in FP4 MoE → eager MoE / Helix+MoE; proceed to regression-window (#15409 then #15414).
+- Hang locus moves to DSA → prioritize #15409/#15414 immediately.
+
+Results for Phase 1 will be appended below as runs complete.
 
 ## Results template
 
