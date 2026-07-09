@@ -5,9 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # NVBug 6396413: DeepSeek V3.2 Helix Admission-Control Investigation
 
-- **Status:** Experiment plan; root cause not confirmed
+- **Status:** B300 warm-up in progress; Arm-A reproduced a PyExecutor model-forward hang; Arm-B running; root cause not confirmed
 - **Created:** 2026-07-06
-- **Updated:** 2026-07-06 with an executable eight-GPU B300 runbook
+- **Updated:** 2026-07-08 with Arm-A warm-up findings on B300 (Arm-B warm-up in flight)
 - **Component:** PyTorch backend, disaggregated serving, Helix context parallelism
 - **Execution hardware:** One exclusive eight-GPU B300 node; original incident hardware was B200
 - **Related change:** [PR #15356](https://github.com/NVIDIA/TensorRT-LLM/pull/15356)
@@ -1083,41 +1083,109 @@ Require:
 - related post-merge coverage passes when applicable; and
 - all evidence is attached to NVBug 6396413.
 
+## B300 experiment progress (2026-07-08)
+
+Warm-up-only evidence so far. Measured interleaved A/B samples have not started. Do not treat the Arm-A warm-up as
+closure evidence for H0–H4.
+
+### Experiment identity
+
+| Item | Value |
+| --- | --- |
+| Result root | `/home/scratch.chienchunh_coreai/dev/nvbug-6396413-results/20260707T025616Z-861f44e21660` |
+| Base SHA (container-matching) | `5ec0c84ad1684c7d08e17a49cf0d53a061fd85cd` |
+| Diagnostic / experiment SHA | `9f82ceda7dee872e8f6f3f39ac758cd6a6c12de2` |
+| Image tag | `urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-26.02-py3-x86_64-ubuntu24.04-trt10.15.1.29-skip-tritondevel-202606051544-14972` |
+| Physical host (Arm-A / Arm-B) | `umb-b300-dp-217` (runbook expected host was `umb-b300-023`; allocation resumed on a different B300 after eviction) |
+| Model | `DeepSeek-V3.2-Exp-FP4-v2` under `LLM_MODELS_ROOT=/home/scratch.trt_llm_data_ci/llm-models` |
+| Exact test | `TestDeepSeekV32Exp::test_auto_dtype_with_helix[fifo-cudagraph:with_padding-pp1tp1cp4]` |
+| Preflight | Exact-node `--collect-only` collected 1 test; focused admission unit tests 25/25 after diagnostic amend |
+
+### Setup notes that unblocked the warm-up
+
+Earlier Arm-A attempts failed before product execution for infrastructure reasons, not admission:
+
+1. Home quota (`/home/chienchunh`, 5 GB) was full, so DeepGEMM / CUDA JIT caches under `~/.deep_gemm` and `~/.nv` produced `CUDA_ERROR_INVALID_IMAGE`. Redirected `DG_JIT_CACHE_DIR` and `CUDA_CACHE_PATH` to scratch.
+2. NFS model load of the ~386 GB checkpoint exceeded default server/test timeouts. Raised outer/pytest/server/test timeouts for warm-up (`13000s` / `12000s` / `9000s` / `12000s`).
+3. Wheel install used a scratch site-dir + build venv Python because home-quota `pip --user` was impossible.
+
+These are excluded setup/infra issues under the runbook contract. Arm-A attempt-4 is the first end-to-end product run.
+
+### Arm-A warm-up (`warmup-A-attempt-4`, admission on)
+
+| Field | Observation |
+| --- | --- |
+| Arm / bypass | `arm=A`, `bypass=false` on all four generation CP ranks |
+| Config markers | 4/4 `NVBUG6396413_JSON` config events: `max_tokens_in_buffer=8192`, `tokens_per_block=32`, `budget_blocks=256`, `experiment_sha=9f82ceda7dee...` |
+| Pipeline progress | Context + generation + disagg router launched; GSM8K client reached **810/1319** completions (~61%) before hang |
+| Outcome class | **`model_forward_hang`** (not transfer-status stall, not registration timeout, not completed accuracy failure) |
+| Hang detector | All four generation ranks: `Hang detected after 300 seconds` in `PyExecutor` at `2026-07-08 15:14:41` |
+| Hang stack family | `_executor_loop` → `_forward_step` → `model_engine.forward` → DeepSeek V3 `forward_MoE` → `fused_moe` → `run_fp4_block_scale_moe` → `fp4_block_scale_moe_runner` |
+| Last progress before hang | Many `POST /v1/completions` 200 OK responses; eval still advancing at ~6.9 it/s |
+
+Last per-rank aggregate telemetry before the hang (cadence summary at `admission_decisions=600`; ranks agree):
+
+| Metric | Rank 0–3 (same within rounding) |
+| --- | ---: |
+| `would_defer_count` | 1039 |
+| `effective_deferred_requests` | 119 |
+| `effective_deferral_request_ms` (request-ms, overlapping) | ~267192 |
+| `max_effective_deferral_ms` | ~5998 |
+| `blocked_poll_count` | 2 |
+| `blocked_poll_ms` | ~5962 |
+| `decision_ms` (CPU) | ~7.3–7.5 |
+| `max_active_transfer_blocks` | 254 |
+| Cross-rank `decision_digest` | Matched across ranks at each summary cadence |
+
+Interpretation for the admission hypothesis (warm-up only):
+
+- Admission **was active and deferring** under the 256-block budget (`max_active_transfer_blocks=254`, non-zero effective deferral and two blocked polls totaling ~6 s wall).
+- The observed failure is a **model-forward hang inside FP4 block-scale MoE**, after substantial successful generation traffic. That matches the historical “PyExecutor model-forward hang” class more closely than an unmatched admission `WAIT_BEGIN` / transfer-status stall.
+- Admission CPU overhead (`decision_ms` ≈ 7 ms cumulative) is negligible versus the hang.
+- This single Arm-A warm-up **does not yet prove H2** (admission causes the hang). It proves the instrumented default path can reproduce the hang class on this B300 node. Arm-B (bypass) is required to see whether bypassing selection + admission-specific blocked-progress polling removes, preserves, or worsens the hang.
+
+### Arm-B warm-up status
+
+`warmup-B-attempt-2` was relaunched on the same host (`umb-b300-dp-217`) with the same SHA, image wiring, caches, and raised timeouts, and `TRTLLM_DIAG_BYPASS_DISAGG_TRANSFER_ADMISSION=1` confirmed in the generation subprocess environment. Results will be appended here when the run finishes.
+
 ## Results template
 
 ### Environment
 
 | Item | Value |
 | --- | --- |
-| Base `main` SHA | |
-| Diagnostic SHA | |
-| Container image tag | |
-| Container image digest | |
-| DGX host | |
-| Allocation/job ID | |
-| Driver | |
-| CUDA | |
-| PyTorch | |
-| Model snapshot | |
-| Test start/end UTC | |
+| Base `main` SHA | `5ec0c84ad1684c7d08e17a49cf0d53a061fd85cd` |
+| Diagnostic SHA | `9f82ceda7dee872e8f6f3f39ac758cd6a6c12de2` |
+| Container image tag | `pytorch-26.02-py3-...-202606051544-14972` (see `IMAGE_REF` in result `active.env`) |
+| Container image digest | Not yet pinned as an immutable `sha256:` in the result manifest; record before measured block |
+| DGX host | `umb-b300-dp-217` (warm-up block; expected runbook host was `umb-b300-023`) |
+| Allocation/job ID | Initial `3017028`; later resumed under a new Slurm allocation after eviction |
+| Driver | `595.58.03` |
+| CUDA | From pinned 26.02 image |
+| PyTorch | From pinned 26.02 image / build venv |
+| Model snapshot | `/home/scratch.trt_llm_data_ci/llm-models/DeepSeek-V3.2-Exp-FP4-v2` |
+| Test start/end UTC | Arm-A warm-up log window ~2026-07-08 14:50:51 → 15:14:50 (local log timestamps) |
 
 ### Outcome summary
 
 | Arm | Valid | Pass | Accuracy failure | Forward hang | Transfer stall | Other | Median completed duration |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| A: admission on | | | | | | | |
-| B: admission bypassed | | | | | | | |
+| A: admission on | 0 measured (1 warm-up) | 0 | 0 | 1 warm-up | 0 | 0 | N/A (hang) |
+| B: admission bypassed | pending warm-up | | | | | | |
 
 ### Admission summary
 
 | Arm | Limited decisions | Unique deferred | Total deferral | Max wait | Blocked-poll time | Rank mismatch |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| A | | | | | | |
-| B effective; shadow counts only | | | N/A | 0/N/A | | |
+| A (warm-up last summary) | budget pressure observed (`max_active_transfer_blocks=254`) | 119 effective deferred | ~267192 request-ms | ~5998 ms | ~5962 ms (2 polls) | none observed (`decision_digest` matched) |
+| B effective; shadow counts only | pending | pending | N/A | 0/N/A | pending | pending |
 
 ### Conclusion
 
-Pending experiment execution.
+Arm-A warm-up on B300 reproduced the waived test’s **PyExecutor model-forward hang** class while admission was enforcing
+deferral. Hang stacks localize to **FP4 block-scale MoE forward**, not to an unmatched admission wait. Arm-B warm-up is
+in progress to complete the first A-vs-B comparison. No measured-run statistics yet; do not close H0–H4 from warm-up
+alone.
 
 ## References
 
