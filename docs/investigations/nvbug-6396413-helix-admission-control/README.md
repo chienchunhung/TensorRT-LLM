@@ -1249,7 +1249,29 @@ Started 2026-07-09 on host `umb-b300-023` (new allocation after Phase 1 host `um
 | Test node | `fifo-cudagraph:with_padding-pp1tp1cp4` (incident node; not `cudagraph:none`) |
 | Protocol | 1 warm-up + 5 valid runs per SHA, interleaved when both wheels exist; exclude warm-ups |
 
-**Blocker for GPU runs on this allocation:** container `chienchunh-ide-dev-0` currently has no `/dev/nvidia*` device nodes (`nvidia-smi` fails) even though `/proc/driver/nvidia` lists eight GPUs. Parent `103-real` wheel build was started anyway (compile does not need device nodes). GPU warm-up/reps require restoring device mounts (reattach/relaunch container with GPU devices) before measured Phase 2 runs.
+### MoE Phase 2 status (paused 2026-07-09)
+
+Work paused on `umb-b300-023` to free the node for another experiment. Artifacts live on scratch and are intended for resume without rebuilding the parent.
+
+| Item | Status |
+| --- | --- |
+| GPUs on this allocation | Restored (8× B300; `/dev/nvidia*` present). Earlier kickoff note about missing device nodes is obsolete. |
+| Parent wheel (`434dc3345d03`, `103-real`) | **Built and reusable.** Site verified with lightweight file check (`import_ok`). |
+| Parent site (reuse this) | `/home/scratch.chienchunh_coreai/dev/nvbug-6396413-results/phase2-15409-20260709T164012Z/parent-434dc3345d03/site` |
+| Parent wheel file | `/home/scratch.chienchunh_coreai/dev/nvbug-6396413-worktrees/434dc3345d03/build/tensorrt_llm-1.3.0rc20-cp312-cp312-linux_x86_64.whl` |
+| Parent build log | `.../phase2-15409-20260709T164012Z/parent-434dc3345d03/build.log` |
+| Merge wheel (`aaffa2f9fef3`) | **Not done.** CMake failed: `internal_cutlass_kernels` tarball still a Git LFS pointer (133 B). Parent already has the real ~67 MB XZ; copy then rebuild. |
+| Merge LFS fix script | `/home/scratch.chienchunh_coreai/dev/nvbug-6396413-results/fix_merge_lfs.sh` |
+| Unattended Phase 2 orch | `/home/scratch.chienchunh_coreai/dev/nvbug-6396413-results/phase2_unattended.sh` (parent short-circuits on `import_ok`) |
+| Env | `/home/scratch.chienchunh_coreai/dev/nvbug-6396413-results/phase2-15409.env` |
+
+**Resume (host interactive shell, not Cursor agent sandbox):**
+
+1. `bash /home/scratch.chienchunh_coreai/dev/nvbug-6396413-results/fix_merge_lfs.sh` — copies parent’s real `tensorrt_llm_internal_cutlass_kernels_static.tar.xz`, rebuilds merge once.
+2. Orch continues: merge site → warm-up + 5 valid reps per SHA (interleaved) → README fragment + push.
+3. Do **not** rebuild parent unless `parent-434dc3345d03/site` is missing or `import-check.txt` lacks `import_ok`.
+
+**Note:** Full `import tensorrt_llm` can segfault under OpenMPI/PMIX in this IDE container; Phase 2 uses a file-level site check for build gating. Measured runs still load the site under the normal pytest/MPI path.
 
 ## Results template
 
