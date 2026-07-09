@@ -5,9 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # NVBug 6396413: DeepSeek V3.2 Helix Admission-Control Investigation
 
-- **Status:** Admission deprioritized (warm-up A≈B); MoE Phase 1 (`cudagraph:none`) in progress on B300; root cause not confirmed
+- **Status:** MoE Phase 1 (`cudagraph:none`) complete; admission still deprioritized; see Phase 1 results; root cause not confirmed
 - **Created:** 2026-07-06
-- **Updated:** 2026-07-08/09 with complete Arm-B warm-up findings and MoE Phase 1 start
+- **Updated:** 2026-07-09 with MoE Phase 1 (`cudagraph:none`) unattended results
 - **Component:** PyTorch backend, disaggregated serving, Helix context parallelism
 - **Execution hardware:** One exclusive eight-GPU B300 node; original incident hardware was B200
 - **Related change:** [PR #15356](https://github.com/NVIDIA/TensorRT-LLM/pull/15356) (admission hypothesis; now deprioritized for hang)
@@ -1217,7 +1217,20 @@ Stop rules:
 - Still hangs in FP4 MoE → eager MoE / Helix+MoE; proceed to regression-window (#15409 then #15414).
 - Hang locus moves to DSA → prioritize #15409/#15414 immediately.
 
-Results for Phase 1 will be appended below as runs complete.
+### MoE Phase 1 results (`cudagraph:none`, same SHA)
+
+Completed unattended on host `umb-b300-dp-217` at 2026-07-09 07:45 UTC.
+Node: `fifo-cudagraph:none-pp1tp1cp4`. Arm A (admission on). Same experiment SHA / image wiring / caches / raised timeouts as admission warm-ups.
+
+| Run | Outcome | Config markers | Last GSM8K progress | Stack hint |
+| --- | --- | ---: | --- | --- |
+| `phase1-cudagraph-none-warmup` | model_forward_hang | 4 | 837/1319 (~63%) | fp4_block_scale_moe_runner |
+| `phase1-cudagraph-none-rep-1` | model_forward_hang | 4 | 381/1319 (~29%) | fp4_block_scale_moe_runner |
+| `phase1-cudagraph-none-rep-2` | model_forward_hang | 4 | 145/1319 (~11%) | fp4_block_scale_moe_runner |
+| `phase1-cudagraph-none-rep-3` | failed | 0 | n/a | unknown_or_none |
+
+**Decision:** cudagraph:none still hangs (eager MoE / Helix+MoE). Proceed to regression-window PR isolation (#15409 then #15414).
+
 
 ## Results template
 
