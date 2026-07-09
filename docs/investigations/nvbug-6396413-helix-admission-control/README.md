@@ -5,12 +5,12 @@ SPDX-License-Identifier: Apache-2.0
 
 # NVBug 6396413: DeepSeek V3.2 Helix Admission-Control Investigation
 
-- **Status:** B300 warm-up in progress; Arm-A reproduced a PyExecutor model-forward hang; Arm-B running; root cause not confirmed
+- **Status:** Admission deprioritized for the hang (warm-up A≈B); pivot to MoE/DSA model-forward follow-ups; root cause not confirmed
 - **Created:** 2026-07-06
-- **Updated:** 2026-07-08 with Arm-A warm-up findings on B300 (Arm-B warm-up in flight)
+- **Updated:** 2026-07-08 with Arm-A/Arm-B B300 warm-up comparison and early pivot off admission
 - **Component:** PyTorch backend, disaggregated serving, Helix context parallelism
 - **Execution hardware:** One exclusive eight-GPU B300 node; original incident hardware was B200
-- **Related change:** [PR #15356](https://github.com/NVIDIA/TensorRT-LLM/pull/15356)
+- **Related change:** [PR #15356](https://github.com/NVIDIA/TensorRT-LLM/pull/15356) (admission hypothesis; now deprioritized for hang)
 - **Incident job:** [LLM/main/L0_MergeRequest_PR #45198](http://tensorrt-llm.tensorrt-llm-ci-report.sc2-paas.nvidia.com/?job=LLM%2Fmain%2FL0_MergeRequest_PR&build=45198)
 
 > **Agent execution entry point:** Follow [`B300_AGENT_RUNBOOK.md`](B300_AGENT_RUNBOOK.md) from top to bottom. It
@@ -937,7 +937,14 @@ A faster run is not a fix if accuracy or hang incidence worsens.
 
 ## Phase 5: Follow-up ablations
 
-Only start these after the admission A/B is complete. Change one factor at a time:
+> **2026-07-08 decision:** B300 warm-up A≈B both reproduced the same FP4 MoE model-forward hang with a verified
+> admission bypass on Arm B. Measured interleaved admission A/B is **skipped** for hang attribution. Proceed to the
+> MoE/DSA / regression-window follow-ups below. Revisit measured admission A/B only if a later failure mode looks
+> admission-specific (for example unmatched `WAIT_BEGIN` / transfer stall) or if accuracy-only failures need a separate
+> admission screen.
+
+Only start these after the admission A/B is complete **or** after an explicit early-exit decision as above. Change one
+factor at a time:
 
 1. TP1/CP4, FIFO, padded CUDA graph: primary control.
 2. TP1/CP4, FIFO, no CUDA graph.
@@ -1085,8 +1092,10 @@ Require:
 
 ## B300 experiment progress (2026-07-08)
 
-Warm-up-only evidence so far. Measured interleaved A/B samples have not started. Do not treat the Arm-A warm-up as
-closure evidence for H0–H4.
+Warm-up A/B completed on the same host/SHA/image wiring. Measured interleaved admission samples were **not** started;
+the owner decision is to treat warm-up A≈B as sufficient to **deprioritize admission for hang attribution** and pivot to
+MoE/DSA model-forward follow-ups. Scope of that decision: the reproduced **model-forward hang** class on this pinned
+experiment, not every historical accuracy-failure mode in the NVBug census.
 
 ### Experiment identity
 
@@ -1137,16 +1146,61 @@ Last per-rank aggregate telemetry before the hang (cadence summary at `admission
 | `max_active_transfer_blocks` | 254 |
 | Cross-rank `decision_digest` | Matched across ranks at each summary cadence |
 
-Interpretation for the admission hypothesis (warm-up only):
+### Arm-B warm-up (`warmup-B-attempt-2`, admission bypassed)
 
-- Admission **was active and deferring** under the 256-block budget (`max_active_transfer_blocks=254`, non-zero effective deferral and two blocked polls totaling ~6 s wall).
-- The observed failure is a **model-forward hang inside FP4 block-scale MoE**, after substantial successful generation traffic. That matches the historical “PyExecutor model-forward hang” class more closely than an unmatched admission `WAIT_BEGIN` / transfer-status stall.
-- Admission CPU overhead (`decision_ms` ≈ 7 ms cumulative) is negligible versus the hang.
-- This single Arm-A warm-up **does not yet prove H2** (admission causes the hang). It proves the instrumented default path can reproduce the hang class on this B300 node. Arm-B (bypass) is required to see whether bypassing selection + admission-specific blocked-progress polling removes, preserves, or worsens the hang.
+| Field | Observation |
+| --- | --- |
+| Arm / bypass | `arm=B`, `bypass=true` on all four generation CP ranks; gen env confirmed `TRTLLM_DIAG_BYPASS_DISAGG_TRANSFER_ADMISSION=1` |
+| Config markers | 4/4 valid config events (8192 / 32 / 256 / experiment SHA) |
+| Pipeline progress | GSM8K client reached **821/1319** completions (~62%) before hang |
+| Outcome class | **`model_forward_hang`** — same class as Arm A |
+| Hang detector | All four generation ranks: `Hang detected after 300 seconds` at `2026-07-08 18:11:11` (~22.8 min after test start) |
+| Hang stack family | Same as Arm A: DeepSeek V3 `forward_MoE` → `fp4_block_scale_moe_runner` (not DSA projection; not admission wait) |
+| Cleanup note | Pytest/serve still tearing down after the hang (etcd expire noise / `threads can only be started once`); product hang outcome is already decisive |
 
-### Arm-B warm-up status
+Last per-rank aggregate telemetry before the hang (cadence summary at `admission_decisions=600`; ranks agree):
 
-`warmup-B-attempt-2` was relaunched on the same host (`umb-b300-dp-217`) with the same SHA, image wiring, caches, and raised timeouts, and `TRTLLM_DIAG_BYPASS_DISAGG_TRANSFER_ADMISSION=1` confirmed in the generation subprocess environment. Results will be appended here when the run finishes.
+| Metric | Rank 0–3 (same within rounding) |
+| --- | ---: |
+| `would_defer_count` (shadow only) | 120 |
+| `effective_deferred_requests` | **0** |
+| `effective_deferral_request_ms` | **0** |
+| `max_effective_deferral_ms` | **0** |
+| `blocked_poll_count` | **0** |
+| `blocked_poll_ms` | **0** |
+| `decision_ms` (CPU) | ~8.0–8.4 |
+| `max_active_transfer_blocks` | **3450** |
+| Cross-rank agreement | Summaries matched across ranks |
+
+Bypass validation: Arm B still computed the shadow controller (`would_defer_count=120`) but did **not** enforce deferral
+or admission-specific blocked-progress polling. `max_active_transfer_blocks=3450` (≫ 256 budget) is direct evidence of
+over-admission relative to Arm A’s capped ~254 active blocks.
+
+### Warm-up A vs B comparison
+
+| Dimension | Arm A | Arm B | Implication |
+| --- | --- | --- | --- |
+| Admission enforced? | Yes | No (verified) | Toggle worked |
+| GSM8K progress at hang | ~61% (810/1319) | ~62% (821/1319) | Same failure timing window |
+| Outcome | model-forward hang | model-forward hang | No arm split |
+| Hang locus | FP4 MoE runner | FP4 MoE runner | Outside admission wait path |
+| Effective deferral / blocked-poll | 119 / ~6 s | 0 / 0 | Bypass removed admission backpressure |
+| Active transfer blocks | 254 | 3450 | Bypass increased transfer pressure; hang still occurred |
+
+Decision matrix mapping: **both arms fail similarly** → H0/H4 for this hang class (admission unrelated / same independent
+problem). Not H2 (admission causes hang) and not H3 (admission protective against this hang).
+
+### Decision: deprioritize admission; pivot to MoE/DSA
+
+Owner decision on 2026-07-08:
+
+1. Treat warm-up A≈B as enough to **deprioritize PR #15356 admission** as the root cause of the reproduced hang.
+2. **Skip** the measured 5×2 / 10×2 interleaved admission block for hang attribution.
+3. **Pivot** to model-forward follow-ups aligned with the observed stacks and the regression-window alternatives:
+   - Primary fingerprint from these warm-ups: **FP4 block-scale MoE** (`fp4_block_scale_moe_runner`).
+   - Keep **DSA** ([PR #15409](https://github.com/NVIDIA/TensorRT-LLM/pull/15409), [PR #15414](https://github.com/NVIDIA/TensorRT-LLM/pull/15414)) in the next screen because historical CI hang samples were in DSA projection and those PRs touch shared attention / model-engine code in the same window — but do **not** claim the B300 warm-up stacks were DSA.
+   - Prefer same-node parent/merge isolation from Phase 5 (`#15409` then `#15414`, then `#15626` if needed), plus focused MoE ablations (CUDA graph on/off, concurrency) once a separating boundary appears.
+4. Re-open measured admission A/B only if a later signature looks admission-specific, or if completed-accuracy failures need a separate admission screen.
 
 ## Results template
 
@@ -1157,35 +1211,36 @@ Interpretation for the admission hypothesis (warm-up only):
 | Base `main` SHA | `5ec0c84ad1684c7d08e17a49cf0d53a061fd85cd` |
 | Diagnostic SHA | `9f82ceda7dee872e8f6f3f39ac758cd6a6c12de2` |
 | Container image tag | `pytorch-26.02-py3-...-202606051544-14972` (see `IMAGE_REF` in result `active.env`) |
-| Container image digest | Not yet pinned as an immutable `sha256:` in the result manifest; record before measured block |
+| Container image digest | Not pinned as an immutable `sha256:` in the warm-up manifest; pin before any future measured block |
 | DGX host | `umb-b300-dp-217` (warm-up block; expected runbook host was `umb-b300-023`) |
 | Allocation/job ID | Initial `3017028`; later resumed under a new Slurm allocation after eviction |
 | Driver | `595.58.03` |
 | CUDA | From pinned 26.02 image |
 | PyTorch | From pinned 26.02 image / build venv |
 | Model snapshot | `/home/scratch.trt_llm_data_ci/llm-models/DeepSeek-V3.2-Exp-FP4-v2` |
-| Test start/end UTC | Arm-A warm-up log window ~2026-07-08 14:50:51 → 15:14:50 (local log timestamps) |
+| Test start/end UTC | Arm A ~2026-07-08 14:50:51 → 15:14:50; Arm B ~17:48:25 → hang 18:11:11 (local log timestamps) |
 
 ### Outcome summary
 
 | Arm | Valid | Pass | Accuracy failure | Forward hang | Transfer stall | Other | Median completed duration |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | A: admission on | 0 measured (1 warm-up) | 0 | 0 | 1 warm-up | 0 | 0 | N/A (hang) |
-| B: admission bypassed | pending warm-up | | | | | | |
+| B: admission bypassed | 0 measured (1 warm-up) | 0 | 0 | 1 warm-up | 0 | 0 | N/A (hang) |
 
 ### Admission summary
 
 | Arm | Limited decisions | Unique deferred | Total deferral | Max wait | Blocked-poll time | Rank mismatch |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| A (warm-up last summary) | budget pressure observed (`max_active_transfer_blocks=254`) | 119 effective deferred | ~267192 request-ms | ~5998 ms | ~5962 ms (2 polls) | none observed (`decision_digest` matched) |
-| B effective; shadow counts only | pending | pending | N/A | 0/N/A | pending | pending |
+| A (warm-up last summary) | budget pressure (`max_active_transfer_blocks=254`) | 119 effective deferred | ~267192 request-ms | ~5998 ms | ~5962 ms (2 polls) | none observed |
+| B effective; shadow counts only | shadow `would_defer=120`; effective unlimited (`max_active_transfer_blocks=3450`) | **0** effective | **0** | **0** | **0** | none observed |
 
 ### Conclusion
 
-Arm-A warm-up on B300 reproduced the waived test’s **PyExecutor model-forward hang** class while admission was enforcing
-deferral. Hang stacks localize to **FP4 block-scale MoE forward**, not to an unmatched admission wait. Arm-B warm-up is
-in progress to complete the first A-vs-B comparison. No measured-run statistics yet; do not close H0–H4 from warm-up
-alone.
+Warm-up A/B on B300 shows the waived test’s **PyExecutor model-forward hang** in **FP4 block-scale MoE** with and
+without admission enforcement. Admission bypass was validated (zero effective deferral / blocked-poll; much higher
+active transfer blocks) and **did not remove the hang**. Admission is therefore **deprioritized** as the hang root
+cause on this pinned experiment (H0/H4 for the hang). Next work is MoE/DSA / regression-window follow-up, not measured
+admission repetitions. This does not by itself close the NVBug or attribute a specific MoE/DSA PR.
 
 ## References
 
