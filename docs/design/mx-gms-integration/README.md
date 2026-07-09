@@ -5,11 +5,12 @@ SPDX-License-Identifier: Apache-2.0
 
 # TensorRT-LLM Integration with ModelExpress and GPU Memory Service
 
-**Status:** Draft — current implementation source of truth is §18; the
+**Status:** Draft — §18 is the current GMS implementation source of truth, and §21 is the current MX readiness and
+model-family qualification source of truth. The
 [combined MX/GMS prototype](https://github.com/chienchunhung/TensorRT-LLM/tree/dynamo-integration-prototype) is
-historical
+historical.
 **Created:** 2026-04-01
-**Last Updated:** 2026-07-08
+**Last Updated:** 2026-07-09
 
 ---
 
@@ -81,6 +82,9 @@ startup; they are not work to perform on the promotion path.
 20. [ModelExpress End-to-End Verification Plan](20-mx-e2e-verification-plan.md) — Agent-executable single-node runbook
     for validating donor publication, GPU-to-GPU transfer, staged Llama reception, deterministic output equivalence,
     no-disk receiver proof, automatic local-server lifecycle, negative controls, and evidence collection.
+21. [ModelExpress Readiness Gaps and Model-Family Expansion Plan](21-mx-readiness-gaps-and-model-family-plan.md) —
+    Defines the claims that can be made after the Llama qualification, records the remaining safety and operational
+    gaps, and gives a dependency-ordered procedure for qualifying Qwen, DeepSeek, GLM, Kimi, and other model families.
 
 ---
 
