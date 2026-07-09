@@ -5,9 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # NVBug 6396413: DeepSeek V3.2 Helix Admission-Control Investigation
 
-- **Status:** MoE Phase 1 (`cudagraph:none`) complete; admission still deprioritized; see Phase 1 results; root cause not confirmed
+- **Status:** MoE Phase 1 complete (eager MoE hang); Phase 2 PR #15409 parent/merge isolation started; root cause not confirmed
 - **Created:** 2026-07-06
-- **Updated:** 2026-07-09 with MoE Phase 1 (`cudagraph:none`) unattended results
+- **Updated:** 2026-07-09 with Phase 1 results and Phase 2 (#15409) kickoff
 - **Component:** PyTorch backend, disaggregated serving, Helix context parallelism
 - **Execution hardware:** One exclusive eight-GPU B300 node; original incident hardware was B200
 - **Related change:** [PR #15356](https://github.com/NVIDIA/TensorRT-LLM/pull/15356) (admission hypothesis; now deprioritized for hang)
@@ -1231,6 +1231,25 @@ Node: `fifo-cudagraph:none-pp1tp1cp4`. Arm A (admission on). Same experiment SHA
 
 **Decision:** cudagraph:none still hangs (eager MoE / Helix+MoE). Proceed to regression-window PR isolation (#15409 then #15414).
 
+Notes:
+
+- Rep-3 is **not** a product hang: 0 config markers, ~319 s, `process … exited with code 1` during server startup after prior-run cleanup. Treat as excluded infra/setup; the three MoE hangs are the Phase 1 signal.
+- Hang locus unchanged vs CUDA-graph-on warm-ups: `fp4_block_scale_moe_runner`.
+
+### MoE Phase 2 kickoff (PR #15409 parent/merge)
+
+Started 2026-07-09 on host `umb-b300-023` (new allocation after Phase 1 host `umb-b300-dp-217`).
+
+| Item | Value |
+| --- | --- |
+| Parent (control) | `434dc3345d033944076b98eae570ea4bf8bc3337` |
+| Merge (treatment) | `aaffa2f9fef3025e0f698d978385a73460344e0b` (#15409) |
+| Worktrees | `/home/scratch.chienchunh_coreai/dev/nvbug-6396413-worktrees/{434dc3345d03,aaffa2f9fef3}` |
+| Result root | `/home/scratch.chienchunh_coreai/dev/nvbug-6396413-results/phase2-15409-20260709T164012Z` |
+| Test node | `fifo-cudagraph:with_padding-pp1tp1cp4` (incident node; not `cudagraph:none`) |
+| Protocol | 1 warm-up + 5 valid runs per SHA, interleaved when both wheels exist; exclude warm-ups |
+
+**Blocker for GPU runs on this allocation:** container `chienchunh-ide-dev-0` currently has no `/dev/nvidia*` device nodes (`nvidia-smi` fails) even though `/proc/driver/nvidia` lists eight GPUs. Parent `103-real` wheel build was started anyway (compile does not need device nodes). GPU warm-up/reps require restoring device mounts (reattach/relaunch container with GPU devices) before measured Phase 2 runs.
 
 ## Results template
 
