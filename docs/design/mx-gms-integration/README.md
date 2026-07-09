@@ -78,6 +78,9 @@ startup; they are not work to perform on the promotion path.
 19. [ModelStreamer and Weight-Loading Integration Assessment](19-model-streamer-weight-loading-assessment.md) —
     Assesses Run:ai Model Streamer against MX, GMS, GMS storage snapshots, Dynamo process Snapshot, and the TRT-LLM
     weight-loading proposals; defines the recommended ownership boundaries, shared contracts, and phased delivery plan.
+20. [ModelExpress End-to-End Verification Plan](20-mx-e2e-verification-plan.md) — Agent-executable single-node runbook
+    for validating donor publication, GPU-to-GPU transfer, staged Llama reception, deterministic output equivalence,
+    no-disk receiver proof, automatic local-server lifecycle, negative controls, and evidence collection.
 
 ---
 
