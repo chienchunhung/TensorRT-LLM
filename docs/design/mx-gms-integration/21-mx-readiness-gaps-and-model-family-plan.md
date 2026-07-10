@@ -11,9 +11,13 @@ SPDX-License-Identifier: Apache-2.0
 
 **Last Updated:** 2026-07-09
 
-**Implementation assessed:**
-[NVIDIA/TensorRT-LLM#15641](https://github.com/NVIDIA/TensorRT-LLM/pull/15641) at `fc23344fe9`, plus the five merged
-staged-hook waves ending in [NVIDIA/TensorRT-LLM#15432](https://github.com/NVIDIA/TensorRT-LLM/pull/15432)
+**In-flight implementation assessed:**
+[NVIDIA/TensorRT-LLM#15641](https://github.com/NVIDIA/TensorRT-LLM/pull/15641) at `fc23344fe9` (open and non-draft as
+of 2026-07-09), plus the five merged staged-hook waves ending in
+[NVIDIA/TensorRT-LLM#15432](https://github.com/NVIDIA/TensorRT-LLM/pull/15432)
+
+**Readiness accounting:** Treat behavior supplied by PR #15641 as pending until it merges. Re-run validation against
+the final merged commit rather than carrying forward evidence from an earlier PR head.
 
 **Companion execution runbook:** [§20 ModelExpress End-to-End Verification Plan](20-mx-e2e-verification-plan.md)
 
@@ -30,6 +34,10 @@ That is not yet the same as saying that MX is generally ready for TensorRT-LLM. 
 contains only `LlamaForCausalLM` with transform protocol version 1. Other root model classes fall back to Hugging Face
 loading, even when their nested Linear, Attention, MLA, MoE, or Mamba modules already implement staged hooks.
 
+PR #15641 is the delivery vehicle for the optional standalone MX integration baseline and a prerequisite for the
+Llama preview. It packages and operationalizes the merged Wave 5 path; it does not broaden the model-family
+qualification boundary.
+
 MX does not need to support every TensorRT-LLM model before it can become a supported feature. It does need:
 
 1. An explicit, machine-readable support matrix rather than an architectural resemblance claim.
@@ -42,7 +50,7 @@ MX does not need to support every TensorRT-LLM model before it can become a supp
 
 | Level | Claim | Minimum exit gate |
 |:--|:--|:--|
-| R0 - Review ready | PR #15641 is coherent and safe to review. | Unit/CI checks pass; unsupported models and mismatches fall back before P2P; limitations are documented. |
+| R0 - Integration baseline | PR #15641 supplies an optional, safely-falling-back standalone MX path. | The final PR head passes required CI, a production Linux wheel and `[mx]` install, focused loader/identity tests, and base-install dependency checks; unsupported models and mismatches fall back before P2P. |
 | R1 - Llama preview | MX works for one bounded Llama profile. | §20 passes, including exact token equality and a receiver that cannot read weight shards. |
 | R2 - Multi-family beta | MX is usable across representative TRT-LLM model categories. | Llama, Qwen dense, one Qwen MoE profile, one DeepSeek/MLA profile, and one GLM or Kimi text profile pass their declared matrices. Artifact and fallback policy are implemented. |
 | R3 - Supported MX feature | MX has a maintainable production support contract. | Stable upstream API, content and transform-ABI identity, persistent GPU CI, cross-node qualification, observability, documented SLOs, and an explicit support matrix. |
@@ -71,6 +79,35 @@ The following statements describe PR #15641 at the assessed head and should be r
 The important distinction is **migrated** versus **qualified**. A module can have correctly separated staged hooks and
 still be unsafe to enable until the whole root model, every selected backend, and the real transfer path are tested.
 
+### 2.1 What PR #15641 contributes
+
+PR #15641 is an important part of the readiness plan. If it merges at the assessed behavior, it closes the standalone
+installation and node-local usability gap while preserving the Wave 5 safety boundary.
+
+| Area | In-flight change in PR #15641 | Readiness effect after merge | Remaining boundary |
+|:--|:--|:--|:--|
+| Packaging | Adds the optional `tensorrt_llm[mx]` extra with `modelexpress==0.4.1`; MX stays out of base requirements. | Establishes the correct opt-in installation contract for the currently qualified client/server pair. | Keep the exact pin while private MX APIs are used; a public versioned API and compatibility CI are still required before using a range. |
+| Configuration | Adds `mx_config.local_server` fields for enablement, port, server image, Redis image, and startup timeout. An explicit `mx_config.server_url` or `MODEL_EXPRESS_URL` takes precedence. | Makes the MX path configurable through normal TRT-LLM APIs without affecting non-MX loads. | The fields remain prototype status and do not define managed-service ownership or authentication. |
+| Node-local lifecycle | Creates/reuses a per-port Docker network, Redis container, and MX server; validates image/network/port compatibility and handles creation races. | Closes the single-node standalone-server setup gap for Docker-capable environments. | It is not a Kubernetes, multi-node service-discovery, multi-tenant, or production lifecycle manager. |
+| MX 0.4.1 integration | Supports exact-identity source queries, stable model-name resolution, source metadata, and serialized use of process-wide MX environment/identity-builder state. | Makes the released 0.4.1 client/server shape usable from TRT-LLM and preserves SourceIdentity/layout/protocol checks. | It still depends on `_build_trtllm_identity` and temporary process-wide state; this is a pinned compatibility adapter, not a stable public API. |
+| Fallback correctness | Falls back to a complete Hugging Face load on local-server failure, source incompatibility, transfer error, or partial post-transform transfer; avoids republishing workers that received MX weights. | Preserves correctness and avoids mixing a partial post-transform source with raw disk tensors. | Operators still need structured result/reason telemetry and a strict mode that makes unexpected fallback fail CI/startup. |
+| Model support | Retains `LlamaForCausalLM` protocol v1 and rejects a separately loaded draft model from the staged receive path. | Keeps the existing narrow qualification fail-safe while making it usable as a standalone feature. | Qwen, DeepSeek, GLM, Kimi, target-plus-draft, and multimodal roots remain unqualified. |
+| Tests and docs | Adds unit coverage for config, Docker lifecycle/races, source discovery, identity metadata, model-name handoff, fallback, and loader integration, plus a user guide. | Provides the R0 regression-test foundation and documents the intended support scope. | Current-head production Linux wheel validation, focused runtime tests, and the live Llama donor/receiver experiment remain merge/readiness evidence, not unit-test substitutes. |
+
+### 2.2 Post-#15641 residual work
+
+Read the gap register below as the state **after PR #15641 merges**:
+
+- **Partially addressed by #15641:** MX-R5 (correct exact pin, but private API remains), MX-R7 (unit groundwork, but no
+  permanent real-GPU gate), MX-R9 (safe fallback and diagnostics, but no structured terminal result/strict mode), and
+  MX-R12 (local Docker lifecycle only).
+- **Not addressed by #15641:** MX-R1 through MX-R4, MX-R6, MX-R8, MX-R10, MX-R11, MX-R13, and MX-R14.
+- **Immediate merge/readiness evidence:** required CI on the final PR head, a production Linux wheel with both base and
+  `[mx]` installation checks, the focused MX/GMS loader and identity tests, and the §20 live Llama donor/receiver run.
+
+PR #15641 should therefore be credited as the standalone integration baseline, not counted as a Qwen/DeepSeek/GLM/Kimi
+qualification PR or as proof of cross-node and production readiness.
+
 ## 3. Readiness Gap Register
 
 | ID | Gap | Priority | Required closure and evidence |
@@ -79,14 +116,14 @@ still be unsafe to enable until the whole root model, every selected backend, an
 | MX-R2 | The capability gate is too coarse. | P0 | Replace the class-only `isinstance` allowlist with a structured profile keyed by exact root class, architecture/model type, transfer scope, protocol, and feature constraints. Use the same decision for publish and receive. |
 | MX-R3 | Checkpoint contents are not identified. | P0 for content-safe use | Add `ArtifactIdentity`, bind it into SourceIdentity v2 and MX discovery metadata, and reject same-config/different-revision sources before P2P. |
 | MX-R4 | Transform implementation compatibility is represented only by one global protocol integer. | P0 | Define and version a post-transform layout ABI. Include it in compatibility metadata, document bump rules, and test supported producer/receiver version pairs. |
-| MX-R5 | ModelExpress API and package policy are not stable. | P0 for R3 | Keep the exact 0.4.1 pin while private APIs are used. Add public MX identity/query/publish APIs and compatibility CI before adopting a version range. |
+| MX-R5 | ModelExpress API and package policy are not stable. | P0 for R3 | PR #15641 correctly adds the optional extra and exact 0.4.1 pin. Keep that pin while private APIs are used; add public MX identity/query/publish APIs and compatibility CI before adopting a version range. |
 | MX-R6 | Quantization and parallel coverage is not declared per family. | P0 | Publish only combinations with evidence for the claimed dtype, quant algorithm, attention/MoE backend, TP/PP/EP/CP, attention DP, and rank mapping. |
-| MX-R7 | There is no permanent real donor/receiver GPU gate per family. | P0 | Turn the reusable parts of §20 into scheduled or pre-merge GPU jobs. Require exact outputs, transfer evidence, and no-disk receiver proof. |
+| MX-R7 | There is no permanent real donor/receiver GPU gate per family. | P0 | Build on PR #15641's unit coverage by turning the reusable parts of §20 into scheduled or pre-merge GPU jobs. Require exact outputs, transfer evidence, and no-disk receiver proof. |
 | MX-R8 | Single-node transfer does not prove cross-node RDMA. | P0 for a cross-node claim | Run a two-node qualification with the production NIC/NIXL path, rank-to-rank mapping, firewall settings, timeout handling, and failure injection. |
-| MX-R9 | Disk fallback is safe but too easy to miss operationally. | P0 | Emit a structured load result and reason code, counters, and a startup summary. Add a strict `MX required` mode for CI and deployments that must not fall back. |
+| MX-R9 | Disk fallback is safe but too easy to miss operationally. | P0 | Preserve PR #15641's full-disk fallback semantics, then emit a structured load result and reason code, counters, and a startup summary. Add a strict `MX required` mode for CI and deployments that must not fall back. |
 | MX-R10 | Separate target-plus-draft transfer is unsupported; one-engine MTP is not broadly qualified. | P1, feature-specific | Track identity/layout per submodel, make multi-component transfer atomic, and qualify each speculative mode separately. Keep it disabled otherwise. |
 | MX-R11 | Multimodal transfer scope is undefined. | P1, required for Kimi K2.5/Qwen VL | Define whether MX transfers only the language model or the complete wrapper. Give each component identity and atomic fallback semantics. |
-| MX-R12 | Automatic lifecycle is a local Docker convenience, not a managed deployment design. | P1 | Document external-service ownership and add Kubernetes/managed readiness, authentication, cleanup, and multi-tenant isolation before claiming managed lifecycle support. |
+| MX-R12 | Automatic lifecycle is a local Docker convenience, not a managed deployment design. | P1 | Treat PR #15641's Docker/Redis launcher as the standalone path. Document external-service ownership and add Kubernetes/managed readiness, authentication, cleanup, and multi-tenant isolation before claiming managed lifecycle support. |
 | MX-R13 | Startup performance and resource SLOs are not qualified. | P1 for R3 | Measure donor load, publication, discovery, transfer, receiver finalize, peak HBM, CPU, and network use against an HF baseline; define p50/p95 targets. |
 | MX-R14 | MX-to-GMS composition is not an MX-only readiness gate. | P2/separate track | Qualify MX-seeded GMS only after the native GMS committed-layout contract in §18 exists. Do not block standalone MX family work on it. |
 
