@@ -80,11 +80,13 @@ startup; they are not work to perform on the promotion path.
     Assesses Run:ai Model Streamer against MX, GMS, GMS storage snapshots, Dynamo process Snapshot, and the TRT-LLM
     weight-loading proposals; defines the recommended ownership boundaries, shared contracts, and phased delivery plan.
 20. [ModelExpress End-to-End Verification Plan](20-mx-e2e-verification-plan.md) — Agent-executable single-node runbook
-    for validating donor publication, GPU-to-GPU transfer, staged Llama reception, deterministic output equivalence,
-    no-disk receiver proof, automatic local-server lifecycle, negative controls, and evidence collection.
+    for validating a combined PR #15641/#16159 head, content-bound donor publication, GPU-to-GPU transfer, staged
+    Llama reception, deterministic output equivalence, canonical-snapshot no-disk proof, local-server lifecycle,
+    negative controls, and evidence collection.
 21. [ModelExpress Readiness Gaps and Model-Family Expansion Plan](21-mx-readiness-gaps-and-model-family-plan.md) —
-    Defines the claims that can be made after the Llama qualification, records the remaining safety and operational
-    gaps, and gives a dependency-ordered procedure for qualifying Qwen, DeepSeek, GLM, Kimi, and other model families.
+    Accounts for the in-flight standalone MX and ArtifactIdentity PRs, defines the claims that can be made after Llama
+    qualification, and gives a dependency-ordered procedure for qualifying Qwen, DeepSeek, GLM, Kimi, and other
+    families.
 
 ---
 

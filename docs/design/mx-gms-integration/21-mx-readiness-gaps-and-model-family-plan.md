@@ -11,13 +11,18 @@ SPDX-License-Identifier: Apache-2.0
 
 **Last Updated:** 2026-07-09
 
-**In-flight implementation assessed:**
-[NVIDIA/TensorRT-LLM#15641](https://github.com/NVIDIA/TensorRT-LLM/pull/15641) at `fc23344fe9` (open and non-draft as
-of 2026-07-09), plus the five merged staged-hook waves ending in
-[NVIDIA/TensorRT-LLM#15432](https://github.com/NVIDIA/TensorRT-LLM/pull/15432)
+**In-flight implementations assessed:**
 
-**Readiness accounting:** Treat behavior supplied by PR #15641 as pending until it merges. Re-run validation against
-the final merged commit rather than carrying forward evidence from an earlier PR head.
+- [NVIDIA/TensorRT-LLM#15641](https://github.com/NVIDIA/TensorRT-LLM/pull/15641) at `fc23344fe9` (open and non-draft as
+  of 2026-07-09): optional packaging, ModelExpress 0.4.1 integration, and local Docker/Redis lifecycle.
+- [NVIDIA/TensorRT-LLM#16159](https://github.com/NVIDIA/TensorRT-LLM/pull/16159) at `33ee4dd604` (open draft as of
+  2026-07-09): ArtifactIdentity and SourceIdentity format v2.
+- The five merged staged-hook waves ending in
+  [NVIDIA/TensorRT-LLM#15432](https://github.com/NVIDIA/TensorRT-LLM/pull/15432).
+
+**Readiness accounting:** Treat behavior supplied by PRs #15641 and #16159 as pending until each merges. Because both
+touch the loading/identity integration, re-run validation on a final head containing both rather than carrying forward
+evidence from either isolated PR.
 
 **Companion execution runbook:** [§20 ModelExpress End-to-End Verification Plan](20-mx-e2e-verification-plan.md)
 
@@ -25,10 +30,11 @@ the final merged commit rather than carrying forward evidence from an earlier PR
 
 ## 1. Decision Summary
 
-After PR #15641 and a passing §20 experiment, TensorRT-LLM can make this bounded claim:
+After PRs #15641 and #16159 merge and the combined head passes §20, TensorRT-LLM can make this bounded claim:
 
-> **ModelExpress Llama preview:** post-transform MX transfer is functionally qualified for the explicitly tested
-> `LlamaForCausalLM` profile, ModelExpress 0.4.1, and the recorded quantization and parallel configuration.
+> **Content-bound ModelExpress Llama preview:** post-transform MX transfer is functionally qualified for the explicitly
+> tested `LlamaForCausalLM` profile, immutable checkpoint artifact, ModelExpress 0.4.1, and the recorded quantization
+> and parallel configuration.
 
 That is not yet the same as saying that MX is generally ready for TensorRT-LLM. The current receiver capability gate
 contains only `LlamaForCausalLM` with transform protocol version 1. Other root model classes fall back to Hugging Face
@@ -37,6 +43,10 @@ loading, even when their nested Linear, Attention, MLA, MoE, or Mamba modules al
 PR #15641 is the delivery vehicle for the optional standalone MX integration baseline and a prerequisite for the
 Llama preview. It packages and operationalizes the merged Wave 5 path; it does not broaden the model-family
 qualification boundary.
+
+PR #16159 is the delivery vehicle for the separate ArtifactIdentity follow-up called out by #15641. It closes the
+same-config/different-content safety gap for a single checkpoint artifact, but it does not add model families,
+component-scoped identities, GMS metadata transport, or a stable transform-layout ABI.
 
 MX does not need to support every TensorRT-LLM model before it can become a supported feature. It does need:
 
@@ -51,7 +61,7 @@ MX does not need to support every TensorRT-LLM model before it can become a supp
 | Level | Claim | Minimum exit gate |
 |:--|:--|:--|
 | R0 - Integration baseline | PR #15641 supplies an optional, safely-falling-back standalone MX path. | The final PR head passes required CI, a production Linux wheel and `[mx]` install, focused loader/identity tests, and base-install dependency checks; unsupported models and mismatches fall back before P2P. |
-| R1 - Llama preview | MX works for one bounded Llama profile. | §20 passes, including exact token equality and a receiver that cannot read weight shards. |
+| R1 - Content-bound Llama preview | MX works for one bounded Llama profile and immutable artifact. | PR #16159 is merged into the tested #15641 integration; §20 passes, including exact token equality, ArtifactIdentity matching/mismatch controls, and a receiver that cannot read weight shards. |
 | R2 - Multi-family beta | MX is usable across representative TRT-LLM model categories. | Llama, Qwen dense, one Qwen MoE profile, one DeepSeek/MLA profile, and one GLM or Kimi text profile pass their declared matrices. Artifact and fallback policy are implemented. |
 | R3 - Supported MX feature | MX has a maintainable production support contract. | Stable upstream API, content and transform-ABI identity, persistent GPU CI, cross-node qualification, observability, documented SLOs, and an explicit support matrix. |
 
@@ -60,15 +70,17 @@ their own feature qualification. They should not be implied by R2 or R3 unless t
 
 ## 2. Current Implementation Baseline
 
-The following statements describe PR #15641 at the assessed head and should be refreshed when its head changes:
+The following statements describe PRs #15641 and #16159 at the assessed heads and should be refreshed when either
+head changes:
 
 - The five staged-hook migration waves are merged. The loader can run `setup_aliases()`, skip
   `transform_weights()`, and run `cache_derived_state()` for a compatible post-transform receiver.
 - `ModelLoader._MX_STAGED_RECEIVER_ALLOWLIST` contains only `(LlamaForCausalLM, 1)`.
 - The gate uses `isinstance(model, model_type)`. It is class based, not an exact model-profile declaration.
-- `SourceIdentity` covers resolved model configuration, quantization, backend choices, parallel sizes/ranks, and the
-  constructed local tensor name/shape/dtype layout.
-- `SourceIdentity` does not prove that two same-config checkpoints contain the same bytes or resolved revision.
+- PR #15641's SourceIdentity covers resolved model configuration, quantization, backend choices, parallel sizes/ranks,
+  and the constructed local tensor name/shape/dtype layout.
+- PR #16159 proposes SourceIdentity format v2 with a required ArtifactIdentity. It uses an immutable revision for a
+  recognized Hugging Face snapshot or a canonical full-content manifest for a local checkpoint.
 - ModelExpress is an optional `[mx]` extra pinned to `modelexpress==0.4.1`. The integration still uses a private MX
   identity builder and temporary process-wide environment state.
 - A separately loaded draft model is rejected for post-transform MX transfer. The local automatic server path is
@@ -94,19 +106,37 @@ installation and node-local usability gap while preserving the Wave 5 safety bou
 | Model support | Retains `LlamaForCausalLM` protocol v1 and rejects a separately loaded draft model from the staged receive path. | Keeps the existing narrow qualification fail-safe while making it usable as a standalone feature. | Qwen, DeepSeek, GLM, Kimi, target-plus-draft, and multimodal roots remain unqualified. |
 | Tests and docs | Adds unit coverage for config, Docker lifecycle/races, source discovery, identity metadata, model-name handoff, fallback, and loader integration, plus a user guide. | Provides the R0 regression-test foundation and documents the intended support scope. | Current-head production Linux wheel validation, focused runtime tests, and the live Llama donor/receiver experiment remain merge/readiness evidence, not unit-test substitutes. |
 
-### 2.2 Post-#15641 residual work
+### 2.2 What PR #16159 contributes
 
-Read the gap register below as the state **after PR #15641 merges**:
+PR #16159 implements the ArtifactIdentity follow-up that #15641 intentionally left separate. If it merges at the
+assessed behavior, it closes the base checkpoint-content binding gap for MX and for the backend-neutral identity used
+by GMS.
 
+| Area | In-flight change in PR #16159 | Readiness effect after merge | Remaining boundary |
+|:--|:--|:--|:--|
+| Artifact contract | Adds `ArtifactIdentity(format_version, scheme, digest)` with format version 1 and nests it in required SourceIdentity format v2 metadata. | Makes the immutable artifact part of global compatibility instead of relying on model name, config, shapes, and dtype alone. | Composite target/draft/language/vision/adapter components are not represented independently. |
+| Hugging Face snapshots | Derives the digest from a recognized immutable 40- or 64-hex snapshot revision plus repository-relative subpath without rereading model shards. | Preserves a fast identity path and allows an MX receiver to validate a trusted snapshot even when weight shards are unavailable. | The path must retain the canonical `models--.../snapshots/<revision>` structure; arbitrary local copies use the manifest scheme. |
+| Local checkpoints | Builds a canonical SHA-256 manifest over relative file paths, sizes, and full file contents while detecting files that change during hashing. | Gives local checkpoints content-bound, path-independent identity. | Every regular checkpoint file is read in full; large-model startup overhead and any future trusted-manifest/cache policy need explicit measurement and design. |
+| Loader and policy | Passes checkpoint provenance into SourceIdentity construction. Missing, malformed, unknown-version, incomplete, or mismatched artifact metadata rejects sharing. | MX falls back before P2P; the GMS strict gate fails before materialization. | #16159 does not add real GMS metadata publication/retrieval, committed-layout metadata, or MX/GMS composition. |
+| Tests | Adds focused construction, serialization, matching, MX fallback, and strict GMS-gate coverage; the PR reports 43 focused tests. | Provides direct regression coverage for the content-identity safety property. | The full MX/GMS loader suites, a combined #15641 + #16159 Linux wheel, and live donor/receiver validation remain required. |
+
+### 2.3 Post-#15641/#16159 residual work
+
+Read the gap register below as the state **after both PRs merge**:
+
+- **Addressed for a single target checkpoint by #16159:** MX-R3. Component-level artifact identity remains under
+  MX-R10 and MX-R11, while local full-manifest hashing cost remains under MX-R13.
 - **Partially addressed by #15641:** MX-R5 (correct exact pin, but private API remains), MX-R7 (unit groundwork, but no
   permanent real-GPU gate), MX-R9 (safe fallback and diagnostics, but no structured terminal result/strict mode), and
   MX-R12 (local Docker lifecycle only).
-- **Not addressed by #15641:** MX-R1 through MX-R4, MX-R6, MX-R8, MX-R10, MX-R11, MX-R13, and MX-R14.
-- **Immediate merge/readiness evidence:** required CI on the final PR head, a production Linux wheel with both base and
-  `[mx]` installation checks, the focused MX/GMS loader and identity tests, and the §20 live Llama donor/receiver run.
+- **Not addressed by either PR:** MX-R1, MX-R2, MX-R4, MX-R6, MX-R8, MX-R10, MX-R11, MX-R13, and MX-R14.
+- **Immediate merge/readiness evidence:** resolve/rebase any overlap, build a production Linux wheel from one head
+  containing both PRs, run base and `[mx]` installation checks, run the full focused MX/GMS loader and identity suites,
+  and complete the updated §20 live Llama donor/receiver and artifact-mismatch controls.
 
-PR #15641 should therefore be credited as the standalone integration baseline, not counted as a Qwen/DeepSeek/GLM/Kimi
-qualification PR or as proof of cross-node and production readiness.
+PR #15641 should therefore be credited as the standalone integration baseline, and #16159 as the base ArtifactIdentity
+closure. Neither should be counted as a Qwen/DeepSeek/GLM/Kimi qualification PR or as proof of cross-node and
+production readiness.
 
 ## 3. Readiness Gap Register
 
@@ -114,17 +144,17 @@ qualification PR or as proof of cross-node and production readiness.
 |:--|:--|:--|:--|
 | MX-R1 | Post-transform reception is Llama-only. | P0 for R2 | Qualify exact Qwen, DeepSeek, GLM, Kimi, and other priority profiles one at a time; never enable a family only because it looks Llama-like. |
 | MX-R2 | The capability gate is too coarse. | P0 | Replace the class-only `isinstance` allowlist with a structured profile keyed by exact root class, architecture/model type, transfer scope, protocol, and feature constraints. Use the same decision for publish and receive. |
-| MX-R3 | Checkpoint contents are not identified. | P0 for content-safe use | Add `ArtifactIdentity`, bind it into SourceIdentity v2 and MX discovery metadata, and reject same-config/different-revision sources before P2P. |
+| MX-R3 | Checkpoint contents are not identified on landed `main`. | P0 until #16159 merges | PR #16159 adds ArtifactIdentity v1 and SourceIdentity v2, with immutable HF-revision or local full-manifest schemes and fail-closed MX/GMS policy. Merge it, validate it with #15641, and keep component identities tracked under MX-R10/MX-R11. |
 | MX-R4 | Transform implementation compatibility is represented only by one global protocol integer. | P0 | Define and version a post-transform layout ABI. Include it in compatibility metadata, document bump rules, and test supported producer/receiver version pairs. |
 | MX-R5 | ModelExpress API and package policy are not stable. | P0 for R3 | PR #15641 correctly adds the optional extra and exact 0.4.1 pin. Keep that pin while private APIs are used; add public MX identity/query/publish APIs and compatibility CI before adopting a version range. |
 | MX-R6 | Quantization and parallel coverage is not declared per family. | P0 | Publish only combinations with evidence for the claimed dtype, quant algorithm, attention/MoE backend, TP/PP/EP/CP, attention DP, and rank mapping. |
-| MX-R7 | There is no permanent real donor/receiver GPU gate per family. | P0 | Build on PR #15641's unit coverage by turning the reusable parts of §20 into scheduled or pre-merge GPU jobs. Require exact outputs, transfer evidence, and no-disk receiver proof. |
+| MX-R7 | There is no permanent real donor/receiver GPU gate per family. | P0 | Build on PRs #15641/#16159's unit coverage by turning the reusable parts of §20 into scheduled or pre-merge GPU jobs. Require exact outputs, artifact/layout identity evidence, transfer evidence, and no-disk receiver proof. |
 | MX-R8 | Single-node transfer does not prove cross-node RDMA. | P0 for a cross-node claim | Run a two-node qualification with the production NIC/NIXL path, rank-to-rank mapping, firewall settings, timeout handling, and failure injection. |
 | MX-R9 | Disk fallback is safe but too easy to miss operationally. | P0 | Preserve PR #15641's full-disk fallback semantics, then emit a structured load result and reason code, counters, and a startup summary. Add a strict `MX required` mode for CI and deployments that must not fall back. |
 | MX-R10 | Separate target-plus-draft transfer is unsupported; one-engine MTP is not broadly qualified. | P1, feature-specific | Track identity/layout per submodel, make multi-component transfer atomic, and qualify each speculative mode separately. Keep it disabled otherwise. |
 | MX-R11 | Multimodal transfer scope is undefined. | P1, required for Kimi K2.5/Qwen VL | Define whether MX transfers only the language model or the complete wrapper. Give each component identity and atomic fallback semantics. |
 | MX-R12 | Automatic lifecycle is a local Docker convenience, not a managed deployment design. | P1 | Treat PR #15641's Docker/Redis launcher as the standalone path. Document external-service ownership and add Kubernetes/managed readiness, authentication, cleanup, and multi-tenant isolation before claiming managed lifecycle support. |
-| MX-R13 | Startup performance and resource SLOs are not qualified. | P1 for R3 | Measure donor load, publication, discovery, transfer, receiver finalize, peak HBM, CPU, and network use against an HF baseline; define p50/p95 targets. |
+| MX-R13 | Startup performance and resource SLOs are not qualified. | P1 for R3 | Measure ArtifactIdentity construction (especially local full-manifest hashing), donor load, publication, discovery, transfer, receiver finalize, peak HBM, CPU, storage I/O, and network use against an HF baseline; define p50/p95 targets. |
 | MX-R14 | MX-to-GMS composition is not an MX-only readiness gate. | P2/separate track | Qualify MX-seeded GMS only after the native GMS committed-layout contract in §18 exists. Do not block standalone MX family work on it. |
 
 ## 4. Replace the Class Allowlist with Qualification Profiles
@@ -254,7 +284,7 @@ Also assert that no `transform_weights()` implementation is called on the receiv
 - Audit runtime environment variables and defaults that affect transformed layout or structural wiring. Move them into
   resolved/fingerprinted config or exclude the combination.
 - Verify producer rank N can match only receiver rank N for the same TP/PP/EP/CP layout.
-- After ArtifactIdentity lands, prove that two checkpoints with the same config but different tensor contents reject.
+- With PR #16159 integrated, prove that two checkpoints with the same config but different tensor contents reject.
 - Verify an unsupported layout-ABI version rejects before P2P.
 
 **Goal:** Prevent a correct staged implementation from consuming the wrong transformed bytes.
@@ -362,52 +392,65 @@ Split Kimi into text and multimodal milestones:
 **Kimi exit gate:** Text K2 has an explicit profile and real E2E evidence. K2.5 is advertised only after component
 scope, atomicity, and multimodal output tests are complete.
 
-## 8. ArtifactIdentity Follow-Up PR
+## 8. ArtifactIdentity in PR #16159
 
-ArtifactIdentity should remain a separate PR from model-family enablement. It addresses a different safety property:
-SourceIdentity says the runtime layouts are compatible; ArtifactIdentity says the bytes are from the requested model
-artifact.
+PR #16159 keeps ArtifactIdentity separate from model-family enablement, as recommended. SourceIdentity proves runtime
+layout compatibility; the nested ArtifactIdentity proves that source and receiver selected the same immutable
+checkpoint artifact.
 
-### Proposed contract
+### Implemented contract
 
 ```python
 @dataclass(frozen=True)
 class ArtifactIdentity:
     format_version: int
-    provider: str
-    resolved_revision: str
-    manifest_digest: str
-    components: tuple[tuple[str, str], ...]
+    scheme: str
+    digest: str
 ```
 
-- `resolved_revision` is an immutable Hub commit, trusted object-store version, or local manifest revision.
-- `manifest_digest` is a canonical digest over ordered checkpoint object identifiers or shard digests, not a mutable
-  model name.
-- `components` identifies base, adapter, draft, language, vision, or other independently loaded artifacts.
-- Discovery strings such as a Hub model name remain useful labels but are not compatibility proof.
+PR #16159 defines ArtifactIdentity format version 1 and two schemes:
 
-### Resolution strategy
+- **`hf_snapshot_revision`:** hashes a recognized immutable 40- or 64-hex Hugging Face snapshot revision and its
+  repository-relative subpath. It does not reread the model shards.
+- **`checkpoint_manifest_sha256`:** walks a local checkpoint, hashes each retained regular file in full, and hashes the
+  canonical ordered manifest of relative path, size, and SHA-256. Absolute paths are excluded, and a file changing
+  during hashing is rejected.
 
-- **Hugging Face Hub:** use the resolved commit plus LFS object IDs or trusted immutable sibling metadata. Avoid
-  rehashing a very large snapshot on every startup.
-- **Local checkpoint:** require or generate a canonical shard manifest. Cache its digest only with a defensible
-  invalidation key; size/mtime alone is not sufficient for a security-sensitive mode.
-- **Receiver without shard access:** pass the expected immutable artifact identity from the resolver/orchestrator. The
-  no-disk receiver must not need to open weight shards merely to validate a source.
-- **Composite model:** hash an ordered component manifest so target, draft, language, vision, and adapters cannot be
-  silently mixed.
+SourceIdentity format version 2 requires this value, includes it in global matching and serialization, and rejects
+unknown or old identity formats rather than silently accepting content with unknown provenance.
 
-### Integration and tests
+### What #16159 closes
 
-1. Add the ArtifactIdentity fingerprint to SourceIdentity format version 2 or to an equivalent required global
-   compatibility layer.
-2. Include it in MX source publication and exact source discovery.
-3. Reject missing or mismatched ArtifactIdentity before NIXL registration/transfer; MX falls back with an explicit
-   reason.
-4. Test same config/different weights, same model name/different revision, mutated local shard, missing manifest,
-   component order mismatch, and a matching no-disk receiver.
-5. Document the compatibility behavior for old v1 publishers. The safe default for post-transform transfer is fallback,
-   not accepting an identity with unknown contents.
+1. Same-config/same-shape checkpoints with different immutable revisions or local content no longer match.
+2. MX rejects missing, malformed, incomplete, unknown-version, or mismatched artifact metadata and falls back before
+   transfer.
+3. The GMS strict gate rejects the same conditions before materialization.
+4. A trusted canonical Hugging Face snapshot receiver can validate identity without opening checkpoint weight shards.
+5. Focused tests cover construction, serialization, matching, MX fallback, and strict GMS behavior.
+
+### Remaining work after #16159
+
+1. **Combined integration:** #16159 and #15641 are independent in-flight branches that overlap loader/identity tests.
+   Rebase or merge them into one test head and run the complete loader suites plus §20 before crediting the closure.
+2. **Local-checkpoint cost:** the manifest scheme reads every retained file in full. Measure this on representative
+   checkpoints and decide whether a signed/trusted precomputed manifest or safe cache is needed without weakening
+   content binding.
+3. **Composite artifacts:** one ArtifactIdentity covers the checkpoint path passed to ModelLoader. Target, draft,
+   language, vision, and adapter components still need an ordered component identity and atomic transfer contract.
+4. **GMS transport:** #16159 updates the backend-neutral identity and strict gate, but intentionally does not add GMS
+   metadata publication/retrieval or committed-layout metadata.
+5. **Transform ABI:** ArtifactIdentity identifies input content, not the TRT-LLM transform implementation that produced
+   the published runtime layout. MX-R4 remains open.
+6. **Compatibility:** SourceIdentity v1 publishers are intentionally incompatible with required v2 consumers. Verify
+   that mixed-version MX deployments return an explicit fallback reason and document the upgrade order.
+
+### Required combined evidence
+
+- Build and install a production Linux wheel from a head containing both PRs.
+- Run the full focused MX/GMS loader, SourceIdentity, and ArtifactIdentity suites.
+- Run §20 with a canonical HF snapshot for the no-shards receiver gate.
+- Run an artifact-mismatch control that rejects before P2P and then completes the expected disk fallback.
+- Record ArtifactIdentity scheme/digest and SourceIdentity format version in the evidence bundle.
 
 ## 9. ModelExpress Package and API Policy
 
@@ -462,7 +505,7 @@ flowchart TD
     A --> F["DeepSeek V3/V3.2"]
     A --> G["GLM and Kimi K2 text profiles"]
     A --> H["Qwen hybrid and DeepSeek V4"]
-    B["ArtifactIdentity + SourceIdentity v2"] --> I["Persistent GPU and cross-node CI"]
+    B["#16159 ArtifactIdentity + SourceIdentity v2"] --> I["Persistent GPU and cross-node CI"]
     C["Public MX API + structured results"] --> I
     D --> I
     E --> I
@@ -477,7 +520,8 @@ Suggested changes:
 
 1. **Foundation PR:** structured capability profiles, exact matching, symmetric publish/receive gating, reason codes,
    and a reusable full-versus-staged model test harness. No new family enabled.
-2. **ArtifactIdentity PR:** implement §8 and version compatibility metadata. This should be independently reviewable.
+2. **ArtifactIdentity PR #16159:** finish review, merge/rebase it with #15641, measure local-manifest hashing, and run
+   the combined identity/loader/E2E validation in §8 and §20.
 3. **MX API/observability PR:** consume a public MX contract when available, add strict mode and structured results,
    and retain the exact package pin until compatibility CI exists.
 4. **Qwen dense PR:** Qwen2 and Qwen3 exact profiles plus unit and E2E evidence.
@@ -493,12 +537,14 @@ Family PRs may proceed while the public MX API is being developed, but a support
 
 ## 12. Definition of Done
 
-### Llama-only preview
+### Content-bound Llama-only preview
 
 - [ ] PR #15641 is merged with passing required CI.
-- [ ] §20 passes on the exact merged commit.
+- [ ] PR #16159 is merged with passing required CI and its SourceIdentity v2 contract is present in the tested wheel.
+- [ ] §20 passes on an exact commit containing both PRs.
 - [ ] The supported Llama checkpoint, quantization, backend, and parallel profile are published.
-- [ ] Exact token equality, no-disk receiver proof, and negative fallback controls are archived.
+- [ ] Exact token equality, matching ArtifactIdentity, canonical-snapshot no-disk receiver proof, artifact mismatch, and
+  negative fallback controls are archived.
 - [ ] Documentation says `LlamaForCausalLM` preview, not generic Llama-style or all-model support.
 
 ### Multi-family beta
@@ -533,7 +579,7 @@ trtllm_producer_sha:
 trtllm_receiver_sha:
 modelexpress_client/server:
 transform_layout_abi:
-artifact_identity:
+artifact_identity_format/scheme/digest:
 checkpoint:
 dtype/quantization:
 attention/moe_backend:
@@ -564,3 +610,4 @@ A profile is supported only when this record is complete for every row claimed i
 - [NVIDIA/TensorRT-LLM#15387 - Wave 4](https://github.com/NVIDIA/TensorRT-LLM/pull/15387)
 - [NVIDIA/TensorRT-LLM#15432 - Wave 5](https://github.com/NVIDIA/TensorRT-LLM/pull/15432)
 - [NVIDIA/TensorRT-LLM#15641 - Optional standalone MX integration](https://github.com/NVIDIA/TensorRT-LLM/pull/15641)
+- [NVIDIA/TensorRT-LLM#16159 - ArtifactIdentity and SourceIdentity v2](https://github.com/NVIDIA/TensorRT-LLM/pull/16159)

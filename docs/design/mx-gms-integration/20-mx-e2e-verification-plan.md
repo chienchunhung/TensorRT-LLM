@@ -7,10 +7,17 @@ SPDX-License-Identifier: Apache-2.0
 
 [< Back to README](README.md)
 
-**Status:** Ready to execute  
-**Last Updated:** 2026-07-08  
-**Primary implementation under test:**
-[NVIDIA/TensorRT-LLM#15641](https://github.com/NVIDIA/TensorRT-LLM/pull/15641)  
+**Status:** Ready to execute against a combined integration head
+
+**Last Updated:** 2026-07-09
+
+**Implementations under test:**
+
+- [NVIDIA/TensorRT-LLM#15641](https://github.com/NVIDIA/TensorRT-LLM/pull/15641): optional MX packaging, local
+  Docker/Redis lifecycle, and ModelExpress 0.4.1 integration.
+- [NVIDIA/TensorRT-LLM#16159](https://github.com/NVIDIA/TensorRT-LLM/pull/16159): ArtifactIdentity and SourceIdentity
+  format v2.
+
 **Intended executor:** An AI agent with shell access to a Linux cluster, one allocated GPU node, Docker, model weights,
 and permission to build TensorRT-LLM.
 
@@ -27,7 +34,9 @@ Prove that the TensorRT-LLM ModelExpress (MX) integration works end to end on a 
 5. A receiver that cannot read checkpoint weight shards still succeeds, proving that success did not come from a
    silent Hugging Face disk fallback.
 6. TRT-LLM's optional local Docker launcher creates and reuses the MX server and Redis containers correctly.
-7. Unsupported or incompatible configurations reject P2P transfer before RDMA and fall back safely.
+7. Source and receiver match on a content-bound ArtifactIdentity as well as runtime layout identity.
+8. Unsupported, artifact-mismatched, or runtime-incompatible configurations reject P2P transfer before RDMA and fall
+   back safely.
 
 This is a **functional qualification** plan. Collect startup and transfer performance data, but do not fail the core
 experiment solely because a first-run latency target is missed.
@@ -41,8 +50,10 @@ experiment solely because a first-run latency target is missed.
 - PyTorch backend.
 - `LlamaForCausalLM`, transform protocol version 1.
 - ModelExpress client and server version `0.4.1`.
+- ArtifactIdentity format version 1 nested in SourceIdentity format version 2.
 - Explicitly managed MX server first, then TRT-LLM automatic local-server launch.
-- Deterministic inference, transfer evidence, disk-isolation proof, identity mismatch, and server-failure fallback.
+- Deterministic inference, transfer evidence, canonical-snapshot disk-isolation proof, artifact/runtime identity
+  mismatch, and server-failure fallback.
 
 ### Out of scope
 
@@ -51,8 +62,9 @@ experiment solely because a first-run latency target is missed.
 - A separately loaded draft model or target-plus-draft transfer.
 - MX+GMS composition.
 - Production performance sign-off.
-- Exact checkpoint-content isolation. `SourceIdentity` does not yet include `ArtifactIdentity`; use one immutable,
-  recorded checkpoint artifact throughout this experiment.
+- Optimization of local-checkpoint ArtifactIdentity hashing. PR #16159 intentionally reads local checkpoint files in
+  full; this plan records the cost but does not set its production SLO.
+- Component-scoped ArtifactIdentity for target, draft, language, vision, or adapters.
 
 ## 3. Required Result
 
@@ -63,7 +75,8 @@ The executor must finish with one of these explicit outcomes:
 - **BLOCKED:** The environment cannot satisfy a prerequisite such as Docker, NIXL, model access, or a compatible GPU
   allocation. Environment blockers must not be reported as product failures.
 
-Do not report PASS from logs alone. PASS requires exact token-ID equality and the no-weight-shards receiver proof.
+Do not report PASS from logs alone. PASS requires exact token-ID equality, matching ArtifactIdentity evidence, and the
+canonical-snapshot no-weight-shards receiver proof.
 
 ## 4. Recommended Topology
 
@@ -92,7 +105,8 @@ the integration qualified.
 ## 5. Execution Rules for the AI Agent
 
 1. Work in one isolated allocation and one timestamped run directory.
-2. Use a detached worktree at the current PR head. Do not modify or force-push the PR branch while testing.
+2. Use an isolated local integration worktree containing the exact two PR heads. Do not modify or push either PR
+   branch or the temporary merge.
 3. Record every resolved input and exact command before running the experiment.
 4. Keep the donor process alive until every receiver test finishes. MX source tensors and NIXL registrations are
    owned by the live donor process.
@@ -100,8 +114,8 @@ the integration qualified.
 6. Do not change source code to make a test pass unless the user separately authorizes a fix.
 7. Treat donor disk fallback as expected when no source exists. Treat receiver disk fallback as a failure in the
    positive P2P tests.
-8. Run positive transfer tests with an immutable checkpoint. Record its revision or shard hashes because current
-   `SourceIdentity` does not bind identity to checkpoint contents.
+8. Run positive transfer tests with an immutable checkpoint and record the ArtifactIdentity format, scheme, and digest.
+   Use a canonical Hugging Face snapshot path for G4 so identity can be verified without opening weight shards.
 9. Keep baseline, donor, and receiver model settings identical except where a negative test intentionally changes one
    field.
 10. Archive evidence before cleanup.
@@ -112,10 +126,14 @@ The executor must resolve and record these values in `$RUN/manifest.txt`:
 
 | Variable | Required value |
 |:--|:--|
-| `PR_NUMBER` | `15641`, unless the user provides a successor PR |
-| `PR_HEAD` | Exact fetched commit SHA; never assume a stale SHA from this document |
-| `MODEL` | Immutable local path to a `LlamaForCausalLM` checkpoint |
+| `MX_PR_NUMBER` | `15641`, unless the user provides a successor PR |
+| `ARTIFACT_PR_NUMBER` | `16159`, unless the user provides a successor PR |
+| `MX_PR_HEAD` | Exact fetched PR #15641 commit SHA |
+| `ARTIFACT_PR_HEAD` | Exact fetched PR #16159 commit SHA |
+| `TEST_HEAD` | Exact temporary integration commit containing both PRs |
+| `MODEL` | Canonical immutable Hugging Face snapshot path for a `LlamaForCausalLM` checkpoint; required for G4 |
 | `MODEL_REVISION` | Hub commit, LFS object IDs, or a SHA-256 shard manifest |
+| `ARTIFACT_IDENTITY` | Runtime-reported format version, scheme, and digest |
 | `TP` | `1` for two GPUs or `2` for four GPUs |
 | `DONOR_GPUS` | `0` or `0,1` |
 | `RECEIVER_GPUS` | `1` or `2,3` |
@@ -124,7 +142,9 @@ The executor must resolve and record these values in `$RUN/manifest.txt`:
 | `LOCAL_MX_PORT` | Different unused host port, recommended `18002` |
 
 Recommended first model: TinyLlama or another small unquantized Llama checkpoint for setup. After the smoke test,
-repeat G1-G5 with the representative Llama model and quantization configuration intended for support.
+repeat G1-G5 with the representative Llama model and quantization configuration intended for support. Resolve the
+model to its cache path containing `models--<org>--<repo>/snapshots/<immutable-revision>`; a mutable Hub model name or
+an arbitrary copied directory is not sufficient for the G4 no-shards gate.
 
 ## 7. Gate G0: Allocate and Qualify the Environment
 
@@ -171,7 +191,8 @@ Do not proceed unless:
 
 - The requested GPUs are visible and not shared with an unrelated workload.
 - Docker is usable from the environment that will run TRT-LLM.
-- The model path is readable.
+- The model path is readable and resolves under a canonical immutable Hugging Face snapshot directory for the core
+  G0-G5 run.
 - The node has enough HBM for donor and receiver concurrently.
 - The same execution environment can reach `127.0.0.1:<MX_PORT>`.
 
@@ -182,21 +203,41 @@ local-launch gate G5 will remain BLOCKED.
 
 ## 8. Prepare the Exact PR Source and Wheel
 
-**Goal:** Run the experiment against a reproducible PR commit and verify the optional MX dependency contract.
+**Goal:** Run the experiment against one reproducible integration commit containing both PRs and verify the optional MX
+dependency and SourceIdentity v2 contracts.
 
-### Step 8.1: Fetch the current PR head into an isolated worktree
+### Step 8.1: Create a temporary combined integration worktree
 
 ```bash
 export REPO="$RUN/repos/TensorRT-LLM"
 mkdir -p "$RUN/repos"
 git clone https://github.com/NVIDIA/TensorRT-LLM.git "$REPO"
-git -C "$REPO" fetch origin "pull/15641/head:refs/remotes/origin/pr/15641"
-git -C "$REPO" worktree add --detach "$RUN/worktrees/pr15641" refs/remotes/origin/pr/15641
-export SRC="$RUN/worktrees/pr15641"
-git -C "$SRC" rev-parse HEAD | tee "$RUN/pr-head.txt"
+git -C "$REPO" fetch origin \
+  "pull/15641/head:refs/remotes/origin/pr/15641" \
+  "pull/16159/head:refs/remotes/origin/pr/16159"
+
+git -C "$REPO" rev-parse refs/remotes/origin/pr/15641 | tee "$RUN/mx-pr-head.txt"
+git -C "$REPO" rev-parse refs/remotes/origin/pr/16159 | tee "$RUN/artifact-pr-head.txt"
+
+export SRC="$RUN/worktrees/mx-artifact-integration"
+export INTEGRATION_BRANCH="mx-artifact-integration-$(basename "$RUN")"
+git -C "$REPO" worktree add -b "$INTEGRATION_BRANCH" \
+  "$SRC" refs/remotes/origin/pr/16159
+git -C "$SRC" \
+  -c user.name="MX E2E Integration" \
+  -c user.email="mx-e2e-integration@example.invalid" \
+  merge --no-edit refs/remotes/origin/pr/15641
+
+git -C "$SRC" rev-parse HEAD | tee "$RUN/test-head.txt"
+git -C "$SRC" log --oneline --decorate -8 | tee "$RUN/integration-history.txt"
 ```
 
-If the persistent cluster clone already exists, reuse it and create only the detached worktree.
+This merge is a local test artifact only. Do not push it or modify either PR branch. If the merge conflicts, stop and
+report **BLOCKED** with the conflict paths; do not invent an unreviewed integration resolution. If one PR is rebased on
+the other before execution, use that descendant head directly and record the ancestry proof instead of creating a
+redundant merge.
+
+If the persistent cluster clone already exists, reuse it and create only the isolated integration worktree.
 
 ### Step 8.2: Build for the allocated GPU
 
@@ -222,6 +263,26 @@ Resolve the actual wheel path instead of assuming a filename:
 ```bash
 export WHEEL="$(find "$SRC" -path '*/tensorrt_llm-*.whl' -print -quit)"
 test -n "$WHEEL"
+python3 - "$WHEEL" <<'PY' | tee "$RUN/wheel-mx-metadata.txt"
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1]) as wheel:
+    metadata_path = next(
+        name for name in wheel.namelist() if name.endswith(".dist-info/METADATA")
+    )
+    metadata = wheel.read(metadata_path).decode("utf-8")
+
+requirements = [
+    line for line in metadata.splitlines()
+    if line.lower().startswith("requires-dist: modelexpress")
+]
+print("\n".join(requirements))
+assert len(requirements) == 1
+assert "modelexpress==0.4.1" in requirements[0]
+assert "extra == \"mx\"" in requirements[0]
+PY
+
 python3 -m pip install --force-reinstall "${WHEEL}[mx]" \
   2>&1 | tee "$RUN/logs/install-wheel-mx.log"
 python3 -m pip check | tee "$RUN/pip-check.txt"
@@ -239,41 +300,77 @@ assert metadata.version("modelexpress") == "0.4.1"
 
 from modelexpress import trtllm_live_transfer as transfer
 from modelexpress.nixl_transfer import is_nixl_available
+from tensorrt_llm._torch.weight_sharing.artifact_identity import (
+    ARTIFACT_IDENTITY_FORMAT_VERSION,
+)
+from tensorrt_llm._torch.weight_sharing.source_identity import (
+    SOURCE_IDENTITY_FORMAT_VERSION,
+)
 
 for name in ("MxClient", "MxLiveWeightLoader", "publish_model_params", "_build_trtllm_identity"):
     assert hasattr(transfer, name), name
+assert ARTIFACT_IDENTITY_FORMAT_VERSION == 1
+assert SOURCE_IDENTITY_FORMAT_VERSION == 2
+print("artifact-identity-format", ARTIFACT_IDENTITY_FORMAT_VERSION)
+print("source-identity-format", SOURCE_IDENTITY_FORMAT_VERSION)
 assert is_nixl_available(), "NIXL Python bindings are unavailable"
 PY
 ```
 
-**Preparation pass criterion:** The exact PR head builds, `tensorrt_llm[mx]` installs, `pip check` passes,
-ModelExpress is exactly `0.4.1`, required transfer symbols resolve, and NIXL is available.
+### Step 8.5: Run the combined focused unit suite
+
+```bash
+cd "$SRC"
+pytest -q \
+  tests/unittest/_torch/executor/test_model_loader_gms.py \
+  tests/unittest/_torch/executor/test_model_loader_mx.py \
+  tests/unittest/_torch/models/checkpoints/mx/test_mx_checkpoint_loader.py \
+  tests/unittest/_torch/models/checkpoints/mx/test_mx_local_server.py \
+  tests/unittest/_torch/weight_sharing/test_artifact_identity.py \
+  tests/unittest/_torch/weight_sharing/test_source_identity.py \
+  tests/unittest/_torch/weight_sharing/test_mx_source_identity_gate.py \
+  tests/unittest/_torch/weight_sharing/test_gms_source_identity_gate.py \
+  tests/unittest/llmapi/test_mx_args.py \
+  2>&1 | tee "$RUN/logs/focused-mx-artifact-tests.log"
+```
+
+**Preparation pass criterion:** The exact combined `TEST_HEAD` builds, `tensorrt_llm[mx]` installs, `pip check` passes,
+ModelExpress is exactly `0.4.1`, SourceIdentity format v2 resolves, required transfer symbols resolve, and NIXL is
+available. The combined focused suite passes without excluding tests changed by either PR.
 
 ## 9. Record the Immutable Model Artifact
 
-**Goal:** Ensure donor and receiver intentionally use one known checkpoint artifact while ArtifactIdentity is pending.
+**Goal:** Exercise the actual PR #16159 implementation and prove the core run uses one immutable HF snapshot identity.
 
 ```bash
 test -f "$MODEL/config.json"
-python3 - "$MODEL" <<'PY' > "$RUN/model-manifest.sha256"
-import hashlib
-import pathlib
+python3 - "$MODEL" <<'PY' | tee "$RUN/artifact-identity.json"
+import json
 import sys
+import time
 
-root = pathlib.Path(sys.argv[1]).resolve()
-patterns = ("config.json", "*.safetensors.index.json", "*.safetensors", "*.bin")
-files = sorted({path for pattern in patterns for path in root.glob(pattern) if path.is_file()})
-for path in files:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(8 << 20), b""):
-            digest.update(block)
-    print(digest.hexdigest(), path.relative_to(root))
+from tensorrt_llm._torch.weight_sharing.artifact_identity import ArtifactIdentity
+
+started = time.perf_counter()
+identity = ArtifactIdentity.from_checkpoint(sys.argv[1])
+payload = identity.to_dict()
+payload["construction_seconds"] = time.perf_counter() - started
+print(json.dumps(payload, indent=2, sort_keys=True))
+
+assert payload["format_version"] == 1
+assert payload["scheme"] == "hf_snapshot_revision", (
+    "Core G4 requires a canonical Hugging Face snapshot path; arbitrary local "
+    "checkpoints use full-content hashing and cannot support the no-shards view."
+)
 PY
 ```
 
-For very large checkpoints, accepted alternatives are a checked-in manifest of LFS object IDs or a trusted immutable
-Hub revision. Record the exact mechanism in the final report.
+Record the same identity from donor and receiver startup evidence. The format, scheme, and digest must match exactly.
+
+For a separate local-checkpoint characterization, run the same command on the local path and record
+`scheme=checkpoint_manifest_sha256` plus `construction_seconds`. PR #16159 reads every retained file in full for that
+scheme. Do not count those reads as Hugging Face weight loading, but do include them in startup latency and storage-I/O
+analysis. A local checkpoint run cannot satisfy G4 unless a future trusted precomputed-identity input is added.
 
 ## 10. Install the Deterministic Worker Harness
 
@@ -547,6 +644,9 @@ Size mismatch
 Still missing after PVC fallback
 MX P2P transfer failed
 source SourceIdentity incompatible
+SourceIdentity mismatch on fields ['artifact_identity']
+Unsupported SourceIdentity format version
+invalid SourceIdentity
 ```
 
 Compare token IDs:
@@ -572,23 +672,72 @@ and all token IDs are exact matches.
 
 ## 15. Gate G4: No-Weight-Shards Receiver Proof
 
-**Goal:** Prove that a positive receiver result cannot be explained by silent disk fallback.
+**Goal:** Prove that a positive receiver result cannot be explained by silent disk fallback while still allowing
+SourceIdentity v2 to verify the immutable snapshot without reading weight shards.
 
-Create a metadata-only receiver view. Its directory basename must match the donor model basename because MX discovery
-normalizes local model paths to that basename.
+PR #16159 recognizes Hugging Face snapshots by the canonical
+`models--<org>--<repo>/snapshots/<immutable-revision>/<optional-subpath>` structure. Create a metadata-only receiver
+view with the same repository cache name, revision, and subpath. Do not copy the weight shards.
 
 ```bash
-export RECEIVER_MODEL="$RUN/receiver-model/$(basename "$MODEL")"
+export RECEIVER_MODEL="$(python3 - "$MODEL" "$RUN" <<'PY'
+from pathlib import Path
+import sys
+
+model = Path(sys.argv[1]).resolve()
+run = Path(sys.argv[2]).resolve()
+parts = model.parts
+
+for index, part in enumerate(parts[:-1]):
+    if part != "snapshots" or index == 0:
+        continue
+    repository_cache_name = parts[index - 1]
+    revision = parts[index + 1].lower()
+    if not repository_cache_name.startswith("models--"):
+        continue
+    if len(revision) not in (40, 64) or any(char not in "0123456789abcdef" for char in revision):
+        continue
+    subpath = parts[index + 2 :]
+    destination = run / "receiver-hf-cache" / repository_cache_name / "snapshots" / revision
+    if subpath:
+        destination = destination.joinpath(*subpath)
+    print(destination)
+    break
+else:
+    raise SystemExit(
+        "MODEL is not a canonical immutable Hugging Face snapshot path; G4 cannot proceed"
+    )
+PY
+)"
+
 mkdir -p "$RECEIVER_MODEL"
-rsync -a \
+rsync -aL \
   --exclude='*.safetensors' \
   --exclude='*.bin' \
   --exclude='*.pt' \
   --exclude='*.pth' \
+  --exclude='*.ckpt' \
+  --exclude='*.gguf' \
   "$MODEL/" "$RECEIVER_MODEL/"
 
 test -f "$RECEIVER_MODEL/config.json"
-test -z "$(find "$RECEIVER_MODEL" -type f \( -name '*.safetensors' -o -name '*.bin' -o -name '*.pt' -o -name '*.pth' \) -print -quit)"
+test -z "$(find "$RECEIVER_MODEL" -type f \( \
+  -name '*.safetensors' -o -name '*.bin' -o -name '*.pt' -o \
+  -name '*.pth' -o -name '*.ckpt' -o -name '*.gguf' \
+  \) -print -quit)"
+
+python3 - "$MODEL" "$RECEIVER_MODEL" <<'PY' | tee "$RUN/artifact-identity-g4.txt"
+import sys
+
+from tensorrt_llm._torch.weight_sharing.artifact_identity import ArtifactIdentity
+
+donor = ArtifactIdentity.from_checkpoint(sys.argv[1])
+receiver = ArtifactIdentity.from_checkpoint(sys.argv[2])
+print("donor", donor.to_dict())
+print("receiver", receiver.to_dict())
+assert donor.scheme == "hf_snapshot_revision"
+assert receiver == donor, "metadata-only receiver ArtifactIdentity differs from donor"
+PY
 ```
 
 Keep the donor alive and run a fresh receiver process:
@@ -610,11 +759,12 @@ python3 "$RUN/mx_e2e_worker.py" \
 
 Repeat all G3 log checks and compare `receiver-no-shards.json` with `baseline.json`.
 
-If P2P silently falls back, this run should fail because no weight shards are available. A successful run with exact
-tokens is therefore the strongest functional evidence in this plan.
+If P2P silently falls back, this run should fail because no weight shards are available. A successful run with matching
+ArtifactIdentity and exact tokens is therefore the strongest functional evidence in this plan.
 
-**G4 pass criterion:** The receiver has no checkpoint weight files, every rank transfers nonzero bytes, no fallback is
-logged, and token IDs exactly match the HF baseline.
+**G4 pass criterion:** Donor and receiver report the same `hf_snapshot_revision` ArtifactIdentity, the receiver has no
+checkpoint weight files, every rank transfers nonzero bytes, no fallback is logged, and token IDs exactly match the HF
+baseline.
 
 ## 16. Gate G5: Automatic Local-Server Launch and Reuse
 
@@ -723,8 +873,24 @@ Expected result:
 Use a small non-Llama model only when time and storage permit. Expected result: post-transform reception is not
 accepted and the receiver safely uses the standard checkpoint path.
 
-Do not use same-config/different-checkpoint bytes as a safety control until ArtifactIdentity lands. Current identity
-does not make that case safe.
+### N5: Artifact mismatch before RDMA
+
+Use two valid small checkpoint artifacts with the same architecture and tensor shapes but different immutable revisions
+or contents. Keep the receiver artifact fully readable so expected disk fallback can complete. Expected result:
+
+- Source discovery reports an ArtifactIdentity or SourceIdentity mismatch.
+- No direct-transfer log or transferred bytes appear.
+- Rejection happens before P2P registration/transfer.
+- The receiver loads its own artifact from disk and matches that artifact's HF baseline.
+
+For a local-checkpoint variant, use a valid second checkpoint or re-save a changed tensor with the checkpoint library;
+do not corrupt a shard byte and then mistake the expected disk-load failure for identity-gate evidence.
+
+### N6: SourceIdentity v1 compatibility fallback
+
+Use the focused test fixture or a controlled v1 publisher to present metadata without the required v2 ArtifactIdentity.
+Expected result: the v2 receiver rejects it with an explicit unsupported/missing identity reason and falls back before
+P2P. Record the result as upgrade-order evidence; do not relax the v2 requirement.
 
 ## 18. Optional Performance Characterization
 
@@ -746,13 +912,13 @@ and MX numbers without labeling cache state.
 | Gate | Required evidence | Pass condition |
 |:--|:--|:--|
 | G0 Environment | GPU, Docker, NIXL, model, network records | All prerequisites usable |
-| Build/install | Build log, wheel path, `pip check`, versions | PR wheel and MX 0.4.1 installed; NIXL available |
+| Build/install | Both PR heads, integration head, build log, wheel path, `pip check`, versions | Combined wheel, MX 0.4.1, ArtifactIdentity v1, and SourceIdentity v2 installed; NIXL available |
 | G1 Baseline | `baseline.json`, baseline log | Three deterministic outputs produced |
 | G2 Donor | Donor log, published rank metadata, `donor.json` | Every rank publishes; tokens equal baseline; donor stays alive |
 | G3 Full receiver | Receiver and per-rank MX logs, output JSON | Full P2P, staged Llama path, no fallback, exact tokens |
-| G4 No-shards receiver | Metadata-only model listing, logs, output JSON | P2P succeeds with no weight files; exact tokens |
+| G4 No-shards receiver | Matching ArtifactIdentity, metadata-only canonical snapshot listing, logs, output JSON | P2P succeeds with no weight files; exact tokens |
 | G5 Local launch | Docker inspect/logs before and after receiver | Create, reuse, restart, and exact receiver success |
-| G6 Negative controls | Logs and outputs for N1-N3 | Reject/fallback paths are bounded and correct |
+| G6 Negative controls | Logs and outputs for N1-N3 and N5-N6; N4 when available | Runtime/artifact/version reject and fallback paths are bounded and correct |
 | Performance | Three run JSON files and transfer metrics | Reported without overstating cache-state comparisons |
 
 ## 20. Failure Classification
@@ -762,8 +928,8 @@ Use these categories in the final report:
 | Category | Examples | Required action |
 |:--|:--|:--|
 | Environment | No Docker socket, image pull denied, no NIXL, insufficient HBM | Mark BLOCKED; preserve preflight evidence |
-| Build/package | PR wheel does not build, `[mx]` cannot resolve, wrong MX API | Mark FAIL; include exact resolver/build error |
-| Discovery/identity | Donor publishes but receiver cannot select exact source | Mark FAIL; preserve identities, model basenames, rank logs |
+| Build/package | Combined wheel does not build, `[mx]` cannot resolve, wrong MX/identity API | Mark FAIL; include exact resolver/build error |
+| Discovery/identity | Donor publishes but receiver cannot select exact source or matching artifact | Mark FAIL; preserve ArtifactIdentity/SourceIdentity metadata, model names, and rank logs |
 | Transfer | NIXL init/register/receive fails or bytes are zero | Mark FAIL; preserve UCX/NIXL topology and per-rank logs |
 | Layout | Partial fallback, size mismatch, unmatched tensors | Mark FAIL; list all affected names and layouts |
 | Staged hooks | Receiver transfers but reruns transforms or tokens differ | Mark FAIL; preserve staged-path and output evidence |
@@ -777,11 +943,16 @@ The completed run directory should contain at least:
 ```text
 $RUN/
 ├── manifest.txt
-├── pr-head.txt
-├── model-manifest.sha256
+├── mx-pr-head.txt
+├── artifact-pr-head.txt
+├── test-head.txt
+├── integration-history.txt
+├── artifact-identity.json
+├── artifact-identity-g4.txt
 ├── environment.txt
 ├── nvidia-topology.txt
 ├── package-versions.txt
+├── wheel-mx-metadata.txt
 ├── pip-check.txt
 ├── mx_e2e_worker.py
 ├── artifacts/
@@ -791,6 +962,7 @@ $RUN/
 │   └── local-container-inspect.json
 ├── logs/
 │   ├── build-wheel.log
+│   ├── focused-mx-artifact-tests.log
 │   ├── baseline.log
 │   ├── donor.log
 │   ├── receiver-full.log
@@ -819,10 +991,13 @@ PASS | FAIL | BLOCKED
 
 ## Reproduction Identity
 
-- PR and head SHA:
+- MX PR and head SHA:
+- ArtifactIdentity PR and head SHA:
+- Combined test-head SHA:
 - TRT-LLM wheel version:
 - ModelExpress client/server version:
-- Model path and immutable revision/manifest:
+- ArtifactIdentity format/scheme/digest and construction time:
+- Model path and immutable revision:
 - Cluster, node, container:
 - GPU type/count and topology:
 - TP and GPU assignment:
@@ -854,6 +1029,7 @@ PASS | FAIL | BLOCKED
 - Matched tensor counts:
 - Transfer duration and bandwidth:
 - Fallback or mismatch messages:
+- Artifact/version mismatch controls:
 
 ## Performance
 
@@ -861,6 +1037,7 @@ PASS | FAIL | BLOCKED
 - Receiver load times:
 - Median receiver load time:
 - Cache state and disk-read evidence:
+- Local-manifest identity construction time, if characterized:
 
 ## Failures or Deviations
 
@@ -902,15 +1079,17 @@ cluster allocation only after `report.md` and all required evidence are durable.
 
 ## 24. Completion Checklist
 
-- [ ] Exact PR head and immutable model artifact recorded.
+- [ ] Exact #15641, #16159, and combined test heads recorded.
+- [ ] Immutable model revision and ArtifactIdentity format/scheme/digest recorded.
 - [ ] Environment and NIXL preflight passed.
-- [ ] PR wheel built and installed with `[mx]`.
+- [ ] Combined wheel built and installed with `[mx]`; base install remains free of the MX dependency.
 - [ ] HF baseline generated deterministic token IDs.
 - [ ] Every donor rank published nonzero bytes.
 - [ ] Full receiver transferred all tensors and used the staged Llama path.
 - [ ] Full receiver token IDs exactly matched baseline.
-- [ ] Receiver without weight shards succeeded and exactly matched baseline.
+- [ ] Canonical-snapshot receiver without weight shards reported matching ArtifactIdentity, succeeded, and exactly
+  matched baseline.
 - [ ] Automatic local server created, reused, and recovered compatible containers.
-- [ ] Identity mismatch and unavailable-server controls fell back safely.
+- [ ] Runtime identity, artifact identity, v1 metadata, and unavailable-server controls fell back safely.
 - [ ] Logs, outputs, Docker evidence, topology, and package versions archived.
 - [ ] Final report classified the run as PASS, FAIL, or BLOCKED with evidence.
