@@ -208,6 +208,11 @@ The capability-registry and qualification-harness work can start on the merged W
 enabling another family, on a public MX API, or on PR #16159's final wire format. Keep Llama as the only enabled profile
 while replacing the mechanism underneath it.
 
+**Implementation status as of 2026-07-09: planned, not started.** The assessed `upstream/main` still uses
+`_MX_STAGED_RECEIVER_ALLOWLIST` and its `isinstance` loop. No implementation of `PostTransformProfile`, reusable
+family qualification harness, or corresponding open upstream PR was found. The existing tiny-Llama staged-equivalence
+test is the seed to extract, not the completed harness.
+
 Use three reviewable changes rather than one cross-cutting PR:
 
 1. **Exact capability registry:** replace `_MX_STAGED_RECEIVER_ALLOWLIST` and its `isinstance` loop with a
@@ -225,6 +230,38 @@ Use three reviewable changes rather than one cross-cutting PR:
 The first two changes are implementation-ready immediately. The third is design-ready immediately, but its MX wire
 integration should be rebased onto the final identity branch. None of these foundation changes should broaden model
 support; the first family-enablement PR remains Qwen2 dense.
+
+### 4.2 Migration, qualification, and enablement are different
+
+Do not describe every new model profile as another staged-hook migration:
+
+- **Migration** moves lifecycle logic out of legacy `post_load_weights()` into `setup_aliases()`,
+  `transform_weights()`, or `cache_derived_state()`.
+- **Qualification** proves that the complete root model already uses those stages correctly for one exact configuration
+  and that full loading and staged reception are equivalent.
+- **Enablement** adds that proven configuration to the capability registry and public support matrix.
+
+The five merged waves performed most of the shared migration for Linear, Attention, MoE, MLA, Mamba, and related
+modules. The Llama-only receiver gate is a conservative qualification boundary; it is not evidence that every other
+model requires a rewrite. A family PR should modify model lifecycle code only when its audit finds root-specific or
+backend-specific work that the waves did not stage correctly.
+
+After the reusable harness exists, use these expectations instead of assuming several hundred production lines for
+every family:
+
+| Work class | Likely examples, subject to audit | Expected production change | Expected tests/docs change | Typical result |
+|:--|:--|:--|:--|:--|
+| Qualification and enablement only | Qwen2/Qwen3 dense, Mistral, and potentially Mixtral | 0-50 lines | 50-200 lines | Add an exact profile and family fixture; no model-file migration. |
+| Qualification with targeted fixes | Qwen MoE, DeepSeek V3/V3.2, Kimi K2 text, GLM, Qwen3-Next/Qwen3.5 | 20-200 lines | 100-400 lines | Correct a missed alias, derived state, mapper, or backend-specific stage, then register the profile. |
+| Genuine staged-hook migration | DeepSeek V4 and any audit-discovered legacy root | 200+ lines | 200-600 lines | Move known root lifecycle logic into the proper stages before qualification. |
+| New component-transfer protocol | Qwen VL, Kimi K2.5, or separate target-plus-draft transfer | Hundreds or more | Hundreds or more | Define component identity, transactional installation, and atomic fallback; this is not ordinary hook migration. |
+
+These are sizing guides, not commitments. A profile can require substantial GPU and failure-injection evidence while
+changing very little production code. Conversely, a small allowlist diff is not sufficient evidence by itself.
+
+Multiple named models may share one qualification profile when an audit proves that they have the same exact root,
+canonical configuration semantics, transform ABI, tensor layout, feature constraints, and component scope. Register
+that sharing explicitly; do not infer it from `isinstance`, architectural resemblance, or a common marketing family.
 
 ## 5. Model-Family Inventory and Recommended Order
 
