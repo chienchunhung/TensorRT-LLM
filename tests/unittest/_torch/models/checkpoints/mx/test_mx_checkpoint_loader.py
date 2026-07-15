@@ -302,7 +302,7 @@ class TestLoadWeightsMxPath:
         assert result is fallback
         mock_super_load.assert_not_called()
 
-    def test_post_transform_full_success_prepares_receiver_before_p2p(self):
+    def test_post_transform_full_success_prepares_receiver_before_p2p(self) -> None:
         identity = _identity()
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
         model = MagicMock(name="model")
@@ -329,7 +329,9 @@ class TestLoadWeightsMxPath:
         prepare_receiver.assert_called_once_with(model)
         assert events == ["prepare_receiver", "p2p"]
 
-    def test_post_transform_source_without_receiver_preparer_falls_back_before_p2p(self):
+    def test_post_transform_source_without_receiver_preparer_falls_back_before_p2p(
+        self,
+    ) -> None:
         identity = _identity()
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
         disk_weights = {"disk.weight": MagicMock()}
@@ -359,7 +361,9 @@ class TestLoadWeightsMxPath:
         mx_loader.load_weights.assert_not_called()
         mock_super_load.assert_called_once()
 
-    def test_post_transform_source_falls_back_before_p2p_when_not_allowlisted(self):
+    def test_post_transform_source_falls_back_before_p2p_when_not_allowlisted(
+        self,
+    ) -> None:
         identity = _identity()
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
         disk_weights = {"disk.weight": MagicMock()}
@@ -399,7 +403,7 @@ class TestLoadWeightsMxPath:
     )
     def test_post_transform_source_with_unsupported_protocol_falls_back_before_p2p(
         self, protocol_value
-    ):
+    ) -> None:
         identity = _identity()
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
         disk_weights = {"disk.weight": MagicMock()}
@@ -437,7 +441,7 @@ class TestLoadWeightsMxPath:
         prepare_receiver.assert_not_called()
         mock_super_load.assert_called_once()
 
-    def test_selects_matching_source_metadata_from_multiple_instances(self):
+    def test_selects_matching_source_metadata_from_multiple_instances(self) -> None:
         rank0_identity = _identity(rank=0)
         rank1_identity = _identity(rank=1)
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
