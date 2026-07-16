@@ -1,3 +1,6 @@
+Source URL: https://raw.githubusercontent.com/chienchunhung/TensorRT-LLM/docs-and-plans/docs/design/mx-gms-integration/21-mx-readiness-gaps-and-model-family-plan.md
+Title: 21. ModelExpress Readiness Gaps and Model-Family Expansion Plan
+
 <!--
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
@@ -9,12 +12,14 @@ SPDX-License-Identifier: Apache-2.0
 
 **Status:** Proposed readiness and delivery plan
 
-**Last Updated:** 2026-07-09
+**Last Updated:** 2026-07-15
 
 **In-flight implementations assessed:**
 
-- [NVIDIA/TensorRT-LLM#15641](https://github.com/NVIDIA/TensorRT-LLM/pull/15641) at `fc23344fe9` (open and non-draft as
-  of 2026-07-09): optional packaging, ModelExpress 0.4.1 integration, and local Docker/Redis lifecycle.
+- [NVIDIA/TensorRT-LLM#15641](https://github.com/NVIDIA/TensorRT-LLM/pull/15641) at `dabb633dbc` (open and non-draft as
+  of 2026-07-15): optional packaging and external-server ModelExpress 0.4.1 integration. The live qualification
+  evidence below was collected on earlier PR head `752c05c9af` plus the explicitly recorded local MX/TRT fixes and
+  must be rerun on the final PR head.
 - [NVIDIA/TensorRT-LLM#16159](https://github.com/NVIDIA/TensorRT-LLM/pull/16159) at `33ee4dd604` (open draft as of
   2026-07-09): ArtifactIdentity and SourceIdentity format v2.
 - The five merged staged-hook waves ending in
@@ -27,6 +32,49 @@ evidence from either isolated PR.
 **Companion execution runbook:** [§20 ModelExpress End-to-End Verification Plan](20-mx-e2e-verification-plan.md)
 
 ---
+
+## 0. Live Qualification Update (2026-07-15)
+
+The §20 single-node Llama experiment completed on `umb-b300-dp-186` and `umb-b300-dp-184` using B300 GPUs,
+TinyLlama-1.1B-Chat-v1.0 BF16, TRT-LLM head `752c05c9af`, an external native ModelExpress/Redis service, and
+ModelExpress 0.4.1 with a local canonical-wire-catalog patch. The runtime used the image NIXL stack under
+`/opt/nvidia/nvda_nixl` and CUDA-enabled UCX 1.21.0 with `NIXL_UCX_TLS` unset.
+
+| Qualification | Result and retained evidence |
+|:--|:--|
+| TP=1 baseline, donor, and full receiver | PASS. Donor published 135 canonical tensors; the receiver fetched the same source and produced the exact baseline token IDs. |
+| TP=1 no-shards receiver | PASS. The metadata-only receiver tree contained no `.safetensors`, `.bin`, `.pt`, or `.pth` weight files and still produced the exact baseline token IDs. |
+| TP=2 donor/rank matching | PASS. Donor ranks 0 and 1 independently published 135 tensors with distinct source/worker IDs. |
+| TP=2 full receiver | PASS. Receiver ranks 0 and 1 each resolved a matching worker, completed the MX/NIXL path, and produced the exact TP=2 baseline token IDs. |
+| TP=2 no-shards receiver | PASS. Both-rank P2P reception succeeded without checkpoint weight shards and matched the TP=2 baseline. |
+| Negative SourceIdentity/parallel mismatch | PASS. A TP=1 receiver did not fetch TP=2 donor metadata or initialize a target NIXL agent; it performed a complete HF disk load and matched the independent TP=1 baseline. |
+
+The retained output hashes were identical within each expected topology:
+
+- TP=1 baseline and mismatch-fallback receiver:
+  `24f0cd36473e4b1a53156c26abdcc4a9db78f662aa51fad47373b1c8387a9b8d`.
+- TP=2 baseline, donor, full receiver, and no-shards receiver:
+  `45841007c85b4496a6388cbf52d433e741ffb8dfb3048ae78b1de1e14241cabc`.
+
+The runs exposed and validated fixes for two integration defects:
+
+1. ModelExpress's TRT-LLM publisher enumerated post-alias paths such as `next_attn` before canonical paths, causing a
+   partial 71/135 transfer. A local MX patch now excludes runtime-only alias paths, publishes canonical names, and
+   rejects any non-exact source/target catalog before NIXL writes.
+2. TRT-LLM serialized the local checkpoint path (`SourceIdentity.model_name`) into MX's exact discovery identity even
+   though that descriptor is excluded from compatibility matching. Omitting it from compatibility metadata made the
+   no-shards copy path-independent while retaining the normalized outer MX model name.
+
+This is strong isolated-head functional evidence for the bounded Llama BF16 TP=1/TP=2 profile, including no-disk and
+parallel-mismatch controls. It is not yet final merge or released-package evidence. Before crediting R1:
+
+- land and release the canonical-catalog behavior in ModelExpress, update the TRT-LLM dependency, and remove the local
+  runtime patch;
+- replace the test-only 1800-second server lease with publisher heartbeats (or otherwise prove production source
+  liveness under the normal 90-second reaper);
+- rerun the focused suites and §20 on the final #15641 head, then on the combined #15641/#16159 head with
+  ArtifactIdentity controls;
+- retain server-outage and mid-transfer failure-injection controls as open MX-R9/MX-R15 evidence.
 
 ## 1. Decision Summary
 
