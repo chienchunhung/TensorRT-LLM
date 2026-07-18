@@ -56,6 +56,25 @@ The retained output hashes were identical within each expected topology:
 - TP=2 baseline, donor, full receiver, and no-shards receiver:
   `45841007c85b4496a6388cbf52d433e741ffb8dfb3048ae78b1de1e14241cabc`.
 
+### Observed Llama model-load times
+
+The retained worker artifacts also recorded elapsed `LLM(...)` construction time. These are single-run observations
+from the qualification sequence, not controlled performance benchmarks:
+
+| Topology | HF baseline | MX donor (disk load, transform, and publish) | MX full receiver | MX no-shards receiver | Receiver time difference vs. HF |
+|:--|--:|--:|--:|--:|:--|
+| TP=1 | 68.96 s | 159.58 s | 36.65 s | 37.41 s | 46.8% reduction (full); 45.8% reduction (no-shards) |
+| TP=2 | 210.08 s | 285.56 s | 167.82 s | 167.75 s | 20.1% reduction (full); 20.1% reduction (no-shards) |
+| TP=4 | 285.56 s | 461.81 s | 351.32 s | 370.72 s | 23.0% increase (full); 29.8% increase (no-shards) |
+
+The receiver measurements include MX discovery, NIXL transfer, alias setup, derived-state reconstruction, distributed
+runtime startup, and normal TRT-LLM model initialization; they are not pure transfer timings. They exclude Redis/MX
+service startup. Donor values are not directly comparable to the HF baseline because they also include cold-source
+query/fallback and publication. Test ordering, warm filesystem/JIT caches, use of different B300 allocations, HCOLL
+fallback, and disabled NCCL NVLS can materially affect the results. In particular, the TP=4 run used NVLink P2P after
+NVLS initialization was unavailable. Use repeated, randomized same-node trials with phase-level instrumentation before
+making a scaling, performance, or SLO claim.
+
 The runs exposed and validated fixes for two integration defects:
 
 1. ModelExpress's TRT-LLM publisher enumerated post-alias paths such as `next_attn` before canonical paths, causing a
