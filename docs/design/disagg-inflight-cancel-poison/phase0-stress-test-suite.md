@@ -5,23 +5,22 @@
 | **Phase** | 0, prerequisite to behavioural cancellation / poison changes |
 | **JIRA** | [TRTLLM-12648](https://jirasw.nvidia.com/browse/TRTLLM-12648) for weekly stress CI; part of [TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721) |
 | **Owner** | Chien-Chun Hung |
-| **Status as of 2026-06-08** | Skeleton, `log_scanner_thread`, `metrics_thread`, `injector_thread`, and `canary_thread` have landed in `upstream/main` under `tests/integration/defs/stress_test/disagg_cancel/`. The remaining implementation work is `load_thread`, marathon configs / canary references, pytest registration, and at least one full-duration run of each marathon. |
-| **Next step** | Implement `load_thread` as a duration-bounded wrapper around the existing cancellation load generator, then wire the two marathon YAMLs and canary references. |
+| **Status as of 2026-07-19** | The harness, five harness-thread bodies, two YAMLs, pytest entry point, and C++/V1 QA registration have landed through PR #15174. The registered marathon remains a 10 min `log_only` guard; `full_cancel_poison` and the Python/V2 YAML are not enabled in CI. PR #16402 is separately validating the finite Qwen3-32B deadline/cancellation acceptance test. |
+| **Next step** | Complete PR #16402's focused and full CI gates, then qualify a bounded `full_cancel_poison` run before enabling it. Keep admission tuning and the original 10,000-request soak as separately measured follow-up work. |
 
 ## Scope And Motivation
 
-Phase 0 is the permanent regression gate for the NVBug 6104831
-failure class: disaggregated KV-transfer cancellation races that can
-leave the system wedged, crash worker processes, or force a fail-closed
-pool-wide poison cascade.
+Phase 0 is intended to become the permanent regression gate for the
+NVBug 6104831 failure class: disaggregated KV-transfer cancellation
+races that can leave the system wedged, crash worker processes, or
+force a fail-closed pool-wide poison cascade.
 
-The immediate motivation is the cancellation / poison work introduced
-at <https://github.com/NVIDIA/TensorRT-LLM/pull/13713>. That change is
-memory-safe and deliberately fail-closed: if a request is cancelled
-while the remote peer may still be reading or writing an advertised
-transfer buffer, TRT-LLM poisons the transfer pool and the Python
-executor shuts down. That avoids UAF, but it is operationally
-aggressive, so the feature shipped gated and default-OFF.
+The initial cancellation/poison prototype was reviewed in
+<https://github.com/NVIDIA/TensorRT-LLM/pull/13713> but did not merge.
+The gated implementation later merged in
+<https://github.com/NVIDIA/TensorRT-LLM/pull/15238>. Its active-transfer
+cancellation path is deliberately default-off while the project
+qualifies lifecycle, peer-consensus, and poison-buffer behavior.
 
 The customer-visible pressure came from the 2026-05-13 Qwen3-Coder-480B
 incident: the default 60 s transfer timeout fired during transient
@@ -49,18 +48,91 @@ The suite tests one contract:
 Transient failures during stress are allowed. Request errors,
 cancellations, retries during bursts, and short canary error spikes
 during injected peer pauses are expected. The assertion is graceful
-recovery: after SIGCONT, worker-loss absorption, or burst completion,
+recovery: after SIGCONT, worker respawn, or burst completion,
 the deployment must return to a healthy baseline within a bounded time.
+
+## Current Test Inventory And Roles
+
+Two disaggregated stress-test families now cover related failure modes.
+They share cluster setup and exercise the C++/V1 transfer path, but they
+have different operating contracts and should not be treated as
+interchangeable evidence.
+
+| Dimension | Qwen3 finite QA acceptance test | Phase 0 cancellation marathon |
+|---|---|---|
+| Exact test | `disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-qwen3_32b_fp8_stress]` | `stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_disagg_cancellation_marathon[marathon_cpp_v1_deepseek.yaml]` |
+| Origin | PR #14278; PR #16008 later added 10 percent cancellation | PRs #14375, #14807, #14920, #15015, #15124, and #15174 |
+| Model and shape | Qwen3-32B FP8 plus Eagle3; 4 context TP1 workers and 1 generation TP4 worker | DeepSeek-V3-Lite; 3 context and 3 generation TP1 workers |
+| Load | Upstream profile: 10,000 requests at concurrency 512, 8k input and 1k output. PR #16402 uses a bounded 512-request acceptance profile at the same concurrency. | Registered profile: one normal probe every 30 s for 10 min. The full-mode YAML intends batches of 64, periodic 256-request batches, 4k-16k inputs, and 512 output tokens for 2 h. Today the driver treats the concurrency values as batch sizes and hard-codes 10 output tokens. |
+| Cancellation | AIPerf disconnects 10 percent of requests after 0.5 s. PR #16402 keeps active C++ in-flight cancellation default-off, so active transfers retain ownership and drain. | `log_only` sends no cancellations. The full-mode YAML specifies 10 percent, but that knob is not wired: the current custom load disconnects every request in each batch. Full mode is opt-in and unregistered. |
+| Fault injection | None | `full_cancel_poison` schedules SIGSTOP/SIGCONT and SIGKILL/respawn events. |
+| Primary assertions | Direct end-to-end gates are a successful AIPerf process, no configured fatal log signatures, a successful follow-on GSM8K run, and score at or above 0.42. The lifecycle contract exercised by PR #16402 is that every client operation terminates within a bound: deliberately disconnected clients cancel, other requests complete or receive an explicit terminal error, and server-side ownership and router reservations are released exactly once. | No fatal log signatures and at least one successful normal probe in `log_only`. Full mode is designed to add canary correctness, bounded recovery, worker liveness, and KV-utilization growth, but those aggregate gates are not implemented yet. |
+| Intended cadence | Focused QA gate for changes to proxy deadline, cancellation terminalization, and cleanup; then ordinary full PR CI. | Short registered guard today; full fault-injection soak should run weekly/on demand after qualification, not on every PR. |
+| Verified boundary | PR #14278 validated only a smoke and a temporary 16-request reduction. PR #16402 experimental heads passed the 512-request profile with admission multipliers 1 and 2. Validation must be repeated on its final head before merge. The original 10,000-request profile remains unverified. | Unit/component coverage is established and the real `log_only` cluster path is registered. Neither full-mode YAML has a successful full-duration CI qualification, and the current pytest collector does not enforce the proposed aggregate full-mode gates. |
+
+PR #16008 also added
+`test_disaggregated_mixed_stress_test[req10k-conc512-qwen3_32b_fp8_mixed_stress]`.
+That variant mixes normal, streaming, structured-output, and cancelled
+requests, but its 10,000-request profile was explicitly not validated
+end to end when merged. It is adjacent to the finite acceptance test,
+not a substitute for the fault-injection marathon.
+
+### Consolidation Decision
+
+Keep the finite QA acceptance test and the Phase 0 marathon separate:
+
+- The finite Qwen test is an end-to-end request-lifecycle gate. It
+  should stay bounded enough to provide a result during PR validation
+  and should make terminal success, cancellation, or timeout explicit.
+- The marathon is a system-integrity soak. Its unique value is elapsed
+  time, deliberate worker faults, canaries, log scanning, and resource
+  leak detection. Folding those concerns into the finite test would
+  make failures slower and harder to attribute.
+- Share helpers rather than workloads: cluster launch/teardown,
+  terminal-outcome accounting, cancellation telemetry, cleanup timing,
+  log preservation, and post-load recovery probes should have one
+  implementation where practical.
+- Do not claim `full_cancel_poison` coverage from the registered
+  marathon until the YAML mode is actually enabled and qualified.
+- Before comparing full-mode throughput or cancellation rates with the
+  finite Qwen test, wire `client_cancel_rate`, `output_length`, and a
+  true maintained-concurrency contract into the marathon load driver.
+
+There is a narrower future consolidation question between the two
+10,000-request Qwen variants. Once the mixed-stress profile has a clean
+end-to-end qualification, compare its unique assertions with the
+legacy uniform AIPerf soak and retain only one long Qwen soak if their
+signals are redundant. That decision does not affect the Phase 0
+fault-injection marathon.
+
+### Validation Policy
+
+For a PR that changes disaggregated request lifetime or cleanup:
+
+1. Run unit tests for timeout propagation, queued cancellation,
+   exact-once router cleanup, and terminal accounting.
+2. Run the exact finite Qwen QA test using:
+
+   ```text
+   /bot run --only-qa-verify test disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-qwen3_32b_fp8_stress]
+   ```
+
+3. After the focused test passes on the current commit, run the full PR
+   pipeline with `/bot run --disable-fail-fast`.
+4. Run the full marathon separately for soak/fault qualification. It is
+   not a replacement for the focused gate and need not block every PR
+   while in-flight cancellation remains default-off.
 
 ### Coverage Goals
 
-The initial weekly suite covers the two mainstream disaggregated
-deployment cells:
+The full-mode design targets two mainstream disaggregated deployment
+cells. Current CI coverage is narrower and must be reported separately
+from the target:
 
-| Cell | Why it matters | Initial coverage |
+| Cell | Why it matters | Current state |
 |---|---|---|
-| V1 KV cache manager + C++ transceiver + NIXL | Established production path and the cell extended by the fail-closed cancellation work | Marathon A |
-| V2 KV cache manager + Python transceiver + NIXL | Newer path and the architectural template for consensus semantics | Marathon B |
+| V1 KV cache manager + C++ transceiver + NIXL | Established production path and the cell extended by the fail-closed cancellation work | `marathon_cpp_v1_deepseek.yaml` is registered, but only in `log_only` mode. |
+| V2 KV cache manager + Python transceiver + NIXL | Newer path and the architectural template for consensus semantics | `marathon_python_v2_qwen.yaml` is a parse-validated template; it is not parametrized or registered. |
 
 The harness must also be parametric enough to add follow-up YAMLs for
 the third valid cell (V1 + Python), direct UCX, block-reuse off, overlap
@@ -75,7 +147,7 @@ The bug patterns to catch are:
 | Lifetime UAF | Crashes or corrupt canary output after request cancellation | Cancel-during-transfer load and deterministic canaries |
 | Poison cascade | Pool-wide poison followed by executor shutdown / restart | 60 s timeout under high concurrency and injected receiver slowness |
 | Block-reuse interaction | KV blocks pinned or reclaimed incorrectly | Block reuse enabled in both initial marathons |
-| Worker-loss absorption | Deployment does not survive one worker loss in a 3P3D shape | SIGKILL of one worker with kill-only fallback |
+| Worker-loss recovery | Deployment does not recover after one worker is killed in a 3P3D shape | SIGKILL of one worker followed by bounded respawn |
 | Consensus divergence | Rank-batch mismatch, collective deadlock, unreclaimed KV blocks | Follow-up TP/PP/EP consensus-focused configs before Phase 1 claims full axis coverage |
 
 ### Initial Non-Scope
@@ -96,47 +168,54 @@ The bug patterns to catch are:
 
 | Requirement | Value |
 |---|---|
-| Weekly CI budget | 4 h total |
-| Test composition | Two serial 2 h marathons |
-| Local developer mode | Optional smoke mode around 10 min, with one burst and one injection |
-| CI frequency | Weekly stress CI for TRTLLM-12648; opt-in for changes touching disagg cancellation, KV transfer cleanup, or the stress harness |
+| Current registered budget | One 10 min `log_only` run with a 45 min test-list timeout including setup and teardown |
+| Target weekly CI budget | 4 h total |
+| Target full-mode composition | Two serial 2 h marathons after both are qualified |
+| Manual shortened full-mode profile | Proposed 10 min profile with one burst and one injection; this is a duration/configuration override, not a separate harness mode |
+| CI frequency | Focused Qwen QA acceptance on relevant PRs; Phase 0 soak weekly/on demand after qualification |
 | Required environment | `LLM_MODELS_ROOT` set to the chosen model root; NIXL-capable local disagg setup |
 
 ### Hardware Budget
 
-The initial suite targets one 8-GPU B200 or H100 node. With 3P3D and
-TP=1 per worker, each marathon uses six GPUs for workers, leaving two
-for the disagg server and clients. The two marathons run serially.
+The Phase 0 marathon targets one 8-GPU B200 or H100 node. With 3P3D
+and TP=1 per worker, it uses six GPUs for workers. The disagg server
+and clients do not consume the remaining GPUs. If both full-mode
+marathons are enabled, they run serially.
 
 ### Marathon Configurations
 
-| Test ID | Shape | Config | Model class | Duration |
+| YAML / pytest identity | Shape | Config | Enabled behavior | Status |
 |---|---|---|---|---|
-| `marathon_a_v1_cpp_deepseek` | 3P3D local | V1 + C++ transceiver + NIXL, block reuse on, overlap on, 60 s transfer timeout | DeepSeek-class | 2 h |
-| `marathon_b_v2_py_qwen` | 3P3D local | V2 + Python transceiver + NIXL, block reuse on, overlap on, 60 s transfer timeout | Qwen-class | 2 h |
+| `marathon_cpp_v1_deepseek.yaml` | 3P3D local | V1 + C++ transceiver + NIXL, block reuse and overlap on, 60 s transfer timeout | 10 min `log_only`; 2 h `full_cancel_poison` values are present but inactive | Parametrized and QA-registered |
+| `marathon_python_v2_qwen.yaml` | 3P3D local | V2 + Python transceiver + NIXL | Intended 2 h `full_cancel_poison` profile | Template only; not parametrized or registered |
 
 3P3D is deliberate:
 
 - It exercises multi-pair cleanup paths instead of only a single
   context/generation pair.
-- It gives redundancy for the kill-only SIGKILL injection.
+- It gives redundancy while a SIGKILL target is restarted.
 - It is close to common production disaggregated shapes while still
   fitting on one node.
 
 The valid KV-cache / transceiver combinations are:
 
-| Combination | Initial plan |
+| Combination | Coverage plan |
 |---|---|
-| V1 + C++ | Marathon A |
+| V1 + C++ | Registered DeepSeek marathon; full mode still needs qualification |
 | V1 + Python | Follow-up YAML |
 | V2 + C++ | Invalid; reject in config validation |
-| V2 + Python | Marathon B |
+| V2 + Python | Qwen template; parametrization and qualification pending |
 
 ### Workload Pattern
 
-Each marathon repeats the following pattern for 2 h.
+The following is the intended `full_cancel_poison` pattern. It is not
+run by the currently registered `log_only` mode, and its load knobs are
+not fully wired today: `base_concurrency` and burst `concurrency` select
+the number of requests in a sequential batch, `client_cancel_rate` is
+unused because every request is disconnected, and `output_length` is
+unused because the shared load generator hard-codes 10 output tokens.
 
-**Steady state**
+**Target steady state**
 
 - 64 concurrent in-flight requests.
 - Prompt length uniformly distributed from 4k to 12k input tokens.
@@ -144,7 +223,7 @@ Each marathon repeats the following pattern for 2 h.
 - 10 percent client-side cancellation rate, disconnecting during
   prefill.
 
-**Bursts**
+**Target bursts**
 
 - Every 8 min, ramp to 256 concurrent requests for 60 s.
 - Prompt length uniformly distributed from 12k to 16k input tokens.
@@ -156,7 +235,7 @@ Each marathon repeats the following pattern for 2 h.
 T+ 15 min : SIGSTOP random gen worker for 20 s, then SIGCONT
 T+ 30 min : SIGSTOP random gen worker for 30 s, then SIGCONT
 T+ 45 min : SIGSTOP random ctx worker for 20 s, then SIGCONT
-T+ 60 min : SIGKILL gen_worker_0, with kill-only absorption in the initial suite
+T+ 60 min : SIGKILL gen_worker_0, respawn within 60 s
 T+ 75 min : SIGSTOP random gen worker for 20 s, then SIGCONT
 T+ 90 min : SIGSTOP random ctx worker for 30 s, then SIGCONT
 T+105 min : SIGSTOP random gen worker for 20 s, then SIGCONT
@@ -165,58 +244,78 @@ T+120 min : end
 
 SIGSTOP/SIGCONT creates transient peer pauses, which exercise
 cancel-mid-flight plus recovery. SIGKILL creates terminal worker loss;
-the initial shipped shape validates that the remaining five workers
-absorb load. Full respawn support is a follow-up once worker handles
-expose a stable relaunch API.
+the full-mode contract requires the selected worker to be restarted
+within the configured bound and the cluster to become healthy again.
 
 ### Canary Requirements
 
-The canary client runs in parallel for the full marathon:
+The intended canary client runs in parallel for the full marathon:
 
 - 5 requests per minute.
 - Fixed prompt set loaded from `stress_canary_prompts.json`.
 - Greedy decoding with fixed seed.
 - Reference token IDs generated once with the same model and engine
   config, committed beside the YAMLs.
-- Exact token-equivalence check when deterministic; fallback order is
-  exact detokenized text, BLEU / ROUGE threshold, then length-only
-  sanity. Each fallback is weaker and must be documented in the test
-  README.
+- The current implementation compares token IDs only when
+  `reference_token_ids` are present. It parses but does not use
+  `reference_text`.
+- A proposed fallback order is exact detokenized text, BLEU / ROUGE
+  threshold, then length-only sanity. These fallbacks are not
+  implemented; each is weaker and must be documented before it can
+  become an accepted test outcome.
 
-Reference outputs are generated by:
+The planned reference generator location is:
 
 ```text
 tests/integration/defs/stress_test/disagg_cancel/tools/generate_canary_references.py
 ```
 
-Regenerate references when the model checkpoint, dtype, tokenizer,
-max sequence length, or engine config changes in a way that can affect
-greedy output.
+Neither that tool nor `stress_canary_prompts.json` is currently checked
+in. Add both before enabling `full_cancel_poison`. Regenerate references
+when the model checkpoint, dtype, tokenizer, max sequence length, or
+engine config changes in a way that can affect greedy output.
 
 ### Pass Criteria
+
+The following table is the target `full_cancel_poison` contract. The
+current collector returns raw observations plus `failure_reason`, and
+the pytest entry point checks only result shape, fail-fast state, and a
+successful probe for `log_only`. It does not yet compute or enforce the
+aggregate thresholds below.
 
 | Gate | Threshold |
 |---|---|
 | Hard-zero log patterns | 0 occurrences in any worker log |
-| Worker liveness | Every non-intentionally-killed worker alive at end |
+| Worker liveness | The SIGKILL target is respawned within its configured bound and every worker is alive and healthy at end |
 | Final health probe | 5 sequential canaries succeed within 30 s of test end |
 | Canary correctness | 100 percent of returned canaries token-equivalent to reference, unless a documented fallback is active |
 | Canary error rate, overall | Less than 1 percent over the full marathon |
 | Canary error rate, burst / injection window | Less than 10 percent during any 1 min window containing burst or injection |
-| Recovery time after injection | Less than 30 s from SIGCONT or accepted worker-loss event until canary error rate returns below 1 percent |
+| Recovery time after injection | Less than 30 s from SIGCONT or worker respawn until canary error rate returns below 1 percent |
 | KV cache utilization growth | End-of-test utilization no more than baseline plus 10 percentage points |
 
-Hard-zero log patterns include:
+The registered C++/V1 YAML currently scans for:
 
 - `Broken promise`
-- `NO RECOVERY`
 - `Segfault`
+- `Segmentation fault`
 - `SIGSEGV`
 - `0xffffffffffffffff`
-- `Poisoned .* cache transfer buffer`
+- `use-after-free`
+- `heap-use-after-free`
+- `AddressSanitizer:.*use-after-free`
+- `double[- ]free`
 
-`Cannot cancel request` is not capped. It is expected at the boundary
-where cancellation races an in-flight transfer.
+The planned Python/V2 template additionally lists `NO RECOVERY` and
+`Poisoned .* cache transfer buffer`. Before full-mode enablement, align
+the two YAMLs and the runtime contract on one required hard-zero set.
+
+The final policy for `Cannot cancel request` is intentionally unresolved
+while `full_cancel_poison` is disabled. The current runtime can emit it
+at the boundary where cancellation races an active transfer, whereas
+the future full-mode README treats it as a candidate hard-zero signal.
+Before enabling full mode, align the runtime contract, YAML log list,
+and README so the test has one explicit expectation.
 
 ### YAML Configuration Contract
 
@@ -252,6 +351,7 @@ generation_servers:
   # Same shape as context_servers.
 
 stress_config:
+  mode: full_cancel_poison
   duration_min: 120
   kv_cache_manager: v1        # v1 | v2
   transceiver: cpp            # cpp | python; v2 + cpp is invalid
@@ -281,6 +381,7 @@ stress_config:
     - at_min: 60
       type: sigkill
       target: gen_worker_0
+      respawn_within_s: 60
 
   canary:
     prompts_file: stress_canary_prompts.json
@@ -305,11 +406,15 @@ stress_config:
   kv_cache_growth_max: 0.10
 ```
 
-The harness owns translation of `kv_cache_manager` and `transceiver`
-into the current worker config / environment variables. Implementers
-must verify the exact names against the current config classes before
-landing the YAML step, and document the mapping in the harness module
-docstring.
+The nested worker configuration is the runtime source of truth:
+`kv_cache_config.use_kv_cache_manager_v2` selects V1/V2 and
+`cache_transceiver_config.transceiver_runtime` selects C++/Python. The
+harness strips `stress_config` before calling `setup_disagg_cluster`;
+the top-level `kv_cache_manager` and `transceiver` fields are validation
+metadata only. Current validation rejects invalid selector pairs but
+does not cross-check them against the nested worker configuration. Add
+that cross-check before enabling either full-mode YAML so the displayed
+coverage cannot silently differ from the exercised path.
 
 ## Harness Architecture
 
@@ -355,14 +460,19 @@ subprocess signals, worker relaunch decisions, file tailing, and
 Prometheus scraping. Keeping each component in a thread makes failures
 isolated and easier to debug.
 
-Fail-fast behaviour:
+Current fail-fast behaviour:
 
 1. A hard-zero log pattern sets `failed_event` immediately and records
    the offending log line.
-2. Unexpected worker exit sets `failed_event`, except for the
-   intentionally killed worker in the kill-only scenario.
-3. End-of-test gates assert canary correctness, recovery time, final
-   health, and KV utilization growth.
+2. A failed `log_only` probe, a load-runner failure, or expiry of a
+   configured respawn deadline sets `failed_event`.
+3. `wait_until_done()` observes harness events and its overall timeout;
+   it does not generically monitor worker processes for unexpected
+   exits. Add that monitoring before enabling full mode.
+4. The target end-of-test gates assert canary correctness, recovery
+   time, final health, and KV utilization growth. The current result
+   collector records the inputs for those gates but does not aggregate
+   or enforce them.
 
 ### File Layout
 
@@ -370,86 +480,96 @@ Fail-fast behaviour:
 tests/integration/defs/stress_test/disagg_cancel/
 ├── README.md
 ├── __init__.py
+├── _testing.py
 ├── harness.py
 ├── test_disagg_cancel_stress.py
+├── test_canary.py
+├── test_injector.py
+├── test_load_thread.py
+├── test_log_scanner.py
+├── test_metrics_thread.py
 └── configs/
-    ├── stress_canary_prompts.json
-    ├── marathon_a_v1_cpp_deepseek.yaml
-    ├── marathon_b_v2_py_qwen.yaml
+    ├── marathon_cpp_v1_deepseek.yaml
+    ├── marathon_python_v2_qwen.yaml
     └── README.md
 ```
 
-Planned stress test-list entries:
+The current stress test-list entry is:
 
 ```text
-stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_disagg_cancellation_marathon[marathon_a_v1_cpp_deepseek]
-stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_disagg_cancellation_marathon[marathon_b_v2_py_qwen]
+stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_disagg_cancellation_marathon[marathon_cpp_v1_deepseek.yaml] TIMEOUT (45)
 ```
+
+`marathon_python_v2_qwen.yaml` is covered by parse/validation tests but
+is intentionally absent from `_MARATHON_CONFIGS` and the QA list.
+Canary reference JSON and its generator are also not yet checked in.
 
 ## Implementation Roadmap
 
-Phase 0 lands incrementally, one component at a time, so the harness can
-be reviewed and exercised before the full 4 h suite is enabled.
+Phase 0 landed incrementally, one component at a time. The harness is
+implemented; enabling and qualifying its full behavior remains open.
 
 | Step | Boundary | Status | Upstream link |
 |---|---|---|---|
 | 1 | Harness skeleton, initial config, README, `log_scanner_thread` | Merged 2026-05-28 | <https://github.com/NVIDIA/TensorRT-LLM/pull/14375> |
 | 2 | `metrics_thread` and KV-utilization time series | Merged 2026-06-02 | <https://github.com/NVIDIA/TensorRT-LLM/pull/14807> |
-| 3 | `injector_thread`, SIGSTOP/SIGCONT/SIGKILL schedule, kill-only worker-loss handling | Merged 2026-06-04 | <https://github.com/NVIDIA/TensorRT-LLM/pull/14920> |
+| 3 | `injector_thread`, SIGSTOP/SIGCONT/SIGKILL schedule, optional respawn | Merged 2026-06-04 | <https://github.com/NVIDIA/TensorRT-LLM/pull/14920> |
 | 4 | `canary_thread`, deterministic prompts, token-equivalence checks | Merged 2026-06-08 | <https://github.com/NVIDIA/TensorRT-LLM/pull/15015> |
-| 5 | `load_thread`, duration-bounded wrapper around `run_cancel_stress_test` | Next | - |
-| 6 | Marathon YAMLs, canary JSON, reference-generation tool | Pending | - |
-| 7 | Pytest marathon entry point and stress test-list registration | Pending | - |
+| 5 | `load_thread`, duration-bounded wrapper around `run_cancel_stress_test` | Merged 2026-06-09 | <https://github.com/NVIDIA/TensorRT-LLM/pull/15124> |
+| 6 | C++/V1 and Python/V2 YAMLs, mode switch, config validation | Merged 2026-06-10 | <https://github.com/NVIDIA/TensorRT-LLM/pull/15174> |
+| 7 | Pytest entry point and C++/V1 `log_only` QA registration | Merged 2026-06-10 | <https://github.com/NVIDIA/TensorRT-LLM/pull/15174> |
 
 The current status is:
 
-- Done: harness structure, log scanner, metrics scraper, injector, and
-  canary client.
-- In progress next: `load_thread`.
-- Pending after that: two full marathon configs, canary references,
-  reference-generation tool, pytest parametrization, test-list
-  registration, and full-duration validation.
+- Done: harness structure, all five thread bodies, YAML parsing and
+  validation, pytest entry point, real-cluster setup, `log_only`, and
+  one registered C++/V1 test.
+- Pending: canary references and generator, a qualified
+  `full_cancel_poison` run, aggregate full-mode assertions,
+  required-input validation, generic worker-exit monitoring,
+  selector-to-worker-config cross-validation, load-rate/output wiring,
+  aligned hard-zero patterns, Python/V2 parametrization, and an
+  explicit weekly/on-demand schedule for full mode.
 
 ### Step 5 - Load Thread
 
-`load_thread` should drive the existing
+`load_thread` currently drives the existing
 `run_cancel_stress_test(server_url, num_bursts, requests_per_burst,
 prompt_len_range, cancel_after_range)` implementation repeatedly until
-the configured duration elapses. It must:
+the configured duration elapses. Its target contract is to:
 
 - Maintain steady-state load and burst windows from `stress_config`.
 - Respect `stop_event` and `failed_event`.
 - Record request counts, cancellation counts, load errors, and burst
   timestamps for correlation with canary and metrics output.
-- Avoid refactoring the existing disaggregated cancel test unless the
-  current coroutine shape makes wrapping impossible.
+- Reuse the existing cancellation load generator without creating a
+  second request implementation.
+
+Meeting that contract still requires the load-rate, output-length, and
+maintained-concurrency wiring listed in the acceptance checklist.
 
 ### Step 6 - Marathon Configs And References
 
-Add:
-
-- `configs/marathon_a_v1_cpp_deepseek.yaml`
-- `configs/marathon_b_v2_py_qwen.yaml`
-- `configs/stress_canary_prompts.json`
-- `tools/generate_canary_references.py`
-- `configs/README.md` describing model assumptions and config knobs.
-
-This step should also pin the exact config-field / env-var translation
-for V1/V2 and C++/Python selection.
+The two YAMLs and their config README are present. The C++/V1 YAML is
+the only parametrized configuration. Before full mode is enabled, add
+the referenced `stress_canary_prompts.json` and a reproducible
+reference-generation tool, then record the model/config identity used
+to produce those references.
 
 ### Step 7 - Pytest And CI Registration
 
-Add a parametrized pytest entry point over the two marathon YAMLs and
-register the two test IDs in:
+The parametrized pytest entry point exists, but `_MARATHON_CONFIGS`
+contains only `marathon_cpp_v1_deepseek.yaml`. That ID is registered in:
 
 ```text
 tests/integration/test_lists/qa/llm_function_stress.txt
 ```
 
-This step should also update the test README with:
+The README documents modes and invocation. Before adding Python/V2 or
+turning on full mode, it must continue to explain:
 
 - How to run full marathons.
-- How to run smoke mode.
+- How to run a manually shortened full-mode profile.
 - How to inspect logs and metrics after failure.
 - Which failures are expected transient events and which fail the test.
 
@@ -461,15 +581,22 @@ This step should also update the test README with:
 - [x] Log scanner fails fast on hard-zero patterns.
 - [x] Metrics scraper records `trtllm_kv_cache_utilization`.
 - [x] Injector supports scheduled SIGSTOP/SIGCONT/SIGKILL.
-- [x] Canary thread records deterministic canary results.
-- [ ] `load_thread` runs cancellation-heavy load for the configured duration.
-- [ ] Marathon A and Marathon B YAMLs are committed.
+- [x] Canary thread records request outcomes and optional token equivalence.
+- [x] `load_thread` runs cancellation-heavy load for the configured duration.
+- [x] C++/V1 and Python/V2 YAMLs are committed and parse-validated.
 - [ ] Canary prompts and reference token IDs are committed.
 - [ ] Reference-generation tool is committed.
-- [ ] Parametrized pytest marathon entry point is committed.
-- [ ] Two weekly-stress test IDs are registered.
-- [ ] Each marathon has at least one successful full-duration run before weekly CI enablement.
-- [ ] The stress-test README documents failure debugging.
+- [x] Parametrized pytest marathon entry point is committed.
+- [x] The C++/V1 `log_only` test ID is registered.
+- [ ] `collect_results()` and pytest enforce canary, recovery, final-health, KV-growth, and worker-liveness gates in full mode.
+- [ ] Full mode fails setup when required canary prompts or reference data are absent.
+- [ ] `wait_until_done()` detects an unexpected worker exit outside the configured respawn flow.
+- [ ] Top-level KV-manager/transceiver selectors are cross-checked against both nested worker configurations.
+- [ ] `client_cancel_rate`, `output_length`, and maintained concurrency are wired to the full-mode load generator.
+- [ ] Hard-zero patterns and the `Cannot cancel request` policy are aligned across runtime, YAMLs, and README.
+- [ ] Python/V2 is parametrized and registered when its runtime contract is ready.
+- [ ] Each enabled full-mode marathon has a successful full-duration qualification.
+- [x] The stress-test README documents modes, invocation, and failure debugging.
 
 ## Follow-Up Coverage
 
