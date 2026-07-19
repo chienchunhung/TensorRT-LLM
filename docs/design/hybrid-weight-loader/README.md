@@ -31,7 +31,7 @@ WeightLoadPlan
 The current prototype implements the two host policies and the legacy fallback. `gpu_broadcast` is a recognized but
 unavailable policy. The default plan is an ordered eligibility fallback, not a runtime performance tuner: on every
 currently eligible checkpoint it selects `direct_rank_read` because the direct and shared policies have the same
-qualification rules.
+eligibility rules.
 
 The recommended rollout is therefore:
 
@@ -65,7 +65,7 @@ capture can dominate after storage is accelerated. The design must preserve thos
 - Allow an explicit strict policy or an ordered fallback plan.
 - Exploit multiple local CPU processes and threads without redundant physical storage reads when possible.
 - Select all collective behavior before policy-specific I/O begins.
-- Preserve a safe path for unsupported formats, models, and parallel layouts.
+- Preserve a safe path for unsupported sources, formats, load modes, and communicator lifecycles.
 - Keep checkpoint source, host staging, GPU placement, and artifact reuse as separate concerns.
 - Produce enough telemetry to explain both storage-stage and end-to-end speedup.
 - Provide a migration path to ModelStreamer, MX, GMS, and topology-aware GPU distribution.
@@ -141,34 +141,25 @@ checkpoint metadata plus deployment context and chooses a policy; the chosen pol
 
 ## Current Data Paths
 
-All current paths end at the existing mmap-backed SafeTensors and model-specific application logic.
+All current paths use the existing mmap-backed SafeTensors and model-specific application logic. Their scheduling is
+different:
 
 ```text
-checkpoint files
-    |
-    +-- legacy_fallback
-    |      whole files assigned across local ranks
-    |      each owner reads assigned files with a thread pool
-    |
-    +-- direct_rank_read
-    |      files split into 256 MiB extents
-    |      extents striped across local MPI ranks
-    |      bounded 8 MiB buffered pread operations
-    |
-    +-- shared_host_producer
-           all extents assigned to node-local rank 0
-           bounded producer thread pool
-                    |
-                    v
-              Linux page cache
-                    |
-             node-local barrier
-                    |
-                    v
-        every rank opens/maps all shards
-                    |
-        rank-specific mapping/transforms/H2D
+legacy_fallback / shared_host_producer
+checkpoint -> synchronous prefetch -> node barrier -> mmap -> mapping/transforms/H2D
+
+direct_rank_read
+checkpoint -> background extent reads --------------------------+
+             |                                                   |
+             +-> mmap -> mapping/transforms/H2D -> session finish
+                                                         join reads
+                                                         coordinate errors
+                                                         success-only barrier
 ```
+
+The background reads and demand faults both populate the node's Linux page cache. Direct mode can therefore overlap
+filesystem I/O with mmap setup, CPU mapping and transformations, and the existing H2D copies. It does not bypass the
+page cache or place bytes directly in GPU memory.
 
 ### Important Baseline Correction
 
@@ -190,9 +181,14 @@ Both new policies beating legacy is a benchmark hypothesis, not an architectural
 
 ### `direct_rank_read`
 
-Node-local MPI ranks own disjoint 256 MiB file extents. Each rank uses bounded buffered `pread` calls to warm those
-extents into the shared OS page cache. The current defaults cap workers at 16 per rank and 64 per node. After a local
-barrier, every rank uses the existing SafeTensors mmap, mapping, transformation, and H2D path.
+Node-local MPI ranks own disjoint 256 MiB file extents. Each rank starts bounded buffered `pread` calls that warm those
+extents into the shared OS page cache, then immediately enters the existing SafeTensors mmap, mapping, transformation,
+and H2D path. The current defaults cap workers at 16 per rank and 64 per node. At weight-session exit the caller
+coordinates materialization errors, cancels peer work when needed, joins the reader, coordinates read errors, performs
+a node barrier only after success, and releases the node communicator.
+
+This overlapped session is used through `ModelLoader`. A direct call to `HfWeightLoader.load_weights()` remains
+synchronous, so it is not a valid benchmark entry point for the pipelined behavior.
 
 "Direct" means direct rank ownership of regular buffered reads. It does not mean `O_DIRECT`, GDS, or direct-to-GPU
 placement. Each node still stages a complete logical checkpoint, and PP ownership does not yet reduce node storage
@@ -234,9 +230,11 @@ and collective startup cost.
 
 ### `legacy_fallback`
 
-This preserves the existing loader for unsupported formats and configurations. It remains required for `.bin` and
-`.pth`, the raw-weight cache, custom loaders and mappers, and any configuration outside the cooperative qualification
-envelope.
+This preserves the existing native disk loader for local `.bin`/`.pth`, the implicit raw-weight cache path, and other
+compatible configurations that do not use cooperative staging. MX, GMS, format-specific loaders, and object-store
+sources must route to their own source-specific implementation when configured; `legacy_fallback` does not make an
+unsupported URI loadable. Without such an implementation, selection fails. A model-specific or custom mapper alone
+does not make the raw-byte policies ineligible.
 
 ## Default and Strict Selection
 
@@ -264,23 +262,26 @@ the default resolves as follows:
 | Checkpoint | Current default result |
 | --- | --- |
 | Eligible HF SafeTensors checkpoint | `direct_rank_read` |
-| Unsupported model, mapping, format, or parallel mode | `legacy_fallback` |
+| Unsupported native-disk format or communicator | `legacy_fallback` when compatible, otherwise strict failure |
+| Source-specific MX/GMS/object-store path | Existing source adapter when configured, otherwise failure |
 | Raw HF weight cache enabled without an explicit plan | `legacy_fallback` |
 
 The current default is therefore **capability-adaptive**, not **performance-adaptive**, and is behaviorally identical to
 strict direct mode on eligible benchmark cells.
 
-## Current Qualification Envelope
+## Current Eligibility and Qualification
 
-The cooperative policies in PR #16562 are intentionally narrow:
+Eligibility and production qualification are deliberately separate:
 
-| Dimension | Qualified now | Falls back or fails when strict |
+| Dimension | Eligible for the raw-byte policy | Not handled by the policy |
 | --- | --- | --- |
-| Source and format | Filesystem-visible HF SafeTensors, `LoadFormat.AUTO` | `.bin`, `.pth`, direct object-store URIs, MX/GMS paths, format-specific loaders |
-| Model class | Dense unquantized `LlamaForCausalLM`, `Qwen2ForCausalLM`, `Qwen3ForCausalLM` | Other classes, VLMs, custom models |
-| Mapping | Loader-selected registered HF mapper | User-injected custom mapper or explicit model-specific override |
-| Parallelism | TP and PP | CP, EP/MoE, attention DP, DWDP |
-| Features | Base model load | Quantization, LoRA, speculative decoding, dynamic quantization |
+| Source and format | Filesystem-visible native HF SafeTensors with `LoadFormat.AUTO` | `.bin`, `.pth`, direct object-store URIs, MX/GMS paths, Mistral or other format-specific loaders |
+| Model and mapper | Model-neutral; registered and custom downstream mappers receive the same raw tensors | An overridden checkpoint-loader lifecycle that does not enter the native HF/AUTO session |
+| Parallelism and features | Byte staging is independent of TP/PP/CP/EP/attention-DP/DWDP, quantization, LoRA, and target/draft loading | Distributed cooperative loading without MPI-launched ranks or with a mismatched active communicator |
+
+Qwen 3.5, DeepSeek V4, and Llama 4 are therefore eligible when they use the native HF/AUTO SafeTensors path. This is
+not a blanket production-support claim. Each exact model revision, quantization, mapper, topology, speculative mode,
+and text or multimodal construction must pass correctness, memory, lifecycle, and cold-start qualification.
 
 The optimized prefetch path requires the full logical checkpoint to be smaller than 90% of node-local `MemAvailable`
 and no layer-count override. If the guard rejects prefetch, the selected host policy remains in effect but ranks proceed
@@ -308,7 +309,8 @@ Use measured deployment behavior rather than model size alone.
 | Local NVMe RAID or high-concurrency Lustre/parallel filesystem | Start with `direct_rank_read` | These systems commonly reward multiple disjoint reads, subject to measurement. |
 | NFS or another mount where multiple client processes reduce aggregate throughput | `shared_host_producer` | One process owns storage traffic while peers reuse cached pages. |
 | One local rank, warm page cache, or many evenly sized shards | Compare against `legacy_fallback` | Legacy may already expose enough concurrency; cooperative overhead may not help. |
-| Unsupported model, format, mapper, or feature | `legacy_fallback` | Only correctness-qualified policy today. |
+| Unsupported native-disk format or communicator | `legacy_fallback` when compatible | Preserves the existing native disk lifecycle. |
+| MX/GMS/object-store or format-specific source | Its source-specific loader, otherwise failure | `legacy_fallback` cannot create support for an unavailable source. |
 | Raw cache enabled and no plan is explicit | `legacy_fallback` | Preserves the requested cache lifecycle. An explicit direct/shared plan instead ignores the cache with a warning. |
 | Insufficient host memory for full-checkpoint prefetch | No optimized host policy today | Current direct/shared remain selected but skip prefetch and use existing demand-mmap behavior; classify this as an optimized-path miss. |
 | Replicated rank-ready weights, H2D is material, and fast peer links are available | Future `gpu_broadcast` | One H2D plus GPU fan-out may reduce redundant copies. |
@@ -390,7 +392,9 @@ placement.
   active world size.
 - Ranks sharing a node validate `(device, inode, size, modification time)` backing-file identity before cooperative
   reads. Cross-node content or revision identity remains future work.
-- Errors are coordinated before node-local barriers to avoid deadlock.
+- Direct-mode body errors are coordinated before readers are joined; peer reads are cancelled, read errors are then
+  coordinated, and the node barrier is entered only on success.
+- All MPI operations remain on the caller thread; background workers execute only precomputed host reads.
 - No policy switch occurs after storage I/O begins.
 - The current prototype logs selection and fallback information; Phase 0 makes it structured telemetry.
 - HfWeightLoader's rank-local disk-fallback branches for MX/GMS and model-specific loaders remain collective-free until
@@ -402,7 +406,8 @@ placement.
 
 - Port or reimplement hierarchical startup profiling on the current branch.
 - Add per-rank policy, byte, page-fault, memory, and fallback telemetry.
-- Run the current-qualified four-treatment experiment in [the benchmark plan](benchmark-plan.md).
+- Run the current four-treatment experiment and exact-profile qualification in
+  [the benchmark plan](benchmark-plan.md).
 - Keep conclusions conditional on storage type and checkpoint geometry.
 
 ### Phase 1: Stabilize Native Host Policies
@@ -421,14 +426,19 @@ placement.
 
 ### Phase 3: Expand Model and Parallelism Qualification
 
-- Qualify dense Qwen3.5-27B first, then model-specific mappers and the Qwen3.5 MoE variants.
-- Add CP, MoE/EP, attention-DP, independent-replica, quantized, and VLM cases one at a time.
-- Add rank ownership to the plan before claiming selective storage reads.
+- Qualify eligible Qwen 3.5, DeepSeek V4, and Llama 4 profiles from small mapper smokes through full-node flagship
+  configurations.
+- Cover MoE/EP, attention-DP, MTP, PP, independent replicas, quantized formats, and VLM construction with targeted
+  cases rather than a full Cartesian product.
+- Add rank ownership to the plan before claiming selective storage reads; current eligibility still stages raw bytes
+  without interpreting final ownership.
 
 ### Phase 4: Stream and Place Rank-Ready Weights
 
 - Implement bounded pinned producer/consumer buffers where shared mode warrants it.
-- Add source/sink streaming so mapping and H2D overlap storage reads.
+- Replace full-checkpoint page-cache read-ahead with bounded pinned/selective streaming when memory or measured overlap
+  warrants it. Direct mode already provides system-level filesystem-I/O overlap with materialization and H2D, but not
+  pinned-memory asynchronous DMA or direct destination placement.
 - Integrate ModelStreamer as a raw source and MX/GMS as higher-priority artifact sources.
 
 ### Phase 5: GPU Topology-Aware Fan-Out
@@ -443,11 +453,12 @@ placement.
 The native loader advances only when:
 
 - strict policy selection is observable and fallback-free in measured cells;
-- deterministic outputs and sampled parameter fingerprints match legacy;
+- deterministic outputs match legacy, with sampled parameter fingerprints when the worker-rank hook is enabled;
 - distributed runs complete without deadlock or rank divergence;
 - storage-stage gains translate to statistically significant end-to-end gains in target deployments;
 - warm-cache and steady-state performance do not materially regress; and
-- the adaptive selector is evaluated on held-out cells rather than tuned and reported on the same runs.
+- once implemented, the adaptive selector is evaluated on held-out cells rather than tuned and reported on the same
+  runs.
 
 The benchmark may show that one host policy is not useful on a particular filesystem or shard layout. That is a valid
 design result. The policy should remain explicit and opt-in, be refined, or be removed rather than hiding the result by

@@ -3,692 +3,842 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Hybrid Weight Loader Benchmark and Qualification Plan
+# Hybrid Weight Loader: 8xB300 Experiment and Handoff Plan
 
 [< Back to Native Hybrid Weight Loader](README.md)
 
-**Status:** Draft experiment design
+**Status:** Execution handoff specification; node campaign is blocked until the instrumentation gate below passes
 
 **Created:** 2026-07-19
 
 **Last Updated:** 2026-07-19
 
-## 1. Objective
+## 0. Handoff Contract
 
-Measure whether the native host-staging policies reduce cold-start latency relative to the pre-feature TensorRT-LLM
-loader, explain where the gain comes from, and establish the evidence required for a real adaptive policy.
+The execution owner needs exclusive access to one eight-GPU B300 node, the production shared-storage mount, permission
+to perform an administrator-approved client page-cache reset, and access to the pinned model artifacts. The owner is
+responsible for producing measured artifacts, not for proving a predetermined conclusion.
 
-The experiment answers four questions:
+Test [TensorRT-LLM PR #16562](https://github.com/NVIDIA/TensorRT-LLM/pull/16562). At the time this plan was written,
+the expected PR head was:
 
-1. Does `direct_rank_read` reduce checkpoint-loading and end-to-end startup on storage that scales with concurrent
-   readers?
-2. Does `shared_host_producer` reduce those times on storage that penalizes multiple reader processes?
-3. How much of a storage-stage gain survives model mapping, transformation, H2D, warmup, and first inference?
-4. Can a pre-I/O adaptive selector stay close to the fastest static policy across a heterogeneous deployment mix?
+```text
+e836be13846dd7055c3d889cdb1510e71ce25d63
+```
 
-The benchmark must test these hypotheses rather than arrange the matrix to prove a predetermined ordering. Legacy
-loading is already parallel at whole-file granularity, so neither new policy is guaranteed to win for every checkpoint
-layout or filesystem.
+Resolve and record the actual PR head before building. If it differs, review the range diff, record the new immutable
+SHA, and rerun all four treatments from the same binary. Never mix results from different feature commits, containers,
+models, or benchmark instrumentation revisions.
 
-## 2. Four-Treatment Campaigns
+The current handoff is **Campaign 0 only**:
 
-Each campaign has exactly four treatments and runs them with the same binary. This prevents unrelated commit
-differences from being mistaken for loader speedup. The three static treatments are common to both campaigns:
+1. `legacy_fallback` (L)
+2. `direct_rank_read` (D)
+3. `shared_host_producer` (S)
+4. the current default ordered plan (A0)
 
-| ID | Treatment | Configuration | Distinct behavior today |
-| --- | --- | --- | --- |
-| L | Feature-branch legacy proxy | `legacy_fallback` | Existing whole-file assignment and prefetch, plus feature-branch consensus/dispatch overhead |
-| D | Direct rank read | `direct_rank_read` | 256 MiB extents striped across local ranks |
-| S | Shared host producer | `shared_host_producer` | Node-local rank 0 stages all extents |
+A0 is ordered capability fallback, not a performance-adaptive policy. For eligible HF/AUTO SafeTensors checkpoints it
+is expected to select D and match D within noise. A future adaptive selector is out of scope for this run.
 
-The fourth treatment depends on the campaign; A0 and A1 are never run as two treatments in the same campaign:
+### Required Deliverables
 
-| ID | Treatment | Configuration | Distinct behavior |
-| --- | --- | --- | --- |
-| A0 | Ordered capability fallback | Default ordered plan today | Equals D on every eligible cell; measures selection/fallback overhead only |
-| A1 | Future performance-adaptive plan | Pre-I/O selector implemented later | Chooses L, D, or S from a frozen deployment profile |
+The execution owner returns one self-contained campaign directory with:
 
-Use explicit values in every trial:
+- an immutable software, model, configuration, and hardware manifest;
+- every command, environment variable, treatment order, exit status, and exclusion reason;
+- raw per-rank logs and structured interval events;
+- cache-state, CPU, host-memory, storage, and GPU telemetry;
+- correctness and clean-lifecycle results;
+- Nsight Systems traces for representative L and D runs;
+- aggregate tables with paired uncertainty, not isolated best runs; and
+- a short `report.md` that answers the questions in the next section.
+
+Do not invent missing measurements. If storage-side counters, cache-reset authority, model access, or instrumentation
+are unavailable, mark the affected claim as not measured and continue only with conclusions the evidence can support.
+
+## 1. Questions and Claim Boundaries
+
+The campaign answers:
+
+1. Does D reduce model initialization and process-to-first-token latency by overlapping checkpoint I/O with existing
+   materialization/H2D work?
+2. Does S reduce startup on the target NFS by using one node-local storage producer, despite keeping prefetch before
+   materialization?
+3. Which checkpoint geometries and storage states favor L, D, or S?
+4. Do the exact Qwen 3.5, DeepSeek V4, and Llama 4 profiles load correctly and exit cleanly in strict D and S modes?
+5. How much of the storage-stage improvement survives model construction, transformation, H2D, warmup, and first
+   inference?
+
+The current implementation supports system-level filesystem-I/O overlap with materialization and H2D. It does **not**
+use pinned-memory asynchronous DMA, `O_DIRECT`, GPUDirect Storage, direct final-tensor placement, TP/PP/EP-selective
+reads, or GPU fan-out. Do not attribute such mechanisms to a result.
+
+Legacy already assigns whole SafeTensors files across local ranks and prefetches assigned files with threads. The new
+policies are not guaranteed to win for every shard layout or filesystem. In particular:
+
+- D can win through finer extent balancing, more useful I/O concurrency, and hidden read time.
+- S can win when avoiding multi-process storage traffic is worth its synchronous producer/barrier cost.
+- L can remain competitive when many uniform shards already provide enough file-level parallelism.
+- A0 should be equivalent to D on eligible cells; it cannot credibly beat D merely by selecting it.
+
+## 2. Treatments
+
+Run every treatment with the same feature binary and otherwise identical environment.
+
+| ID | Requested plan | Current behavior |
+| --- | --- | --- |
+| L | `legacy_fallback` | Existing whole-file assignment, synchronous prefetch/barrier, then mmap/materialization |
+| D | `direct_rank_read` | Disjoint 256 MiB extents read in the background while `ModelLoader` maps and materializes weights |
+| S | `shared_host_producer` | Node-local rank 0 synchronously stages all extents, peers wait, then all ranks materialize |
+| A0 | Environment variable unset | Ordered plan; expected to select D for eligible native HF/AUTO SafeTensors |
+
+Set the common controls before every run:
 
 ```bash
 export TRTLLM_HF_WEIGHT_CACHE=0
 export TLLM_OVERRIDE_LAYER_NUM=0
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+```
 
-# L: legacy
+Set exactly one treatment:
+
+```bash
+# L
 export TRTLLM_HF_WEIGHT_LOAD_PLAN=legacy_fallback
 
-# D: direct
+# D
 export TRTLLM_HF_WEIGHT_LOAD_PLAN=direct_rank_read
 
-# S: shared
+# S
 export TRTLLM_HF_WEIGHT_LOAD_PLAN=shared_host_producer
 
-# A0: current ordered fallback
-export TRTLLM_HF_WEIGHT_LOAD_PLAN=direct_rank_read,shared_host_producer,gpu_broadcast,legacy_fallback
+# A0: test the actual default, not a locally reconstructed order
+unset TRTLLM_HF_WEIGHT_LOAD_PLAN
 ```
 
-Also fix `LoadFormat.AUTO`, the HF checkpoint loader, model revision, dtype, and all serving options. The raw HF weight
-cache is disabled because it uses a different lifecycle and the implicit plan preserves it by selecting legacy.
+Structured policy telemetry is a hard instrumentation gate for all four treatments: every rank must emit requested
+plan, selected policy, eligibility/fallback reasons, and run ID. D/S/A0 also retain the built-in INFO logs containing
+`Using <policy> SafeTensors loading`, prefetch-enabled or skipped state, mmap setup, and direct-mode assigned bytes/read
+time/exposed tail. L needs an unambiguous benchmark-only `legacy_fallback` selection/path event because the current
+built-in path does not emit the same selected-policy line; `command.json` alone is insufficient.
 
-Treatment L is a proxy, not automatically the pre-feature baseline: the feature branch adds manifest consensus, plan
-coordination, policy resolution, and communicator handling around legacy I/O. Before using L as the baseline, use at
-least five paired base-commit-versus-L pilot trials in one representative cold cell and one warm cell to estimate
-variance; exclude those pilots from confirmation. Freeze the confirmatory sample count before collecting it. For each
-metric, test whether the paired feature/base log-time ratio lies wholly inside the predeclared equivalence interval
-`[log(0.98), log(1.02)]`. Do not inspect an ordinary confidence interval and append samples until it crosses a boundary;
-an inconclusive fixed-size campaign remains inconclusive unless a separate, newly designed campaign or a predeclared
-group-sequential design with alpha spending is used. If L is not equivalent or equivalence remains inconclusive, report
-the unmodified base as an additional control and compute treatment speedups against both baselines.
+### Pre-Feature Baseline Check
 
-A0 and A1 belong to separate campaigns:
+L is a feature-branch proxy for the pre-feature implementation. Before using it as the only baseline, run five paired
+pilot blocks comparing the PR base commit with feature-branch L in one representative cold cell and one warm cell.
+Exclude these pilots from confirmation. Compute a paired confidence interval for the log-time ratio and require the
+whole interval to lie inside `[log(0.98), log(1.02)]`; an equivalent paired TOST procedure is acceptable if declared in
+advance. If the fixed pilot is inconclusive or shows a material difference, retain the unmodified base as an additional
+reported control; do not hide feature-branch overhead inside L.
 
-- **Campaign 0:** run L/D/S/A0 with the current feature binary. A0 validates deterministic capability fallback.
-- **Campaign 1:** after implementing A1, rerun L/D/S/A1 with the same new binary. Do not reuse Campaign 0 static-policy
-  times, because selector implementation or rebasing can change the other paths.
+## 3. Before Reserving the Expensive Node
 
-### Required Naming in Results
+### 3.1 Resolve the Exact Software Revision
 
-Until a performance selector is implemented, label treatment A0 **ordered fallback/direct-equivalent**, not adaptive.
-Direct and shared currently have identical qualification rules, direct appears first, and GPU fan-out is unavailable.
-Therefore A0 must resolve to direct on an eligible checkpoint and cannot honestly outperform it except through noise.
+From a clean TensorRT-LLM checkout:
 
-For a future A1 selector, define the oracle from cell-level static-policy estimators:
+```bash
+gh pr view 16562 --repo NVIDIA/TensorRT-LLM --json headRefOid,baseRefOid,url
+gh pr checkout 16562 --repo NVIDIA/TensorRT-LLM
+git status --short --branch
+git rev-parse HEAD
+git submodule status
+```
+
+On a checkout with an `upstream` remote, an equivalent detached setup is:
+
+```bash
+git fetch upstream pull/16562/head:refs/remotes/upstream/pr/16562
+git worktree add --detach ../trtllm-pr-16562 upstream/pr/16562
+```
+
+Record the PR head, PR base, any local benchmark-instrumentation commit, container digest, CUDA, driver, NCCL, Python,
+PyTorch, SafeTensors, mpi4py, Nsight Systems, and TensorRT-LLM versions. A local instrumentation commit is acceptable
+only if it is identical across L/D/S/A0, its patch is archived, and it does not alter policy scheduling.
+
+Pin the image named by `jenkins/current_image_tags.properties` and record its immutable digest. Query the actual GPU
+compute capability rather than assuming it:
+
+```bash
+nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader
+```
+
+The repository currently builds B300 for `103-real`. After confirming that value on the assigned node, use this
+source-backed release build:
+
+```bash
+python3 scripts/build_wheel.py \
+  --build_type Release \
+  --cuda_architectures 103-real \
+  --use_ccache \
+  --nvtx \
+  --install \
+  --yes
+```
+
+Do not use `--fast_build` for headline startup: omitted kernels or JIT work can change initialization. Then run the
+repository-prescribed smoke workflow for the target container and save all build commands and logs. Verify that Python
+imports the newly installed checkout before running the authoritative focused suite:
+
+```bash
+python3 -c 'import tensorrt_llm; print(tensorrt_llm.__file__)'
+git rev-parse HEAD
+pytest -q tests/unittest/_torch/models/checkpoints/hf/test_weight_load_plan.py
+```
+
+A pre-build pure-Python test is optional and non-authoritative because it can use stale installed bindings.
+
+### 3.2 Inventory Models and Checked-In Configurations
+
+Set `LLM_MODELS_ROOT` and inspect local artifacts rather than assuming public names map to mounted paths:
+
+```bash
+rg -n 'Qwen3.5|DeepSeek-V4|Llama-4' \
+  tests/integration/defs/perf/_model_paths.py \
+  tests/test_common/llm_data.py \
+  examples/configs/curated/lookup.yaml
+
+MODEL="$LLM_MODELS_ROOT/Qwen3.5-397B-A17B-NVFP4"
+test -f "$MODEL/config.json"
+jq '{architectures,model_type,quantization_config}' "$MODEL/config.json"
+find -L "$MODEL" -maxdepth 1 -type f -name '*.safetensors' -printf '%s %p\n' | sort -n
+```
+
+For each candidate, pin an immutable model revision or internal artifact identity and record a manifest of every
+SafeTensors file. Prefer publisher/artifact-system digests. If local hashes are required, compute them once before the
+verified client-cache reset; hashing a checkpoint reads it fully and can warm an uncontrolled NFS backend. If backend
+cache cannot subsequently be reset, use the immutable revision plus size/stat manifest for trial identity and disclose
+the hashing-induced backend warming. Require a nonzero SafeTensors count and confirm the intended load is not `.bin`,
+`.pth`, MX, GMS, or a format-specific checkpoint loader.
+
+Use `pytest --collect-only` to obtain exact test IDs from the checked-out revision instead of guessing parameter IDs:
+
+```bash
+pytest --collect-only -q tests/integration/defs/test_e2e.py | rg 'Llama-4-(Scout|Maverick)'
+pytest --collect-only -q tests/integration/defs/accuracy/test_llm_api_pytorch.py \
+  | rg 'Qwen3_5_397B|DeepSeekV4'
+```
+
+### 3.3 Node and Storage Preflight
+
+Record before the first trial:
+
+- eight visible B300 GPUs, NVLink/NVSwitch topology, per-GPU HBM, persistence and clock state;
+- CPU sockets, cores, NUMA nodes, memory capacity, `MemAvailable`, and CPU affinity;
+- mount source, filesystem type/options, client version, network interfaces, routing, and link speed;
+- local NVMe identity, capacity, filesystem, and stripe/RAID layout when used;
+- whether the storage administrator can reset and verify backend cache state; and
+- whether the job has approved authority to reset the node's client page cache.
+
+At minimum archive:
+
+```bash
+git rev-parse HEAD
+nvidia-smi -L
+nvidia-smi topo -m
+nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader
+lscpu
+numactl -H
+free -b
+findmnt -T "$MODEL" -o SOURCE,FSTYPE,OPTIONS
+```
+
+All ranks must resolve the checkpoint to the same node-local backing files. The checkpoint total must be below 90% of
+the minimum `MemAvailable` observed across ranks, and `TLLM_OVERRIDE_LAYER_NUM` must be zero. Otherwise the selected
+host policy intentionally skips full read-ahead; classify that run as an optimized-path miss, not as D/S performance.
+
+### 3.4 Instrumentation Gate
+
+Do not reserve the headline node campaign until the execution owner checks in or attaches a campaign-local supervisor,
+probe, parser, and benchmark-only instrumentation patch; unit-tests them; and demonstrates one smoke run with all
+required primary boundaries. PR #16562 currently emits useful human-readable policy logs and `Model init total`, but
+final attribution needs structured events. The instrumentation must use `perf_counter_ns` without inserting new
+headline CUDA synchronizations or barriers. Archive the exact scripts, patch, tests, and digests in the campaign.
+
+Required events are:
 
 ```text
-oracle_cell_time = min(median(legacy_time), median(direct_time), median(shared_time))
-adaptive_cell_regret = (median(adaptive_time) - oracle_cell_time) / oracle_cell_time
+supervisor_spawn_start                              # external supervisor
+llm_constructor_start / llm_constructor_end
+model_init_start / model_init_end
+weight_session_enter / weight_session_exit
+read_ahead_start / read_ahead_end                 # D; synchronous prefetch interval for L/S
+safetensors_map_start / safetensors_map_end
+materialization_start / materialization_end
+session_finish_start / session_finish_end         # includes any exposed D read tail
+final_existing_model_load_cuda_sync
+service_ready                                     # server campaign only
+first_request_start / first_token
+shutdown_complete                                  # emitted before rank exit
+supervisor_observed_process_exit                    # external supervisor
 ```
 
-A chooser can approach the oracle; it cannot intrinsically beat the oracle unless it adds a genuinely new mixed or
-overlapped data path.
+Record events per rank with monotonic timestamps and a shared run ID. The D read interval crosses map and
+materialization; it is not a child phase that can be added to them. All headline measurements must preserve production
+overlap. Diagnostic runs may add NVTX ranges and synchronizations, but must be labeled and excluded from headline
+statistics.
 
-## 3. Primary Metrics
+The `ModelLoader` or complete `LLM(...)` path is mandatory. Direct calls to `HfWeightLoader.load_weights()` are
+synchronous by design and do not benchmark D's pipelined session.
 
-Report two product-level critical paths:
+The PR already prints per-rank `Model init total -- <seconds>` after an existing final model-load CUDA synchronization;
+parse and report the rank maximum even if narrower structured instrumentation is not yet available. It does not yet
+provide a structured requested/selected-policy record, a narrow checkpoint-to-final-CUDA timer, a page-residency tool,
+or a parameter-fingerprint harness. These are experiment prerequisites or explicitly reported measurement gaps, not
+fields to synthesize after the run.
 
-| Metric | Boundary | Interpretation |
+## 4. Metrics
+
+### 4.1 Primary Product Metrics
+
+| Metric | Boundary | Purpose |
 | --- | --- | --- |
-| `llm_init_e2e_s` | External driver immediately before `LLM(...)` through constructor return | Programmatic LLM readiness, including worker and executor setup |
-| `cold_start_to_first_token_s` | Process launch through completion of a deterministic one-token request | User-visible cold start and primary headline |
+| `llm_init_e2e_s` | Immediately before `LLM(...)` through constructor return | Programmatic model readiness |
+| `model_init_total_s` | `ModelLoader.load()` model-init region through its existing final CUDA completion | Model construction plus weights to usable CUDA state |
+| `weight_session_s` | Weight-session enter through exit after mapper/materialization | Inclusive loader/materialization critical path |
+| `cold_start_to_first_token_s` | External supervisor timestamp immediately before process spawn through receipt of the first-token event over IPC | Primary user-visible headline |
+| `probe_start_to_first_token_s` | Probe timestamp before imports/configuration through the first token | In-process diagnostic; excludes process-spawn latency |
 
-If `trtllm-serve` is the deployment target, also report:
+For `trtllm-serve`, also report process-to-health, health-to-first-token, and process-to-first-token. The full campaign
+may use an in-process `LLM` harness for lower-variance mechanism measurement and a smaller server subset for operational
+validation. Never reuse an `LLM` or server process across timed trials.
 
-- `process_start_to_health_s`: launch through the first successful readiness response;
-- `health_to_first_token_s`: ready service through the first successful token; and
-- `process_start_to_first_token_s`: their end-to-end critical path.
+Do not include remote model download in the primary loader comparison. Pre-stage one immutable checkpoint on the target
+mount. Measure object-store or Hugging Face acquisition separately because the current policies begin after files are
+visible through the filesystem.
 
-Do not combine remote model acquisition with raw checkpoint loading in the primary comparison. Pre-stage one immutable
-checkpoint for all treatments. Report Hugging Face or object-store download separately because the current native
-policies begin after files exist locally or on a mounted filesystem.
+### 4.2 Direct-Mode Overlap Metrics
 
-## 4. Phase Timing
-
-The implementation PR currently logs cooperative prefetch and mmap setup durations, but that is insufficient for
-end-to-end attribution. Port the hierarchical profiler described in
-[Startup Methodology and Test Plan](../mx-gms-integration/10-methodology.md), or add an equivalent structured profiler,
-before collecting headline results.
-
-Required nested timers are:
+For D derive:
 
 ```text
-startup
-├── configuration_and_tokenizer
-├── worker_and_executor_initialization
-│   ├── model_config_and_defaults
-│   ├── model_init_total
-│   │   ├── model_config_validation
-│   │   ├── model_construction
-│   │   ├── parameter_allocation
-│   │   └── checkpoint_to_cuda_total
-│   │       ├── raw_checkpoint_load
-│   │       │   ├── checkpoint_discovery
-│   │       │   ├── policy_selection
-│   │       │   ├── storage_prefetch
-│   │       │   └── safetensors_map_setup
-│   │       ├── weight_mapper_initialization
-│   │       ├── weight_application_enqueue
-│   │       └── post_load_and_final_cuda_completion
-│   ├── kv_cache_and_executor_tail
-│   └── warmup_compile_autotune_cuda_graphs
-├── service_ready
-└── first_successful_token
+read_elapsed_s = read_ahead_end - read_ahead_start
+
+materialization_overlap_s =
+    max(0, min(read_ahead_end, materialization_end)
+           - max(read_ahead_start, materialization_start))
+
+hidden_read_fraction =
+    max(0, read_elapsed_s - exposed_read_tail_s) / read_elapsed_s
+
+exposed_tail_fraction = exposed_read_tail_s / read_elapsed_s
 ```
 
-Recommended code boundaries on PR #16562 are:
+`hidden_read_fraction` is a scheduling-overlap measure, not proof that all overlapped time was removed from the critical
+path. Compare paired E2E/model-init results for the causal product effect.
 
-| Timer | Boundary |
+For a representative L and D cell, use Nsight Systems with CUDA, NVTX, and OS-runtime tracing. The mechanism gate for
+I/O/H2D overlap is at least one weight-materialization H2D copy occurring inside both the materialization range and the
+background read interval:
+
+```text
+read_ahead_start
+    < weight_materialization_h2d_start
+    < read_ahead_end
+```
+
+Scope the H2D event with the materialization NVTX/event range. A CUDA copy that occurs before read-ahead starts does not
+prove overlap, even if it is earlier than the final read.
+
+Use CUDA events or trace timestamps for GPU-only copy duration; do not label a synchronized wall span containing CPU
+transforms and page faults as pure H2D. Verify the installed `nsys` options on the node before recording the command.
+An expected diagnostic shape, subject to `nsys profile --help` on the installed version, is:
+
+```bash
+nsys profile \
+  -f true \
+  -t cuda,nvtx,osrt,python-gil \
+  --sample=none \
+  --gpu-metrics-devices=none \
+  --trace-fork-before-exec=true \
+  --export=sqlite \
+  -o "$ARTIFACT_DIR/startup" \
+  -- python "$CAMPAIGN_DIR/startup_probe.py" --run-manifest "$RUN_MANIFEST"
+```
+
+Preserve `.nsys-rep` and SQLite output. Current PR code lacks dedicated NVTX ranges around the background reader and
+materialization. Add diagnostic-only ranges before claiming an automatically computed overlap percentage; otherwise
+report visual/timestamp evidence plus the logged `read_elapsed - exposed_tail` proxy, with that limitation.
+
+Before accepting a diagnostic trace, run an untimed trace preflight and verify that the installed-version launcher
+arrangement captures all eight ranks, `trtllm-direct-rank-read-ahead` threads, `pread` activity, and CUDA H2D events.
+Tracing only the probe parent is insufficient. Record the exact MPI/worker launch arrangement and adjust the
+installed-version all-process or fork/exec options before the diagnostic campaign if any worker is absent.
+
+### 4.3 Distributed Aggregation
+
+Startup completes when the slowest required rank is ready. Report:
+
+- externally observed process-to-first-token time;
+- distributed span `max(rank_end) - min(rank_start)`;
+- rank minimum, median, maximum, and start/end skew;
+- slowest-rank identity and rank-local assigned/completed bytes; and
+- node aggregate prefetch rate computed as total policy-assigned/completed prefetch bytes divided by
+  `max(read_end) - min(read_start)`.
+
+The current D log reports a rank-local read rate. Do not sum rank-local rates or present one rank's value as node
+throughput. The numerator above excludes demand reads/page faults during mmap and materialization, which can approach
+world-size times the checkpoint. Do not average rank durations and call that the startup critical path.
+
+### 4.4 I/O, Memory, and Resource Telemetry
+
+Capture per run:
+
+- checkpoint logical/on-disk bytes, shard count, min/median/max shard size, skew, and largest-shard fraction;
+- assigned/completed/cancelled extents and bytes by rank when available;
+- process `read_chars`, `read_bytes`, major/minor faults, CPU time, RSS, and peak RSS;
+- node `MemAvailable`, page-cache residency before/after, and cache growth;
+- filesystem/client counters, server bytes/requests/latency, and network bytes when authoritative;
+- peak HBM by rank, H2D count/bytes/duration and copy-engine activity in diagnostics; and
+- selected policy, prefetch guard, extent/read size, worker caps/actual workers, and fallback reasons.
+
+`read_chars` is syscall-visible logical traffic, while process `read_bytes` is not a portable NFS/Lustre authority.
+Claim physical throughput, request amplification, or reduced backend bytes only when storage-side counters or an
+isolated OS I/O trace support it.
+
+## 5. Controlled Initial State
+
+### 5.1 Cache-State Classes
+
+| State | Definition | Use |
+| --- | --- | --- |
+| Client cold, backend controlled | Checkpoint residency below 1%; backend cache reset and verified | Strongest storage claim |
+| Client cold, backend warm/unknown | Client residency below 1%; backend state not controlled | Primary production observation if backend control is unavailable |
+| Client warm | Checkpoint pages intentionally remain resident | Restart negative control |
+
+For every cold trial:
+
+1. Terminate prior server/worker processes and verify GPUs are empty.
+2. Flush dirty data and use only the administrator-approved client-cache reset mechanism.
+3. Verify below 1% residency across the exact SafeTensors manifest with `mincore`, `vmtouch`, or equivalent telemetry.
+4. Start a fresh process group and record cache/storage counters before workload launch.
+5. Run exactly one timed initialization and first-token probe.
+6. Shut down all ranks and verify cleanup before resetting for the next treatment.
+
+On an exclusive node, the standard Linux client reset is shown below only as the expected administrator-approved
+operation; do not execute it on a shared host or without authorization:
+
+```bash
+sync
+sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+find -L "$MODEL" -maxdepth 1 -type f -name '*.safetensors' -print0 \
+  | xargs -0 -r vmtouch -v -f -m "$VMTOUCH_MAX_FILE_SIZE"
+```
+
+`vmtouch` is an external prerequisite. Set `VMTOUCH_MAX_FILE_SIZE` above the largest shard using syntax supported by the
+installed version; its default maximum can skip multi-gigabyte SafeTensors. Parse and archive summed resident and total
+page counts, assert accounted bytes/pages equal the frozen manifest, and require the resident ratio to be below 1%. A
+purpose-built `mincore` helper is preferable when this accounting cannot be made exact. Non-root eviction remains a
+weaker fallback and still requires post-eviction verification.
+
+Dropping Linux client page cache does not flush an NFS server or appliance cache. If backend reset is unavailable,
+label it uncontrolled. Inode-distinct replicas can reduce client reuse but do not prove a cold backend and can change
+stripe placement. If replicas are used, balance treatment-to-replica assignment and record layout metadata.
+
+For a warm-cache block, independently populate the exact SafeTensors manifest before **each** treatment and verify at
+least 99% client residency. Use a fresh model process, randomize treatment order, and record whether backend state is
+controlled. Do not run L/D/S/A0 sequentially against progressively warmer pages and call that a balanced warm block.
+
+### 5.2 Other Caches and Runtime State
+
+Use one prebuilt image and identical compile, autotune, tokenizer, kernel, and CUDA-graph cache snapshots for all
+treatments. The primary loader-isolation campaign may prepopulate non-weight caches. A secondary full-cold campaign may
+clear them, but must time them separately. Keep GPU clocks, power, CPU affinity, worker counts, KV-cache settings,
+prompt, and serving configuration fixed inside each cell.
+
+## 6. Model and Topology Campaign
+
+Raw-byte eligibility is model-neutral for native HF/AUTO SafeTensors, but each exact downstream profile must be
+qualified. The staged matrix below avoids spending the full node on a broken model/configuration and avoids a full
+parallelism Cartesian product.
+
+Expected internal paths on the checked revision are listed only as discovery aids; verify them during preflight:
+
+| Artifact | Expected local path |
 | --- | --- |
-| `worker_executor_init` | `BaseWorker.setup_engine()` entry through return |
-| `create_py_executor` | `create_py_executor()` entry through return |
-| `model_init_total` | `ModelLoader.load()` entry through its final CUDA synchronization and cleanup |
-| `checkpoint_to_cuda_total` | Immediately before `checkpoint_loader.load_weights()` through final post-load CUDA completion |
-| `checkpoint_discovery` | HF file discovery and distributed manifest consensus |
-| `policy_selection` | Plan coordination, eligibility evaluation, and policy resolution |
-| `storage_prefetch` | Whole-file or extent prefetch, on every rank |
-| `safetensors_map_setup` | `safetensors.torch.load_file()` calls and cooperative mmap setup |
-| `raw_checkpoint_load` | Inclusive outer `checkpoint_loader.load_weights()` call; contains discovery, selection, prefetch, and mmap setup |
-| `weight_mapper_initialization` | Mapper creation/initialization after raw checkpoint loading and before model application |
-| `weight_application_enqueue` | Model `_call_load_weights()` entry through return without adding a headline synchronization |
-| `post_load_and_final_cuda_completion` | Model post-load hooks through the existing final model-load CUDA synchronization |
+| Qwen 3.5 flagship | `$LLM_MODELS_ROOT/Qwen3.5-397B-A17B-NVFP4` |
+| DeepSeek V4 Flash/Pro | `$LLM_MODELS_ROOT/DeepSeek-V4-Flash`, `$LLM_MODELS_ROOT/DeepSeek-V4-Pro` |
+| Llama 4 Scout FP8 | `$LLM_MODELS_ROOT/llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8` |
+| Llama 4 Maverick FP8 | `$LLM_MODELS_ROOT/llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8` |
 
-Use `time.perf_counter_ns()` and emit structured JSON or JSONL after measured regions. Headline runs must preserve
-production overlap. Extra barriers and `torch.cuda.synchronize()` calls are allowed only in breakdown runs because
-they can alter the critical path. The existing final synchronization makes `model_init_total` and
-`checkpoint_to_cuda_total` safe primary spans.
+### Stage 0: Harness and Loader Smoke
 
-Emit two distinct `profile_kind` values:
+1. Run the focused unit suite.
+2. Run Qwen3.5-4B BF16 through the normal model loader to validate the Qwen 3.5 mapper and instrumentation.
+3. Run `$LLM_MODELS_ROOT/Qwen3/Qwen3-8B` BF16 with TP8 for three complete L/D/S/A0 cold blocks and one independently
+   prepared warm block.
 
-- `production_unperturbed`: authoritative E2E and inclusive totals. Intermediate H2D can complete during a later span,
-  so subphases are not a pure hardware-work decomposition and inclusive parents must not be added to their children.
-- `diagnostic_synchronized` or `diagnostic_nsys`: explicit CUDA completion boundaries and memcpy attribution. These
-  runs explain mechanism but are excluded from headline E2E statistics.
+The small TP8 checkpoint validates rank collaboration, cache control, event aggregation, policy assertions, timeout,
+first-token correctness, and process cleanup. TP8 is a new smoke qualification for this model on the tested revision,
+not checked-in topology coverage; first require an untimed legacy bring-up. It is not a flagship performance result.
 
-Do not sum diagnostic phase maxima to reconstruct production startup.
+### Stage 1: Flagship Qualification
 
-### mmap and Page-Fault Attribution
+Run one untimed or diagnostic legacy bring-up first, then one strict D and one strict S bring-up for each candidate.
+Proceed only after format, memory, correctness, and lifecycle gates pass.
 
-SafeTensors uses mmap. Mapping a file does not prove its tensor pages were physically read; demand faults can occur
-later during weight application. At each phase boundary capture:
-
-- process `read_bytes` and `read_chars`;
-- major and minor page faults;
-- RSS, peak RSS, and node page-cache growth;
-- logical checkpoint bytes;
-- assigned file, extent, and byte counts per rank; and
-- storage-side byte and request counters where available.
-
-This separates a fast `load_file()` call from the physical reads it may defer.
-
-### Distributed Aggregation
-
-Startup completes after every required rank is ready. For durations report:
-
-- `max_local_duration`: the largest process-local phase duration;
-- `distributed_span`: `max(rank_end) - min(rank_start)` using a synchronized epoch or coordinator-observed events;
-- externally observed process-to-ready and process-to-first-token latency;
-- rank minimum, median, maximum, and start/end skew; and
-- node-local sum for bytes and I/O operations.
-
-Do not call `max_local_duration` the distributed critical path: a late-starting shorter rank can still determine
-readiness. Do not add headline barriers merely to align timers; gather events after the measured region. Never sum
-overlapping per-rank durations or use their mean as startup latency.
-
-## 5. Policy and Resource Telemetry
-
-Every result must include:
-
-- `profile_kind`: `production_unperturbed`, `diagnostic_synchronized`, or `diagnostic_nsys`;
-
-### Policy identity
-
-- requested plan and strict/ordered mode;
-- selected policy on every rank;
-- eligibility decision and every skipped-policy reason;
-- prefetch enabled or disabled;
-- extent size, read size, worker caps, and actual workers;
-- checkpoint manifest and backing-file identity; and
-- selector/profile version for A1.
-
-### Checkpoint geometry
-
-- total logical and on-disk bytes;
-- number of SafeTensors shards;
-- minimum, median, maximum, and coefficient of variation of shard size;
-- largest-shard fraction; and
-- bytes assigned and completed by each rank.
-
-### Host and storage
-
-- filesystem type, mount source, options, and storage class;
-- `MemAvailable` before load and checkpoint-to-available-memory ratio;
-- logical bytes assigned and completed by the policy;
-- process syscall-visible bytes such as `read_chars`;
-- client block/filesystem-accounted bytes such as `read_bytes`, NFS, Lustre, or block-device counters;
-- authoritative storage/server bytes when the platform exposes them;
-- effective prefetch throughput from logical bytes divided by the distributed prefetch span;
-- physical throughput, read amplification, request rate, request size, queue depth, and latency only when their
-  authoritative counters are available;
-- per-rank CPU utilization and aggregate peak RSS;
-- page-cache residency before and after the run.
-
-`read_chars` is logical syscall traffic, and process `read_bytes` is not a portable authoritative measure of NFS,
-Lustre, or storage-appliance traffic. Gate physical-throughput and read-amplification claims on storage-side counters or
-an isolated OS I/O trace. Otherwise report the metric at its actual accounting layer.
-
-### GPU
-
-- peak HBM by rank;
-- H2D memcpy count, bytes, and duration in diagnostic runs;
-- copy-engine utilization; and
-- future NCCL/NVLink bytes for GPU fan-out.
-
-Use Nsight Systems with CUDA, NVTX, and OS-runtime tracing for one or two representative diagnostic runs. Exclude those
-runs from headline timing statistics. A synchronized wall timer around weight application includes CPU transforms,
-residual page faults, and H2D completion; it must not be labeled pure H2D.
-
-## 6. Controlled Initial Conditions
-
-### Reproduction Identity
-
-Record:
-
-- TensorRT-LLM base and feature commit SHAs;
-- container digest, CUDA, driver, NCCL, Python, PyTorch, and SafeTensors versions;
-- immutable model revision and checkpoint file digests or manifest identity;
-- GPU, CPU, NUMA, RAM, NIC, filesystem, and mount topology;
-- GPU persistence mode, power limit, application clocks, and boost state;
-- CPU affinity and worker configuration; and
-- serving configuration, quantization, and parallel mapping.
-
-An HGX B300 node provides eight NVLink-connected GPUs and approximately 2.30 TB aggregate HBM, but model admission
-must use measured per-rank peak HBM rather than aggregate parameter arithmetic. See the
-[NVIDIA HGX B300 component specification](https://docs.nvidia.com/enterprise-reference-architectures/hgx-ai-factory/latest/components.html).
-
-### Weight-Cache State
-
-Define at least these conditions:
-
-| State | Meaning | Use |
-| --- | --- | --- |
-| Client cold, backend controlled | Client residency is below 1%; backend cache is reset and the reset is verified | Primary storage claim |
-| Client cold, backend warm/unknown | Client cache is cold but NFS or object backend cache is not controlled | Useful production observation, labeled exactly |
-| Client warm | Checkpoint pages remain resident | Restart/failover negative control |
-
-For every cold trial on a dedicated node:
-
-1. Terminate all prior server and worker processes and verify GPUs are empty.
-2. Flush dirty data and use the approved privileged mechanism to drop client page cache.
-3. Verify less than 1% of checkpoint pages are resident with `mincore`, `vmtouch`, or equivalent telemetry.
-4. Start a fresh process group; never reuse an `LLM` instance.
-5. Record client and storage-side counters.
-6. Reset the client cache before the next treatment and, for the controlled-backend condition, reset and verify the
-   backend cache too.
-
-Dropping Linux page cache does not flush an NFS server or storage appliance cache. Prefer an administrator-supported
-backend reset and verify it. If unavailable, inode-distinct checkpoint replicas can reduce client reuse but do not
-prove that the backend is cold, and can change Lustre stripe placement or local physical layout. Orthogonally balance
-treatment-to-replica assignment, record stripe/layout metadata, and label the backend state as uncontrolled.
-
-### Compilation and Runtime Caches
-
-The primary loader-isolation suite keeps non-weight compile, autotune, and kernel caches identical across treatments.
-Use one prebuilt image and the same prepopulated or empty cache snapshot for every run. A secondary full-cold suite may
-clear those caches to measure operational startup, but must report their time separately because loader policy should
-not affect them.
-
-### Full-Prefetch Guard
-
-The cooperative prototype prefetches only when checkpoint bytes are below 90% of node-local `MemAvailable`. Reject or
-separately classify a trial when:
-
-- the guard disables prefetch;
-- policies observe different available-memory decisions; or
-- another process creates material memory pressure during the run.
-
-Without this check, a nominal direct/shared trial may actually measure the same demand-mmap path as legacy.
-
-## 7. Storage and Checkpoint Geometry Matrix
-
-Storage behavior is the principal independent variable.
-
-| Storage class | Expected use | Hypothesis |
-| --- | --- | --- |
-| Local NVMe or NVMe RAID, client cold | Node-local staging | Direct should benefit if throughput scales with queue depth and readers. |
-| Production NFS, client cold | Common first load on a fresh node | Shared may benefit when multiple client processes contend; direct may win on a scalable server. |
-| Lustre or another parallel filesystem, client cold | High-bandwidth cluster deployment | Direct should benefit when extents distribute across targets and queues. |
-| Page-cache warm | Rapid restart control | All modes should converge; material overhead is a regression. |
-| Object storage through ModelStreamer | Future source experiment | Tests source integration, not the current native mounted-file implementation. |
-
-Use the publisher's natural shard layout for every headline claim. Add a diagnostic copy of one checkpoint with the
-same tensor values resharded into 1, 8, and 64 approximately uniform files. This explains mechanism:
-
-- one large shard stresses legacy whole-file assignment and should expose chunk-striping benefit;
-- eight shards approximately match an eight-rank node;
-- many uniform shards give legacy abundant file-level parallelism and may reduce the new policies' advantage.
-
-Controlled layouts are explanatory and must not replace an unfavorable natural-layout result.
-
-## 8. Tiered Model Plan
-
-The benchmark is split into current qualification and future family qualification. Do not run a strict direct/shared
-comparison on a model that the policy rejects and then report fallback timing as an optimized result.
-
-### Tier 0: Smoke and Harness Validation
-
-| Model | Precision | Topology | Storage | Runs |
-| --- | --- | --- | --- | --- |
-| `Qwen/Qwen3-8B` | BF16 | TP8 | Production shared filesystem | 3 cold runs per treatment |
-
-Purpose:
-
-- validate timer schema, cache reset, strict selection, distributed completion, and correctness;
-- estimate variance and choose the headline repetition count; and
-- contribute observations to the separate paired base-versus-L equivalence gate.
-
-### Tier 1: Current-Qualified Core
-
-| Model | Why | Topologies | Storage |
+| Family | First gate | Full-node target | Source-backed starting point and caveat |
 | --- | --- | --- | --- |
-| `Qwen/Qwen3-32B` BF16 | Dense model for rank-count and PP sweeps | TP1, TP2, TP4, TP8; TP4xPP2, TP2xPP4, TP1xPP8 | NVMe plus production NFS/Lustre |
-| `meta-llama/Meta-Llama-3.1-405B` BF16 | Large dense checkpoint that exercises an 8xB300 node | TP8 and TP4xPP2 | NVMe plus production NFS/Lustre |
+| Qwen 3.5 | Qwen3.5-35B-A3B BF16, then 397B TP4/EP4 | `Qwen3.5-397B-A17B-NVFP4`, TP8/EP8, attention-DP off; qualify attention-DP/MTP separately | PR-head `examples/configs/curated/qwen3.5.yaml`; TP8 stanza `qwen3_5_397b_fp4_tep8_1k1k` in `tests/scripts/perf-sanity/aggregated/qwen3_5_397b_fp4_blackwell.yaml`. That file currently lists B200, so B300 is a qualification result, not a pre-existing claim. |
+| DeepSeek V4 | `DeepSeek-V4-Flash`, TP4/EP4, attention-DP, TRTLLM MoE | `DeepSeek-V4-Pro`, TP8/EP8; MTP off for loader isolation, then MTP1 | B300 CI covers Flash in `l0_dgx_b300.yml`. Pro starts from `examples/configs/curated/deepseek-v4-pro-{throughput,latency}.yaml` and the eight-rank accuracy path; curated compatibility currently names B200, so fit/correctness on B300 is a gate. Both curated YAMLs enable MTP: archive a derived MTP-off copy with `speculative_config` removed, then use the unmodified throughput config for MTP1. |
+| Llama 4 | Scout FP8 | Maverick FP8, TP8/EP8, text-only request first | `examples/configs/curated/llama-4-scout.yaml`, `examples/models/core/llama4/README.md`, and checked eight-GPU Scout/Maverick tests. Aggregate construction already creates and loads the vision encoder even for text-only prompts; an image-input follow-up changes preprocessing/first inference, not weight-loading coverage. Full-node Llama 4 PP remains unqualified. |
 
-Use the largest accessible dense Llama revision that passes the exact class, mapper, HBM, and host-prefetch gates. If
-the gated 405B artifact is unavailable, select the largest qualified Llama checkpoint and record the substitution.
+Use the exact checkpoint paths present under `LLM_MODELS_ROOT`; do not silently substitute a different model, revision,
+precision, converted format, topology, or MoE backend. If the largest target fails a gate, report the failure and move
+to the next-largest pinned variant as a separately named cell.
 
-The core headline subset is:
+Kimi K2.5 may be added as a stretch family only after the required three families complete. It must not displace the
+Qwen 3.5, DeepSeek V4, or Llama 4 coverage requested here.
 
-```text
-2 models
-x 2 eight-rank topologies (TP8, TP4xPP2)
-x 2 cold storage classes (local NVMe, production shared storage)
-x 4 treatments
-x 10 paired repetitions
-```
+### Stage 2: Five-Block Screening
 
-At the ten-repetition planning floor, this is 320 confirmatory startup trials per campaign. Run Campaign 0 first. Use a
-separate five-repetition screening campaign to estimate variance, freeze the confirmatory sample count, and exclude
-those screening observations from confirmatory intervals. Campaign 1 reruns all four treatments after A1 exists. The
-broader TP/PP sweep uses five exploratory repetitions per cell.
+Before screening, predeclare every production cell and its aggregate weight. For each qualified full-node target, run
+five randomized complete L/D/S/A0 blocks on the production shared mount with verified client-cold state. Freeze one
+natural checkpoint layout and one production topology per model.
 
-### Tier 2: Parallelism Isolation
+Screening decides which cells merit confirmation. It does not establish tail latency or broad production support.
+Promote a cell when:
 
-Use one qualified dense model to isolate how assignment changes with local rank count and ownership:
+- all functional and lifecycle gates pass;
+- cache and read-ahead preconditions are valid;
+- the paired effect is large enough to matter operationally; and
+- variability is low enough for a fixed confirmatory campaign to be informative.
 
-- TP1, TP2, TP4, and TP8;
-- TP4xPP2, TP2xPP4, and TP1xPP8; and
-- two simultaneous TP4 replicas and four simultaneous TP2 replicas as a separate replica-startup storm.
+Record cells where D or S loses. Do not prune unfavorable valid results.
 
-Independent serving replicas are not the same as one `Mapping.dp_size` dimension. Each communicator can independently
-stage the same checkpoint, so launch-wave tests must report aggregate node and storage load as well as per-replica
-readiness.
+### Stage 3: Ten-Block Confirmation
 
-CP, EP, attention-DP, and DWDP are outside the current cooperative qualification envelope. They belong in Tier 3
-after correctness support is added.
+For every promoted cell, predeclare and run ten new randomized complete blocks. Screening observations are excluded.
+The primary storage is the target NFS/shared filesystem. Add local NVMe and warm-page-cache controls for at least one
+model that passed screening. Promotion makes this a conditional per-cell follow-up. Do not make a fleet-wide
+confirmatory aggregate claim unless every predeclared production cell is confirmed; any exploratory screening
+aggregate must include valid losing and inconclusive cells as well as winners.
 
-### Tier 3: Largest Practical Model in Each Requested Family
+Ten blocks support a median-effect estimate, not a p95 claim. A tail campaign needs a separately predeclared,
+precision-driven sample count; use at least 50 observations for exploratory p90 and at least 100 before presenting a
+useful p95 estimate.
 
-An 8xB300 fit does not imply cooperative-loader support. The PR base already has TensorRT-LLM model implementations
-for all four families, including DeepSeek V4 on Blackwell. PR #16562 still rejects them because its cooperative
-allowlist contains only dense Llama/Qwen2/Qwen3 and because these flagship paths add MoE/EP, attention DP, VLM,
-compressed or quantized formats, MTP, and model-specific mapping requirements.
+### Stage 4: Mechanism Diagnostics
 
-| Family | Exact campaign candidate and precision | Initial topology | Cooperative qualification required |
-| --- | --- | --- | --- |
-| DeepSeek V4 | [`deepseek-ai/DeepSeek-V4-Pro`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro), official mixed FP4/FP8 Instruct checkpoint | Checked-in TP8/EP8 shape, MTP disabled for loader isolation first | Model-class allowlist, mixed precision, MoE/EP, mapper, then MTP separately; use V4 Flash only if Pro fails a recorded fit gate. |
-| Qwen 3.5 | [`nvidia/Qwen3.5-397B-A17B-NVFP4`](https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4), NVFP4 | Checked-in TP4/EP4 with attention DP; then validated TP8/EP8 or two concurrent TP4 replicas | Qualify `Qwen/Qwen3.5-27B` BF16 as the dense stepping-stone, then class, NVFP4, MoE/EP, mapper, and attention DP. |
-| Kimi K2 family | [`moonshotai/Kimi-K2.5`](https://huggingface.co/moonshotai/Kimi-K2.5), native INT4/compressed SafeTensors | Validated text-only TP8/EP8 first; keep the vision path separate | Kimi K2.5 class, compressed format, MoE/EP, mapper/custom code, text/VLM boundary, and attention DP. Use checked-in `nvidia/Kimi-K2-Thinking-NVFP4` as a separate K2 deployment control, not a silent substitute. |
-| Llama | [`nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8`](https://huggingface.co/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8), FP8 | Validated TP8/EP8 first | Llama 4 class, FP8, MoE/EP, mapper, and multimodal boundary. |
+For one large model on the target shared mount:
 
-Before admission, the campaign manifest must replace all floating revisions with immutable repository commit IDs and
-record total SafeTensors bytes, file geometry, and measured `MemAvailable`. Never benchmark `main` as an identity.
-HBM fit and host-prefetch fit are independent: a checkpoint can fit in 2.30 TB aggregate HBM but fail the
-`checkpoint_bytes < 0.9 * MemAvailable` guard.
+- capture one or two L traces and one or two D traces with Nsight Systems;
+- preserve NVTX/event alignment, H2D copies, OS reads, page faults, and CPU threads;
+- compare natural shard layout with controlled 1-, 8-, and 64-shard copies only if exact tensor equivalence and storage
+  layout are documented; and
+- exclude all traced/synchronized runs from headline timing statistics.
 
-At execution time, pin the exact model revision and choose the largest variant satisfying all gates:
+Natural publisher shard layout remains the headline. Resharded copies explain mechanism only.
 
-1. TRT-LLM model and checkpoint mapping are supported on the tested commit.
-2. Strict direct and shared policies select without fallback.
-3. The exact SafeTensors and quantization format is qualified.
-4. Checkpoint bytes satisfy the host full-prefetch guard.
-5. Peak HBM stays below the predefined per-rank safety budget after KV-cache and warmup allocation.
-6. Deterministic first inference matches legacy.
+### Stage 5: Targeted Parallelism Coverage
 
-If the largest family model fails a gate, record the failure as a qualification result and test the next-largest
-supported variant. Do not silently change precision or use a converted checkpoint only for one treatment.
+Use a covering set rather than a Cartesian product:
 
-### Tier 3 Parallelism Covering Set
-
-Avoid a full Cartesian product. Use one dense and one MoE representative:
-
-| Concern | Eight-GPU examples after qualification | What it reveals |
+| Concern | Targeted comparison | Interpretation |
 | --- | --- | --- |
-| TP | TP8 | Rank slicing and I/O issuer scaling |
-| PP | TP4xPP2, TP2xPP4 | Layer ownership; current full-checkpoint staging inefficiency |
-| CP | TP4xCP2, or a validated TP/PP/CP product of eight | Replicated weight consumers and future producer groups |
-| EP | A checked-in eight-rank TP/EP mapping such as TP8/EP8, plus TP8/EP1 control | Expert ownership and selective-read opportunity; EP does not multiply world size independently of TP/PP/CP |
-| Attention DP/DWDP | On/off in a supported MoE configuration | Duplicated attention-weight demand and communicator semantics |
-| Replica DP | 2xTP4 and 4xTP2 launched concurrently | Cold-start storms across independent communicators |
+| TP/rank count | Pin `llama-3.3-models/Llama-3.3-70B-Instruct-FP8`, then qualify TP1/2/4/8 points not already covered on the checked revision | I/O issuer scaling and extent balance; do not assume mathematical divisibility implies runtime support |
+| PP | Checked `llama-3.3-models/Llama-3.3-70B-Instruct-FP8` at TP2xPP4 | Current policies still stage the full node checkpoint; this measures overlap, not selective PP reads |
+| EP and attention DP | One flagship MoE profile with ADP off/on | Downstream correctness and replicated consumer behavior; raw-byte eligibility is unchanged |
+| MTP/speculation | DeepSeek V4 or Qwen 3.5 target with MTP off/on | Target plus draft lifecycle and added materialization work |
+| CP | Only a checked model/runtime configuration | Qualification; no source-backed flagship eight-GPU CP example was found during plan authoring |
+| Replica DP | Two TP4 or four TP2 independent replicas launched together | Node/storage cold-start storm; each communicator may stage its own checkpoint |
+| VLM | Llama 4 text-only versus image-input first inference | Aggregate startup loads both vision and text weights in either case; this isolates preprocessing/first-inference effects, not extra loader coverage |
 
-Use checked-in validated model configurations when possible. Do not invent a mathematically valid product that the
-model or runtime does not support.
+Current D/S policies assign raw storage bytes without interpreting final tensor ownership. A PP/EP/CP result must not
+be reported as rank-selective reading or reduced logical checkpoint bytes.
 
-## 9. Execution Protocol
+## 7. Trial Protocol
 
-### Blocked Randomization
+### 7.1 Blocked Randomization
 
-Treat one trial for each of L, D, S, and A as a block, where A is A0 in Campaign 0 and A1 in Campaign 1. Never mix A0
-and A1 observations. Keep the same node and software image within a block, and balance treatment order across blocks.
+One block contains one valid cold trial of L, D, S, and A0 on the same node and immutable checkpoint. Randomize order
+within every block and balance order over the campaign. A four-period Latin-square rotation is an acceptable starting
+schedule; one balanced sequence is `L-D-S-A0`, `D-S-A0-L`, `S-A0-L-D`, `A0-L-D-S`. Generate and archive the complete
+schedule before running.
 
-Use one of two explicit storage protocols:
+If the backend cache is controlled, use one checkpoint replica and reset/verify it before every treatment. If backend
+cache is uncontrolled and multiple replicas are used, balance treatment, order, replica, and stripe layout; include
+those factors in analysis and label the storage state honestly.
 
-- **Controlled backend:** use the same immutable checkpoint replica for all four treatments and perform a verified
-  client-and-backend cache reset before every treatment. Randomize treatment order within the block.
-- **Uncontrolled backend:** do not claim backend-cold results. Use equivalent immutable checkpoint replicas and a
-  Latin-square schedule that balances both treatment order and treatment-to-replica assignment across blocks. Record
-  replica identity, stripe or physical layout, observed backend state, and time trend; include replica, layout, and
-  order effects in the analysis.
+Set a fixed per-model job timeout after an untimed legacy pilot and before comparative trials. A timeout, policy
+mismatch, cache-precondition failure, or infrastructure failure invalidates the run but remains in the exclusion log.
+Do not replace it silently or append samples until an interval becomes favorable.
 
-The uncontrolled protocol cannot make backend state cold, but it prevents one treatment or one replica layout from
-being systematically favored.
+### 7.2 One-Run Harness Contract
 
-### Adaptive Calibration and Held-Out Validation
+The execution owner may use the existing cluster launcher or create benchmark-only harness scripts outside the
+production package. Every one-run invocation must:
 
-Campaign 1 has two disjoint stages:
+1. consume a frozen JSON/YAML run manifest;
+2. set exactly one treatment and launch the normal multi-rank LLM/ModelLoader path;
+3. emit process and rank events to a unique run directory;
+4. construct the model once;
+5. issue one deterministic greedy request with exactly one output token;
+6. stop the first-token timer at the first token, before heavyweight correctness probes;
+7. run post-timing correctness/resource checks;
+8. shut down cleanly and return a meaningful exit status; and
+9. write a completion sentinel only after every rank and child process exits.
 
-1. **Calibration:** measure the I/O issuer curve on independent calibration objects and designated mounts; train or tune
-   the selector; then freeze the profile contents, version, expiry, thresholds, and deployment weights.
-2. **Held-out validation:** run L/D/S/A1 on predeclared mount identities, checkpoint geometries, or a later time window
-   that was not used to tune the selector.
+The repository does not currently contain a cold-start probe with these semantics; the checked quickstart performs an
+untimed warmup. Before node execution, add a campaign-local `startup_supervisor.py` and `startup_probe.py`. The
+supervisor records time immediately before spawning the frozen launcher argv, receives structured rank/first-token
+events over a pipe or local socket, enforces the manifest timeout, and records PID exit timestamps/statuses. The probe
+records a timestamp before LLM import/configuration, constructs
+`LLM(model=<local-path>, backend="pytorch", **frozen_config)`, and times constructor return.
 
-Compute oracle regret and any "adaptive is best" result only on the held-out set. If only one physical mount exists,
-use disjoint calibration files and model geometries plus a time-separated validation campaign, and state the resulting
-generalization limitation.
+Freeze one short text prompt per model before the campaign, tokenize it once with the pinned local tokenizer, and
+archive both exact text and token IDs in the manifest. Validate every ID against the model vocabulary. The probe passes
+the archived `prompt_token_ids` directly; it must not tokenize inside the timed path. Set a fixed seed of 12345 and use:
 
-### Repetitions
-
-| Stage | Repetitions per cell | Report |
-| --- | --- | --- |
-| Smoke | 3 | Individual observations and range; no distributional claim |
-| Screening matrix | 5 | Individual observations, median, and range; intervals are exploratory only |
-| Headline median-effect cells | 10 | Individual points, median, range, and paired median-speedup interval; no tail claim |
-| Exploratory p90 campaign | Predeclared precision-driven count, at least 50 | p50/p90 with order-statistic uncertainty |
-| Useful p95 campaign | Predeclared precision-driven count, at least 100 | p50/p90/p95; larger samples are required for SLO claims |
-| Nsight diagnostic | 1-2 | Timeline and bytes; excluded from headline statistics |
-
-Use pilot data to estimate variance, then freeze the sample count for each confirmatory campaign before collecting its
-observations. If the resulting interval is inconclusive, report it as such; do not append observations in response to
-the observed interval. A separately registered follow-up campaign may use a newly fixed sample count. Bootstrap
-complete randomized blocks, not independent treatment observations. Do not select one "representative" run for the
-headline comparison; preserve paired blocks and report the distribution. A representative run may be used only for an
-internally consistent phase waterfall after the distribution is reported.
-
-### Correctness Probe
-
-Immediately after readiness, issue the fixed deterministic one-token request and stop every headline timer. Only then
-run parameter fingerprinting, additional prompts and logits, log scanning, and the steady-state probe. The timed token
-output remains part of the correctness comparison, but benchmark-only GPU reads or device-to-host copies must not
-contaminate process-to-first-token latency.
-
-Every measured run must then:
-
-- confirm the requested and selected policy on every rank;
-- confirm manifest and model revision identity;
-- record parameter count and peak HBM;
-- compare deterministic sampled post-load parameter fingerprints with L;
-- compare the recorded timed token, then execute additional fixed greedy prompts and compare their output;
-- compare selected logits within the dtype-specific tolerance; and
-- scan logs for missing weights, unexpected fallback, collective, CUDA, or I/O errors.
-
-Because load ordering should not alter tensor values, bit-exact sampled weight fingerprints are the preferred gate.
-Tolerance applies to inference output only where later kernels are nondeterministic.
-
-### Steady-State Non-Regression
-
-After startup, run a short fixed throughput and TTFT workload. Loader policy should not alter steady-state weights or
-runtime state. Report throughput, TTFT, and output correctness; a regression suggests unintended cache, placement, or
-synchronization effects.
-
-## 10. Analysis
-
-For every paired block compute the L-relative effects:
-
-```text
-startup_speedup_pct = 100 * (T_L_e2e - T_mode_e2e) / T_L_e2e
-
-checkpoint_to_cuda_speedup_pct =
-    100 * (T_L_checkpoint_to_cuda - T_mode_checkpoint_to_cuda)
-        / T_L_checkpoint_to_cuda
-
-prefetch_speedup_x = T_L_prefetch / T_mode_prefetch
+```python
+SamplingParams(
+    max_tokens=1,
+    min_tokens=1,
+    end_id=manifest_eos_token_id,
+    pad_id=manifest_pad_or_eos_token_id,
+    temperature=0,
+    seed=12345,
+    ignore_eos=True,
+    detokenize=False,
+    add_special_tokens=False,
+)
 ```
 
-Define the oracle at the held-out **cell** level, not as a clairvoyant per-run minimum:
+The manifest must contain the complete resolved LLM arguments, launcher argv, environment, timeout, event socket/path,
+and output directory. The runnable contract is:
 
-```text
-oracle_cell_time = min(median(T_L), median(T_D), median(T_S))
-
-adaptive_cell_regret_pct =
-    100 * (median(T_A1) - oracle_cell_time) / oracle_cell_time
+```bash
+timeout "$RUN_TIMEOUT" python "$CAMPAIGN_DIR/startup_supervisor.py" \
+  --run-manifest "$RUN_MANIFEST" \
+  --output-dir "$RUN_OUTPUT_DIR"
 ```
 
-Bootstrap complete blocks and recompute the three static medians, oracle choice, and adaptive regret inside every
-replicate. A minimum over L/D/S within each individual block is biased by run noise and must not be used for the A1
-acceptance gate.
+Use `llm.generate_async(prompt_token_ids, sampling_params, streaming=True)` as shown by the checked-in async-streaming
+example, iterate it with `async for`, and emit the first-token event on the first yielded output. Archive the pinned EOS
+and pad IDs with the prompt token IDs. If the checked API cannot provide a streaming result for the profile, label the
+metric `request_start_to_one_token_completion_s` and do not report it as TTFT.
+The probe must emit exact generated token IDs, run identity, PR/instrumentation commits, policy, init duration, and the
+accurately named request metric before `llm.shutdown()`, then emit `shutdown_complete`. The supervisor owns
+process-launch and process-exit timing. Archive both scripts, their tests, and their digests with the campaign.
 
-Report medians with paired-block bootstrap 95% confidence intervals. Report tails only for campaigns meeting the
-predeclared precision-driven sample count. Across a predefined deployment mix, define aggregate improvement as the
-geometric mean of positive time ratios `T_L / T_mode`, then convert the ratio to a percentage. Never take a geometric
-mean of signed speedup percentages. An explicitly weighted mean must use weights frozen before results are inspected.
+For server validation, the normal entry point is:
+
+```bash
+trtllm-serve <pinned-local-model-path> --config <frozen-config.yaml>
+```
+
+Use checked-in model configurations as starting points, but materialize a frozen campaign copy with all implicit values
+expanded. Do not pass a nested perf-sanity suite file directly to `trtllm-serve`; extract its named `server_configs`
+stanza or use the suite's own harness.
+
+For a server-only first-request cross-check, the checked-in `benchmark_serving.py` supports a one-prompt random workload
+with one output token and detailed saved results. Preserve its exact invocation after validating flags against
+`--help`; an external driver is still required for process-start-to-health and process-start-to-first-token timing.
+
+### 7.3 Correctness and Lifecycle Gates
+
+After first-token timing, every measured run must verify:
+
+- requested and selected policy on every rank, with no unexpected fallback;
+- read-ahead guard and checkpoint manifest identity;
+- parameter count and peak HBM/RSS;
+- deterministic first token and additional fixed greedy outputs matching L;
+- selected logits within a predeclared dtype-specific tolerance when available;
+- no missing-weight, collective, CUDA, I/O, or silent mapper errors;
+- all ranks and child processes exit before timeout;
+- no orphan server or read-ahead process/thread remains;
+- GPU memory returns to the pre-run baseline.
+
+Bit-exact sampled parameter fingerprints are an optional stronger gate until a benchmark-only worker-rank hook exists.
+If implemented, freeze parameter names, offsets, raw-byte hash, and per-rank JSON schema and run it after the headline
+timer so device-to-host probes do not contaminate startup. Do not require an external probe to inspect inaccessible
+worker parameters.
+
+During qualification, run one immediate same-profile warm restart after the first successful strict D and S bring-up
+per cell. Record it as a non-headline lifecycle probe, verify cleanup, and perform the full verified cold reset before
+the next randomized treatment. Do not double every confirmatory run with an ambiguous restart.
+
+The checked-in unit suite covers direct-session error ordering. If a safe multi-rank fault hook exists, add optional
+diagnostics for read start, read, mmap, and materialization failures. Expected D cleanup is: coordinate body error,
+cancel peer reads, join readers, coordinate read errors, skip the success barrier, free the communicator once, and keep
+the original body error primary. Do not claim runtime fault injection if only unit coverage was executed.
+
+### 7.4 Steady-State Non-Regression
+
+After startup checks, run a short fixed throughput and TTFT workload. Compare output correctness, throughput, and TTFT
+with L. Loader policy should not alter steady-state weights or runtime state; a persistent delta suggests unintended
+cache, placement, or synchronization effects.
+
+## 8. Analysis
+
+For each complete paired block and mode `M` compute:
+
+```text
+cold_start_speedup_pct(M) =
+    100 * (T_L_first_token - T_M_first_token) / T_L_first_token
+
+llm_init_speedup_pct(M) =
+    100 * (T_L_llm_init - T_M_llm_init) / T_L_llm_init
+
+model_init_speedup_pct(M) =
+    100 * (T_L_model_init - T_M_model_init) / T_L_model_init
+
+weight_session_speedup_pct(M) =
+    100 * (T_L_weight_session - T_M_weight_session) / T_L_weight_session
+```
+
+Report individual observations, paired medians, ranges, and paired-block bootstrap 95% confidence intervals. Bootstrap
+complete blocks, not independent treatment observations. If the fixed campaign is inconclusive, report that result;
+do not add samples in response to the observed interval.
 
 Also report:
 
-- baseline fraction of E2E time spent in `checkpoint_to_cuda_total` and `model_init_total`;
-- delta by phase, to show where time moved rather than disappeared;
-- logical/effective throughput, plus physical throughput and read amplification only when authoritative counters exist;
-- rank imbalance and slowest-rank identity;
-- peak host memory and HBM deltas; and
-- A1 decision accuracy and selector overhead.
+- baseline fraction of startup in model init and the weight session;
+- D read elapsed, exposed tail, overlap interval, hidden/exposed fractions, and traced H2D overlap;
+- S synchronous prefetch duration and whether its throughput gain offsets its serial position;
+- logical node read rate and physical throughput only at their supported accounting layers;
+- rank imbalance, page faults, peak host memory, and peak HBM; and
+- A0 selection overhead/parity with D.
 
-Use Amdahl's law as a sanity check. Exact storage-wait fraction requires isolated storage-side or OS I/O tracing. When
-that is unavailable, label cold-minus-warm delta or prefetch-span contribution as an estimate rather than measured I/O
-time. If estimated checkpoint I/O is 40% of baseline startup, even infinite I/O speedup can reduce E2E by at most 40%
-unless phases are overlapped or removed.
+Do not use `prefetch_speedup_x` as a headline comparison: D's read interval intentionally overlaps later work, while
+L/S prefetch is serial. A shorter or faster read span is useful mechanism evidence but paired critical-path latency is
+the product outcome.
 
-## 11. Hypotheses and Acceptance Gates
+Use Amdahl's law as a sanity check. When isolated storage wait is unavailable, label cold-minus-warm delta as an
+estimate rather than measured I/O time.
 
-### Mechanism Hypotheses
+### Aggregate Deployment Result
 
-- D should beat L when storage throughput scales with disjoint readers, especially for a few large or skewed shards.
-- S may beat L and D when the storage client penalizes multiple processes or connections.
-- L may remain competitive with many uniform shards because it already parallelizes whole files across ranks.
-- All policies should converge in warm-cache cells; material extra overhead is a regression.
-- A1 should select D on scalable storage, S on client-limited storage, and L when unsupported or empirically fastest.
+Predefine the production cells and their weights before screening. Aggregate positive time ratios with a geometric
+mean, then convert the ratio to a percentage. Never geometrically average signed speedup percentages. A confirmatory
+deployment aggregate requires confirmation of every predeclared cell; otherwise label an all-cell screening aggregate
+exploratory and keep conditional confirmation results per-cell.
+
+Campaign 0 has no adaptive-oracle comparison. A0's expected result is parity with D in eligible cells and compatibility
+fallback elsewhere.
+
+## 9. Acceptance and Decision Gates
 
 ### Functional Gates
 
-- Strict D and S select the exact requested policy on every rank; any fallback invalidates the trial.
-- All ranks complete without deadlock, timeout, or divergent manifest/plan.
-- Weight fingerprints and deterministic inference match L.
-- Full-prefetch and memory-guard state are present in the artifact.
-- No mode exceeds the agreed host or HBM budget.
+- All four treatments emit matching requested/selected policy telemetry on every rank; strict D/S select exactly as
+  requested, L selects legacy, and A0 selects the expected eligible default.
+- The full-read-ahead guard is active in performance cells.
+- Correctness matches L.
+- All ranks complete without deadlock, divergence, timeout, or leak; qualification lifecycle restarts pass.
+- Host and HBM peaks remain inside predeclared safety budgets.
 
-### Suggested Performance Gates
+### Performance Gates
 
-A result is statistically positive when the paired-bootstrap 95% confidence interval for speedup excludes zero. A
-material target-cell win is:
+A positive result has a paired-bootstrap 95% confidence interval excluding zero. Initial materiality targets are:
 
-- at least 10% median `checkpoint_to_cuda_total` reduction; and
+- at least 10% median model-init or weight-session reduction; and
 - at least 5% median process-to-first-token reduction.
 
-These thresholds are initial decision gates, not facts about expected hardware performance.
+These are decision thresholds, not promised outcomes. To claim a static mode beats L overall, its lower confidence bound
+for the predefined production-cell aggregate must be positive. One synthetic shard-layout win is insufficient.
 
-To claim that both static modes beat legacy overall, each static mode must have a positive lower confidence bound for
-`GM(T_L / T_mode) - 1` across the predefined production cells. A favorable synthetic one-shard diagnostic is not
-sufficient.
+A0 passes when it selects correctly and remains within 2% of D on eligible cells, subject to the observed noise floor.
+It is not expected to outperform D. Steady-state throughput and TTFT should remain within 2% of L unless pilot variance
+justifies a wider predeclared equivalence band.
 
-To claim A1 is the best general policy:
+### Decision Table
 
-- median adaptive regret is at most 5%; p90 regret is at most 10% only in a separately funded tail campaign;
-- selector overhead is below 1% of E2E startup;
-- no qualified cell materially regresses relative to L without an explicit fallback; and
-- aggregate startup across the frozen deployment mix beats both fixed D and fixed S with a confidence interval that
-  excludes parity.
-
-Per-cell dominance over the oracle is neither required nor credible for a selector. In Campaign 0, where A is the
-current A0 ordered fallback, the correct expected result is parity with D on eligible cells and parity with L where
-direct is not eligible.
-
-Steady-state throughput and TTFT should remain within 2% of L unless normal run-to-run variance justifies a wider
-predeclared bound.
-
-## 12. Result Tables
-
-### Headline
-
-| Model | Topology | Storage/cache | Campaign | Treatment | Selected policy | Profile kind | First-token median [CI] | E2E speedup | Checkpoint-to-CUDA speedup | Peak RSS/HBM | Result |
-| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |
-| | | | 0 or 1 | L | | production_unperturbed | | baseline | baseline | | |
-| | | | | D | | production_unperturbed | | | | | |
-| | | | | S | | production_unperturbed | | | | | |
-| | | | 0 | A0 | | production_unperturbed | | | | | |
-| | | | 1 | A1 | | production_unperturbed | | | | | |
-
-### Phase Attribution
-
-| Cell | Treatment | Profile kind | Model-init total | Checkpoint-to-CUDA total | Raw checkpoint load | Discovery | Selection | Prefetch | mmap/setup | Apply enqueue | Post-load/final CUDA | Warmup/tail | E2E |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| | | production_unperturbed | | | | | | | | | | | |
-
-Inclusive parents overlap their children, and production H2D completion can land in the post-load span. Do not add
-columns to reconstruct E2E. Publish synchronized/Nsight H2D attribution in a separate diagnostic table.
-
-### Adaptive Selection
-
-| Held-out cell | Profile version | Oracle policy | Adaptive policy | Oracle time | Adaptive time | Regret | Decision reason |
-| --- | --- | --- | --- | ---: | ---: | ---: | --- |
-| | | | | | | | |
-
-## 13. Decision Outcomes
-
-The experiment leads to one of these actions:
-
-| Evidence | Decision |
+| Evidence | Next action |
 | --- | --- |
-| D wins consistently on target scalable storage | Keep D as primary for those profiled deployments. |
-| S wins on client-limited storage | Implement and test the full bounded pinned producer/consumer pipeline. |
-| L is competitive for natural many-shard layouts | Preserve L and include shard geometry in selection. |
-| A1 stays near the oracle on held-out cells | Promote adaptive selection behind an explicit experimental configuration. |
-| A1 has high regret or unstable decisions | Use deployment-static policy profiles rather than per-start auto selection. |
-| I/O improves but E2E barely moves | Prioritize mapping, transforms, H2D overlap, post-load work, or reusable artifacts. |
-| Largest models fail the host-memory guard | Move to bounded streaming/selective reads instead of full page-cache prefetch. |
-| MoE/CP/DP qualification fails | Keep fallback and fix rank-ownership/communicator contracts before performance work. |
+| D wins and traces show useful I/O/materialization/H2D overlap | Keep D as the primary policy for the measured deployment profile. |
+| D reads quickly but exposes a large tail | Tune issuer count/NUMA or implement finer bounded streaming and destination placement. |
+| S wins on target NFS | Invest in the full bounded pinned producer/consumer design and remeasure. |
+| S loses because prefetch stays serial | Keep it explicit for client-limited storage; do not make it the default. |
+| L is competitive on natural many-shard checkpoints | Preserve L and include shard geometry in future selection. |
+| I/O improves but first-token barely changes | Prioritize transforms, H2D, warmup, compilation, or reusable MX/GMS/Snapshot artifacts. |
+| Full read-ahead fails the host-memory guard | Move to bounded selective streaming; do not tune the guard around unsafe memory pressure. |
+| A flagship profile fails correctness/lifecycle | Keep the exact profile unqualified and fix downstream integration before performance claims. |
+| A0 matches D | Capability fallback works as designed; performance adaptation remains future work. |
 
-## 14. Required Artifacts
+## 10. Artifact Layout
 
-Store one directory per immutable run campaign:
+Store one directory per immutable campaign:
 
 ```text
 campaign/
-├── manifest.json
-├── environment/
-│   ├── software.json
-│   ├── hardware.json
-│   ├── topology.txt
-│   └── storage.json
-├── cells/<cell-id>/<treatment>/<run-id>/
-│   ├── startup-profile.json
-│   ├── rank-events.jsonl
-│   ├── resource-telemetry.jsonl
-│   ├── stdout.log
-│   ├── correctness.json
-│   └── command.json
-├── aggregate.csv
-├── aggregate.json
-└── report.md
++-- manifest.json
++-- instrumentation.patch
++-- schedule.csv
++-- environment/
+|   +-- software.json
+|   +-- hardware.json
+|   +-- topology.txt
+|   +-- storage.json
+|   +-- model-manifests/
+|   +-- versions.txt
++-- cells/<cell-id>/<treatment>/<run-id>/
+|   +-- command.json
+|   +-- environment.json
+|   +-- cache-state.json
+|   +-- startup-profile.json
+|   +-- rank-events.jsonl
+|   +-- resource-telemetry.jsonl
+|   +-- stdout.log
+|   +-- stderr.log
+|   +-- correctness.json
+|   +-- lifecycle.json
+|   +-- exit-status.json
+|   +-- nvidia-smi-samples.csv
+|   +-- complete
++-- nsys/
+|   +-- <run-id>.nsys-rep
+|   +-- <run-id>-overlap.json
++-- exclusions.csv
++-- aggregate.csv
++-- aggregate.json
++-- report.md
 ```
 
-The report must list excluded runs and reasons. Never silently discard an outlier; distinguish infrastructure failure,
-invalid cache state, unexpected fallback, correctness failure, and valid performance variation.
+Never silently discard an outlier. Classify it as valid variation, infrastructure failure, invalid cache state,
+unexpected fallback, correctness failure, timeout, or lifecycle failure.
+
+### Required Headline Table
+
+| Model/revision | Topology | Storage/cache | Treatment | Selected policy | N | First-token median [CI] | LLM-init median [CI] | Model-init median [CI] | Weight-session median [CI] | Exposed read tail | Peak RSS/HBM | Result |
+| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| | | | L | | | | | | | | | |
+| | | | D | | | | | | | | | |
+| | | | S | | | | | | | | | |
+| | | | A0 | | | | | | | | | |
+
+### Required Mechanism Table
+
+| Cell/run | Mode | Read span | Node logical rate | mmap span | Materialization span | Materialization overlap | Hidden read fraction | First H2D before final read? | Storage counter scope |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| | | | | | | | | | |
+
+## 11. Copy/Paste Brief for the Execution Agent
+
+> Execute Campaign 0 in `docs/design/hybrid-weight-loader/benchmark-plan.md` against TensorRT-LLM PR #16562 on one
+> exclusive 8xB300 node. Resolve and pin the PR head, container, model revisions, configs, and instrumentation patch.
+> Do not change loader scheduling. First satisfy the unit, model-inventory, node/storage, cache-control, and structured
+> timing gates. Run L/D/S/A0 from the same binary through the full ModelLoader/LLM path. Use fresh processes, verified
+> cache state, randomized complete blocks, deterministic one-token correctness, clean-shutdown checks, and the staged
+> smoke -> flagship qualification -> 5-block screening -> 10-block confirmation sequence. Prioritize Qwen3.5-397B
+> NVFP4, DeepSeek V4 Pro, and Llama 4 Scout/Maverick with the source-backed configs and caveats in the plan. Capture
+> representative L/D Nsight traces to prove or refute I/O/H2D overlap. Return all raw artifacts and an evidence-backed
+> report; do not claim A0 is adaptive, do not assume D or S must win, and do not invent unavailable measurements.
+
+## 12. Future Campaign: Performance-Adaptive A1
+
+After a real pre-I/O selector exists, run a new L/D/S/A1 campaign from one new binary. Calibrate storage profiles on
+independent objects, freeze the selector/profile, and validate on held-out cells. Define the cell oracle from static
+medians:
+
+```text
+oracle_cell_time = min(median(T_L), median(T_D), median(T_S))
+adaptive_regret = (median(T_A1) - oracle_cell_time) / oracle_cell_time
+```
+
+Recollect L/D/S with the A1 binary; do not reuse Campaign 0 timings. A chooser can approach the static oracle but cannot
+intrinsically beat it unless it implements a genuinely new mixed/overlapped data path.
 
 ## References
 
@@ -698,3 +848,4 @@ invalid cache state, unexpected fallback, correctness failure, and valid perform
 - [ModelStreamer and Weight-Loading Integration Assessment](../mx-gms-integration/19-model-streamer-weight-loading-assessment.md)
 - [TensorRT-LLM performance benchmarking guide](../../source/developer-guide/perf-benchmarking.md)
 - [TensorRT-LLM supported models](../../source/models/supported-models.md)
+- [vmtouch upstream](https://github.com/hoytech/vmtouch)
