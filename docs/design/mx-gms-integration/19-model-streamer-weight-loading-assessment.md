@@ -11,11 +11,14 @@ SPDX-License-Identifier: Apache-2.0
 
 **Created:** 2026-07-08
 
-**Last Updated:** 2026-07-08
+**Last Updated:** 2026-07-19
 
 > [§18 GMS Integration Gaps and Concrete PR Plan](18-gms-integration-gaps-and-concrete-pr-plan.md) remains the
 > implementation source of truth for the GMS lifecycle and PR ordering. This assessment defines storage-ingress and
 > weight-materialization composition; it does not add a GMS delivery gate.
+
+The implemented native host-policy prototype, policy-selection guidance, and four-treatment cold-start experiment are
+specified in [Native Hybrid Weight Loader](../hybrid-weight-loader/README.md).
 
 ## Executive Summary
 
@@ -109,8 +112,9 @@ counts, cancellation, and rank-failure handling.
 ### Rank-Aware Weight Manifest
 
 The proposal's weight-use manifest is its strongest architectural idea. It should become a backend-neutral
-`WeightLoadPlan` that describes what each rank requires before storage reads begin. The plan can then drive selective
-SafeTensors reads, ModelStreamer scheduling, MX source matching, GMS layout construction, and artifact identity.
+`RankWeightManifest` that describes what each rank requires before storage reads begin. The manifest can then drive
+selective SafeTensors reads, ModelStreamer scheduling, MX source matching, GMS layout construction, and artifact
+identity.
 
 ### Transformed Weight Cache
 
@@ -149,7 +153,7 @@ Fresh process
           +-- native Hugging Face loader
                     |
                     v
-             WeightLoadPlan
+          RankWeightManifest
                     |
                     v
        destination allocation policy
@@ -171,9 +175,15 @@ silently change behavior.
 
 ## Core Architecture Contracts
 
-### `WeightLoadPlan`
+### `RankWeightManifest`
 
-A `WeightLoadPlan` describes rank-local requirements without binding them to one storage backend. It should include:
+> Terminology update: earlier revisions called this richer tensor/rank object `WeightLoadPlan`. PR #16562 uses that name
+> for an ordered policy tuple. This assessment now uses `RankWeightManifest`, following the
+> [native loader design](../hybrid-weight-loader/README.md#terminology-policy-plan-versus-rank-manifest), so the two
+> contracts do not share a public name.
+
+A `RankWeightManifest` describes rank-local requirements without binding them to one storage backend. It should
+include:
 
 - Immutable source identity and checkpoint revision.
 - Source tensor name, object or file extent, slice, dtype, and checksum information.
@@ -246,7 +256,8 @@ group, which may not be initialized at the relevant point in TensorRT-LLM's MPI 
 4. **Destination-layout assumptions.** Treat allocation as a policy interface and validate alignment, alias, stride,
    replacement-storage, VMM, NIXL, and GMS rules before claiming direct-placement or TLB benefits.
 5. **Ambiguous metrics.** Do not combine reading and application into one timer. Report the selected source, hit or
-   fallback reason, bytes, throughput, per-rank values, and maximum-rank critical path.
+   fallback reason, bytes, throughput, per-rank values, distributed critical span, maximum local-rank duration, and
+   rank skew.
 6. **Silent backend selection.** Package presence must not change correctness or startup behavior unexpectedly.
 7. **Distributed-runtime coupling.** Validate Torch process-group and MPI lifecycle compatibility before enabling
    distributed ModelStreamer loading.
@@ -258,7 +269,7 @@ group, which may not be initialized at the relevant point in TensorRT-LLM's MPI 
 
 - Standardize hierarchical startup metrics and cold/warm baselines.
 - Define correctness, memory-pressure, and fallback acceptance criteria.
-- Draft `WeightLoadPlan` and `RuntimeWeightArtifact` schemas.
+- Draft `RankWeightManifest` and `RuntimeWeightArtifact` schemas.
 
 ### Phase 1: Low-Risk Cold-Storage Integration
 
@@ -282,7 +293,7 @@ group, which may not be initialized at the relevant point in TensorRT-LLM's MPI 
 
 ### Phase 4: Selective and Direct Placement
 
-- Add range-selective reads based on `WeightLoadPlan`.
+- Add range-selective reads based on `RankWeightManifest`.
 - Evaluate direct placement into registered or GMS-managed destinations.
 - Expand object-store and provider-native authentication support.
 - Evaluate distributed ModelStreamer only after process-group compatibility is proven.
@@ -306,7 +317,7 @@ At minimum, validation should cover:
 - Native fallback after ModelStreamer initialization or read failure.
 - Numerical equivalence and first-inference correctness.
 - Peak CPU, pinned-host, and HBM usage.
-- p50/p95 phase timing and maximum-rank latency.
+- Sample-supported p50/p95 phase timing, distributed critical span, and maximum local-rank duration.
 
 ## Explicit Non-Goal: Legacy TensorRT `.engine` Loading
 
