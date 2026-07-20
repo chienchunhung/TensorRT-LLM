@@ -919,8 +919,10 @@ Docker was unavailable for G5, and G6 was not run.
 - PyTorch backend on B300 nodes, with donor GPUs 0-3 and receiver GPUs 4-7 for TP=4.
 - Native Redis and MX server at `http://127.0.0.1:8001`; automatic Docker lifecycle was not exercised.
 - Checkpoints resided on NFS. Before every measured stage, the harness requested eviction of the local client page
-  cache for weight files with `POSIX_FADV_DONTNEED`. Results are therefore labeled `nfs-local-page-cache-cold`; they
-  do not claim eviction of server-side NFS caches.
+  cache for weight files with `POSIX_FADV_DONTNEED`, but it did not gate execution on measured residency.
+  Subsequent `mincore` validation on the same mount showed that the advisory could leave 100% of pages resident.
+  These measurements must therefore be treated as client-cache warm/uncontrolled, not as first-read NFS results;
+  server-side NFS cache was also uncontrolled.
 - Each complete run executed an HF baseline, an MX donor, a full-checkpoint MX receiver, and an MX receiver whose
   local view omitted weight shards. Scenario ordering rotated between cycles.
 - The 70B run used two-hour donor/heartbeat timeouts. The 405B-FP8 run used four-hour timeouts,
@@ -1001,6 +1003,8 @@ should not be treated as multi-cycle means.
 
 #### Remaining qualification work
 
+- Repeat the scaling characterization with a privileged node page-cache drop and a post-reset `mincore` residency
+  requirement below 1%; do not use the existing results as true-cold NFS measurements.
 - Repeat the representative positive path on the exact combined #15641 + #16159 integration head.
 - Record ArtifactIdentity v1 and SourceIdentity v2 from a canonical immutable Hugging Face snapshot, including the G4
   metadata-only receiver proof.
