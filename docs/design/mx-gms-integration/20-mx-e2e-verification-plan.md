@@ -907,6 +907,107 @@ Run this section only after G0-G5 pass.
 Report performance as measured evidence, not as a core correctness gate. Do not compare cold disk, warm page cache,
 and MX numbers without labeling cache state.
 
+### 18.1 July 2026 characterization results
+
+The following results were collected on July 17-19, 2026 against PR #15641 at
+`752c05c9af87813ced3622836585c20c7c6f8e20`. They characterize the explicit-server MX data path across three Llama
+model sizes. They do **not** constitute the overall PASS defined in Section 3: the run did not include PR #16159,
+Docker was unavailable for G5, and G6 was not run.
+
+#### Method
+
+- PyTorch backend on B300 nodes, with donor GPUs 0-3 and receiver GPUs 4-7 for TP=4.
+- Native Redis and MX server at `http://127.0.0.1:8001`; automatic Docker lifecycle was not exercised.
+- Checkpoints resided on NFS. Before every measured stage, the harness requested eviction of the local client page
+  cache for weight files with `POSIX_FADV_DONTNEED`. Results are therefore labeled `nfs-local-page-cache-cold`; they
+  do not claim eviction of server-side NFS caches.
+- Each complete run executed an HF baseline, an MX donor, a full-checkpoint MX receiver, and an MX receiver whose
+  local view omitted weight shards. Scenario ordering rotated between cycles.
+- The 70B run used two-hour donor/heartbeat timeouts. The 405B-FP8 run used four-hour timeouts,
+  `max_seq_len=2048`, and `kv_cache_config.free_gpu_memory_fraction=0.30`.
+- `LLM init` is wall time around `LLM(...)`. `Model loader` and `checkpoint source` are the maximum observed rank
+  durations. `MX transfer` is the mean across cycles of each cycle's maximum rank duration.
+- Reductions are relative to the HF baseline at the same model, cache mode, and TP:
+  `(HF - MX) / HF * 100`.
+
+#### Run matrix and correctness
+
+| Model | Quantization | TP | Complete runs | Result |
+|:--|:--|--:|--:|:--|
+| TinyLlama-1.1B-Chat-v1.0 | BF16 | 1 | 2 of 3 | Two complete runs passed; cycle 2 hit a harness quoting error during G4 and is excluded |
+| TinyLlama-1.1B-Chat-v1.0 | BF16 | 2 | 3 of 3 | All four scenarios passed |
+| TinyLlama-1.1B-Chat-v1.0 | BF16 | 4 | 3 of 3 | All four scenarios passed |
+| Llama-3.3-70B-Instruct | BF16 | 4 | 5 of 5 | All four scenarios passed |
+| Llama-3.1-405B-Instruct-FP8 | FP8 | 4 | 5 of 5 | All four scenarios passed |
+
+For every complete run, baseline, donor, full receiver, and no-shards receiver produced the same deterministic token
+hash. Every receiver rank matched all published tensors and logged direct transfer into model parameters. The observed
+TP=4 per-rank payloads were 135 tensors/0.55 GB for TinyLlama, 483 tensors/35.28 GB for 70B, and 3,279
+tensors/102.52 GB for 405B-FP8. The corresponding aggregate logical payloads across four ranks were 2.20 GB,
+141.12 GB, and 410.08 GB.
+
+The no-shards result proves the PR #15641 receiver did not silently load local weight shards. It does not satisfy the
+updated G4 ArtifactIdentity requirement by itself: these runs predated the combined #15641 + #16159 head and did not
+record a canonical-snapshot ArtifactIdentity v1 digest inside SourceIdentity v2.
+
+#### End-to-end LLM initialization
+
+Times are arithmetic means over the complete runs above.
+
+| Model | TP | N | HF (s) | MX full (s) | Reduction | MX no-shards (s) | Reduction |
+|:--|--:|--:|--:|--:|--:|--:|--:|
+| TinyLlama-1.1B BF16 | 1 | 2 | 268.08 | 263.26 | 1.8% | 261.91 | 2.3% |
+| TinyLlama-1.1B BF16 | 2 | 3 | 226.05 | 208.37 | 7.8% | 217.72 | 3.7% |
+| TinyLlama-1.1B BF16 | 4 | 3 | 152.47 | 106.47 | 30.2% | 114.36 | 25.0% |
+| Llama-3.3-70B BF16 | 4 | 5 | 345.64 | 117.99 | 65.9% | 119.34 | 65.5% |
+| Llama-3.1-405B FP8 | 4 | 5 | 592.61 | 190.39 | 67.9% | 190.29 | 67.9% |
+
+The total-init benefit grows with model size because fixed process and distributed-startup costs dominate TinyLlama,
+whereas NFS checkpoint reads dominate the larger baselines.
+
+#### Model-loader and checkpoint-source durations
+
+| Model | TP | HF loader (s) | MX full loader (s) | Reduction | MX no-shards loader (s) | Reduction |
+|:--|--:|--:|--:|--:|--:|--:|
+| TinyLlama-1.1B BF16 | 1 | 9.64 | 1.36 | 85.9% | 1.35 | 86.0% |
+| TinyLlama-1.1B BF16 | 2 | 7.21 | 1.57 | 78.2% | 1.46 | 79.8% |
+| TinyLlama-1.1B BF16 | 4 | 7.64 | 2.12 | 72.3% | 2.16 | 71.7% |
+| Llama-3.3-70B BF16 | 4 | 212.61 | 2.37 | 98.9% | 2.24 | 98.9% |
+| Llama-3.1-405B FP8 | 4 | 380.35 | 5.60 | 98.5% | 5.62 | 98.5% |
+
+| Model | TP | HF checkpoint source (s) | MX full source (s) | Reduction | MX no-shards source (s) | Reduction |
+|:--|--:|--:|--:|--:|--:|--:|
+| TinyLlama-1.1B BF16 | 1 | 8.83 | 1.21 | 86.3% | 1.20 | 86.4% |
+| TinyLlama-1.1B BF16 | 2 | 6.55 | 1.34 | 79.6% | 1.31 | 80.0% |
+| TinyLlama-1.1B BF16 | 4 | 6.45 | 1.62 | 74.8% | 1.68 | 74.0% |
+| Llama-3.3-70B BF16 | 4 | 206.13 | 1.30 | 99.4% | 1.26 | 99.4% |
+| Llama-3.1-405B FP8 | 4 | 361.18 | 4.36 | 98.8% | 4.35 | 98.8% |
+
+#### Direct-transfer duration
+
+| Model | TP | Timing samples | MX full max-rank mean (s) | MX no-shards max-rank mean (s) |
+|:--|--:|--:|--:|--:|
+| TinyLlama-1.1B BF16 | 1 | 1 | 0.29 | 0.28 |
+| TinyLlama-1.1B BF16 | 2 | 1 | 0.51 | 0.52 |
+| TinyLlama-1.1B BF16 | 4 | 1 | 0.99 | 1.35 |
+| Llama-3.3-70B BF16 | 4 | 5 | 0.37 | 0.35 |
+| Llama-3.1-405B FP8 | 4 | 5 | 1.05 | 1.08 |
+
+These are MX-reported operation durations, not an independent fabric-throughput measurement. In particular, the
+logical tensor byte counts and derived Gbps can exceed a physical-link interpretation when the same-node path uses
+GPU-memory registration and asynchronous operations. Use the end-to-end initialization and loader timings for the
+startup comparison. The TinyLlama parser emitted transfer durations for only one cycle at each TP, so those values
+should not be treated as multi-cycle means.
+
+#### Remaining qualification work
+
+- Repeat the representative positive path on the exact combined #15641 + #16159 integration head.
+- Record ArtifactIdentity v1 and SourceIdentity v2 from a canonical immutable Hugging Face snapshot, including the G4
+  metadata-only receiver proof.
+- Run G5 in an environment with Docker access.
+- Run the G6 negative controls. Until these steps complete, retain the Section 3 outcome as **BLOCKED/INCOMPLETE**,
+  not PASS.
+
 ## 19. Acceptance Matrix
 
 | Gate | Required evidence | Pass condition |
