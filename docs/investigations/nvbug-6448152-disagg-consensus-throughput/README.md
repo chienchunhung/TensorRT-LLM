@@ -17,7 +17,8 @@ SPDX-License-Identifier: Apache-2.0
   [PR #15737](https://github.com/NVIDIA/TensorRT-LLM/pull/15737)
 - **Validated design experiments:** [PR #16580](https://github.com/NVIDIA/TensorRT-LLM/pull/16580) and
   [PR #16581](https://github.com/NVIDIA/TensorRT-LLM/pull/16581)
-- **Official latest-main production PR:** TBD
+- **Official latest-main production PR:**
+  [PR #16634](https://github.com/NVIDIA/TensorRT-LLM/pull/16634)
 
 > [!IMPORTANT]
 > The decisive experiments in PRs #16565, #16566, #16567, #16572, #16580, and #16581 use a **controlled historical
@@ -459,7 +460,9 @@ Until that contract exists and is tested under pressure, the official first PR s
 ### 9.1 First official PR
 
 Reconstruct the #16580 design from the latest `upstream/main` rather than rebasing its historical experiment merge.
-The official PR link and title are TBD. Scope it to:
+The official production port is
+[PR #16634: make C++ context-transfer consensus asynchronous](https://github.com/NVIDIA/TensorRT-LLM/pull/16634).
+Its scope is:
 
 1. a reusable asynchronous PP vote reducer and coordinator;
 2. a repeatable nonterminal timeout/cancel proposal phase that preserves #15238 behavior;
