@@ -1003,8 +1003,9 @@ should not be treated as multi-cycle means.
 
 #### Remaining qualification work
 
-- Repeat the scaling characterization with a privileged node page-cache drop and a post-reset `mincore` residency
-  requirement below 1%; do not use the existing results as true-cold NFS measurements.
+- Repeat the scaling characterization with either a privileged node page-cache drop or an `O_DIRECT` copy to fresh
+  checkpoint inodes, followed by a `mincore` residency requirement below 1%; do not use the existing results as
+  true-cold NFS measurements.
 - Repeat the representative positive path on the exact combined #15641 + #16159 integration head.
 - Record ArtifactIdentity v1 and SourceIdentity v2 from a canonical immutable Hugging Face snapshot, including the G4
   metadata-only receiver proof.
