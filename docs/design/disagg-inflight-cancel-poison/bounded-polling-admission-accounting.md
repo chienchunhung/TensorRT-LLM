@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Bounded Polling Admission Accounting Addendum
 
 | | |
@@ -5,7 +10,11 @@
 | **Date** | 2026-06-24 |
 | **Related PRs** | <https://github.com/NVIDIA/TensorRT-LLM/pull/15181>, <https://github.com/NVIDIA/TensorRT-LLM/pull/15356>, <https://github.com/NVIDIA/TensorRT-LLM/pull/15238> |
 | **Related tests** | `TestQwen3_8B::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1tp1cp4]`, `TestQwen3_8B::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1tp2cp2]` |
-| **Status** | Design note before implementation |
+| **Status** | Historical motivation for the admission accounting implemented by PR #15356 |
+
+> **Current design:** This addendum preserves the bounded-polling incident history that motivated PR #15356. See
+> [Disaggregated KV Transfer Admission Control](../disagg-kv-transfer-admission-control/README.md) for the current
+> two-stage semantics, proposed adaptive logical-window derivation and guardrails, and GB300 telemetry results.
 
 ## Why This Addendum Exists
 

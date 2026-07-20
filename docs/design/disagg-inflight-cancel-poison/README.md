@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Architecturally Correct Request Cancellation for Disaggregated KV Transfer
 
 | | |
@@ -670,6 +675,10 @@ In-flight cancel + poison fix lands default-OFF, gated under TRTLLM_DISAGG_ENABL
   separates transfer queueing latency from actual transport service
   rate, and records the follow-up need for a tunable transfer-admission
   window / transfer-concurrency policy.
+- [Disaggregated KV Transfer Admission Control](../disagg-kv-transfer-admission-control/README.md)
+  — current two-stage semantics, proposed adaptive logical-window derivation,
+  telemetry design, and GB300 validation of the follow-up identified by
+  the bounded-polling addendum.
 - [`appendix-v1-consensus-collective.md`](appendix-v1-consensus-collective.md) —
   **DRAFT APPENDIX** — packed V1 `(rid, state)` consensus collective
   for the L2 state-transition gap. This is the concrete collective
