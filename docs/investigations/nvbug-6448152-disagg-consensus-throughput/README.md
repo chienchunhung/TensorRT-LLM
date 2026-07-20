@@ -12,40 +12,42 @@ SPDX-License-Identifier: Apache-2.0
 - **Reported transport:** NIXL with the UCX backend
 - **Reported topology:** one four-GPU PP4 context worker and one eight-GPU DEP8 generation worker on three GB300 nodes
 - **Primary regression:** output-token throughput fell from approximately 1573 to 817 tokens/s
-- **Correctness origin:** [PR #15139](https://github.com/NVIDIA/TensorRT-LLM/pull/15139), which made terminal KV-transfer state transitions consistent across ranks
-- **Related safety fixes:** [PR #15238](https://github.com/NVIDIA/TensorRT-LLM/pull/15238) and
-  [PR #15737](https://github.com/NVIDIA/TensorRT-LLM/pull/15737)
-- **Validated design experiments:** [PR #16580](https://github.com/NVIDIA/TensorRT-LLM/pull/16580) and
-  [PR #16581](https://github.com/NVIDIA/TensorRT-LLM/pull/16581)
+- **Correctness origin:** pull request 15139, which made terminal KV-transfer state transitions consistent across ranks
+- **Related safety fixes:** pull request 15238 and
+  pull request 15737
+- **Validated design experiments:** pull request 16580 and
+  pull request 16581
 - **Official latest-main production PR:**
-  [PR #16634](https://github.com/NVIDIA/TensorRT-LLM/pull/16634)
+  pull request 16634
 
 > [!IMPORTANT]
-> The decisive experiments in PRs #16565, #16566, #16567, #16572, #16580, and #16581 use a **controlled historical
-> tree around PR #15139**, with the same minimal PR #15737 sender-race fix on both control and treatment. They prove
-> what caused the adjacent pre-/post-#15139 regression and which mechanism repairs it. They are **not** a substitute
-> for validating a production port on current `main`. In particular, PR #15238 merged later and changed timeout,
+> The decisive experiments in pull requests 16565, 16566, 16567, 16572, 16580, and 16581 use a **controlled historical
+> tree around pull request 15139**, with the same minimal pull request 15737 sender-race fix on both control and
+> treatment. They prove what caused the adjacent before/after-pull-request-15139 regression and which mechanism repairs
+> it. They are **not** a substitute
+> for validating a production port on current `main`. In particular, pull request 15238 merged later and changed timeout,
 > cancellation, request-retention, and cleanup semantics. The official implementation must be reconstructed from the
 > latest `main` and rerun the exact GB300 workload before it is ready to merge.
 
 ## 1. Executive summary
 
-PR #15139 fixed a real distributed-correctness problem. Before it, one rank could observe a local transfer future as
+Pull request 15139 fixed a real distributed-correctness problem. Before it, one rank could observe a local transfer future as
 complete or failed and mutate its request state while another rank still considered the same request in progress.
-That can make scheduling, response publication, cancellation, and resource cleanup diverge across ranks. PR #15139
+That can make scheduling, response publication, cancellation, and resource cleanup diverge across ranks. Pull request 15139
 therefore retained each locally terminal request, reduced packed terminal votes across the relevant rank groups, and
 applied the state transition only after a common result existed.
 
 The correctness rule was right; the synchronous execution shape was not. For the reported PP4 context worker, each PP
-stage reaches the transfer-status check at a different time because pipeline stages are doing different work. PR
-#15139 put a blocking PP collective at that staggered scheduler point. Early PP stages repeatedly waited for the last
+stage reaches the transfer-status check at a different time because pipeline stages are doing different work. Pull
+request 15139 put a blocking PP collective at that staggered scheduler point. Early PP stages repeatedly waited for the last
 stage to arrive. The collective payload was tiny, but the *rendezvous* exposed pipeline entry skew as idle scheduler
 time. NVBug 6448152 reported the resulting output-token-throughput drop from **1573.57 to 817.33 tokens/s**.
 
 The controlled evidence is now strong:
 
-1. With the PR #15737 lost-wakeup fix applied identically to both sides, the pre-#15139 control passed 512/512 requests
-   at **1557.83 tokens/s**, while the post-#15139 treatment missed the 5400-second harness deadline and completed only
+1. With the pull request 15737 lost-wakeup fix applied identically to both sides, the control before pull request 15139
+   passed 512/512 requests at **1557.83 tokens/s**, while the treatment after pull request 15139 missed the 5400-second
+   harness deadline and completed only
    481/512 requests. Its printed 598.42 tokens/s is censored and is not a valid throughput measurement.
 2. Transition-only instrumentation reproduced the pre-teardown rate at approximately **818 tokens/s** and measured
    negligible TP consensus time (at most 5 microseconds), but enormous asymmetric PP wait: approximately 4240, 3204,
@@ -53,21 +55,23 @@ The controlled evidence is now strong:
 3. An unsafe diagnostic that removed only context-side global consensus recovered 512/512 at **1564.71 tokens/s**.
    This established that the context consensus path, not generation cleanup, was the causal phase, but could not be a
    production fix because it permitted rank-divergent terminal decisions.
-4. PR #16580 replaced the scheduler-hot-path PP terminal-outcome collective with asynchronous point-to-point
+4. Pull request 16580 replaced the scheduler-hot-path PP terminal-outcome collective with asynchronous point-to-point
    agreement: immutable votes flow to the last PP rank, that coordinator reduces them, and one authoritative commit
    flows back. Ranks poll without waiting; request state and resource release still wait for the global commit. It
    passed 512/512 at
    **1548.84 tokens/s**, 99.42% of the matched control.
-5. PR #16581 kept exactly the same agreement protocol and additionally reclaimed locally quiesced successful KV before
-   global commit. It passed 512/512 at **1575.23 tokens/s**. The small difference from #16580 is within normal run
-   variation; because #16580 already recovered throughput while retaining resources globally, deferred reclamation was
+5. Pull request 16581 kept exactly the same agreement protocol and additionally reclaimed locally quiesced successful
+   KV before global commit. It passed 512/512 at **1575.23 tokens/s**. The small difference from pull request 16580 is
+   within normal run variation; because pull request 16580 already recovered throughput while retaining resources
+   globally, deferred reclamation was
    not a material limiter for this workload.
 
-The recommended first production PR is therefore the smallest safe result: adapt PR #16580's asynchronous ordered PP
+The recommended first production pull request is therefore the smallest safe result: adapt pull request 16580's
+asynchronous ordered PP
 commit to the latest `main`, keep KV and request resources retained until global commit, remove diagnostic-only gates
-and logging, and qualify it comprehensively. The adaptation must preserve PR #15238's two-phase cancellation contract:
+and logging, and qualify it comprehensively. The adaptation must preserve pull request 15238's two-phase cancellation contract:
 a timeout/cancel observation is a repeatable nonterminal proposal, all ranks coordinate cancellation, and only local
-quiescence produces an immutable terminal acknowledgement for the authoritative commit. Treat PR #16581's early
+quiescence produces an immutable terminal acknowledgement for the authoritative commit. Treat pull request 16581's early
 reclamation as a separate capacity optimization that needs an explicit request/epoch credit contract before broad
 enablement.
 
@@ -112,7 +116,7 @@ The workload has the topology that most strongly exposes the defect:
 The incident dashboard supplied with the NVBug is
 [here](https://tensorrt-llm.tensorrt-llm-perf-ci-report.sc2-paas.nvidia.com/?selectedGpus=b200%2Cgb200%2Cgb300&selectedBranches=main&selectedCurve=perf_instability&selectedNvbug=**all**&pinnedSection=e2e-gb300_deepseek-r1-fp4_128k8k_con256_ctx1_pp4_gen1_dep8_eplb0_mtp1_ccb-NIXL-con256_iter2_isl131072_osl8192%7Cmain%7Cgb300&in_time-from=2026-06-29).
 
-## 3. What PR #15139 was trying to fix
+## 3. What pull request 15139 was trying to fix
 
 ### 3.1 The pre-consensus correctness gap
 
@@ -139,9 +143,9 @@ The required reduction semantics are:
   quiescence rule; and
 - no rank performs an irreversible terminal transition from a merely local observation.
 
-### 3.2 What merged PR #15139 implemented
+### 3.2 What merged pull request 15139 implemented
 
-PR #15139 added the V1 C++ equivalent of that rule. The merged implementation:
+Pull request 15139 added the V1 C++ equivalent of that rule. The merged implementation:
 
 1. records a local immutable `{request_id, completed|failed}` outcome;
 2. retains the `LlmRequest` in an awaiting-consensus map after consuming its future;
@@ -156,22 +160,22 @@ The context path retains local results and calls the two-level reduction before 
 
 This is the safety property that the final solution must preserve.
 
-### 3.3 Did PR #15139 consolidate the collectives into one?
+### 3.3 Did pull request 15139 consolidate the collectives into one?
 
 Only partially. It consolidated `completed` and `failed` into one packed logical state payload, but it did **not** turn
 the context hot path into one nonblocking operation:
 
 - A variable-size packed reduction uses an `allgather` for per-rank sizes followed by `allgatherv` for the payload.
 - CTX applies that reduction hierarchically: once for the TP/CP group, then again for the PP group.
-- The pre-existing ready-request-ID gather was deliberately retained in PR #15139.
+- The pre-existing ready-request-ID gather was deliberately retained in pull request 15139.
 
 Therefore, “one packed state representation” is not the same as “one physical collective” or “one rendezvous.” The
 payload optimization reduces bytes and duplicated outcome lists; it does not eliminate scheduler synchronization.
 
-PR #16386 later explored worker-published votes so the qualified PP path would not enter the rolling PP terminal-
-outcome collective. The final successful experiment, PR #16580, goes further in architectural clarity: one coordinator
+Pull request 16386 later explored worker-published votes so the qualified PP path would not enter the rolling PP terminal-
+outcome collective. The final successful experiment, pull request 16580, goes further in architectural clarity: one coordinator
 receives point-to-point immutable terminal votes and broadcasts an authoritative decision, with **no terminal-outcome
-collective on the changed PP scheduler path**. The separate ready-request-ID consensus remains; #16580 did not claim
+collective on the changed PP scheduler path**. The separate ready-request-ID consensus remains; pull request 16580 did not claim
 to remove every PP collective in the transceiver.
 
 ## 4. Why a tiny collective became a large throughput loss
@@ -215,29 +219,29 @@ optimize the bytes after participation starts, but it still has an all-participa
 
 Several useful experiments were first run on then-current `main`:
 
-- PR #16386 combined/streamlined status handling and tried worker-published PP votes.
-- PR #16449 allowed successful local CTX release before the global decision.
-- PR #16487 removed runtime/per-request PP consensus traffic entirely for the qualified path.
-- PR #16518 doubled the logical transfer-admission budget and verified that the expanded window was exercised.
+- pull request 16386 combined/streamlined status handling and tried worker-published PP votes.
+- pull request 16449 allowed successful local CTX release before the global decision.
+- pull request 16487 removed runtime/per-request PP consensus traffic entirely for the qualified path.
+- pull request 16518 doubled the logical transfer-admission budget and verified that the expanded window was exercised.
 
 Those points all remained near 800 tokens/s. They ruled out simple explanations on those exact trees, but they did not
-form an adjacent pre-/post-#15139 comparison. By then, `main` included later changes, including PR #15238's timeout,
+form an adjacent comparison before and after pull request 15139. By then, `main` included later changes, including pull request 15238's timeout,
 cancellation, retention, and cleanup behavior. A no-consensus switch on such a tree does not reconstruct the complete
-pre-#15139 lifecycle, and a result near 800 cannot distinguish a failed consensus optimization from another later-tree
+lifecycle before pull request 15139, and a result near 800 cannot distinguish a failed consensus optimization from another later-tree
 limiter.
 
 This is why the earlier results appeared to contradict the final conclusion. They answered “does this switch recover
 this later tree?” The controlled experiment answered the narrower causal question: “with every other tree difference
-held fixed, what does PR #15139 itself do?”
+held fixed, what does pull request 15139 itself do?”
 
 ### 5.2 The matched historical-tree construction
 
-PRs #16565 and #16566 were deliberately constructed so that:
+pull requests 16565 and 16566 were deliberately constructed so that:
 
-- both include the same minimal CacheSender readiness synchronization from merged PR #15737;
+- both include the same minimal CacheSender readiness synchronization from merged pull request 15737;
 - both include the CI-only `--no-container-mount-home` compatibility fix;
 - both use tree-identical no-op merge parents solely to pass the CI mergeability gate; and
-- the only inter-arm tree difference is the original two-file PR #15139 patch, with matching stable patch ID.
+- the only inter-arm tree difference is the original two-file pull request 15139 patch, with matching stable patch ID.
 
 That removes the known sender lost-wakeup race as a confound without importing unrelated current-main behavior.
 
@@ -259,27 +263,27 @@ the number must not be compared as a normal performance point.
 | Experiment | Controlled question | Result | Interpretation |
 | --- | --- | --- | --- |
 | NVBug good/bad samples | Is there a large main-branch regression? | 1573.57 -> 817.33 tok/s | Establishes the incident, not causality by itself. |
-| PR #16386 | Do packed/worker-published status changes recover then-current main? | ~796.69 tok/s | No recovery on that later tree; ambiguous mechanism attribution. |
-| PR #16449 | Does early local CTX completion recover then-current main? | 798.40 tok/s | No recovery on that later tree; did not recreate the historical baseline. |
-| PR #16487 | Does removing runtime PP consensus traffic recover then-current main? | 798.58 tok/s | No; shows another later-tree factor remained, not that #15139 was innocent. |
-| PR #16518 | Does a genuinely exercised 2x logical admission budget recover? | 799.32 tok/s | No meaningful movement; conservative admission was not an independent explanation. |
-| PR #16565 | Pre-#15139 control plus common #15737 fix | **512/512, 1557.83 tok/s** | Valid high control. |
-| PR #16566 | Post-#15139 treatment plus same #15737 fix | 481/512; 598.42 raw, censored | #15139-specific stall remains after fixing the sender race. |
-| PR #16567 | Where does the treatment wait? | 480/512; ~818 pre-teardown | Localizes the steady loss to CTX PP consensus entry skew. |
-| PR #16572 | What if CTX uses local terminal decisions? | **512/512, 1564.71 tok/s** | Causal upper bound; unsafe because global consistency is removed. |
-| PR #16580 | Can asynchronous agreement preserve consistency and recover performance while retaining resources globally? | **512/512, 1548.84 tok/s** | Yes; 99.42% of matched control. |
-| PR #16581 | Does locally quiesced early KV reclamation add material recovery? | **512/512, 1575.23 tok/s** | Safe in narrow experiment; no evidence it is needed for this workload's throughput. |
-| PR #16589 targeted coverage | Does the exact #16580 tree survive broader functional tests? | 3430 passed, 0 failed, 1447 skipped | NIXL and UCX 8-rank coordinator tests and flag-off compatibility passed. Full CI was still in progress when this document was updated. |
+| pull request 16386 | Do packed/worker-published status changes recover then-current main? | ~796.69 tok/s | No recovery on that later tree; ambiguous mechanism attribution. |
+| pull request 16449 | Does early local CTX completion recover then-current main? | 798.40 tok/s | No recovery on that later tree; did not recreate the historical baseline. |
+| pull request 16487 | Does removing runtime PP consensus traffic recover then-current main? | 798.58 tok/s | No; shows another later-tree factor remained, not that pull request 15139 was innocent. |
+| pull request 16518 | Does a genuinely exercised 2x logical admission budget recover? | 799.32 tok/s | No meaningful movement; conservative admission was not an independent explanation. |
+| pull request 16565 | Control before pull request 15139 plus common pull request 15737 fix | **512/512, 1557.83 tok/s** | Valid high control. |
+| pull request 16566 | Treatment after pull request 15139 plus same pull request 15737 fix | 481/512; 598.42 raw, censored | The stall specific to pull request 15139 remains after fixing the sender race. |
+| pull request 16567 | Where does the treatment wait? | 480/512; ~818 pre-teardown | Localizes the steady loss to CTX PP consensus entry skew. |
+| pull request 16572 | What if CTX uses local terminal decisions? | **512/512, 1564.71 tok/s** | Causal upper bound; unsafe because global consistency is removed. |
+| pull request 16580 | Can asynchronous agreement preserve consistency and recover performance while retaining resources globally? | **512/512, 1548.84 tok/s** | Yes; 99.42% of matched control. |
+| pull request 16581 | Does locally quiesced early KV reclamation add material recovery? | **512/512, 1575.23 tok/s** | Safe in narrow experiment; no evidence it is needed for this workload's throughput. |
+| pull request 16589 targeted coverage | Does the exact pull request 16580 tree survive broader functional tests? | 3430 passed, 0 failed, 1447 skipped | NIXL and UCX 8-rank coordinator tests and flag-off compatibility passed. Full CI was still in progress when this document was updated. |
 
-### 6.1 PR #15737: a real race, but not this regression's dominant cause
+### 6.1 Pull request 15737: a real race, but not this regression's dominant cause
 
-PR #15737 fixed a lost-wakeup/data race in `CacheSender`. The response queue and readiness predicate had been protected
+Pull request 15737 fixed a lost-wakeup/data race in `CacheSender`. The response queue and readiness predicate had been protected
 by different mutexes. A remover could observe the last response, another thread could insert and notify, and the remover
 could then overwrite the readiness flag to false. The queue would be nonempty while the response worker slept.
 
 That bug can produce a generation stall and had to be removed from the experiment. It was therefore backported
-identically to #16565 and #16566. The control remained high while treatment still stalled, proving that the sleep/wake
-race was not sufficient to explain the treatment-specific regression. The conclusion is not that PR #15737 was
+identically to pull requests 16565 and 16566. The control remained high while treatment still stalled, proving that the sleep/wake
+race was not sufficient to explain the treatment-specific regression. The conclusion is not that pull request 15737 was
 unnecessary; it is that it fixed an independent liveness defect.
 
 ### 6.2 Admission-control diagnostics
@@ -289,13 +293,13 @@ transfer buffer. A 131072-token request costs 2048 blocks, so the expanded windo
 one-shot marker proved usage exceeded the original window. Throughput nevertheless remained approximately 799
 tokens/s.
 
-That substantially lowers the probability that PR #15238's admission budget was the direct source of the original
-two-times throughput loss. It does **not** remove the need to validate the official latest-main port with current PR
-#15238 semantics; admission can interact with different request sizes, buffer capacities, or early reclamation.
+That substantially lowers the probability that pull request 15238's admission budget was the direct source of the original
+two-times throughput loss. It does **not** remove the need to validate the official latest-main port with current pull
+request 15238 semantics; admission can interact with different request sizes, buffer capacities, or early reclamation.
 
 ### 6.3 Instrumentation result: the decisive localization
 
-PR #16567 added transition-only logging, not per-poll logging and not another collective. It recorded:
+Pull request 16567 added transition-only logging, not per-poll logging and not another collective. It recorded:
 
 - local future terminal events;
 - first wait timeout;
@@ -323,9 +327,9 @@ other three ranks paid for that lateness as exposed scheduler wait.
 
 ## 7. The final consensus design
 
-### 7.1 PR #16580: asynchronous ordered commit
+### 7.1 Pull request 16580: asynchronous ordered commit
 
-PR #16580 changes the execution shape without weakening the decision rule:
+Pull request 16580 changes the execution shape without weakening the decision rule:
 
 ```mermaid
 flowchart LR
@@ -370,17 +374,17 @@ membership and failure handling were defined.
 
 ### 7.3 Complexity and progress
 
-The coordinator design uses fan-in plus fan-out, approximately `2 * (P - 1)` tiny messages per request. PR #16386's
+The coordinator design uses fan-in plus fan-out, approximately `2 * (P - 1)` tiny messages per request. Pull request 16386's
 all-peer mailbox shape used `P * (P - 1)` messages. Neither is data-bandwidth-heavy at PP4, but coordinator fan-in/out
 has lower message growth and a single place to order decisions.
 
 Progress must not depend on a thread that the scheduler has blocked. The production port therefore needs a dedicated
 or otherwise guaranteed progress path, correct MPI thread-support qualification, bounded bookkeeping, and ordered
-shutdown. PR #16580's diagnostic implementation uses nonblocking sends, probing, and bounded teardown as the prototype.
+shutdown. Pull request 16580's diagnostic implementation uses nonblocking sends, probing, and bounded teardown as the prototype.
 
 ### 7.4 Latest-main cancellation needs two protocol phases
 
-PR #16580 was intentionally evaluated on the controlled historical tree. On current `main`, merged PR #15238 makes a
+Pull request 16580 was intentionally evaluated on the controlled historical tree. On current `main`, merged pull request 15238 makes a
 deadline timeout fundamentally different from a completed or failed transfer: observing a timeout does **not** prove
 that the local transport future is quiescent. It is unsafe to publish the first timeout observation as an immutable
 terminal vote and immediately reclaim buffers.
@@ -398,7 +402,7 @@ The production state machine must distinguish:
 Success and failure paths that are already locally quiescent may enter the terminal-acknowledgement phase directly.
 The globally selected failure/cancellation result may be known earlier, but state mutation, response publication, and
 resource reuse remain gated by the authoritative commit and the applicable local-quiescence condition. This retains
-#15238's safety semantics without reintroducing a blocking PP rendezvous.
+pull request 15238's safety semantics without reintroducing a blocking PP rendezvous.
 
 ### 7.5 Global consistency does not mean wall-clock simultaneity
 
@@ -411,9 +415,9 @@ Participants may receive the commit at slightly different times. That is safe if
 
 The invariant is a common ordered decision, not simultaneous CPU instructions on every rank.
 
-## 8. PR #16581: locally quiesced reclamation
+## 8. Pull request 16581: locally quiesced reclamation
 
-PR #16581 asks a separate question: after a rank's local NIXL sender future is terminal and its sender session is
+Pull request 16581 asks a separate question: after a rank's local NIXL sender future is terminal and its sender session is
 released, may that rank return its successful request's primary KV allocation before the PP-wide commit?
 
 Its diagnostic path:
@@ -426,7 +430,7 @@ Its diagnostic path:
 - rejects configurations with pinned reuse blocks, multiple transfer producers, connectors, separate draft KV, TP/CP,
   attention DP, Mamba/VSWA, or other ownership ambiguity.
 
-The early-release implementation and guards are visible in PR #16581's
+The early-release implementation and guards are visible in pull request 16581's
 [`py_executor.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/c108fde7a37094430256c2f449ee453e3e519210/tensorrt_llm/_torch/pyexecutor/py_executor.py#L288-L333)
 and its
 [status integration](https://github.com/NVIDIA/TensorRT-LLM/blob/c108fde7a37094430256c2f449ee453e3e519210/tensorrt_llm/_torch/pyexecutor/py_executor.py#L4550-L4588).
@@ -435,7 +439,8 @@ The test was successful and exercised substantial pre-commit release on PP ranks
 last rank as expected. There was no double free, retry exhaustion, coordinator timeout, cleanup error, or failed
 request.
 
-However, #16580 already achieved 1548.84 tokens/s while retaining all KV until global commit. #16581's 1575.23 tokens/s
+However, pull request 16580 already achieved 1548.84 tokens/s while retaining all KV until global commit. Pull request
+16581's 1575.23 tokens/s
 does not establish a material throughput gain over that result. For this workload, early reclamation is a capacity and
 tail-risk optimization, not the regression fix.
 
@@ -459,13 +464,13 @@ Until that contract exists and is tested under pressure, the official first PR s
 
 ### 9.1 First official PR
 
-Reconstruct the #16580 design from the latest `upstream/main` rather than rebasing its historical experiment merge.
+Reconstruct the pull request 16580 design from the latest `upstream/main` rather than rebasing its historical experiment merge.
 The official production port is
-[PR #16634: make C++ context-transfer consensus asynchronous](https://github.com/NVIDIA/TensorRT-LLM/pull/16634).
+pull request 16634: make C++ context-transfer consensus asynchronous.
 Its scope is:
 
 1. a reusable asynchronous PP vote reducer and coordinator;
-2. a repeatable nonterminal timeout/cancel proposal phase that preserves #15238 behavior;
+2. a repeatable nonterminal timeout/cancel proposal phase that preserves pull request 15238 behavior;
 3. one immutable terminal acknowledgement per request epoch/rank only after local quiescence;
 4. one authoritative, ordered commit with failure/cancellation precedence;
 5. nonblocking scheduler polling and a guaranteed progress mechanism;
@@ -481,7 +486,7 @@ product patch. Keep useful bounded debug counters behind normal logging levels.
 
 ### 9.2 Separate follow-up
 
-Port PR #16581 only after the coordinator PR is stable. Add explicit reclaim-credit semantics and validate capacity
+Port pull request 16581 only after the coordinator PR is stable. Add explicit reclaim-credit semantics and validate capacity
 pressure, partial failures, cancellation, block reuse, speculative/draft KV, Mamba/VSWA, connectors, and request-ID
 reuse. Do not make the coordinator PR depend on early reclamation.
 
@@ -499,7 +504,7 @@ The official PR must rerun the exact NVBug stage and selector on its latest-main
 - no cancellation, timeout, cleanup, double-free, or teardown error; and
 - no regression with the feature inactive or on PP1.
 
-Because PR #15238 is now present, add explicit latest-main tests for:
+Because pull request 15238 is now present, add explicit latest-main tests for:
 
 - cancellation disabled, the NVBug performance case;
 - cancellation enabled with success, failure, user cancellation, and deadline timeout;
@@ -522,13 +527,13 @@ At minimum:
 - fault tests: coordinator exit, peer exit, delayed/lost message where injectable, bounded shutdown; and
 - full non-fail-fast CI, with failures classified rather than hidden by waivers.
 
-PR #16589 already provided useful historical-tree coverage: 3430 passed, zero failed, and both 8-rank NIXL and UCX
+Pull request 16589 already provided useful historical-tree coverage: 3430 passed, zero failed, and both 8-rank NIXL and UCX
 `ContextTransferCoordinatorTest` paths completed without MPI/shutdown hangs. That evidence reduces implementation risk
 but does not replace the latest-main run.
 
 ## 10. Is the approach PP-only or generally multi-rank?
 
-The **implemented and measured optimization is PP-specific**. PR #16580 activates only for the C++ transceiver with an
+The **implemented and measured optimization is PP-specific**. Pull request 16580 activates only for the C++ transceiver with an
 MPI control plane, NIXL/UCX, TP1, CP1, PP greater than one, attention DP disabled, and the exact compatible lifecycle
 mode. It chooses the last PP stage as coordinator because the trace identified PP-stage entry skew.
 
@@ -541,7 +546,7 @@ local terminal fact -> asynchronous group vote -> one ordered group decision -> 
 It is not correct to enable one global coordinator indiscriminately for every distributed strategy. Membership and
 ownership differ:
 
-| Parallel strategy | Does the current #16580 implementation apply? | Generalization assessment |
+| Parallel strategy | Does the current pull request 16580 implementation apply? | Generalization assessment |
 | --- | --- | --- |
 | PP > 1, TP1/CP1 | **Yes, experimental path** | Direct target. Stage skew makes synchronous scheduler collectives especially expensive. |
 | PP1 | No coordinator needed | Reduce locally; adding messages would be pure overhead. |
@@ -582,7 +587,7 @@ and
 [`check_gen_transfer_status`](https://github.com/NVIDIA/TensorRT-LLM/blob/4e38fb823c115f96186493acd22650ec466f98fe/tensorrt_llm/_torch/disaggregation/transceiver.py#L608-L667).
 
 Therefore the finding is relevant: Python has already optimized the number of outcome payload collectives, but it has
-not removed the blocking PP rendezvous semantic. The qualified C++ #16580 experiment replaced only the terminal-outcome
+not removed the blocking PP rendezvous semantic. The qualified C++ pull request 16580 experiment replaced only the terminal-outcome
 PP rendezvous; it did not remove the separate readiness consensus. Python must not conflate those two protocol stages.
 
 ### 11.2 What can be reused
@@ -608,7 +613,7 @@ The C++ result does not prove that Python currently suffers the same two-times r
 - Python's transfer sessions, GIL behavior, object serialization, and process-group backend differ.
 - The current implementation may use MPI or Torch distributed; point-to-point progress and thread-safety guarantees
   differ between them.
-- Python now batches three outcomes into one allgather, so its collective count differs from the original #15139 path.
+- Python now batches three outcomes into one allgather, so its collective count differs from the original pull request 15139 path.
 - Generation-first readiness consensus and partial request ownership add semantics absent from the PP4 CTX experiment.
 - Cancellation is a distinct outcome in Python and must remain so.
 
@@ -623,7 +628,7 @@ The Python effort should start with measurement, not an unconditional port.
    smaller PP4 functional workload. Require all requests to succeed.
 3. **Split TP and PP, then split readiness and outcome.** Keep TP/CP behavior and Python readiness consensus unchanged;
    replace only the context PP terminal-outcome rendezvous with an asynchronous coordinator. This is the safest
-   one-factor translation of #16580.
+   one-factor translation of pull request 16580.
 4. **Preserve global retention first.** Do not combine the first async-agreement experiment with early KV release.
 5. **Compare against a local-only upper bound only under an exact diagnostic gate.** Never ship the local-only path.
 6. **Measure the remaining readiness rendezvous.** If outcome-only replacement is correct but does not recover the
@@ -660,8 +665,8 @@ backend-specific progress adapters, not one implementation forced across C++ MPI
 
 ### Established with controlled evidence
 
-- PR #15139 introduced the treatment-specific regression on the adjacent historical tree.
-- The common PR #15737 sender-race fix did not remove it.
+- pull request 15139 introduced the treatment-specific regression on the adjacent historical tree.
+- The common pull request 15737 sender-race fix did not remove it.
 - The initiating mechanism was synchronous CTX PP consensus entry skew.
 - Admission relaxation did not independently recover throughput.
 - Generation cleanup and deferred Python resource release were not the initiating steady-state mechanism.
@@ -670,10 +675,10 @@ backend-specific progress adapters, not one implementation forced across C++ MPI
 
 ### Not yet established
 
-- That a straightforward cherry-pick of #16580 onto latest `main` is correct with merged PR #15238 cancellation.
+- That a straightforward cherry-pick of pull request 16580 onto latest `main` is correct with merged pull request 15238 cancellation.
 - That the same magnitude of regression exists for Python transceiver.
 - That TP, CP, attention DP, or EP should use the PP-last coordinator without topology-specific design.
-- That local early reclamation is broadly safe or beneficial outside the narrow #16581 configuration.
+- That local early reclamation is broadly safe or beneficial outside the narrow pull request 16581 configuration.
 - That one coordinator has acceptable failure and message-rate behavior at PP8+ or under sustained small-request load.
 
 ## 13. Decision record
@@ -682,28 +687,28 @@ backend-specific progress adapters, not one implementation forced across C++ MPI
 | --- | --- |
 | Preserve cross-rank terminal consensus | It closes observed state divergence and is required for safe cancellation/cleanup. |
 | Remove the blocking PP rendezvous from the scheduler hot path | Instrumentation measured entry skew as the dominant cost. |
-| Use asynchronous fan-in/ordered commit | #16580 recovered 99.42% of control while preserving global retention and outcome. |
-| Keep resources globally retained in the first production PR | #16580 already recovered; this is the simplest safety envelope. |
-| Put early reclamation in a follow-up | #16581 adds distributed-capacity semantics without a material measured gain here. |
+| Use asynchronous fan-in/ordered commit | Pull request 16580 recovered 99.42% of control while preserving global retention and outcome. |
+| Keep resources globally retained in the first production pull request | Pull request 16580 already recovered; this is the simplest safety envelope. |
+| Put early reclamation in a follow-up | Pull request 16581 adds distributed-capacity semantics without a material measured gain here. |
 | Scope initial enablement to qualified PP > 1 | That is the implemented and measured topology; other rank dimensions need explicit membership design. |
 | Port from latest main, do not merge the historical experiment | Later merged timeout/cancellation behavior changes the integration contract. |
 | Investigate Python separately | The protocol insight transfers, but its runtime, collectives, and ownership differ. |
 
 ## 14. Source and artifact index
 
-- [PR #15139: add disaggregated transfer-state consensus](https://github.com/NVIDIA/TensorRT-LLM/pull/15139)
-- [PR #15238: gated C++ NIXL cancellation and safe cleanup](https://github.com/NVIDIA/TensorRT-LLM/pull/15238)
-- [PR #15737: sender lost-wakeup fix](https://github.com/NVIDIA/TensorRT-LLM/pull/15737)
-- [PR #16386: worker-published PP transfer status](https://github.com/NVIDIA/TensorRT-LLM/pull/16386)
-- [PR #16449: early local CTX completion diagnostic](https://github.com/NVIDIA/TensorRT-LLM/pull/16449)
-- [PR #16487: no runtime PP consensus diagnostic](https://github.com/NVIDIA/TensorRT-LLM/pull/16487)
-- [PR #16517: 2x admission, PP consensus disabled](https://github.com/NVIDIA/TensorRT-LLM/pull/16517)
-- [PR #16518: 2x admission, PP consensus enabled](https://github.com/NVIDIA/TensorRT-LLM/pull/16518)
-- [PR #16565: matched pre-#15139 control with sender fix](https://github.com/NVIDIA/TensorRT-LLM/pull/16565)
-- [PR #16566: matched post-#15139 treatment with sender fix](https://github.com/NVIDIA/TensorRT-LLM/pull/16566)
-- [PR #16567: lifecycle/consensus instrumentation](https://github.com/NVIDIA/TensorRT-LLM/pull/16567)
-- [PR #16572: unsafe local-only CTX upper bound](https://github.com/NVIDIA/TensorRT-LLM/pull/16572)
-- [PR #16580: asynchronous coordinator with global retention](https://github.com/NVIDIA/TensorRT-LLM/pull/16580)
-- [PR #16581: local-quiescence KV reclamation arm](https://github.com/NVIDIA/TensorRT-LLM/pull/16581)
-- [PR #16589: unchanged-tree additional #16580 coverage](https://github.com/NVIDIA/TensorRT-LLM/pull/16589)
+- pull request 15139: add disaggregated transfer-state consensus
+- pull request 15238: gated C++ NIXL cancellation and safe cleanup
+- pull request 15737: sender lost-wakeup fix
+- pull request 16386: worker-published PP transfer status
+- pull request 16449: early local CTX completion diagnostic
+- pull request 16487: no runtime PP consensus diagnostic
+- pull request 16517: 2x admission, PP consensus disabled
+- pull request 16518: 2x admission, PP consensus enabled
+- pull request 16565: matched control before pull request 15139 with sender fix
+- pull request 16566: matched treatment after pull request 15139 with sender fix
+- pull request 16567: lifecycle/consensus instrumentation
+- pull request 16572: unsafe local-only CTX upper bound
+- pull request 16580: asynchronous coordinator with global retention
+- pull request 16581: local-quiescence KV reclamation arm
+- pull request 16589: unchanged-tree additional pull request 16580 coverage
 - [Earlier cross-rank consistency investigation](../nvbug-6104831-disagg-permanent-wedge/14-cross-rank-consistency-enforcement.md)
