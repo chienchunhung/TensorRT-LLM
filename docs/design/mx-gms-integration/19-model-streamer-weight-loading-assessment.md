@@ -11,14 +11,15 @@ SPDX-License-Identifier: Apache-2.0
 
 **Created:** 2026-07-08
 
-**Last Updated:** 2026-07-19
+**Last Updated:** 2026-07-21
 
 > [§18 GMS Integration Gaps and Concrete PR Plan](18-gms-integration-gaps-and-concrete-pr-plan.md) remains the
 > implementation source of truth for the GMS lifecycle and PR ordering. This assessment defines storage-ingress and
 > weight-materialization composition; it does not add a GMS delivery gate.
 
-The implemented native host-policy prototype, policy-selection guidance, and four-treatment cold-start experiment are
-specified in [Native Hybrid Weight Loader](../hybrid-weight-loader/README.md).
+The implemented host-policy prototype, policy-selection guidance, and four-treatment cold-start experiment are
+specified in
+[Rank-Cooperative Checkpoint Loading](../rank-cooperative-checkpoint-loading/design.md).
 
 ## Executive Summary
 
@@ -179,7 +180,8 @@ silently change behavior.
 
 > Terminology update: earlier revisions called this richer tensor/rank object `WeightLoadPlan`. PR #16562 uses that name
 > for an ordered policy tuple. This assessment now uses `RankWeightManifest`, following the
-> [native loader design](../hybrid-weight-loader/README.md#terminology-policy-plan-versus-rank-manifest), so the two
+> [checkpoint-loading design](../rank-cooperative-checkpoint-loading/design.md#terminology-policy-plan-versus-rank-manifest),
+> so the two
 > contracts do not share a public name.
 
 A `RankWeightManifest` describes rank-local requirements without binding them to one storage backend. It should

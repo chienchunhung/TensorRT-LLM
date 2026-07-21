@@ -3,26 +3,30 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Native Hybrid Weight Loader
+# Rank-Cooperative Checkpoint Loading
+
+*Parallel read-ahead and pipelined materialization for faster cold starts.*
+
+[< Back to design package](README.md)
 
 **Status:** Draft design; host-staging prototype in
 [TensorRT-LLM PR #16562](https://github.com/NVIDIA/TensorRT-LLM/pull/16562)
 
 **Created:** 2026-07-19
 
-**Last Updated:** 2026-07-19
+**Last Updated:** 2026-07-21
 
-See the [benchmark and qualification plan](benchmark-plan.md) for the four-treatment experiment, metrics, model matrix,
-and acceptance gates.
+See the [benchmark and qualification plan](benchmark-plan.md) for the four-treatment experiment, metrics, model
+matrix, and acceptance gates.
 
 ## Executive Decision
 
 TensorRT-LLM should keep weight source selection separate from the policy used to stage and materialize those weights.
-The native loader should provide a deterministic, observable policy plan:
+The TensorRT-LLM checkpoint-loading layer should provide a deterministic, observable policy plan:
 
 ```text
 WeightLoadPlan
-    +-- direct_rank_read       # primary native host policy
+    +-- direct_rank_read       # primary rank-cooperative host policy
     +-- shared_host_producer   # single-producer host policy
     +-- gpu_broadcast          # future topology-aware GPU fan-out
     +-- legacy_fallback        # compatibility path
@@ -41,9 +45,46 @@ The recommended rollout is therefore:
 4. Expand from page-cache staging to rank-selective loading and GPU fan-out only after TensorRT-LLM exposes a
    rank-aware final-weight materialization contract.
 
-This native work is complementary to ModelStreamer, ModelExpress (MX), GPU Memory Service (GMS), and process
-snapshots. The broader composition is described in
+This rank-cooperative checkpoint work is complementary to ModelStreamer, ModelExpress (MX), GPU Memory Service (GMS),
+and process snapshots. The broader composition is described in
 [ModelStreamer and Weight-Loading Integration Assessment](../mx-gms-integration/19-model-streamer-weight-loading-assessment.md).
+
+## Startup North Star and Current Scope
+
+The product objective is fast, efficient, and predictable TensorRT-LLM startup: minimize the time from process launch
+to a ready service and first successful token without trading away correctness, memory safety, failure recovery, or
+steady-state performance. Checkpoint loading is one critical component of that path, not the complete startup system.
+
+A first-principles startup model treats the work as replaceable and measurable stages:
+
+```text
+process launch
+    -> runtime and distributed initialization
+    -> reusable-state and artifact resolution
+    -> raw checkpoint discovery and acquisition, when required
+    -> staging, mapping, transformation, and H2D placement
+    -> post-load initialization, KV-cache setup, compilation, and autotuning
+    -> CUDA graph capture, service readiness, and first inference
+```
+
+The current implementation scope is the raw-checkpoint branch, from filesystem-visible SafeTensors through existing
+materialization and final CUDA completion. It tests cooperative I/O scheduling and, in direct mode, overlaps read-ahead
+with existing materialization and H2D while measuring the full process-to-first-token path. A checkpoint-stage
+improvement is useful only when it reduces the end-to-end startup critical path.
+
+The architecture must remain open to complementary work that skips, replaces, or accelerates other stages:
+
+- Dynamo process snapshots can restore a complete warmed process and bypass most of the sequence.
+- MX and GMS can reuse compatible materialized weights and avoid raw checkpoint work.
+- ModelStreamer, GDS, or another source can replace native filesystem byte acquisition.
+- A future `RankWeightManifest` can enable TP/PP/CP/EP-selective reads, transformations, and placement.
+- Bounded pinned pipelines and topology-aware GPU fan-out can optimize the materialization and placement stages.
+- Compilation, autotuning, KV-cache initialization, CUDA graph capture, and readiness remain independently measurable
+  optimization targets.
+
+Consequently, this design does not make the checkpoint loader a monolithic startup orchestrator. It preserves explicit
+contracts between source selection, I/O policy, materialization, placement, reusable artifacts, and hierarchical
+startup telemetry so each stage can evolve independently.
 
 ## Problem
 
@@ -62,16 +103,19 @@ capture can dominate after storage is accelerated. The design must preserve thos
 
 ## Goals
 
+- Reduce end-to-end TensorRT-LLM startup when a raw checkpoint load is required.
 - Allow an explicit strict policy or an ordered fallback plan.
 - Exploit multiple local CPU processes and threads without redundant physical storage reads when possible.
 - Select all collective behavior before policy-specific I/O begins.
 - Preserve a safe path for unsupported sources, formats, load modes, and communicator lifecycles.
 - Keep checkpoint source, host staging, GPU placement, and artifact reuse as separate concerns.
 - Produce enough telemetry to explain both storage-stage and end-to-end speedup.
-- Provide a migration path to ModelStreamer, MX, GMS, and topology-aware GPU distribution.
+- Preserve integration seams for ModelStreamer, MX, GMS, snapshots, and topology-aware GPU distribution.
 
 ## Non-Goals of the Current Prototype
 
+- A single implementation that optimizes or orchestrates every TensorRT-LLM startup phase.
+- Implementing MX, GMS, process snapshots, ModelStreamer, compilation, or warmup optimizations in this prototype.
 - Remote Hugging Face download acceleration or direct object-store streaming.
 - Linux `O_DIRECT`, GPUDirect Storage, or direct reads into final parameter storage.
 - A complete Yijin-style pinned shared-memory producer/consumer pipeline.
@@ -80,7 +124,7 @@ capture can dominate after storage is accelerated. The design must preserve thos
 - Legacy TensorRT `.engine` deserialization acceleration.
 - Automatic performance selection based only on the presence of an optional package.
 
-## Layered Architecture
+## Composable Startup Architecture
 
 The word "loader" spans several independent decisions. They should not be encoded as one enum.
 
@@ -109,7 +153,8 @@ flowchart TD
     G2 --> H
     G3 --> H
     G4 --> H
-    H --> I["Transform, H2D, post-load, warmup"]
+    H --> I["Transform and H2D placement"]
+    I --> J["Post-load initialization and readiness"]
 ```
 
 The layers have different owners:
@@ -122,10 +167,12 @@ The layers have different owners:
 | Load policy | Decide which ranks or producers fetch and stage bytes. | The four policies in this document |
 | Materialization | Map source tensors to rank-owned parameters and apply transformations. | TensorRT-LLM model and weight mapper |
 | Placement | Allocate and populate final host or GPU storage. | CUDA allocator, future GMS-aware destination |
+| Post-load readiness | Prepare runtime state after weights are usable. | KV cache, compilation, autotuning, CUDA graphs, warmup |
 
-ModelStreamer can become a raw-source adapter without replacing the native policy and materialization contracts. MX
-and GMS should remain ahead of raw loading in the source cascade because a compatible post-transform artifact can skip
-more work than a faster checkpoint read.
+ModelStreamer can become a raw-source adapter without replacing the checkpoint policy and materialization contracts.
+MX and GMS should remain ahead of raw loading in the source cascade because a compatible post-transform artifact can
+skip more work than a faster checkpoint read. Every layer should emit compatible phase boundaries so improvements can
+be attributed locally and validated against the shared end-to-end startup metric.
 
 ## Terminology: Policy Plan Versus Rank Manifest
 
@@ -410,7 +457,7 @@ placement.
   [the benchmark plan](benchmark-plan.md).
 - Keep conclusions conditional on storage type and checkpoint geometry.
 
-### Phase 1: Stabilize Native Host Policies
+### Phase 1: Stabilize Rank-Cooperative Host Policies
 
 - Tune extent size, worker caps, CPU affinity, and NUMA behavior from evidence.
 - Validate cancellation, error propagation, and repeated startup.
@@ -450,7 +497,7 @@ placement.
 
 ## Decision Gates
 
-The native loader advances only when:
+The rank-cooperative checkpoint-loading design advances only when:
 
 - strict policy selection is observable and fallback-free in measured cells;
 - deterministic outputs match legacy, with sampled parameter fingerprints when the worker-rank hook is enabled;

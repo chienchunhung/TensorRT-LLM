@@ -3,15 +3,15 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Hybrid Weight Loader: 8xB300 Experiment and Handoff Plan
+# Rank-Cooperative Checkpoint Loading: 8xB300 Experiment and Handoff Plan
 
-[< Back to Native Hybrid Weight Loader](README.md)
+[< Back to design package](README.md) | [Main design](design.md)
 
 **Status:** Execution handoff specification; node campaign is blocked until the instrumentation gate below passes
 
 **Created:** 2026-07-19
 
-**Last Updated:** 2026-07-19
+**Last Updated:** 2026-07-21
 
 ## 0. Handoff Contract
 
@@ -39,6 +39,12 @@ The current handoff is **Campaign 0 only**:
 
 A0 is ordered capability fallback, not a performance-adaptive policy. For eligible HF/AUTO SafeTensors checkpoints it
 is expected to select D and match D within noise. A future adaptive selector is out of scope for this run.
+
+This campaign isolates checkpoint-loading policy inside the larger TensorRT-LLM startup path. Snapshot, MX/GMS,
+ModelStreamer, compilation, autotuning, KV-cache setup, and CUDA graph improvements are not treatment variables in
+Campaign 0. Keep those phases and their caches fixed across L/D/S/A0, preserve their timing boundaries, and report when
+accelerating checkpoint work merely moves the startup bottleneck into another phase. The same process-to-first-token
+measurement hierarchy should remain usable by later campaigns that compose or compare those mechanisms.
 
 ### Required Deliverables
 
@@ -816,7 +822,8 @@ unexpected fallback, correctness failure, timeout, or lifecycle failure.
 
 ## 11. Copy/Paste Brief for the Execution Agent
 
-> Execute Campaign 0 in `docs/design/hybrid-weight-loader/benchmark-plan.md` against TensorRT-LLM PR #16562 on one
+> Execute Campaign 0 in `docs/design/rank-cooperative-checkpoint-loading/benchmark-plan.md` against TensorRT-LLM PR
+> #16562 on one
 > exclusive 8xB300 node. Resolve and pin the PR head, container, model revisions, configs, and instrumentation patch.
 > Do not change loader scheduling. First satisfy the unit, model-inventory, node/storage, cache-control, and structured
 > timing gates. Run L/D/S/A0 from the same binary through the full ModelLoader/LLM path. Use fresh processes, verified
@@ -842,7 +849,7 @@ intrinsically beat it unless it implements a genuinely new mixed/overlapped data
 
 ## References
 
-- [Native Hybrid Weight Loader](README.md)
+- [Rank-Cooperative Checkpoint Loading](design.md)
 - [TensorRT-LLM PR #16562](https://github.com/NVIDIA/TensorRT-LLM/pull/16562)
 - [Startup Methodology and Test Plan](../mx-gms-integration/10-methodology.md)
 - [ModelStreamer and Weight-Loading Integration Assessment](../mx-gms-integration/19-model-streamer-weight-loading-assessment.md)
