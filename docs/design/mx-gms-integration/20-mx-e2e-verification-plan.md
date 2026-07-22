@@ -1028,6 +1028,33 @@ Negative reductions mean the treatment was slower than legacy. Because there is 
 show direction and magnitude but do not provide statistical confidence. Direct rank read improved the larger
 DeepSeek checkpoint substantially; shared host producer was slower than legacy for both models.
 
+The initial DeepSeek treatments above were interrupted and resumed across different node allocations. Their absolute
+results remain valid individual observations, but their cross-policy ranking is confounded by node and NFS-path
+variation. The controlled same-node rerun below supersedes that DeepSeek policy comparison.
+
+#### Same-node instrumented DeepSeek rerun
+
+The rerun kept legacy, direct rank read, and shared host producer on `umb-b300-dp-147` for the entire sequence. Every
+event recorded the same hostname; each run used the same TP=8 configuration and passed the zero-resident-page gate.
+
+| Policy | Model init (s) | Reduction | LLM init (s) | Reduction | Process to first token (s) | Reduction |
+|:--|--:|--:|--:|--:|--:|--:|
+| Legacy fallback | 532.65 | — | 822.75 | — | 886.50 | — |
+| Direct rank read | 394.65 | 25.9% | 681.43 | 17.2% | 745.96 | 15.9% |
+| Shared host producer | 582.68 | -9.4% | 866.72 | -5.3% | 931.61 | -5.1% |
+
+| Policy | Checkpoint read/prefetch (s) | Aggregate read rate | SafeTensors mapping (s) | Materialization (s) | Weight session (s) |
+|:--|--:|--:|--:|--:|--:|
+| Legacy fallback | 314.92 | 2.56 GiB/s | 27.27 | 172.37 | 514.19 |
+| Direct rank read | 315.75 | 2.55 GiB/s | 203.98 | 169.97 | 374.76 |
+| Shared host producer | 374.37 | 2.15 GiB/s | 27.72 | 162.27 | 564.58 |
+
+Direct rank read overlapped checkpoint I/O with mapping and materialization; every rank reported zero exposed read tail.
+Shared host producer assigned the complete 864.72 GB checkpoint to one local producer with 16 workers, but achieved
+lower aggregate NFS throughput than the distributed legacy/direct paths on this node. For this controlled run, direct
+rank read is the only policy that improves startup; shared host producer should not be a default candidate without
+further redesign or storage-specific qualification.
+
 #### Remaining qualification work
 
 - Repeat the scaling characterization with either a privileged node page-cache drop or an `O_DIRECT` copy to fresh
