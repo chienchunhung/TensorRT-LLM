@@ -1001,6 +1001,33 @@ GPU-memory registration and asynchronous operations. Use the end-to-end initiali
 startup comparison. The TinyLlama parser emitted transfer durations for only one cycle at each TP, so those values
 should not be treated as multi-cycle means.
 
+### 18.2 Native TRT-LLM loader reference results
+
+These July 20-21, 2026 measurements are a reference comparison for the native TRT-LLM checkpoint loaders from
+PR #16562 at `e836be13846dd7055c3d889cdb1510e71ce25d63`. They do not exercise MX and are not evidence for any MX gate.
+
+The runs used one balanced L/D/S/A0 block on eight B300 GPUs at TP=8. Before every measured run, the checkpoint was
+copied through `O_DIRECT` to fresh inodes on a writable NFS volume. `mincore` then verified zero resident client pages
+for every SafeTensors shard before timed startup. The copy itself was outside the timed interval; NFS server-side cache
+remained uncontrolled. Qwen used the Triton GDN fallback consistently across treatments. DeepSeek used batch size 1,
+`max_seq_len=512`, `max_num_tokens=64`, and a 10% KV-cache fraction.
+
+| Model | Checkpoint | Policy | Model init (s) | Reduction | LLM init (s) | Reduction | Process to first token (s) | Reduction |
+|:--|--:|:--|--:|--:|--:|--:|--:|--:|
+| Qwen3.5-397B-A17B-FP8 | 406.15 GB | Legacy fallback | 466.06 | — | 594.05 | — | 645.45 | — |
+| Qwen3.5-397B-A17B-FP8 | 406.15 GB | Direct rank read | 438.71 | 5.9% | 568.64 | 4.3% | 620.66 | 3.8% |
+| Qwen3.5-397B-A17B-FP8 | 406.15 GB | Shared host producer | 519.55 | -11.5% | 645.54 | -8.7% | 696.56 | -7.9% |
+| Qwen3.5-397B-A17B-FP8 | 406.15 GB | Default plan (direct) | 424.77 | 8.9% | 554.56 | 6.6% | 615.69 | 4.6% |
+| DeepSeek-V4-Pro | 864.72 GB | Legacy fallback | 514.01 | — | 826.10 | — | 959.31 | — |
+| DeepSeek-V4-Pro | 864.72 GB | Direct rank read | 349.50 | 32.0% | 688.61 | 16.6% | 848.71 | 11.5% |
+| DeepSeek-V4-Pro | 864.72 GB | Shared host producer | 601.49 | -17.0% | 895.62 | -8.4% | 1007.99 | -5.1% |
+| DeepSeek-V4-Pro | 864.72 GB | Default plan (direct) | 358.67 | 30.2% | 667.07 | 19.3% | 787.59 | 17.9% |
+
+All eight measured runs selected the expected policy on every rank, generated one token, and shut down cleanly.
+Negative reductions mean the treatment was slower than legacy. Because there is only one block per model, these values
+show direction and magnitude but do not provide statistical confidence. Direct rank read improved the larger
+DeepSeek checkpoint substantially; shared host producer was slower than legacy for both models.
+
 #### Remaining qualification work
 
 - Repeat the scaling characterization with either a privileged node page-cache drop or an `O_DIRECT` copy to fresh
