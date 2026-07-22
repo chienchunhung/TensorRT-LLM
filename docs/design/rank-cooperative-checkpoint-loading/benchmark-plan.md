@@ -11,7 +11,7 @@ SPDX-License-Identifier: Apache-2.0
 
 **Created:** 2026-07-19
 
-**Last Updated:** 2026-07-21
+**Last Updated:** 2026-07-22
 
 ## 0. Handoff Contract
 
@@ -19,16 +19,15 @@ The execution owner needs exclusive access to one eight-GPU B300 node, the produ
 to perform an administrator-approved client page-cache reset, and access to the pinned model artifacts. The owner is
 responsible for producing measured artifacts, not for proving a predetermined conclusion.
 
-Test [TensorRT-LLM PR #16562](https://github.com/NVIDIA/TensorRT-LLM/pull/16562). At the time this plan was written,
-the expected PR head was:
+Test [TensorRT-LLM PR #16562](https://github.com/NVIDIA/TensorRT-LLM/pull/16562) at the reviewed feature commit:
 
 ```text
-e836be13846dd7055c3d889cdb1510e71ce25d63
+aa7a616b0add9ffceab5bf72cb5ae35e0f81e64a
 ```
 
-Resolve and record the actual PR head before building. If it differs, review the range diff, record the new immutable
-SHA, and rerun all four treatments from the same binary. Never mix results from different feature commits, containers,
-models, or benchmark instrumentation revisions.
+Resolve and record the actual PR head before building. If it differs from the pinned commit, review the range diff,
+record the new immutable SHA, and rerun all four treatments from the same binary. Never mix results from different
+feature commits, containers, models, or benchmark instrumentation revisions.
 
 The current handoff is **Campaign 0 only**:
 
@@ -55,7 +54,7 @@ The execution owner returns one self-contained campaign directory with:
 - raw per-rank logs and structured interval events;
 - cache-state, CPU, host-memory, storage, and GPU telemetry;
 - correctness and clean-lifecycle results;
-- Nsight Systems traces for representative L and D runs;
+- Nsight Systems traces for representative L, D, and S runs;
 - aggregate tables with paired uncertainty, not isolated best runs; and
 - a short `report.md` that answers the questions in the next section.
 
@@ -68,22 +67,26 @@ The campaign answers:
 
 1. Does D reduce model initialization and process-to-first-token latency by overlapping checkpoint I/O with existing
    materialization/H2D work?
-2. Does S reduce startup on the target NFS by using one node-local storage producer, despite keeping prefetch before
-   materialization?
+2. Does S reduce startup on the target NFS with one producer per node, a bounded MPI shared double buffer, and overlap
+   of batch N+1 I/O with batch N materialization/H2D?
 3. Which checkpoint geometries and storage states favor L, D, or S?
-4. Do the exact Qwen 3.5, DeepSeek V4, and Llama 4 profiles load correctly and exit cleanly in strict D and S modes?
+4. Do qualified Qwen 3.5 and Llama 4 profiles load correctly and exit cleanly in strict D and S, and does DeepSeek V4
+   behave correctly in strict D while strict S fails early with the documented unsupported reason?
 5. How much of the storage-stage improvement survives model construction, transformation, H2D, warmup, and first
    inference?
 
-The current implementation supports system-level filesystem-I/O overlap with materialization and H2D. It does **not**
-use pinned-memory asynchronous DMA, `O_DIRECT`, GPUDirect Storage, direct final-tensor placement, TP/PP/EP-selective
-reads, or GPU fan-out. Do not attribute such mechanisms to a result.
+The current implementation provides two different overlaps. D warms the OS page cache while existing mmap-driven
+materialization/H2D proceeds. S publishes atomic tensor groups through a bounded shared arena while the producer fills
+the next slot; when every rank CUDA-registers that arena, consumers borrow immutable tensor views directly. S may
+stage a group in rank-local pinned or pageable storage when the direct path is unavailable. Neither mode uses
+`O_DIRECT`, GPUDirect Storage, final-parameter destination reads, TP/PP/EP-selective reads, or GPU fan-out.
 
 Legacy already assigns whole SafeTensors files across local ranks and prefetches assigned files with threads. The new
 policies are not guaranteed to win for every shard layout or filesystem. In particular:
 
 - D can win through finer extent balancing, more useful I/O concurrency, and hidden read time.
-- S can win when avoiding multi-process storage traffic is worth its synchronous producer/barrier cost.
+- S can win when one issuer avoids storage contention and bounded shared streaming hides producer I/O without excessive
+  slot, staging, synchronization, or module-dispatch overhead.
 - L can remain competitive when many uniform shards already provide enough file-level parallelism.
 - A0 should be equivalent to D on eligible cells; it cannot credibly beat D merely by selecting it.
 
@@ -95,8 +98,11 @@ Run every treatment with the same feature binary and otherwise identical environ
 | --- | --- | --- |
 | L | `legacy_fallback` | Existing whole-file assignment, synchronous prefetch/barrier, then mmap/materialization |
 | D | `direct_rank_read` | Disjoint 256 MiB extents read in the background while `ModelLoader` maps and materializes weights |
-| S | `shared_host_producer` | Node-local rank 0 synchronously stages all extents, peers wait, then all ranks materialize |
+| S | `shared_host_producer` | One producer per node fills a bounded MPI shared double buffer; all ranks consume atomic groups while the next batch is read |
 | A0 | Environment variable unset | Ordered plan; expected to select D for eligible native HF/AUTO SafeTensors |
+
+`single_producer_page_cache_prefetch` is an optional diagnostic only. It is the old synchronous rank-0 prefetch and
+barrier path; do not substitute it for S or include it among the four main treatments.
 
 Set the common controls before every run:
 
@@ -124,10 +130,11 @@ unset TRTLLM_HF_WEIGHT_LOAD_PLAN
 ```
 
 Structured policy telemetry is a hard instrumentation gate for all four treatments: every rank must emit requested
-plan, selected policy, eligibility/fallback reasons, and run ID. D/S/A0 also retain the built-in INFO logs containing
-`Using <policy> SafeTensors loading`, prefetch-enabled or skipped state, mmap setup, and direct-mode assigned bytes/read
-time/exposed tail. L needs an unambiguous benchmark-only `legacy_fallback` selection/path event because the current
-built-in path does not emit the same selected-policy line; `command.json` alone is insufficient.
+plan, selected policy, eligibility/fallback reasons, and run ID. D must retain assigned/completed bytes, read span, and
+exposed tail. S must retain configured/effective slot bytes, buffer budget, largest group, groups fitting one slot,
+producer workers, `all_ranks_host_registered`, direct-view groups/bytes, staged groups/bytes, batches/bytes published,
+and registration detail. L needs an unambiguous benchmark-only `legacy_fallback` selection/path event;
+`command.json` alone is insufficient.
 
 ### Pre-Feature Baseline Check
 
@@ -137,6 +144,22 @@ Exclude these pilots from confirmation. Compute a paired confidence interval for
 whole interval to lie inside `[log(0.98), log(1.02)]`; an equivalent paired TOST procedure is acceptable if declared in
 advance. If the fixed pilot is inconclusive or shows a material difference, retain the unmodified base as an additional
 reported control; do not hide feature-branch overhead inside L.
+
+### Yijin Comparability Contract
+
+Treatment S tests the core Yijin mechanism: one storage producer per node, a bounded shared host stream, parallel
+consumers, and overlap of producer I/O with consumer materialization/H2D. Compare its numeric results with Yijin's
+measurements only when model/checkpoint bytes, storage and cache state, node topology, rank count, precision, startup
+boundary, trial count, and correctness gates are equivalent. Otherwise compare mechanisms and report the TRT-LLM
+L/D/S effect sizes without asserting numerical reproduction.
+
+The S treatment always tests the core one-producer/bounded-stream/parallel-consumer pipeline. Its closest
+direct-shared-buffer comparison additionally requires CUDA registration on every rank of every node, full direct
+borrowed-view byte/group coverage, zero staged bytes, and measured peak host memory. Quantized profiles currently add
+a rank-local staging copy for source-lifetime safety; report those as a separate conservative S-staged stratum rather
+than presenting them as a direct-path reproduction. Transformed-weight caching, producer persistence across restarts,
+rank-selective source reads, GPU fan-out, and cross-node deduplication are outside this comparison and must not be
+credited to S.
 
 ## 3. Before Reserving the Expensive Node
 
@@ -190,7 +213,18 @@ imports the newly installed checkout before running the authoritative focused su
 ```bash
 python3 -c 'import tensorrt_llm; print(tensorrt_llm.__file__)'
 git rev-parse HEAD
-pytest -q tests/unittest/_torch/models/checkpoints/hf/test_weight_load_plan.py
+pytest -q \
+  tests/unittest/_torch/models/checkpoints/hf/test_weight_load_plan.py \
+  tests/unittest/_torch/models/checkpoints/hf/test_incremental_weight_groups.py \
+  tests/unittest/_torch/models/checkpoints/hf/test_shared_host_stream.py \
+  tests/unittest/_torch/modeling/test_qwen3_5_incremental_loading.py \
+  tests/unittest/_torch/modeling/test_llama4_incremental_loading.py \
+  tests/unittest/_torch/test_mmap_utils.py
+
+# Production MPI-window epoch smoke; do not substitute the single-process skip.
+mpiexec -n 2 pytest -q \
+  tests/unittest/_torch/models/checkpoints/hf/test_shared_host_stream.py \
+  -k production_mpi_shared_window_epoch_smoke
 ```
 
 A pre-build pure-Python test is optional and non-authoritative because it can use stale installed bindings.
@@ -250,9 +284,10 @@ free -b
 findmnt -T "$MODEL" -o SOURCE,FSTYPE,OPTIONS
 ```
 
-All ranks must resolve the checkpoint to the same node-local backing files. The checkpoint total must be below 90% of
-the minimum `MemAvailable` observed across ranks, and `TLLM_OVERRIDE_LAYER_NUM` must be zero. Otherwise the selected
-host policy intentionally skips full read-ahead; classify that run as an optimized-path miss, not as D/S performance.
+All ranks must resolve the checkpoint to the same node-local backing files and `TLLM_OVERRIDE_LAYER_NUM` must be zero.
+D additionally requires its full-checkpoint read-ahead guard to pass. S instead requires room for two effective shared
+slots, rank-local staging if exercised, and normal model construction. Predeclare a host-memory safety limit and reject
+an S performance run that exceeds it; do not apply D's full-checkpoint page-cache rule to S.
 
 ### 3.4 Instrumentation Gate
 
@@ -269,10 +304,13 @@ supervisor_spawn_start                              # external supervisor
 llm_constructor_start / llm_constructor_end
 model_init_start / model_init_end
 weight_session_enter / weight_session_exit
-read_ahead_start / read_ahead_end                 # D; synchronous prefetch interval for L/S
+read_ahead_start / read_ahead_end                 # L and D
+shared_stream_start / shared_stream_end           # S inclusive stream lifecycle
+shared_batch_read_start / shared_batch_publish    # S producer, per batch
+shared_batch_consume_start / shared_batch_ack     # S per rank, per batch
 safetensors_map_start / safetensors_map_end
 materialization_start / materialization_end
-session_finish_start / session_finish_end         # includes any exposed D read tail
+session_finish_start / session_finish_end         # includes exposed D/S tail and consensus
 final_existing_model_load_cuda_sync
 service_ready                                     # server campaign only
 first_request_start / first_token
@@ -285,14 +323,27 @@ materialization; it is not a child phase that can be added to them. All headline
 overlap. Diagnostic runs may add NVTX ranges and synchronizations, but must be labeled and excluded from headline
 statistics.
 
-The `ModelLoader` or complete `LLM(...)` path is mandatory. Direct calls to `HfWeightLoader.load_weights()` are
-synchronous by design and do not benchmark D's pipelined session.
+The `ModelLoader` or complete `LLM(...)` path is mandatory. Direct calls to `HfWeightLoader.load_weights()` do not
+exercise the same D/S pipelined model-materialization session.
 
 The PR already prints per-rank `Model init total -- <seconds>` after an existing final model-load CUDA synchronization;
 parse and report the rank maximum even if narrower structured instrumentation is not yet available. It does not yet
 provide a structured requested/selected-policy record, a narrow checkpoint-to-final-CUDA timer, a page-residency tool,
 or a parameter-fingerprint harness. These are experiment prerequisites or explicitly reported measurement gaps, not
 fields to synthesize after the run.
+
+Before an S run is accepted, parse its final telemetry on every rank. Require
+`direct_view_groups + staged_groups == group_count` and
+`direct_view_bytes + staged_bytes == logical manifest tensor bytes`. Report effective slot count/bytes and
+largest-group bytes, and capture node plus per-rank peak host memory. The producer/consumer S comparison remains valid
+when a qualified profile uses rank-local staging, but report it as an S-staged stratum because the extra CPU copy is a
+conservative difference from a direct shared-buffer H2D path. For the S-direct subanalysis, require every node-local
+rank record to report `all_ranks_host_registered=true`, `staged_bytes=0`, and full direct byte coverage. Do not pool
+S-staged and S-direct results. Do not use `bytes_published` as the coverage denominator because it may include alignment
+padding.
+Also retain the group/batch count, batch-payload distribution, and time spent between read completion, publication,
+all-rank acknowledgement, and slot reuse. The initial implementation does not pack multiple independent groups into
+one batch, so this coordination cost is part of treatment S rather than noise to subtract after the run.
 
 ## 4. Metrics
 
@@ -314,7 +365,7 @@ Do not include remote model download in the primary loader comparison. Pre-stage
 mount. Measure object-store or Hugging Face acquisition separately because the current policies begin after files are
 visible through the filesystem.
 
-### 4.2 Direct-Mode Overlap Metrics
+### 4.2 D/S Overlap and Shared-Transport Metrics
 
 For D derive:
 
@@ -334,9 +385,27 @@ exposed_tail_fraction = exposed_read_tail_s / read_elapsed_s
 `hidden_read_fraction` is a scheduling-overlap measure, not proof that all overlapped time was removed from the critical
 path. Compare paired E2E/model-init results for the causal product effect.
 
-For a representative L and D cell, use Nsight Systems with CUDA, NVTX, and OS-runtime tracing. The mechanism gate for
-I/O/H2D overlap is at least one weight-materialization H2D copy occurring inside both the materialization range and the
-background read interval:
+For S, derive per-batch producer/consumer overlap from the structured events and aggregate only over batches with both
+boundaries present:
+
+```text
+shared_io_materialization_overlap_s(batch N) =
+    overlap(read(batch N+1), consume_and_h2d(batch N))
+
+logical_materialized_bytes = direct_view_bytes + staged_bytes
+direct_byte_coverage = direct_view_bytes / logical_materialized_bytes
+staged_byte_fraction = staged_bytes / logical_materialized_bytes
+```
+
+Require `all_ranks_host_registered=true`, direct group and byte coverage of the complete logical manifest, and
+`staged_bytes=0` for the primary Yijin-style direct-borrowed S comparison. Report other S runs separately as
+registration or staging-fallback diagnostics. Always report effective slot bytes, largest group bytes, groups fitting
+one slot, batch count, and peak host memory; these explain whether the bounded design stayed bounded in practice.
+
+For a representative L, D, and direct-borrowed S cell, use Nsight Systems with CUDA, NVTX, and OS-runtime tracing. The
+D mechanism gate is at least one weight-materialization H2D copy inside both materialization and background read. The
+S gate is at least one batch N H2D copy concurrent with producer I/O for batch N+1, plus evidence that the consumed
+tensor address belongs to the registered shared arena rather than a rank-local staging allocation.
 
 ```text
 read_ahead_start
@@ -368,7 +437,8 @@ materialization. Add diagnostic-only ranges before claiming an automatically com
 report visual/timestamp evidence plus the logged `read_elapsed - exposed_tail` proxy, with that limitation.
 
 Before accepting a diagnostic trace, run an untimed trace preflight and verify that the installed-version launcher
-arrangement captures all eight ranks, `trtllm-direct-rank-read-ahead` threads, `pread` activity, and CUDA H2D events.
+arrangement captures all eight ranks, direct read-ahead and S producer worker threads, `pread` activity, MPI shared
+publication/acknowledgement ranges, module dispatch, and CUDA H2D events.
 Tracing only the probe parent is insufficient. Record the exact MPI/worker launch arrangement and adjust the
 installed-version all-process or fork/exec options before the diagnostic campaign if any worker is absent.
 
@@ -398,6 +468,9 @@ Capture per run:
 - filesystem/client counters, server bytes/requests/latency, and network bytes when authoritative;
 - peak HBM by rank, H2D count/bytes/duration and copy-engine activity in diagnostics; and
 - selected policy, prefetch guard, extent/read size, worker caps/actual workers, and fallback reasons.
+- for S, configured/effective slot capacity, total arena allocation, largest atomic group, groups fitting one slot,
+  `all_ranks_host_registered`, direct/staged groups and bytes, published batches/bytes, and node/per-rank peak host
+  memory.
 
 `read_chars` is syscall-visible logical traffic, while process `read_bytes` is not a portable NFS/Lustre authority.
 Claim physical throughput, request amplification, or reduced backend bytes only when storage-side counters or an
@@ -455,14 +528,23 @@ prompt, and serving configuration fixed inside each cell.
 
 ## 6. Model and Topology Campaign
 
-Raw-byte eligibility is model-neutral for native HF/AUTO SafeTensors, but each exact downstream profile must be
-qualified. The staged matrix below avoids spending the full node on a broken model/configuration and avoids a full
+D is model-neutral for native HF/AUTO SafeTensors. S additionally requires an explicitly qualified atomic manifest,
+top-level and nested-module partial loading, and a source-tensor lifetime contract. A model using the exact generic HF mapper remains
+ineligible unless its concrete class declares the audited opt-in; custom mappers and derived classes must qualify
+independently. The staged matrix below avoids spending the full node on a broken model/configuration and avoids a full
 parallelism Cartesian product.
+
+Preflight must record whether the selected Linear/MoE backend and quant method advertise partial-load support. Dynamic
+EPLB and Llama 4 min-latency mode are expected strict-S rejections in this revision and must not be relabeled as S
+measurements after an ordered fallback. Quantized Qwen 3.5/Llama 4 cells are expected to use S-staged unless a later
+per-group source-lifetime audit enables direct views; retain direct/staged telemetry rather than assuming one path from
+the model name.
 
 Expected internal paths on the checked revision are listed only as discovery aids; verify them during preflight:
 
 | Artifact | Expected local path |
 | --- | --- |
+| Qwen 3.5 smoke | Resolve the smallest available BF16 Qwen 3.5 checkpoint; prefer `Qwen3.5-4B` when present |
 | Qwen 3.5 flagship | `$LLM_MODELS_ROOT/Qwen3.5-397B-A17B-NVFP4` |
 | DeepSeek V4 Flash/Pro | `$LLM_MODELS_ROOT/DeepSeek-V4-Flash`, `$LLM_MODELS_ROOT/DeepSeek-V4-Pro` |
 | Llama 4 Scout FP8 | `$LLM_MODELS_ROOT/llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8` |
@@ -471,9 +553,11 @@ Expected internal paths on the checked revision are listed only as discovery aid
 ### Stage 0: Harness and Loader Smoke
 
 1. Run the focused unit suite.
-2. Run Qwen3.5-4B BF16 through the normal model loader to validate the Qwen 3.5 mapper and instrumentation.
-3. Run `$LLM_MODELS_ROOT/Qwen3/Qwen3-8B` BF16 with TP8 for three complete L/D/S/A0 cold blocks and one independently
-   prepared warm block.
+2. Resolve the smallest available BF16 Qwen 3.5 checkpoint, preferring Qwen3.5-4B, and run it through the normal model
+   loader to validate the qualified Qwen 3.5 mapper and instrumentation.
+3. After an untimed legacy TP8 bring-up succeeds for that same checkpoint, run three complete L/D/S/A0 cold blocks
+   and one independently prepared warm block. Do not substitute a plain Qwen 3 checkpoint: it has no S qualification
+   in this revision.
 
 The small TP8 checkpoint validates rank collaboration, cache control, event aggregation, policy assertions, timeout,
 first-token correctness, and process cleanup. TP8 is a new smoke qualification for this model on the tested revision,
@@ -481,13 +565,14 @@ not checked-in topology coverage; first require an untimed legacy bring-up. It i
 
 ### Stage 1: Flagship Qualification
 
-Run one untimed or diagnostic legacy bring-up first, then one strict D and one strict S bring-up for each candidate.
-Proceed only after format, memory, correctness, and lifecycle gates pass.
+Run one untimed or diagnostic legacy bring-up first, then strict D and, only where supported, strict S. For DeepSeek V4,
+verify strict S rejects before payload I/O or parameter mutation and run performance with L/D/A0 only; do not label
+that expected rejection as an S benchmark result.
 
 | Family | First gate | Full-node target | Source-backed starting point and caveat |
 | --- | --- | --- | --- |
 | Qwen 3.5 | Qwen3.5-35B-A3B BF16, then 397B TP4/EP4 | `Qwen3.5-397B-A17B-NVFP4`, TP8/EP8, attention-DP off; qualify attention-DP/MTP separately | PR-head `examples/configs/curated/qwen3.5.yaml`; TP8 stanza `qwen3_5_397b_fp4_tep8_1k1k` in `tests/scripts/perf-sanity/aggregated/qwen3_5_397b_fp4_blackwell.yaml`. That file currently lists B200, so B300 is a qualification result, not a pre-existing claim. |
-| DeepSeek V4 | `DeepSeek-V4-Flash`, TP4/EP4, attention-DP, TRTLLM MoE | `DeepSeek-V4-Pro`, TP8/EP8; MTP off for loader isolation, then MTP1 | B300 CI covers Flash in `l0_dgx_b300.yml`. Pro starts from `examples/configs/curated/deepseek-v4-pro-{throughput,latency}.yaml` and the eight-rank accuracy path; curated compatibility currently names B200, so fit/correctness on B300 is a gate. Both curated YAMLs enable MTP: archive a derived MTP-off copy with `speculative_config` removed, then use the unmodified throughput config for MTP1. |
+| DeepSeek V4 | `DeepSeek-V4-Flash`, TP4/EP4, attention-DP, TRTLLM MoE; strict D plus strict-S early-rejection gate | `DeepSeek-V4-Pro`, TP8/EP8; L/D/A0 only; MTP off then MTP1 | S is intentionally unsupported because the bespoke loader requires a complete checkpoint transaction. B300 CI covers Flash in `l0_dgx_b300.yml`. Pro starts from `examples/configs/curated/deepseek-v4-pro-{throughput,latency}.yaml`; archive the exact derived MTP-off config. |
 | Llama 4 | Scout FP8 | Maverick FP8, TP8/EP8, text-only request first | `examples/configs/curated/llama-4-scout.yaml`, `examples/models/core/llama4/README.md`, and checked eight-GPU Scout/Maverick tests. Aggregate construction already creates and loads the vision encoder even for text-only prompts; an image-input follow-up changes preprocessing/first inference, not weight-loading coverage. Full-node Llama 4 PP remains unqualified. |
 
 Use the exact checkpoint paths present under `LLM_MODELS_ROOT`; do not silently substitute a different model, revision,
@@ -499,9 +584,10 @@ Qwen 3.5, DeepSeek V4, or Llama 4 coverage requested here.
 
 ### Stage 2: Five-Block Screening
 
-Before screening, predeclare every production cell and its aggregate weight. For each qualified full-node target, run
-five randomized complete L/D/S/A0 blocks on the production shared mount with verified client-cold state. Freeze one
-natural checkpoint layout and one production topology per model.
+Before screening, predeclare every production cell and its aggregate weight. For each S-qualified Qwen/Llama target,
+run five randomized complete L/D/S/A0 blocks on the production shared mount with verified client-cold state. DeepSeek
+V4 runs balanced L/D/A0 blocks plus the untimed strict-S rejection gate. Freeze one natural checkpoint layout and one
+production topology per model.
 
 Screening decides which cells merit confirmation. It does not establish tail latency or broad production support.
 Promote a cell when:
@@ -529,8 +615,10 @@ useful p95 estimate.
 
 For one large model on the target shared mount:
 
-- capture one or two L traces and one or two D traces with Nsight Systems;
+- capture one or two L, D, and direct-borrowed S traces with Nsight Systems;
 - preserve NVTX/event alignment, H2D copies, OS reads, page faults, and CPU threads;
+- for S, preserve producer batch reads, publication, module dispatch, H2D, all-rank acknowledgement, slot reuse, and
+  shared-arena address/registration evidence;
 - compare natural shard layout with controlled 1-, 8-, and 64-shard copies only if exact tensor equivalence and storage
   layout are documented; and
 - exclude all traced/synchronized runs from headline timing statistics.
@@ -543,25 +631,27 @@ Use a covering set rather than a Cartesian product:
 
 | Concern | Targeted comparison | Interpretation |
 | --- | --- | --- |
-| TP/rank count | Pin `llama-3.3-models/Llama-3.3-70B-Instruct-FP8`, then qualify TP1/2/4/8 points not already covered on the checked revision | I/O issuer scaling and extent balance; do not assume mathematical divisibility implies runtime support |
-| PP | Checked `llama-3.3-models/Llama-3.3-70B-Instruct-FP8` at TP2xPP4 | Current policies still stage the full node checkpoint; this measures overlap, not selective PP reads |
+| TP/rank count | Use the smallest available S-qualified Qwen 3.5 BF16 checkpoint, preferring Qwen3.5-4B, then qualify TP1/2/4/8 points not already covered on the checked revision | I/O issuer scaling and extent balance; do not substitute an unqualified generic-mapper model or assume mathematical divisibility implies runtime support |
+| PP | Qualify the same Qwen 3.5 checkpoint at TP2xPP4 before timing; if it cannot run PP, report the gap instead of substituting an S-ineligible model | Current policies still read the full node checkpoint; this measures overlap and ownership correctness, not selective PP reads |
 | EP and attention DP | One flagship MoE profile with ADP off/on | Downstream correctness and replicated consumer behavior; raw-byte eligibility is unchanged |
-| MTP/speculation | DeepSeek V4 or Qwen 3.5 target with MTP off/on | Target plus draft lifecycle and added materialization work |
-| CP | Only a checked model/runtime configuration | Qualification; no source-backed flagship eight-GPU CP example was found during plan authoring |
+| MTP/speculation | Qwen 3.5 integrated MTP off/on for S; DeepSeek V4 is D-only; separately opened draft checkpoints must pass the documented S early-rejection gate | Integrated MTP dependency coverage versus unsupported multi-checkpoint transaction boundaries |
+| CP | Only a checked S-qualified Qwen 3.5 or Llama 4 configuration; otherwise report D-only coverage | Qualification; no source-backed flagship eight-GPU CP example was found during plan authoring |
 | Replica DP | Two TP4 or four TP2 independent replicas launched together | Node/storage cold-start storm; each communicator may stage its own checkpoint |
 | VLM | Llama 4 text-only versus image-input first inference | Aggregate startup loads both vision and text weights in either case; this isolates preprocessing/first-inference effects, not extra loader coverage |
 
-Current D/S policies assign raw storage bytes without interpreting final tensor ownership. A PP/EP/CP result must not
-be reported as rank-selective reading or reduced logical checkpoint bytes.
+D assigns raw storage extents without final tensor ownership. S uses dependency-safe mapper groups and targeted module
+dispatch, but every node producer still reads the complete logical checkpoint; a PP/EP/CP result must not be reported
+as rank-selective source acquisition or reduced logical checkpoint bytes.
 
 ## 7. Trial Protocol
 
 ### 7.1 Blocked Randomization
 
-One block contains one valid cold trial of L, D, S, and A0 on the same node and immutable checkpoint. Randomize order
-within every block and balance order over the campaign. A four-period Latin-square rotation is an acceptable starting
-schedule; one balanced sequence is `L-D-S-A0`, `D-S-A0-L`, `S-A0-L-D`, `A0-L-D-S`. Generate and archive the complete
-schedule before running.
+For an S-qualified cell, one block contains one valid cold trial of L, D, S, and A0 on the same node and immutable
+checkpoint. Randomize order within every block and balance order over the campaign. A four-period Latin-square
+rotation is an acceptable starting schedule; one balanced sequence is `L-D-S-A0`, `D-S-A0-L`, `S-A0-L-D`,
+`A0-L-D-S`. DeepSeek V4 uses a separately balanced L/D/A0 schedule after its strict-S early-rejection gate. Generate
+and archive the complete schedule before running.
 
 If the backend cache is controlled, use one checkpoint replica and reset/verify it before every treatment. If backend
 cache is uncontrolled and multiple replicas are used, balance treatment, order, replica, and stripe layout; include
@@ -648,6 +738,8 @@ After first-token timing, every measured run must verify:
 
 - requested and selected policy on every rank, with no unexpected fallback;
 - read-ahead guard and checkpoint manifest identity;
+- for S, exact manifest coverage, all-rank host-registration result, effective slots/largest group, direct/staged byte
+  accounting, and immutable borrowed-view lifetime checks;
 - parameter count and peak HBM/RSS;
 - deterministic first token and additional fixed greedy outputs matching L;
 - selected logits within a predeclared dtype-specific tolerance when available;
@@ -702,14 +794,15 @@ Also report:
 
 - baseline fraction of startup in model init and the weight session;
 - D read elapsed, exposed tail, overlap interval, hidden/exposed fractions, and traced H2D overlap;
-- S synchronous prefetch duration and whether its throughput gain offsets its serial position;
+- S producer read/consumer overlap, batch publication and acknowledgement tails, effective slot sizing,
+  direct-versus-staged coverage, and peak shared plus rank-local host memory;
 - logical node read rate and physical throughput only at their supported accounting layers;
 - rank imbalance, page faults, peak host memory, and peak HBM; and
 - A0 selection overhead/parity with D.
 
-Do not use `prefetch_speedup_x` as a headline comparison: D's read interval intentionally overlaps later work, while
-L/S prefetch is serial. A shorter or faster read span is useful mechanism evidence but paired critical-path latency is
-the product outcome.
+Do not use `prefetch_speedup_x` as a headline comparison: D overlaps page-cache read-ahead with the mmap path, while S
+overlaps next-batch producer I/O with current-batch materialization/H2D. Their read spans have different semantics;
+paired critical-path latency is the product outcome.
 
 Use Amdahl's law as a sanity check. When isolated storage wait is unavailable, label cold-minus-warm delta as an
 estimate rather than measured I/O time.
@@ -728,9 +821,13 @@ fallback elsewhere.
 
 ### Functional Gates
 
-- All four treatments emit matching requested/selected policy telemetry on every rank; strict D/S select exactly as
-  requested, L selects legacy, and A0 selects the expected eligible default.
-- The full-read-ahead guard is active in performance cells.
+- In S-qualified cells, all four treatments emit matching requested/selected policy telemetry on every rank; strict
+  D/S select exactly as requested, L selects legacy, and A0 selects D. DeepSeek V4 instead passes the documented
+  strict-S pre-I/O rejection gate and emits matching L/D/A0 telemetry.
+- Headline S/Yijin runs have `all_ranks_host_registered=true`, complete direct group/byte coverage, zero staged bytes,
+  and recorded effective slots, largest group, and peak host memory. Fallback runs are reported separately.
+- The full-read-ahead guard is active for L/D performance cells; S instead stays within its predeclared shared-slot
+  and rank-local staging memory budgets.
 - Correctness matches L.
 - All ranks complete without deadlock, divergence, timeout, or leak; qualification lifecycle restarts pass.
 - Host and HBM peaks remain inside predeclared safety budgets.
@@ -755,8 +852,9 @@ justifies a wider predeclared equivalence band.
 | --- | --- |
 | D wins and traces show useful I/O/materialization/H2D overlap | Keep D as the primary policy for the measured deployment profile. |
 | D reads quickly but exposes a large tail | Tune issuer count/NUMA or implement finer bounded streaming and destination placement. |
-| S wins on target NFS | Invest in the full bounded pinned producer/consumer design and remeasure. |
-| S loses because prefetch stays serial | Keep it explicit for client-limited storage; do not make it the default. |
+| S wins on target NFS with full direct coverage | Keep the bounded shared producer/consumer path and tune slot/workers from traces. |
+| S loses despite full direct coverage | Attribute producer, dispatch, H2D, acknowledgement, or slot tail before changing policy order. |
+| S requires substantial staging or registration fails | Treat it as fallback evidence; fix registration/atomic grouping before comparing with Yijin's direct shared path. |
 | L is competitive on natural many-shard checkpoints | Preserve L and include shard geometry in future selection. |
 | I/O improves but first-token barely changes | Prioritize transforms, H2D, warmup, compilation, or reusable MX/GMS/Snapshot artifacts. |
 | Full read-ahead fails the host-memory guard | Move to bounded selective streaming; do not tune the guard around unsafe memory pressure. |
@@ -807,7 +905,7 @@ unexpected fallback, correctness failure, timeout, or lifecycle failure.
 
 ### Required Headline Table
 
-| Model/revision | Topology | Storage/cache | Treatment | Selected policy | N | First-token median [CI] | LLM-init median [CI] | Model-init median [CI] | Weight-session median [CI] | Exposed read tail | Peak RSS/HBM | Result |
+| Model/revision | Topology | Storage/cache | Treatment | Selected policy | N | First-token median [CI] | Model-init median [CI] | Weight-session median [CI] | S direct/staged bytes | Effective slots/largest group | Peak host/HBM | Result |
 | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | | | | L | | | | | | | | | |
 | | | | D | | | | | | | | | |
@@ -816,8 +914,8 @@ unexpected fallback, correctness failure, timeout, or lifecycle failure.
 
 ### Required Mechanism Table
 
-| Cell/run | Mode | Read span | Node logical rate | mmap span | Materialization span | Materialization overlap | Hidden read fraction | First H2D before final read? | Storage counter scope |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| Cell/run | Mode | Read span | Node logical rate | Materialization span | I/O/materialization overlap | Host registered all ranks? | Direct/staged coverage | Slot/batch tail | Storage counter scope |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- | ---: | --- |
 | | | | | | | | | | |
 
 ## 11. Copy/Paste Brief for the Execution Agent
@@ -826,12 +924,17 @@ unexpected fallback, correctness failure, timeout, or lifecycle failure.
 > #16562 on one
 > exclusive 8xB300 node. Resolve and pin the PR head, container, model revisions, configs, and instrumentation patch.
 > Do not change loader scheduling. First satisfy the unit, model-inventory, node/storage, cache-control, and structured
-> timing gates. Run L/D/S/A0 from the same binary through the full ModelLoader/LLM path. Use fresh processes, verified
+> timing gates. Run L/D/S/A0 from the same binary through the full ModelLoader/LLM path for S-qualified cells; run
+> L/D/A0 plus the strict-S rejection gate for DeepSeek V4. Use fresh processes, verified
 > cache state, randomized complete blocks, deterministic one-token correctness, clean-shutdown checks, and the staged
 > smoke -> flagship qualification -> 5-block screening -> 10-block confirmation sequence. Prioritize Qwen3.5-397B
 > NVFP4, DeepSeek V4 Pro, and Llama 4 Scout/Maverick with the source-backed configs and caveats in the plan. Capture
-> representative L/D Nsight traces to prove or refute I/O/H2D overlap. Return all raw artifacts and an evidence-backed
-> report; do not claim A0 is adaptive, do not assume D or S must win, and do not invent unavailable measurements.
+> representative L/D/S Nsight traces to prove or refute I/O/materialization/H2D overlap. Report the core S treatment
+> for every qualified profile, but require node-local all-rank CUDA registration and full direct byte/group coverage
+> for the direct-shared-buffer Yijin subanalysis; report quantized staging and peak host memory separately. DeepSeek V4
+> strict S is expected to reject before mutation, while D remains supported.
+> Return all raw artifacts and an evidence-backed report; do not claim A0 is adaptive, do not assume D or S must win,
+> and do not invent unavailable measurements.
 
 ## 12. Future Campaign: Performance-Adaptive A1
 

@@ -25,8 +25,10 @@ compilation, warmup, and other startup improvements.
 ## Scope
 
 The current implementation focuses on filesystem-visible SafeTensors checkpoints and the path from raw checkpoint
-bytes through materialization and existing H2D placement. It measures end-to-end process-to-first-token latency so a
-local checkpoint-loading gain is accepted only when it improves the larger startup critical path.
+bytes through materialization and existing H2D placement. It compares rank-owned page-cache read-ahead with a
+Yijin-style, one-producer-per-node bounded shared-memory stream that pipelines I/O, dependency-group materialization,
+and H2D. It measures end-to-end process-to-first-token latency so a local checkpoint-loading gain is accepted only when
+it improves the larger startup critical path.
 
 Higher-level mechanisms remain separate and complementary:
 

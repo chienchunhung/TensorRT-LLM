@@ -14,7 +14,7 @@ SPDX-License-Identifier: Apache-2.0
 
 **Created:** 2026-07-19
 
-**Last Updated:** 2026-07-21
+**Last Updated:** 2026-07-22
 
 See the [benchmark and qualification plan](benchmark-plan.md) for the four-treatment experiment, metrics, model
 matrix, and acceptance gates.
@@ -27,22 +27,22 @@ The TensorRT-LLM checkpoint-loading layer should provide a deterministic, observ
 ```text
 WeightLoadPlan
     +-- direct_rank_read       # primary rank-cooperative host policy
-    +-- shared_host_producer   # single-producer host policy
+    +-- shared_host_producer   # bounded node-local producer/consumer stream
     +-- gpu_broadcast          # future topology-aware GPU fan-out
     +-- legacy_fallback        # compatibility path
 ```
 
 The current prototype implements the two host policies and the legacy fallback. `gpu_broadcast` is a recognized but
 unavailable policy. The default plan is an ordered eligibility fallback, not a runtime performance tuner: on every
-currently eligible checkpoint it selects `direct_rank_read` because the direct and shared policies have the same
-eligibility rules.
+native HF/AUTO SafeTensors checkpoint eligible for D it selects `direct_rank_read` because D precedes S. S has stricter
+mapper, nested-module partial-loading, and source-lifetime requirements.
 
 The recommended rollout is therefore:
 
 1. Benchmark `legacy_fallback`, `direct_rank_read`, and `shared_host_producer` as three distinct paths.
 2. Preserve the ordered plan for capability fallback and explicit failure behavior.
 3. Add a performance-adaptive selector only after storage-specific measurements identify stable decision signals.
-4. Expand from page-cache staging to rank-selective loading and GPU fan-out only after TensorRT-LLM exposes a
+4. Expand from rank-cooperative staging to rank-selective loading and GPU fan-out only after TensorRT-LLM exposes a
    rank-aware final-weight materialization contract.
 
 This rank-cooperative checkpoint work is complementary to ModelStreamer, ModelExpress (MX), GPU Memory Service (GMS),
@@ -118,7 +118,7 @@ capture can dominate after storage is accelerated. The design must preserve thos
 - Implementing MX, GMS, process snapshots, ModelStreamer, compilation, or warmup optimizations in this prototype.
 - Remote Hugging Face download acceleration or direct object-store streaming.
 - Linux `O_DIRECT`, GPUDirect Storage, or direct reads into final parameter storage.
-- A complete Yijin-style pinned shared-memory producer/consumer pipeline.
+- NUMA-aware producer placement, transformed-weight caching, or restart reuse.
 - TP-, PP-, CP-, or EP-selective file-range reads.
 - A literal full-model broadcast to every GPU.
 - Legacy TensorRT `.engine` deserialization acceleration.
@@ -188,12 +188,12 @@ checkpoint metadata plus deployment context and chooses a policy; the chosen pol
 
 ## Current Data Paths
 
-All current paths use the existing mmap-backed SafeTensors and model-specific application logic. Their scheduling is
-different:
+The legacy and direct paths use the existing mmap-backed SafeTensors logic. Shared-host mode uses the same mapper and
+model transformations through an incremental dependency-group stream:
 
 ```text
-legacy_fallback / shared_host_producer
-checkpoint -> synchronous prefetch -> node barrier -> mmap -> mapping/transforms/H2D
+legacy_fallback
+checkpoint -> synchronous whole-file prefetch -> node barrier -> mmap -> mapping/transforms/H2D
 
 direct_rank_read
 checkpoint -> background extent reads --------------------------+
@@ -202,11 +202,18 @@ checkpoint -> background extent reads --------------------------+
                                                          join reads
                                                          coordinate errors
                                                          success-only barrier
+
+shared_host_producer
+checkpoint -> producer fills shared slot N+1 -------------------+
+             |                                                   |
+             +-> all ranks consume slot N -> transforms/H2D -> acknowledge
+                                                            reuse slot
 ```
 
-The background reads and demand faults both populate the node's Linux page cache. Direct mode can therefore overlap
-filesystem I/O with mmap setup, CPU mapping and transformations, and the existing H2D copies. It does not bypass the
-page cache or place bytes directly in GPU memory.
+The direct-mode background reads and demand faults both populate the node's Linux page cache. Direct mode can therefore
+overlap filesystem I/O with mmap setup, CPU mapping and transformations, and the existing H2D copies. Shared mode
+instead publishes raw tensor groups through an optionally CUDA-registered shared arena and pipelines producer I/O with
+consumer transformation/H2D. Neither policy uses `O_DIRECT`, GDS, or final-parameter destination reads.
 
 ### Important Baseline Correction
 
@@ -243,13 +250,42 @@ traffic.
 
 ### `shared_host_producer`
 
-Node-local rank 0 owns all extents and uses up to 16 read workers by default. Peers issue no explicit storage prefetch,
-wait at a local barrier, and then map the shared cached pages.
+Each node elects local rank 0 as its sole storage producer. The producer issues parallel `pread` operations into an MPI
+shared-memory double buffer while every local rank materializes the previously published atomic dependency group. The
+configured 256 MiB slot grows to fit the largest group, subject to the configured total buffer budget. SafeTensors
+headers and the initialized mapper's exact-cover group manifest are validated before payload I/O.
 
-This v0 policy is a controlled single-producer baseline. It is not Yijin's full design: there is no bounded pinned
-shared-memory ring, rank-use manifest, partial tensor stream, CUDA-event acknowledgement, NUMA-aware queue, or
-crash-safe producer reclamation. If v0 wins on client-limited storage, it provides evidence for implementing that
-pipeline; if it loses because one producer is the bottleneck, that is also useful evidence.
+These are ordinary buffered filesystem reads: NFS or local-storage data still passes through the node's Linux page
+cache before the kernel copies it into the shared arena. Unlike D, S does not require warming and mmap-reading a full
+logical checkpoint before consumers can use it; the arena remains bounded to the active double-buffer slots.
+
+Every rank attempts to CUDA-register the shared arena. When registration succeeds on every rank sharing one node's
+arena, the group fits a slot, and the mapper qualifies the runtime profile's source lifetime, mapper and model code
+borrow immutable tensors directly from the shared bytes; current-stream synchronization and all-rank completion
+consensus gate slot reuse. Registration fallback is node-local, so one node does not disable direct views elsewhere.
+If registration is unavailable or a group cannot use a direct lease, the correctness path stages it in rank-local
+pinned memory, with a logged pageable fallback. Quantized profiles currently stage because some Linear and MoE methods
+retain source-backed temporaries until end-of-checkpoint processing; integrated-GPU profiles stage to keep shared
+transport pages outside legacy mmap-eviction hooks. Unquantized static Qwen 3.5 and Llama 4 profiles on discrete GPUs
+may use direct views. Incremental module dispatch visits only destination subtrees needed by that group. Telemetry
+reports configured/effective slot size, largest group, single-slot coverage, node-local registration consensus, direct
+and staged groups/bytes, and producer progress.
+
+After mapper coverage is complete, the loader runs each eligible module's deferred
+`process_weights_after_loading` hook exactly once before the last batch consensus; wrapper-owned MoE backends are
+de-duplicated. Deferred quantization/fusion and CUDA-sync failures therefore become collective stream failures before
+the final slot is reused. The common `post_load_weights` lifecycle still runs afterward.
+
+This is the bounded producer/consumer mechanism needed for a fair comparison with Yijin's proposal. It is not a
+transformed-weight cache: the producer does not retain a full model, and the arena is reclaimed after the session.
+The older synchronous one-producer page-cache experiment remains separately selectable as
+`single_producer_page_cache_prefetch` and is not treatment S.
+
+The initial transport preserves one atomic dependency group per published batch (or several batches when one group
+exceeds a slot); it does not yet pack multiple small independent groups into one publication. This keeps mapper and
+failure boundaries simple, but can expose per-batch MPI coordination and reduce producer I/O width for tiny groups.
+Benchmarks must retain group/batch counts, payload-size distribution, and publish/acknowledgement time. Multi-group
+packing is a follow-up if those measurements show material overhead.
 
 ### `gpu_broadcast`
 
@@ -303,8 +339,7 @@ export TRTLLM_HF_WEIGHT_LOAD_PLAN=shared_host_producer
 export TRTLLM_HF_WEIGHT_LOAD_PLAN=direct_rank_read,shared_host_producer,gpu_broadcast,legacy_fallback
 ```
 
-The current direct and shared policies have the same eligibility rules and GPU fan-out is unavailable. Consequently,
-the default resolves as follows:
+GPU fan-out is unavailable and D precedes the more narrowly qualified S. Consequently, the default resolves as follows:
 
 | Checkpoint | Current default result |
 | --- | --- |
@@ -323,27 +358,38 @@ Eligibility and production qualification are deliberately separate:
 | Dimension | Eligible for the raw-byte policy | Not handled by the policy |
 | --- | --- | --- |
 | Source and format | Filesystem-visible native HF SafeTensors with `LoadFormat.AUTO` | `.bin`, `.pth`, direct object-store URIs, MX/GMS paths, Mistral or other format-specific loaders |
-| Model and mapper | Model-neutral; registered and custom downstream mappers receive the same raw tensors | An overridden checkpoint-loader lifecycle that does not enter the native HF/AUTO session |
-| Parallelism and features | Byte staging is independent of TP/PP/CP/EP/attention-DP/DWDP, quantization, LoRA, and target/draft loading | Distributed cooperative loading without MPI-launched ranks or with a mismatched active communicator |
+| Model and mapper | D is model-neutral. S requires partial model loading, nested Linear/MoE backend capability, a mapper-owned exact-cover atomic dependency manifest, and an audited source-tensor lifetime contract. | An overridden checkpoint-loader lifecycle that does not enter the native HF/AUTO session; a mapper or nested backend without the S contracts |
+| Parallelism and features | D's byte staging is independent of TP/PP/CP/EP/attention-DP/DWDP. S remains valid only for qualified combinations covered by its mapper manifest. | Distributed cooperative loading without MPI-launched ranks or with a mismatched active communicator; separately opened speculative draft checkpoints in S |
 
-Qwen 3.5, DeepSeek V4, and Llama 4 are therefore eligible when they use the native HF/AUTO SafeTensors path. This is
-not a blanket production-support claim. Each exact model revision, quantization, mapper, topology, speculative mode,
-and text or multimodal construction must pass correctness, memory, lifecycle, and cold-start qualification.
+Qwen 3.5 text/VLM and Llama 4 have initial S manifests. After an end-to-end audit, a model class using the exact
+unmodified generic HF mapper may declare a class-local S opt-in; without that marker it is ineligible. Custom mappers
+and derived model classes must qualify and opt in independently rather than inheriting safety.
+DeepSeek V4 remains deliberately unsupported in strict S because its bespoke whole-checkpoint loader has no safe
+partial-load transaction. DeepSeek V4 remains eligible for D. None of these statements is a blanket production-support
+claim: every exact revision, quantization, mapper, topology, speculative mode, and text or multimodal construction must
+pass correctness, memory, lifecycle, and cold-start qualification.
 
-The optimized prefetch path requires the full logical checkpoint to be smaller than 90% of node-local `MemAvailable`
-and no layer-count override. If the guard rejects prefetch, the selected host policy remains in effect but ranks proceed
-through the existing demand-mmap behavior. Trials must record whether prefetch actually ran; a requested policy name
-alone does not prove that the optimized data path executed.
+Shared preflight walks nested Linear and MoE modules before header parsing or shared-window allocation. A backend or
+quant method that cannot consume `allow_partial_loading=True` makes strict S fail and makes an ordered plan advance
+before parameter mutation. Dynamic EPLB is currently ineligible because it deliberately retains complete raw expert
+tensors past a bounded batch; static EPLB remains eligible when its backend passes the nested capability check.
+Llama 4 min-latency mode is also ineligible because it eagerly derives FP8 layouts before deferred partial-load
+finalization.
+
+The D prefetch path retains the full-checkpoint host-memory guard. S instead requires enough host memory for two
+effective shared slots plus any per-rank staging fallback and normal model construction. Trials must report the
+effective slot allocation, direct/staged byte coverage, and measured peak host memory; a requested policy name alone
+does not prove that the intended direct-borrowed path executed.
 
 ### Multi-Node Boundary
 
-The current coordination unit is one active MPI communicator split into node-local groups. Each node independently
-stages a complete logical checkpoint into its own page cache; bytes are not exchanged between node page caches, and PP
-ownership does not reduce inter-node storage traffic.
+The current coordination unit is one active MPI communicator split into node-local groups. D independently stages a
+complete logical checkpoint into each node's page cache. S creates one producer and one shared arena per node. Bytes
+are not exchanged between nodes, and PP ownership does not yet reduce inter-node storage traffic.
 
 Cross-node raw-byte sharing should be evaluated through distributed ModelStreamer or another source adapter.
 Cross-node rank-ready GPU artifact transfer belongs with MX/NIXL and the runtime-artifact contract. Keeping those paths
-outside the page-cache policies avoids duplicating transport, authentication, retry, and failure-handling logic inside
+outside these host policies avoids duplicating transport, authentication, retry, and failure-handling logic inside
 the native HF loader.
 
 ## When to Adopt Each Strategy
@@ -354,12 +400,12 @@ Use measured deployment behavior rather than model size alone.
 | --- | --- | --- |
 | Few large or skewed shards; storage throughput scales with outstanding reads | `direct_rank_read` | Chunk striping balances work across ranks and exposes node-wide concurrency. |
 | Local NVMe RAID or high-concurrency Lustre/parallel filesystem | Start with `direct_rank_read` | These systems commonly reward multiple disjoint reads, subject to measurement. |
-| NFS or another mount where multiple client processes reduce aggregate throughput | `shared_host_producer` | One process owns storage traffic while peers reuse cached pages. |
+| NFS or another mount where multiple client processes reduce aggregate throughput | `shared_host_producer` | One process owns storage I/O while all ranks consume a bounded shared stream and overlap the next read with current materialization/H2D. |
 | One local rank, warm page cache, or many evenly sized shards | Compare against `legacy_fallback` | Legacy may already expose enough concurrency; cooperative overhead may not help. |
 | Unsupported native-disk format or communicator | `legacy_fallback` when compatible | Preserves the existing native disk lifecycle. |
 | MX/GMS/object-store or format-specific source | Its source-specific loader, otherwise failure | `legacy_fallback` cannot create support for an unavailable source. |
 | Raw cache enabled and no plan is explicit | `legacy_fallback` | Preserves the requested cache lifecycle. An explicit direct/shared plan instead ignores the cache with a warning. |
-| Insufficient host memory for full-checkpoint prefetch | No optimized host policy today | Current direct/shared remain selected but skip prefetch and use existing demand-mmap behavior; classify this as an optimized-path miss. |
+| Full-checkpoint page-cache headroom is limited but a bounded group buffer fits | `shared_host_producer` | S bounds shared arena capacity to two effective slots plus any explicitly measured staging fallback. |
 | Replicated rank-ready weights, H2D is material, and fast peer links are available | Future `gpu_broadcast` | One H2D plus GPU fan-out may reduce redundant copies. |
 | Mostly disjoint TP/EP payloads or weak peer topology | Direct per-rank placement | A producer and scatter can add an unnecessary hop. |
 | Compatible GMS/MX/Snapshot artifact exists | Use that higher-level source before raw loading | Reusing materialized state skips more startup work than accelerating raw bytes. |
@@ -441,6 +487,12 @@ placement.
   reads. Cross-node content or revision identity remains future work.
 - Direct-mode body errors are coordinated before readers are joined; peer reads are cancelled, read errors are then
   coordinated, and the node barrier is entered only on success.
+- Shared-mode publication and completion use all-rank consensus; a slot is never reused until every consumer has
+  completed or the coordinated error path has cancelled and finalized the stream.
+- Borrowed shared tensor views are immutable and may not be retained beyond their lease. Runtime profiles that do not
+  qualify for that direct-view contract use the rank-local staging path instead.
+- Nested Linear/MoE backends that do not advertise partial-load support, dynamic EPLB, and Llama 4 min-latency mode
+  fail S preflight before header parsing, window allocation, or model mutation.
 - All MPI operations remain on the caller thread; background workers execute only precomputed host reads.
 - No policy switch occurs after storage I/O begins.
 - The current prototype logs selection and fallback information; Phase 0 makes it structured telemetry.
@@ -473,8 +525,8 @@ placement.
 
 ### Phase 3: Expand Model and Parallelism Qualification
 
-- Qualify eligible Qwen 3.5, DeepSeek V4, and Llama 4 profiles from small mapper smokes through full-node flagship
-  configurations.
+- Qualify Qwen 3.5 and Llama 4 S manifests and D across flagship configurations; keep DeepSeek V4 strict S explicitly
+  unsupported until its loader gains a partial-load contract.
 - Cover MoE/EP, attention-DP, MTP, PP, independent replicas, quantized formats, and VLM construction with targeted
   cases rather than a full Cartesian product.
 - Add rank ownership to the plan before claiming selective storage reads; current eligibility still stages raw bytes
@@ -482,10 +534,10 @@ placement.
 
 ### Phase 4: Stream and Place Rank-Ready Weights
 
-- Implement bounded pinned producer/consumer buffers where shared mode warrants it.
-- Replace full-checkpoint page-cache read-ahead with bounded pinned/selective streaming when memory or measured overlap
-  warrants it. Direct mode already provides system-level filesystem-I/O overlap with materialization and H2D, but not
-  pinned-memory asynchronous DMA or direct destination placement.
+- Tune the implemented bounded shared-memory producer/consumer pipeline, CUDA registration, group sizing, and staging
+  fallback from measured direct/staged coverage and peak host memory.
+- Add destination-oriented rank selection where measured storage amplification warrants it. Direct mode still uses
+  page-cache read-ahead; shared mode currently streams raw dependency groups rather than final parameter destinations.
 - Integrate ModelStreamer as a raw source and MX/GMS as higher-priority artifact sources.
 
 ### Phase 5: GPU Topology-Aware Fan-Out
@@ -500,6 +552,7 @@ placement.
 The rank-cooperative checkpoint-loading design advances only when:
 
 - strict policy selection is observable and fallback-free in measured cells;
+- strict S reports all-rank CUDA registration, direct/staged coverage, effective slot sizing, and peak host memory;
 - deterministic outputs match legacy, with sampled parameter fingerprints when the worker-rank hook is enabled;
 - distributed runs complete without deadlock or rank divergence;
 - storage-stage gains translate to statistically significant end-to-end gains in target deployments;
