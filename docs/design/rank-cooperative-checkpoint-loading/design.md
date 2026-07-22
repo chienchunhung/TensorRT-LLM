@@ -186,29 +186,81 @@ same term for a much richer tensor/rank manifest. These are different objects an
 The richer object should be named `RankWeightManifest` or `WeightMaterializationPlan`. The policy selector consumes
 checkpoint metadata plus deployment context and chooses a policy; the chosen policy consumes the rank manifest.
 
-## Current Data Paths
+## Policy Workflows at a Glance
 
-The legacy and direct paths use the existing mmap-backed SafeTensors logic. Shared-host mode uses the same mapper and
-model transformations through an incremental dependency-group stream:
+L, D, and S are distinct execution paths. The default ordered plan, called A0 in the benchmark plan, selects exactly
+one path before payload I/O; it is not another transport and does not mix policies during a load. G is a future path.
+The historical single-producer page-cache policy is diagnostic only and must not be reported as S.
 
-```text
-legacy_fallback
-checkpoint -> synchronous whole-file prefetch -> node barrier -> mmap -> mapping/transforms/H2D
+```mermaid
+flowchart TB
+    subgraph L["L · legacy_fallback — SafeTensors baseline"]
+        direction LR
+        L1["Ranks divide whole checkpoint files"]
+        L2["Per-rank threaded prefetch when enabled<br/>into the node OS page cache"]
+        L3["Node barrier"]
+        L4["Every rank mmap → map/transform → H2D"]
+        L1 --> L2 --> L3 --> L4
+    end
 
-direct_rank_read
-checkpoint -> background extent reads --------------------------+
-             |                                                   |
-             +-> mmap -> mapping/transforms/H2D -> session finish
-                                                         join reads
-                                                         coordinate errors
-                                                         success-only barrier
+    subgraph D["D · direct_rank_read — rank-cooperative read-ahead"]
+        direction LR
+        D1["Ranks divide fixed-size file extents"]
+        D2["Background pread<br/>into the node OS page cache"]
+        D3["Every rank mmap → map/transform → H2D"]
+        D4["Active-world materialization-error consensus<br/>cancel remaining reads on failure"]
+        D5["Join background readers"]
+        D6["Active-world read-error consensus"]
+        D7["Success-only node barrier"]
+        D1 --> D2
+        D1 --> D3
+        D2 -. "overlaps" .-> D3
+        D3 --> D4
+        D2 --> D5
+        D4 --> D5 --> D6 --> D7
+    end
 
-shared_host_producer
-checkpoint -> producer fills shared slot N+1 -------------------+
-             |                                                   |
-             +-> all ranks consume slot N -> transforms/H2D -> acknowledge
-                                                            reuse slot
+    subgraph S["S · shared_host_producer — bounded producer/consumer stream"]
+        direction LR
+        S0["Steady state: groups N and N+1"]
+        S1["Rank 0: parallel pread of group N+1<br/>through page cache into inactive shared slot"]
+        S2["All ranks: consume published group N<br/>direct view or local staging → transform → H2D"]
+        S3["Active-world completion consensus<br/>node-local slot N becomes reusable"]
+        S0 --> S1
+        S0 --> S2 --> S3
+        S1 -. "overlaps" .-> S2
+    end
+
+    subgraph G["G · gpu_broadcast — future and currently unavailable"]
+        direction LR
+        G1["Storage producer → bounded host staging"]
+        G2["One producer GPU per topology domain"]
+        G3["Broadcast replicated tensors<br/>scatter/send rank-owned shards"]
+        G4["Owning GPU destinations"]
+        G1 --> G2 --> G3 --> G4
+    end
+
+    subgraph P["Diagnostic only · single_producer_page_cache_prefetch"]
+        direction LR
+        P1["Rank 0 reads the full checkpoint"]
+        P2["Warm node OS page cache"]
+        P3["Node barrier"]
+        P4["Every rank mmap → map/transform → H2D"]
+        P1 --> P2 --> P3 --> P4
+    end
 ```
+
+Solid arrows are ordered stages. A dashed arrow is intentional I/O/materialization overlap. Storage assignment, shared
+arenas, and node barriers are node-local; "rank 0" in a storage lane means node-local rank 0. Policy selection and
+error/protocol consensus span the active world so every node follows the same collective sequence.
+
+| Path | Storage readers per node | Intermediate bytes | I/O/materialization overlap | Completion boundary |
+| --- | --- | --- | --- | --- |
+| L | Ranks with assigned whole files; up to 16 prefetch workers per reading rank when enabled | Linux page cache, then mmap | No intentional overlap: prefetch completes before the barrier and materialization | Node barrier before mmap/materialization |
+| D | Every rank with assigned fixed-size extents | Linux page cache, then mmap | Yes: background read-ahead runs beside mmap, transformation, and H2D | Active-world materialization-error consensus/cancel, join readers, active-world read-error consensus, then success-only node barrier |
+| S | One producer process with a default 64-worker I/O pool | Linux page cache, then a bounded MPI shared-memory double buffer; optional rank-local staging | Yes: producer fills group N+1 while all ranks materialize group N | Active-world consensus before a node-local consumed slot is reused |
+| G | Future producer per node or NVLink/NVSwitch domain | Bounded host staging followed by a producer GPU | Intended: source, H2D, and GPU fan-out pipeline | Topology-aware transfer completion; not implemented |
+| Diagnostic page-cache producer | Rank 0 with up to 16 prefetch workers by default | Linux page cache, then mmap | No | Node barrier before mmap/materialization |
 
 The direct-mode background reads and demand faults both populate the node's Linux page cache. Direct mode can therefore
 overlap filesystem I/O with mmap setup, CPU mapping and transformations, and the existing H2D copies. Shared mode
@@ -219,8 +271,8 @@ consumer transformation/H2D. Neither policy uses `O_DIRECT`, GDS, or final-param
 
 The legacy TensorRT-LLM SafeTensors path is not uniformly single-threaded. It already assigns whole checkpoint files
 across node-local ranks and prefetches assigned files with threads before every rank maps the checkpoint. The new
-`direct_rank_read` policy changes the assignment unit from a whole file to a fixed-size extent and bounds concurrency
-at the node level.
+`direct_rank_read` policy changes the assignment unit from a whole file to a fixed-size extent and targets a bounded
+node-level read-ahead budget through equal per-rank quotas.
 
 This distinction predicts where speedup is most likely:
 
@@ -235,11 +287,37 @@ Both new policies beating legacy is a benchmark hypothesis, not an architectural
 
 ### `direct_rank_read`
 
-Node-local MPI ranks own disjoint 256 MiB file extents. Each rank starts bounded buffered `pread` calls that warm those
-extents into the shared OS page cache, then immediately enters the existing SafeTensors mmap, mapping, transformation,
-and H2D path. The current defaults cap workers at 16 per rank and 64 per node. At weight-session exit the caller
-coordinates materialization errors, cancels peer work when needed, joins the reader, coordinates read errors, performs
-a node barrier only after success, and releases the node communicator.
+Node-local MPI ranks own disjoint 256 MiB file extents. Each rank with assigned extents starts bounded buffered `pread`
+calls that warm those extents into the shared OS page cache, then immediately enters the existing SafeTensors mmap,
+mapping, transformation, and H2D path. At weight-session exit the caller coordinates materialization errors across the
+active world, cancels peer work when needed, joins the reader, coordinates read errors across the active world,
+performs a node barrier only after success, and releases the node communicator.
+
+With the default settings, a rank's read-ahead worker count is:
+
+```text
+min(assigned_extents_on_rank, 16, max(1, floor(64 / local_rank_count)))
+```
+
+Extents are round-robin striped across local ranks, so assigned extent counts differ by at most one. The default quota
+is therefore already divided equally across ranks that have read-ahead work:
+
+| Local ranks | Maximum workers per reading rank | Aggregate when every rank has enough extents |
+| ---: | ---: | ---: |
+| 4 | 16 | 64 |
+| 8 | 8 | 64 |
+| 16 | 4 | 64 |
+| 32 | 2 | 64 |
+| 64 | 1 | 64 |
+| 65 | 1 | 65 |
+
+A rank receives zero workers only when it owns zero extents, which can happen when there are fewer extents than ranks;
+that rank has no read-ahead assignment and is not starved. This is a per-rank quota, not a node-global worker pool:
+unused quota is not rebalanced, and an explicit per-rank override bypasses the 64-worker target. For more than 64 local
+ranks, preserving at least one worker per reading rank necessarily exceeds 64, so 64 is a target rather than a strict
+node cap. A future strict-budget scheduler would need to elect at most 64 reader ranks and redistribute extents among
+them, because it cannot both enforce a 64-worker cap and give more than 64 ranks at least one worker. The later
+SafeTensors mapping thread pools are separate from this read-ahead budget.
 
 This overlapped session is used through `ModelLoader`. A direct call to `HfWeightLoader.load_weights()` remains
 synchronous, so it is not a valid benchmark entry point for the pipelined behavior.
@@ -255,14 +333,20 @@ shared-memory double buffer while every local rank materializes the previously p
 configured 256 MiB slot grows to fit the largest group, subject to the configured total buffer budget. SafeTensors
 headers and the initialized mapper's exact-cover group manifest are validated before payload I/O.
 
+The production path gives the one producer a 64-worker I/O pool by default. Consumer ranks intentionally have no
+storage-read workers: they consume the producer's shared stream and perform their own mapping, transformation, and H2D
+work. This is producer/consumer division of labor, not rank starvation. An explicit worker setting applies to the
+producer pool in S, despite the current configuration field retaining a per-rank-oriented name.
+
 These are ordinary buffered filesystem reads: NFS or local-storage data still passes through the node's Linux page
 cache before the kernel copies it into the shared arena. Unlike D, S does not require warming and mmap-reading a full
 logical checkpoint before consumers can use it; the arena remains bounded to the active double-buffer slots.
 
 Every rank attempts to CUDA-register the shared arena. When registration succeeds on every rank sharing one node's
 arena, the group fits a slot, and the mapper qualifies the runtime profile's source lifetime, mapper and model code
-borrow immutable tensors directly from the shared bytes; current-stream synchronization and all-rank completion
-consensus gate slot reuse. Registration fallback is node-local, so one node does not disable direct views elsewhere.
+borrow immutable tensors directly from the shared bytes; current-stream synchronization and active-world completion
+consensus gate reuse of every node-local slot. Registration fallback is node-local, so one node does not disable direct
+views elsewhere.
 If registration is unavailable or a group cannot use a direct lease, the correctness path stages it in rank-local
 pinned memory, with a logged pageable fallback. Quantized profiles currently stage because some Linear and MoE methods
 retain source-backed temporaries until end-of-checkpoint processing; integrated-GPU profiles stage to keep shared
@@ -330,6 +414,28 @@ direct_rank_read,shared_host_producer,gpu_broadcast,legacy_fallback
 Qualification and selection complete before policy-specific collectives or I/O. The loader does not start one policy
 and switch after partial reads. A single explicitly configured policy is strict and fails when unavailable; an ordered
 sequence permits preflight fallback.
+
+```mermaid
+flowchart LR
+    A0["A0 · ordered capability preflight<br/>D → S → G → L"]
+    DQ{"D eligible?"}
+    SQ{"S eligible?"}
+    GQ{"G available?"}
+    LQ{"L compatible?"}
+
+    A0 --> DQ
+    DQ -->|"yes"| D["Execute D for the whole session"]
+    DQ -->|"no"| SQ
+    SQ -->|"yes"| S["Execute S for the whole session"]
+    SQ -->|"no"| GQ
+    GQ -->|"yes — future"| G["Execute G for the whole session"]
+    GQ -->|"no"| LQ
+    LQ -->|"yes"| L["Execute L for the whole session"]
+    LQ -->|"no"| F["Fail before payload I/O"]
+```
+
+For currently eligible native HF/AUTO SafeTensors checkpoints, A0 selects D. It neither measures competing policies
+nor switches after loading begins, so A0 should match strict D within experimental noise.
 
 ```bash
 # Strict benchmark treatment.
