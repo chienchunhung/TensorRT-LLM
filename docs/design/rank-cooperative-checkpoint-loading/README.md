@@ -25,11 +25,19 @@ compilation, warmup, and other startup improvements.
 ## Scope
 
 The current implementation focuses on filesystem-visible SafeTensors checkpoints and the path from raw checkpoint
-bytes through materialization and existing H2D placement. It compares **Rank-Striped Read-Ahead** with
-**Node-Shared Weight Streaming**, a Yijin-style, one-producer-per-node bounded shared-memory pipeline. The latter fills
-batch N+1 while ranks consume batch N; model transformation and H2D begin when a batch completes its atomic weight
-group. It measures end-to-end process-to-first-token latency so a local checkpoint-loading gain is accepted only when
-it improves the larger startup critical path.
+bytes through materialization and existing H2D placement. It separates three mechanisms:
+
+- **Rank-Striped Read-Ahead**: ranks issue disjoint background reads into the Linux page cache while the unchanged
+  mmap-driven loader proceeds. This is opportunistic read-ahead, not a bounded data stream.
+- **Node-Shared Weight Streaming**: one producer process per node fills a bounded shared-memory double buffer while
+  every local rank consumes the previously published batch. This is the Yijin-style single-producer treatment.
+- **Rank-Cooperative Weight Streaming**: multiple node-local rank processes collectively fill disjoint regions of the
+  same bounded shared slots while consumers materialize the previous batch.
+
+The two streaming mechanisms deliberately share batch planning, mapper contracts, consumer materialization, shared
+memory, and H2D behavior; only their I/O producer assignment differs. This makes their benchmark comparison isolate
+single-process versus multi-rank storage issuance. The package measures end-to-end process-to-first-token latency so a
+local checkpoint-loading gain is accepted only when it improves the larger startup critical path.
 
 Higher-level mechanisms remain separate and complementary:
 

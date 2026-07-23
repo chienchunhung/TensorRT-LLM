@@ -16,7 +16,7 @@ SPDX-License-Identifier: Apache-2.0
 
 **Last Updated:** 2026-07-22
 
-See the [benchmark and qualification plan](benchmark-plan.md) for the four-treatment experiment, metrics, model
+See the [benchmark and qualification plan](benchmark-plan.md) for the five-treatment experiment, metrics, model
 matrix, and acceptance gates.
 
 ## Executive Decision
@@ -27,7 +27,8 @@ The TensorRT-LLM checkpoint-loading layer should provide a deterministic, observ
 ```text
 Automatic Capability Selection (AUTO)
     +-- Rank-Striped Read-Ahead       (RANK-STRIPED)
-    +-- Node-Shared Weight Streaming  (NODE-STREAM)
+    +-- Node-Shared Weight Streaming  (NODE-STREAM; one producer)
+    +-- Rank-Cooperative Weight Streaming (RANK-STREAM; multiple producers)
     +-- Topology-Aware GPU Fan-Out    (GPU-FANOUT; future)
     +-- Native Checkpoint Loader      (NATIVE)
 ```
@@ -40,6 +41,7 @@ commands in this document use the exact spellings accepted by the pinned prototy
 | Native Checkpoint Loader | `NATIVE` | `legacy_fallback` | `native` |
 | Rank-Striped Read-Ahead | `RANK-STRIPED` | `direct_rank_read` | `rank_striped_readahead` |
 | Node-Shared Weight Streaming | `NODE-STREAM` | `shared_host_producer` | `node_shared_stream` |
+| Rank-Cooperative Weight Streaming | `RANK-STREAM` | `rank_cooperative_stream` | `rank_cooperative_stream` |
 | Topology-Aware GPU Fan-Out | `GPU-FANOUT` | `gpu_broadcast` | `gpu_fanout` |
 | Automatic Capability Selection | `AUTO` | Environment variable unset | `auto` or environment variable unset |
 | Single-Reader Cache Warmup (diagnostic) | `CACHE-WARMUP` | `single_producer_page_cache_prefetch` | `single_reader_cache_warmup` |
@@ -47,16 +49,16 @@ commands in this document use the exact spellings accepted by the pinned prototy
 Before the prototype becomes a public API, the implementation should accept the recommended tokens and may preserve
 the current spellings as compatibility aliases. Logs and telemetry should normalize to one canonical name.
 
-The current prototype implements the two CPU-host policies and the native loader. Topology-Aware GPU Fan-Out is
+The target prototype implements the three CPU-host mechanisms and the native loader. Topology-Aware GPU Fan-Out is
 recognized but unavailable. AUTO is an ordered capability fallback, not a runtime performance tuner: for an eligible
-native HF/AUTO SafeTensors checkpoint it selects RANK-STRIPED because that policy precedes NODE-STREAM. NODE-STREAM has
-stricter partial-loading, nested-module, and exact-cover mapper-manifest requirements. CUDA registration and borrowed
-source lifetime do not determine NODE-STREAM eligibility; they determine whether an eligible atomic group can use a
-direct shared-buffer view or must use rank-local staging.
+native HF/AUTO SafeTensors checkpoint it selects RANK-STRIPED because that policy precedes both streams. NODE-STREAM
+and RANK-STREAM share the stricter partial-loading, nested-module, and exact-cover mapper-manifest requirements. CUDA
+registration and borrowed source lifetime do not determine stream eligibility; they determine whether an eligible
+atomic group can use a direct shared-buffer view or must use rank-local staging.
 
 The recommended rollout is therefore:
 
-1. Benchmark NATIVE, RANK-STRIPED, and NODE-STREAM as three distinct paths.
+1. Benchmark NATIVE, RANK-STRIPED, NODE-STREAM, and RANK-STREAM as four distinct static paths.
 2. Preserve the ordered plan for capability fallback and explicit failure behavior.
 3. Add a performance-adaptive selector only after storage-specific measurements identify stable decision signals.
 4. Expand from rank-cooperative staging to rank-selective loading and GPU fan-out only after TensorRT-LLM exposes a
@@ -85,8 +87,8 @@ process launch
 ```
 
 The current implementation scope is the raw-checkpoint branch, from filesystem-visible SafeTensors through existing
-materialization and final CUDA completion. It tests cooperative I/O scheduling and, in RANK-STRIPED, overlaps
-read-ahead with existing materialization and H2D while measuring the full process-to-first-token path. A
+materialization and final CUDA completion. It tests opportunistic page-cache overlap in RANK-STRIPED and explicit
+batch N/N+1 producer-consumer overlap in both shared-buffer streams while measuring the full process-to-first-token path. A
 checkpoint-stage improvement is useful only when it reduces the end-to-end startup critical path.
 
 The architecture must remain open to complementary work that skips, replaces, or accelerates other stages:
@@ -163,13 +165,15 @@ flowchart TD
 
     G --> G1["Rank-Striped Read-Ahead"]
     G --> G2["Node-Shared Weight Streaming"]
-    G --> G3["Topology-Aware GPU Fan-Out"]
-    G --> G4["Native Checkpoint Loader"]
+    G --> G3["Rank-Cooperative Weight Streaming"]
+    G --> G4["Topology-Aware GPU Fan-Out"]
+    G --> G5["Native Checkpoint Loader"]
 
     G1 --> H["Rank-aware materialization"]
     G2 --> H
     G3 --> H
     G4 --> H
+    G5 --> H
     H --> I["Transform and H2D placement"]
     I --> J["Post-load initialization and readiness"]
 ```
@@ -181,7 +185,7 @@ The layers have different owners:
 | Process restoration | Skip startup work when a complete warmed-process image is valid. | Dynamo Snapshot |
 | Artifact reuse | Reattach or transfer already materialized, identity-compatible weights. | GMS, GMS storage snapshot, MX |
 | Raw source | Locate and deliver checkpoint bytes. | Native filesystem, ModelStreamer, GDS |
-| Load policy | Decide which ranks or producers fetch and stage bytes. | The four policies in this document |
+| Load policy | Decide which ranks or producers fetch and stage bytes. | The policies in this document |
 | Materialization | Map source tensors to rank-owned parameters and apply transformations. | TensorRT-LLM model and weight mapper |
 | Placement | Allocate and populate final host or GPU storage. | CUDA allocator, future GMS-aware destination |
 | Post-load readiness | Prepare runtime state after weights are usable. | KV cache, compilation, autotuning, CUDA graphs, warmup |
@@ -205,9 +209,9 @@ checkpoint metadata plus deployment context and chooses a policy; the chosen pol
 
 ## Policy Workflows at a Glance
 
-NATIVE, RANK-STRIPED, and NODE-STREAM are distinct execution paths. AUTO selects exactly one path before payload I/O;
-it is not another transport and does not mix policies during a load. GPU-FANOUT is a future path. The historical
-single-reader page-cache policy is diagnostic only and must not be reported as NODE-STREAM.
+NATIVE, RANK-STRIPED, NODE-STREAM, and RANK-STREAM are distinct execution paths. AUTO selects exactly one path before
+payload I/O; it is not another transport and does not mix policies during a load. GPU-FANOUT is a future path. The
+historical single-reader page-cache policy is diagnostic only and must not be reported as either shared-buffer stream.
 
 ```mermaid
 flowchart TB
@@ -253,6 +257,22 @@ flowchart TB
         S1 -. "overlaps" .-> S2
     end
 
+    subgraph RANK_STREAM["RANK-STREAM · Rank-Cooperative Weight Streaming"]
+        direction LR
+        R0["Steady state: batches N and N+1"]
+        R1["Multiple local ranks: parallel preadv of disjoint extents<br/>into one inactive shared slot for batch N+1"]
+        R2["All local ranks: consume batch N<br/>direct view or append to rank-local group staging"]
+        R4{"Batch N completes<br/>its atomic weight group?"}
+        R5["Yes: map/transform → H2D"]
+        R6["No: await the group's next batch"]
+        R3["Active-world completion consensus<br/>node-local slot N becomes reusable"]
+        R0 --> R1
+        R0 --> R2 --> R4
+        R4 -->|"yes"| R5 --> R3
+        R4 -->|"no"| R6 --> R3
+        R1 -. "overlaps" .-> R2
+    end
+
     subgraph GPU_FANOUT["GPU-FANOUT · Topology-Aware GPU Fan-Out — future"]
         direction LR
         G1["Storage producer → bounded host staging"]
@@ -281,14 +301,16 @@ error/protocol consensus span the active world so every node follows the same co
 | NATIVE | Ranks with assigned whole files; up to 16 prefetch workers per reading rank when enabled | Linux page cache, then mmap | No intentional overlap: prefetch completes before the barrier and materialization | Node barrier before mmap/materialization |
 | RANK-STRIPED | Every rank with assigned fixed-size extents | Linux page cache, then mmap | Yes: background read-ahead runs beside mmap, transformation, and H2D | Active-world materialization-error consensus/cancel, join readers, active-world read-error consensus, then success-only node barrier |
 | NODE-STREAM | One producer process with a default 64-worker I/O pool | Linux page cache, bounded MPI shared-memory double buffer, and optional rank-local group staging | Yes: producer fills batch N+1 while consumers process batch N; transform/H2D begins only when N completes its atomic group | Active-world consensus before a node-local consumed slot is reused |
+| RANK-STREAM | Multiple node-local producer processes sharing one node-level worker budget | Linux page cache, the same bounded MPI shared-memory double buffer, and optional rank-local group staging | Yes: rank producers collectively fill disjoint regions of batch N+1 while consumers process batch N; transform/H2D follows the same atomic-group boundary as NODE-STREAM | Producer-owner threads synchronize their completed writes; active-world consensus gates slot reuse |
 | GPU-FANOUT | Future producer per node or NVLink/NVSwitch domain | Bounded host staging followed by a producer GPU | Intended: source, H2D, and GPU fan-out pipeline | Topology-aware transfer completion; not implemented |
 | CACHE-WARMUP diagnostic | Node rank 0 with up to 16 prefetch workers by default | Linux page cache, then mmap | No | Node barrier before mmap/materialization |
 
 RANK-STRIPED background reads and demand faults both populate the node's Linux page cache, so filesystem I/O can
-overlap mmap setup, CPU mapping and transformations, and the existing H2D copies. NODE-STREAM instead publishes raw
-checkpoint batches through an optionally CUDA-registered shared arena. It pipelines producer I/O with consumer batch
-assembly and, for a group-completing batch, transformation/H2D. Neither policy uses `O_DIRECT`, GDS, or
-final-parameter destination reads.
+overlap mmap setup, CPU mapping and transformations, and the existing H2D copies. It has no batch-ready handoff,
+backpressure, or page-residency lifetime guarantee: foreground demand faults may race ahead of background reads.
+NODE-STREAM and RANK-STREAM instead publish raw checkpoint batches through the same optionally CUDA-registered shared
+arena. They pipeline producer I/O with consumer batch assembly and, for a group-completing batch,
+transformation/H2D. Neither stream uses `O_DIRECT`, GDS, or final-parameter destination reads.
 
 ### Important Baseline Correction
 
@@ -304,7 +326,7 @@ This distinction predicts where speedup is most likely:
 - A filesystem that rewards many outstanding reads can favor RANK-STRIPED.
 - A filesystem that penalizes multiple clients or processes can favor a shared producer.
 
-Both new policies beating NATIVE is a benchmark hypothesis, not an architectural guarantee.
+All three optimized policies beating NATIVE is a benchmark hypothesis, not an architectural guarantee.
 
 ## Policy Semantics
 
@@ -315,6 +337,12 @@ calls that warm those extents into the shared OS page cache, then immediately en
 mapping, transformation, and H2D path. At weight-session exit the caller coordinates materialization errors across the
 active world, cancels peer work when needed, joins the reader, coordinates read errors across the active world,
 performs a node barrier only after success, and releases the node communicator.
+
+The background reader is launched before foreground SafeTensors mapping and model materialization, but there is no
+"first extent ready" barrier or producer/consumer handoff. Foreground mmap demand faults begin immediately and can
+overtake the background `pread` calls. RANK-STRIPED is therefore an overlapped page-cache read-ahead policy, not a
+bounded weight stream. Its strength is broad compatibility with the unchanged full-checkpoint loader; its weakness is
+that overlap depth, cache-hit timing, and useful read ordering are opportunistic.
 
 With the default settings, a rank's read-ahead worker count is:
 
@@ -393,7 +421,7 @@ work. This is producer/consumer division of labor, not rank starvation. An expli
 producer pool in NODE-STREAM, despite the current configuration field retaining a per-rank-oriented name.
 
 These are ordinary buffered filesystem reads: NFS or local-storage data still passes through the node's Linux page
-cache before the kernel copies it into the shared arena. Unlike RANK-STRIPED, NODE-STREAM does not require warming and
+cache before the kernel copies it into the shared arena. Unlike RANK-STRIPED, the shared-buffer streams do not require warming and
 mmap-reading a full logical checkpoint before consumers can use it; the arena remains bounded to the active
 double-buffer slots.
 
@@ -416,7 +444,7 @@ de-duplicated. Deferred quantization/fusion and CUDA-sync failures therefore bec
 the final slot is reused. The common `post_load_weights` lifecycle still runs afterward.
 
 CUDA registration and the borrowed-source lifetime contract qualify this direct-view fast path; they are not
-NODE-STREAM eligibility requirements. An eligible run that fails either condition remains NODE-STREAM but uses
+shared-buffer-stream eligibility requirements. An eligible run that fails either condition remains on its selected stream but uses
 rank-local staging.
 
 The configured arena budget caps only the two MPI shared slots. It does not cap rank-local fallback staging, which can
@@ -428,7 +456,7 @@ budget.
 This is the bounded producer/consumer mechanism needed for a fair comparison with Yijin's proposal. It is not a
 transformed-weight cache: the producer does not retain a full model, and the arena is reclaimed after the session.
 The older synchronous one-producer page-cache experiment remains separately selectable as Single-Reader Cache Warmup
-(`single_producer_page_cache_prefetch`) and is not NODE-STREAM.
+(`single_producer_page_cache_prefetch`) and is neither NODE-STREAM nor RANK-STREAM.
 
 The initial transport preserves at most one atomic dependency group per published batch; a group may span several
 batches when it exceeds a slot. It does not yet pack multiple small independent groups into one publication. This
@@ -436,6 +464,61 @@ keeps mapper and failure boundaries simple, but can expose per-batch MPI coordin
 for tiny groups.
 Benchmarks must retain group/batch counts, payload-size distribution, and publish/acknowledgement time. Multi-group
 packing is a follow-up if those measurements show material overhead.
+
+### Rank-Cooperative Weight Streaming (`rank_cooperative_stream`)
+
+RANK-STREAM reuses NODE-STREAM's SafeTensors metadata, atomic-group manifest, batch plan, MPI shared-memory slots,
+consumer materialization, CUDA-registration decision, staging fallback, completion consensus, and cleanup lifecycle.
+It changes only the storage producer executor. Instead of electing only node-local rank 0, a bounded set of local ranks
+collectively fills disjoint extents of the same inactive slot.
+
+```mermaid
+sequenceDiagram
+    participant P as Node-local rank producers
+    participant W as One MPI shared double buffer
+    participant C as All local consumers
+    participant M as Mapper / transform / H2D
+    participant A as Active-world consensus
+
+    loop Ordered checkpoint batches
+        par Collectively fill batch N+1
+            P->>W: Each producer preadv its disjoint extents
+            P->>P: Owner threads wait for local I/O workers
+            P->>W: Node synchronization publishes complete slot
+        and Consume published batch N
+            W-->>C: Identical batch lease on every local rank
+            alt Batch N completes its atomic group
+                C->>M: Direct group view or completed local staging
+                M-->>C: Group materialized on destination rank
+            else Group continues in a later batch
+                C->>C: Append bytes to rank-local group staging
+            end
+        end
+        C->>A: Completion or error outcome
+        A-->>P: Consensus gates slot reuse
+    end
+```
+
+The configured worker count is a **node-level budget**, not a multiplier applied independently to every rank. If the
+budget is smaller than the number of local ranks, only that many ranks become producers. Otherwise the budget is
+divided as evenly as possible across the active producers; batch extents are round-robin striped across those
+producers and each extent has exactly one writer. This prevents an eight-rank node configured for 64 workers from
+accidentally creating 512 storage workers.
+
+All MPI and shared-window synchronization remains on each rank's owner thread. Background worker threads execute only
+precomputed `preadv` operations into nonoverlapping byte ranges, so the mode does not require
+`MPI_THREAD_MULTIPLE`. A batch is published only after every producer's local writes are complete and visible. The
+consumer protocol is deliberately identical to NODE-STREAM, making a benchmark between the two streams isolate the
+effect of one process versus multiple rank processes issuing storage I/O.
+
+RANK-STREAM is still not rank-selective loading. Every node collectively reads one complete logical checkpoint, and
+all consumers still apply their existing TP/PP/CP/EP mapping. A future `RankWeightManifest` can restrict producers to
+bytes actually needed by local destinations. Until then, the likely benefit is higher aggregate issue bandwidth on
+storage that scales across processes, NIC queues, or NUMA domains—not reduced logical checkpoint bytes.
+
+Multiple producers are not inherently faster. If NODE-STREAM's single process and thread pool already saturate the
+mount, RANK-STREAM adds synchronization and filesystem-client contention without increasing bandwidth. It must remain
+explicitly selectable and opt-in until storage-specific measurements justify an automatic choice.
 
 ### Topology-Aware GPU Fan-Out (`gpu_broadcast`)
 
@@ -477,6 +560,10 @@ AUTO currently expands to the following provisional implementation tokens:
 direct_rank_read,shared_host_producer,gpu_broadcast,legacy_fallback
 ```
 
+RANK-STREAM is intentionally not inserted into the implicit order before comparative qualification. It is available
+as a strict policy or in an explicitly configured ordered plan. This keeps the existing default stable while making
+all three mechanisms independently benchmarkable from one binary.
+
 Qualification and selection complete before policy-specific collectives or I/O. The loader does not start one policy
 and switch after partial reads. A single explicitly configured policy is strict and fails when unavailable; an ordered
 sequence permits preflight fallback.
@@ -507,8 +594,14 @@ policies nor switches after loading begins, so AUTO should match strict RANK-STR
 # Strict NODE-STREAM benchmark treatment; current PR token.
 export TRTLLM_HF_WEIGHT_LOAD_PLAN=shared_host_producer
 
+# Strict RANK-STREAM benchmark treatment.
+export TRTLLM_HF_WEIGHT_LOAD_PLAN=rank_cooperative_stream
+
 # AUTO expressed explicitly with current PR tokens.
 export TRTLLM_HF_WEIGHT_LOAD_PLAN=direct_rank_read,shared_host_producer,gpu_broadcast,legacy_fallback
+
+# Explicit experimental stream fallback order.
+export TRTLLM_HF_WEIGHT_LOAD_PLAN=rank_cooperative_stream,shared_host_producer,legacy_fallback
 ```
 
 GPU-FANOUT is unavailable and RANK-STRIPED precedes the more narrowly qualified NODE-STREAM. Consequently, AUTO
@@ -531,26 +624,27 @@ Eligibility and production qualification are deliberately separate:
 | Dimension | Eligible for the raw-byte policy | Not handled by the policy |
 | --- | --- | --- |
 | Source and format | Filesystem-visible native HF SafeTensors with `LoadFormat.AUTO` | `.bin`, `.pth`, direct object-store URIs, MX/GMS paths, Mistral or other format-specific loaders |
-| Model and mapper | RANK-STRIPED is model-neutral. NODE-STREAM requires partial model loading, nested Linear/MoE backend capability, and a mapper-owned exact-cover atomic dependency manifest. Borrowed-source lifetime safety is required only for NODE-STREAM's direct-view fast path. | An overridden checkpoint-loader lifecycle that does not enter the native HF/AUTO session; a mapper or nested backend without the NODE-STREAM contracts |
-| Parallelism and features | RANK-STRIPED byte staging is independent of TP/PP/CP/EP/attention-DP/DWDP. NODE-STREAM remains valid only for qualified combinations covered by its mapper manifest. | Distributed cooperative loading without MPI-launched ranks or with a mismatched active communicator; separately opened speculative draft checkpoints in NODE-STREAM |
+| Model and mapper | RANK-STRIPED is model-neutral. NODE-STREAM and RANK-STREAM require partial model loading, nested Linear/MoE backend capability, and a mapper-owned exact-cover atomic dependency manifest. Borrowed-source lifetime safety is required only for their direct-view fast path. | An overridden checkpoint-loader lifecycle that does not enter the native HF/AUTO session; a mapper or nested backend without the bounded-stream contracts |
+| Parallelism and features | RANK-STRIPED byte staging is independent of TP/PP/CP/EP/attention-DP/DWDP. Both shared-buffer streams remain valid only for qualified combinations covered by their common mapper manifest. | Distributed cooperative loading without MPI-launched ranks or with a mismatched active communicator; separately opened speculative draft checkpoints in either shared-buffer stream |
 
-Qwen 3.5 text/VLM and Llama 4 have initial NODE-STREAM manifests. After an end-to-end audit, a model class using the
-exact unmodified generic HF mapper may declare a class-local NODE-STREAM opt-in; without that marker it is ineligible.
+Qwen 3.5 text/VLM and Llama 4 have initial bounded-stream manifests shared by NODE-STREAM and RANK-STREAM. After an
+end-to-end audit, a model class using the exact unmodified generic HF mapper may declare a class-local stream opt-in;
+without that marker it is ineligible.
 Custom mappers and derived model classes must qualify and opt in independently rather than inheriting safety. DeepSeek
-V4 remains deliberately unsupported in strict NODE-STREAM because its bespoke whole-checkpoint loader has no safe
-partial-load transaction. DeepSeek V4 remains eligible for RANK-STRIPED. None of these statements is a blanket
+V4 remains deliberately unsupported in both strict shared-buffer streams because its bespoke whole-checkpoint loader
+has no safe partial-load transaction. DeepSeek V4 remains eligible for RANK-STRIPED. None of these statements is a blanket
 production-support claim: every exact revision, quantization, mapper, topology, speculative mode, and text or
 multimodal construction must pass correctness, memory, lifecycle, and cold-start qualification.
 
-NODE-STREAM preflight walks nested Linear and MoE modules before header parsing or shared-window allocation. A backend
-or quant method that cannot consume `allow_partial_loading=True` makes strict NODE-STREAM fail and makes an ordered
+Shared-buffer-stream preflight walks nested Linear and MoE modules before header parsing or shared-window allocation. A backend
+or quant method that cannot consume `allow_partial_loading=True` makes either strict shared-buffer stream fail and makes an ordered
 plan advance before parameter mutation. Dynamic EPLB is currently ineligible because it deliberately retains complete
 raw expert tensors past a bounded batch; static EPLB remains eligible when its backend passes the nested capability
 check.
 Llama 4 min-latency mode is also ineligible because it eagerly derives FP8 layouts before deferred partial-load
 finalization.
 
-RANK-STRIPED retains the full-checkpoint host-memory guard. NODE-STREAM instead requires enough host memory for two
+RANK-STRIPED retains the full-checkpoint host-memory guard. NODE-STREAM and RANK-STREAM instead require enough host memory for two
 effective shared slots, normal model construction, and any rank-local staging. The arena budget does not constrain
 staging: in the conservative path, each local rank may hold one complete atomic group. Trials must report effective
 slot allocation, largest group, direct/staged byte coverage, rank-local staging, and measured peak host memory; a
@@ -560,7 +654,8 @@ requested policy name alone does not prove that the intended direct-borrowed pat
 
 The current coordination unit is one active MPI communicator split into node-local groups. RANK-STRIPED independently
 stages a complete logical checkpoint into each node's page cache. NODE-STREAM creates one producer and one shared arena
-per node. Bytes are not exchanged between nodes, and PP ownership does not yet reduce inter-node storage traffic.
+per node; RANK-STREAM creates multiple local producers writing the same one arena per node. Bytes are not exchanged
+between nodes, and PP ownership does not yet reduce inter-node storage traffic.
 
 Cross-node raw-byte sharing should be evaluated through distributed ModelStreamer or another source adapter.
 Cross-node rank-ready GPU artifact transfer belongs with MX/NIXL and the runtime-artifact contract. Keeping those paths
@@ -574,13 +669,14 @@ Use measured deployment behavior rather than model size alone.
 | Situation | Preferred policy | Reason |
 | --- | --- | --- |
 | Few large or skewed shards; storage throughput scales with outstanding reads | RANK-STRIPED | Chunk striping balances work across ranks and exposes node-wide concurrency. |
-| Local NVMe RAID or high-concurrency Lustre/parallel filesystem | Start with RANK-STRIPED | These systems commonly reward multiple disjoint reads, subject to measurement. |
+| Broad model coverage is required and bounded-stream mapper contracts are unavailable | RANK-STRIPED | It leaves the existing full-checkpoint mmap/materialization path unchanged, at the cost of opportunistic rather than readiness-gated overlap. |
+| Local NVMe RAID, multi-queue storage, or a Lustre/parallel filesystem whose throughput scales across rank processes | RANK-STREAM | Multiple rank producers fill one bounded shared batch without duplicating logical checkpoint bytes. Compare against RANK-STRIPED because shared-buffer coordination may outweigh its benefits. |
 | NFS or another mount where multiple client processes reduce aggregate throughput | NODE-STREAM | One process owns storage I/O while all ranks consume a bounded shared stream and overlap the next batch read with current batch assembly or group materialization/H2D. |
 | One local rank, warm page cache, or many evenly sized shards | Compare against NATIVE | The native loader may already expose enough concurrency; cooperative overhead may not help. |
 | Unsupported native-disk format or communicator | NATIVE when compatible | Preserves the existing native disk lifecycle. |
 | MX/GMS/object-store or format-specific source | Its source-specific loader, otherwise failure | NATIVE cannot create support for an unavailable source. |
-| Raw cache enabled and no plan is explicit | NATIVE | Preserves the requested cache lifecycle. An explicit RANK-STRIPED or NODE-STREAM plan instead ignores the cache with a warning. |
-| Full-checkpoint page-cache headroom is limited but the shared arena and worst-case per-rank group staging fit | NODE-STREAM | The arena is bounded to two slots, but staging memory must be budgeted separately per rank. |
+| Raw cache enabled and no plan is explicit | NATIVE | Preserves the requested cache lifecycle. An explicit RANK-STRIPED, NODE-STREAM, or RANK-STREAM plan instead ignores the cache with a warning. |
+| Full-checkpoint page-cache headroom is limited but the shared arena and worst-case per-rank group staging fit | Compare NODE-STREAM and RANK-STREAM | Both use the same bounded two-slot arena; the storage issuer scaling determines which producer mode is preferable. |
 | Replicated rank-ready weights, H2D is material, and fast peer links are available | Future GPU-FANOUT | One H2D plus GPU fan-out may reduce redundant copies. |
 | Mostly disjoint TP/EP payloads or weak peer topology | Direct per-rank placement | A producer and scatter can add an unnecessary hop. |
 | Compatible GMS/MX/Snapshot artifact exists | Use that higher-level source before raw loading | Reusing materialized state skips more startup work than accelerating raw bytes. |
@@ -590,7 +686,7 @@ A practical decision sequence is:
 1. Attempt compatible process or runtime-weight reuse through Snapshot, GMS, or MX.
 2. If raw loading is required, reject policies outside the correctness envelope.
 3. Check host-memory and cache constraints.
-4. Use a validated storage profile to choose RANK-STRIPED or NODE-STREAM.
+4. Use a validated storage profile to choose RANK-STRIPED, NODE-STREAM, or RANK-STREAM.
 5. Preserve NATIVE as an explicit compatibility and regression control.
 
 ## Performance-Adaptive Selection
@@ -598,11 +694,12 @@ A practical decision sequence is:
 ### Why the Current Ordered Plan Is Not Enough
 
 An ordered plan answers "which policy is available?" It does not answer "which eligible policy is faster here?" Putting
-RANK-STRIPED before NODE-STREAM cannot adapt to a client-limited NFS mount, and putting NODE-STREAM first cannot adapt
-to a scalable NVMe or Lustre mount.
+RANK-STRIPED before the streams cannot adapt to a client-limited NFS mount, and putting NODE-STREAM first cannot adapt
+to a mount that needs multiple rank processes to reach peak throughput. RANK-STREAM also needlessly adds producer
+coordination when one process already saturates storage.
 
 A genuine adaptive policy must select before any checkpoint I/O or policy-specific collective. Trial-reading the real
-checkpoint with both policies would warm the cache, charge extra startup time, and make distributed switching unsafe.
+checkpoint with competing policies would warm the cache, charge extra startup time, and make distributed switching unsafe.
 
 ### Proposed Adaptive Selector
 
@@ -623,7 +720,9 @@ can choose:
 ```text
 unsupported or memory guard failed       -> NATIVE (future selector choice)
 best measured issuer count <= 1          -> NODE-STREAM
-throughput scales across local ranks      -> RANK-STRIPED
+bounded stream eligible and throughput
+scales across rank processes              -> RANK-STREAM
+stream ineligible but read-ahead helps    -> RANK-STRIPED
 no trustworthy profile                   -> deterministic ordered fallback
 ```
 
@@ -631,8 +730,8 @@ All ranks must agree on the context hash, selected policy, parameters, and fallb
 of the public benchmark record.
 
 An adaptive selector can match the faster static policy in each environment; it cannot be faster than the per-cell
-oracle merely by choosing between them. Its value appears across a heterogeneous deployment mix. A "hybrid is best"
-claim should mean low regret versus the oracle in each cell and better aggregate startup than either fixed policy
+oracle merely by choosing among them. Its value appears across a heterogeneous deployment mix. A "hybrid is best"
+claim should mean low regret versus the oracle in each cell and better aggregate startup than any single fixed policy
 across the predefined mix. A strictly faster per-cell result requires a new mixed data path, such as pipelined selective
 reads plus direct destination placement.
 
@@ -662,12 +761,14 @@ placement.
   reads. Cross-node content or revision identity remains future work.
 - RANK-STRIPED body errors are coordinated before readers are joined; peer reads are cancelled, read errors are then
   coordinated, and the node barrier is entered only on success.
-- NODE-STREAM publication and completion use active-world consensus; a node-local slot is never reused until every
-  consumer has completed or the coordinated error path has cancelled and finalized the stream.
+- NODE-STREAM and RANK-STREAM publication and completion use active-world consensus; a node-local slot is never reused
+  until every consumer has completed or the coordinated error path has cancelled and finalized the stream.
+- RANK-STREAM assigns every batch extent to exactly one active node-local producer. Producer workers perform no MPI;
+  creator threads synchronize local writes before publication.
 - Borrowed shared tensor views are immutable and may not be retained beyond their lease. Runtime profiles that do not
   qualify for that direct-view contract use the rank-local staging path instead.
 - Nested Linear/MoE backends that do not advertise partial-load support, dynamic EPLB, and Llama 4 min-latency mode
-  fail NODE-STREAM preflight before header parsing, window allocation, or model mutation.
+  fail shared-buffer-stream preflight before header parsing, window allocation, or model mutation.
 - All MPI operations remain on the caller thread; background workers execute only precomputed host reads.
 - No policy switch occurs after storage I/O begins.
 - The current prototype logs selection and fallback information; Phase 0 makes it structured telemetry.
@@ -680,7 +781,7 @@ placement.
 
 - Port or reimplement hierarchical startup profiling on the current branch.
 - Add per-rank policy, byte, page-fault, memory, and fallback telemetry.
-- Run the current four-treatment experiment and exact-profile qualification in
+- Run the five-treatment experiment and exact-profile qualification in
   [the benchmark plan](benchmark-plan.md).
 - Keep conclusions conditional on storage type and checkpoint geometry.
 
@@ -694,14 +795,14 @@ placement.
 ### Phase 2: Add Performance-Adaptive Selection
 
 - Introduce a versioned storage calibration/profile cache.
-- Select RANK-STRIPED, NODE-STREAM, or NATIVE before I/O.
+- Select RANK-STRIPED, NODE-STREAM, RANK-STREAM, or NATIVE before I/O.
 - Validate against held-out cells and the static-policy oracle.
 - Do not enable adaptive selection by default until regret and non-regression gates pass.
 
 ### Phase 3: Expand Model and Parallelism Qualification
 
-- Qualify Qwen 3.5 and Llama 4 NODE-STREAM manifests and RANK-STRIPED across flagship configurations; keep DeepSeek V4
-  strict NODE-STREAM explicitly unsupported until its loader gains a partial-load contract.
+- Qualify Qwen 3.5 and Llama 4 bounded-stream manifests and RANK-STRIPED across flagship configurations; keep DeepSeek
+  V4 strict NODE-STREAM and RANK-STREAM explicitly unsupported until its loader gains a partial-load contract.
 - Cover MoE/EP, attention-DP, MTP, PP, independent replicas, quantized formats, and VLM construction with targeted
   cases rather than a full Cartesian product.
 - Add rank ownership to the plan before claiming selective storage reads; current eligibility still stages raw bytes
@@ -709,10 +810,11 @@ placement.
 
 ### Phase 4: Stream and Place Rank-Ready Weights
 
-- Tune the implemented bounded shared-memory producer/consumer pipeline, CUDA registration, group sizing, and staging
+- Tune both producer executors of the bounded shared-memory pipeline, CUDA registration, group sizing, and staging
   fallback from measured direct/staged coverage and peak host memory.
 - Add destination-oriented rank selection where measured storage amplification warrants it. RANK-STRIPED still uses
-  page-cache read-ahead; NODE-STREAM currently streams raw dependency groups rather than final parameter destinations.
+  page-cache read-ahead; NODE-STREAM and RANK-STREAM currently stream raw dependency groups rather than final
+  parameter destinations.
 - Integrate ModelStreamer as a raw source and MX/GMS as higher-priority artifact sources.
 
 ### Phase 5: GPU Topology-Aware Fan-Out
@@ -727,8 +829,8 @@ placement.
 The rank-cooperative checkpoint-loading design advances only when:
 
 - strict policy selection is observable and fallback-free in measured cells;
-- strict NODE-STREAM reports node-local CUDA registration, direct/staged coverage, effective slot sizing, per-rank
-  staging, and peak host memory;
+- both strict shared-buffer streams report producer mode/count, node and local worker budgets, node-local CUDA
+  registration, direct/staged coverage, effective slot sizing, per-rank staging, and peak host memory;
 - deterministic outputs match NATIVE, with sampled parameter fingerprints when the worker-rank hook is enabled;
 - distributed runs complete without deadlock or rank divergence;
 - storage-stage gains translate to statistically significant end-to-end gains in target deployments;
