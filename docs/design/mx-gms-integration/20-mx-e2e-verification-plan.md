@@ -1055,6 +1055,26 @@ lower aggregate NFS throughput than the distributed legacy/direct paths on this 
 rank read is the only policy that improves startup; shared host producer should not be a default candidate without
 further redesign or storage-specific qualification.
 
+#### Updated PR-head qualification and model selection
+
+PR #16562 was rebuilt at `aa7a616b0add9ffceab5bf72cb5ae35e0f81e64a`, including the bounded incremental
+shared-host stream reimplementation. A same-node, zero-resident-page rerun on `umb-b300-dp-147` produced:
+
+| DeepSeek-V4-Pro policy | Model init (s) | Reduction | LLM init (s) | Reduction | Process to first token (s) | Reduction |
+|:--|--:|--:|--:|--:|--:|--:|
+| Legacy fallback | 520.28 | — | 853.06 | — | 919.44 | — |
+| Direct rank read | 379.97 | 27.0% | 684.98 | 19.7% | 755.27 | 17.9% |
+| Shared host producer | Ineligible | — | Ineligible | — | Ineligible | — |
+
+The strict shared-host plan was rejected before weight loading because `DeepseekV4ForCausalLM.load_weights` does not
+support incremental `allow_partial_loading`. Adding that support requires a separate model-loader refactor because
+DeepSeek-V4 materializes multi-tensor fused projections and other dependency groups from a complete weight dictionary.
+It is therefore not a valid model for comparing all three policies in the updated PR.
+
+The next fair comparison uses Qwen3.5-397B-A17B-FP8 (406.15 GB, TP=8). Its model and mapper explicitly support
+incremental weight groups, so legacy fallback, direct rank read, and the reimplemented shared host producer can run
+under the same true-cold and same-node controls.
+
 #### Remaining qualification work
 
 - Repeat the scaling characterization with either a privileged node page-cache drop or an `O_DIRECT` copy to fresh
