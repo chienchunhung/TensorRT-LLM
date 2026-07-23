@@ -19,15 +19,22 @@ The execution owner needs exclusive access to one eight-GPU B300 node, the produ
 to perform an administrator-approved client page-cache reset, and access to the pinned model artifacts. The owner is
 responsible for producing measured artifacts, not for proving a predetermined conclusion.
 
-Use the latest reviewed head of [TensorRT-LLM PR #16562](https://github.com/NVIDIA/TensorRT-LLM/pull/16562) that
-contains the RANK-STREAM implementation. The last reviewed two-mechanism baseline was:
+Use the reviewed Campaign 0 implementation from
+[TensorRT-LLM PR #16562](https://github.com/NVIDIA/TensorRT-LLM/pull/16562):
+
+```text
+6065ccb57dd1ceff28278fee019a5412fcf19646
+```
+
+The last reviewed two-mechanism baseline, retained for implementation-diff reference only, was:
 
 ```text
 aa7a616b0add9ffceab5bf72cb5ae35e0f81e64a
 ```
 
-Resolve and record the actual PR head before building. Review the range from the baseline above, record the new
-immutable SHA, verify that `rank_cooperative_stream` is selectable, and run all five treatments from the same binary.
+Build the pinned Campaign 0 SHA unless a later revision of this document names a reviewed successor. If the PR head
+has advanced, record both SHAs and review the range before substituting it. Verify that `rank_cooperative_stream` is
+selectable, and run all five treatments from the same binary.
 Never mix results from different feature commits, containers, models, or benchmark instrumentation revisions.
 
 The current handoff is **Campaign 0 only**:

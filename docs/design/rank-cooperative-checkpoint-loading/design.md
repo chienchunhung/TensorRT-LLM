@@ -510,6 +510,8 @@ precomputed `preadv` operations into nonoverlapping byte ranges, so the mode doe
 `MPI_THREAD_MULTIPLE`. A batch is published only after every producer's local writes are complete and visible. The
 consumer protocol is deliberately identical to NODE-STREAM, making a benchmark between the two streams isolate the
 effect of one process versus multiple rank processes issuing storage I/O.
+The production shared-window factory requires the MPI unified memory model and rejects a separate-model window before
+payload I/O, because producers and consumers directly load and store the shared slot bytes.
 
 RANK-STREAM is still not rank-selective loading. Every node collectively reads one complete logical checkpoint, and
 all consumers still apply their existing TP/PP/CP/EP mapping. A future `RankWeightManifest` can restrict producers to
