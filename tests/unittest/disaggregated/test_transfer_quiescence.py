@@ -265,6 +265,9 @@ def _make_rx_session(task_status: TaskStatus = TaskStatus.INIT) -> tuple[RxSessi
     session._close_requested = False
     session._terminal_status = None
     session._exception = None
+    session.transfer_start_time = None
+    session.transfer_end_time = None
+    session.kv_cache_size_bytes = 0
     session._kv_tasks = [task]
     session._need_aux = False
     session._outstanding_operations = 0
@@ -510,10 +513,12 @@ def test_rx_wrong_v2_result_identity_fails_closed_without_retiring_credit(
         0,
         True,
         AgentResult.SUCCESS,
+        transfer_size=4096,
         sender_endpoint=sender_endpoint,
         request_epoch=request_epoch,
     )
 
+    assert session.kv_cache_size_bytes == 0
     assert session._outstanding_operations == 1
     assert task.status == TaskStatus.TRANSFERRING
     assert session.status == SessionStatus.ERROR
@@ -537,12 +542,15 @@ def test_rx_exact_v2_result_retires_once_and_duplicate_is_idempotent() -> None:
             0,
             True,
             AgentResult.SUCCESS,
+            transfer_size=4096,
             sender_endpoint="tcp://sender",
             request_epoch=session.request_epoch,
         )
 
+    assert session.kv_cache_size_bytes == 4096
     assert session._outstanding_operations == 0
     assert task.status == TaskStatus.TRANSFERRED
+    assert session.transfer_end_time is not None
     assert session._retired_operation_keys == {("kv", 0, 0)}
 
 
