@@ -48,6 +48,10 @@ class _FakeRequest:
     state: Optional[LlmRequestState] = None
     request_id: int = 0
     py_disaggregated_params: Optional[object] = None
+    kv_cache_transfer_start: Optional[int] = None
+
+    def set_kv_cache_transfer_start(self, value: int) -> None:
+        self.kv_cache_transfer_start = value
 
 
 class _FakeTransferWorker:
