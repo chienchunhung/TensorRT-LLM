@@ -646,6 +646,51 @@ check.
 Llama 4 min-latency mode is also ineligible because it eagerly derives FP8 layouts before deferred partial-load
 finalization.
 
+### Design Gap: Why Partial Loading Is Model-Specific
+
+Supporting `allow_partial_loading=True` is not a signature-only change. A bounded stream may expose only one dependency
+group at a time and may release its source bytes immediately after that group is consumed. The model, mapper, nested
+modules, and finalization path must therefore satisfy one transaction contract:
+
+1. **Exact atomic groups:** the mapper must partition every checkpoint key exactly once and keep every cross-key
+   dependency in one group. Examples include fused Q/K/V projections, weight plus block/global scales, gate weight plus
+   correction bias, fused experts, and multimodal encoder/projector transforms.
+2. **Incremental and idempotent mutation:** top-level `load_weights` must accept a complete group without requiring
+   unrelated keys, must not reopen the checkpoint, and must not repeat or corrupt parameters loaded by earlier groups.
+3. **Nested backend capability:** every destination Linear, MoE, quantization, and auxiliary module reached by a group
+   must support partial loading. One unsupported nested method makes the whole stream ineligible.
+4. **Explicit finalization:** aliases, cross-layer norm wiring, scale folding, derived layouts, and other transforms
+   that require previously loaded parameters must run once after all required groups arrive, not implicitly during
+   each partial call.
+5. **Bounded source lifetime:** code must not retain raw tensors or borrowed views after acknowledging a group unless
+   it stages owned storage. Dynamic EPLB and similar features that intentionally retain a complete raw expert set
+   violate this contract.
+6. **One coordinated checkpoint transaction:** separately opened target/draft checkpoints and wrappers that delegate
+   to multiple independent whole-state loaders need an explicit multi-session protocol; partial support in one nested
+   component is insufficient.
+
+These constraints explain why mathematically splittable checkpoints are not automatically streamable. Whole-checkpoint
+loaders commonly perform direct dictionary lookups, cross-key fusion, quantization conversion, multimodal remapping,
+and post-load aliasing in one call. Silently presenting arbitrary subsets would risk missing keys, duplicated
+transforms, dangling borrowed storage, or partially mutated models. Strict preflight rejects these configurations
+before payload I/O rather than falling back after mutation.
+
+| Family/path | Current bounded-stream status | Principal gap |
+| --- | --- | --- |
+| Qwen 3.5 | Initially qualified | Model-specific mapper publishes audited groups and model/modules implement partial loading. |
+| Llama 4 | Initially qualified, except min-latency mode | Aggregate text/vision groups are explicit; min-latency eagerly derives layouts before deferred finalization. |
+| DeepSeek V3/V3.2 | Ineligible | Bespoke loader lacks a top-level partial contract; Q/KV and quant scales are fused across keys; post-load aliases cross layers; generic mapper publishes no audited manifest. |
+| DeepSeek V4 | Ineligible | Bespoke whole-checkpoint loader and cross-layer finalization require a complete transaction; no audited manifest. |
+| Kimi K2 using the DeepSeek V3 backbone | Ineligible | Inherits the DeepSeek V3 loader and mapper gaps. |
+| Kimi K2.5 multimodal wrapper | Ineligible | Wrapper, vision encoder, and DeepSeek V3 backbone expect complete dictionaries and multi-key transforms; no audited aggregate manifest. |
+| Other generic/custom HF models | Ineligible by default | Must opt in only after an exact-class audit; custom mappers and derived classes cannot inherit another class's safety claim. |
+
+Closing this gap for a family requires a model-specific dependency audit, an exact-cover mapper manifest, incremental
+top-level and nested loaders, an explicit one-shot finalizer, quantization-specific group tests, incomplete-group
+negative tests, borrowed-lifetime checks, and end-to-end parity across the intended TP/PP/EP/attention-DP/speculative
+configurations. Until those gates pass, RANK-STRIPED remains the model-neutral optimization because it preserves the
+existing complete-dictionary materialization contract.
+
 RANK-STRIPED retains the full-checkpoint host-memory guard. NODE-STREAM and RANK-STREAM instead require enough host memory for two
 effective shared slots, normal model construction, and any rank-local staging. The arena budget does not constrain
 staging: in the conservative path, each local rank may hold one complete atomic group. Trials must report effective
