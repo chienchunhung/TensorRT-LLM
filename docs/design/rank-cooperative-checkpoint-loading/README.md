@@ -20,7 +20,11 @@ compilation, warmup, and other startup improvements.
 | Document | Purpose |
 | --- | --- |
 | [Main design](design.md) | Architecture, policy semantics, integration boundaries, and rollout plan. |
-| [Experiment and benchmark plan](benchmark-plan.md) | Reproducible 8xB300 campaign, metrics, qualification matrix, and acceptance gates. |
+| [Experiment and benchmark plan](benchmark-plan.md) | Reproducible 8xB300 campaign, metrics, qualification matrix, acceptance gates, and measured results in Appendices A-B. |
+
+The latest measured evidence is the preliminary two-block, same-node Qwen3.5-397B-A17B-FP8 qualification in
+`benchmark-plan.md` Appendix B. Results from different models, PR revisions, nodes, and cache protocols are listed as
+separate rounds and must not be combined.
 
 ## Scope
 

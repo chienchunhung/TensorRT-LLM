@@ -1105,6 +1105,77 @@ lower aggregate NFS throughput than the distributed legacy/direct paths on this 
 rank read is the only policy that improves startup; shared host producer should not be a default candidate without
 further redesign or storage-specific qualification.
 
+## Appendix B: Current Streaming Prototype Results
+
+> **Result-provenance warning:** these results came from multiple independent experiment rounds, not one continuous
+> campaign. The rounds used different model sizes, quantization formats, PR #16562 revisions, loader implementations,
+> nodes, run counts, and cache controls. Compare a treatment only with the baseline from the same round, model,
+> checkpoint, node/cache protocol, and runtime configuration. Do not aggregate superseded, cross-node, ineligible, or
+> failed-OOM observations.
+
+| Round | PR/head | Model/checkpoint | Node/control | Comparability |
+| --- | --- | --- | --- | --- |
+| Historical reference (Appendix A) | `e836be1384` | Qwen3.5-397B FP8 and DeepSeek-V4-Pro | One block per model; `O_DIRECT`; initial DeepSeek crossed nodes | Early direction only; the controlled DeepSeek rerun supersedes its cross-node ranking. |
+| Updated stream qualification | `aa7a616b0a` | DeepSeek-V4-Pro | Same-node strict qualification | DeepSeek-V4 rejected incremental streaming because its loader lacked `allow_partial_loading`. |
+| Four-policy Qwen qualification | `0fe10ac670` | Qwen3.5-397B FP8 (406.15 GB) | `umb-b300-dp-199`; one true-cold run per policy | First current direct/node-stream/rank-stream/native comparison; one block only. |
+| Repeated instrumented Qwen campaign | `0fe10ac670` | Qwen3.5-397B FP8 (406.15 GB) | `umb-b300-dp-186`; two complete true-cold blocks | Latest results; eight per-rank-verified same-node runs. Block 3 was interrupted. |
+| Excluded capacity diagnostic | `0fe10ac670` | Qwen3.5-397B BF16 (806.80 GB) | B300 TP=8; roughly 2 TiB host RAM | Rank-stream completed, but rank-striped read-ahead triggered host OOM. Excluded from speed comparisons. |
+
+### Updated-head eligibility result
+
+At `aa7a616b0add9ffceab5bf72cb5ae35e0f81e64a`, strict shared streaming rejected
+`DeepseekV4ForCausalLM` before payload I/O because its `load_weights` path did not support incremental
+`allow_partial_loading`. Qwen3.5-397B-A17B-FP8 was selected for the fair four-policy comparison because its mapper
+provides qualified atomic weight groups.
+
+### One-block four-policy qualification
+
+At `0fe10ac670b821fe634c27ad24cd1315b2ad7a39`, one true-cold TP=8 run per strict policy completed on
+`umb-b300-dp-199`. `O_DIRECT` staging and `mincore` verified zero resident client pages before every timed startup.
+All ranks selected the requested policy, generated one token, and shut down cleanly.
+
+| Policy | Model init (s) | Reduction | Weight session (s) | Reduction | LLM init (s) | Reduction | Process to first token (s) | Reduction |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| NATIVE (`legacy_fallback`) | 349.97 | — | 346.99 | — | 459.99 | — | 528.14 | — |
+| RANK-STRIPED (`direct_rank_read`) | 306.34 | 12.5% | 303.35 | 12.6% | 418.59 | 9.0% | 487.36 | 7.7% |
+| NODE-STREAM (`shared_host_producer`) | 344.93 | 1.4% | 340.52 | 1.9% | 457.33 | 0.6% | 525.79 | 0.4% |
+| RANK-STREAM (`rank_cooperative_stream`) | 318.17 | 9.1% | 310.02 | 10.7% | 466.98 | -1.5% | 538.69 | -2.0% |
+
+The one-block rank-stream loading gain did not improve full startup, but one observation provides no statistical
+confidence and fixed treatment order can expose JIT, runtime-cache, and storage-order effects.
+
+### Preliminary repeated instrumented qualification
+
+A follow-up added timing for sampler and KV-cache initialization, executor construction, attention JIT, autotuning,
+CUDA graph capture, model warmup, worker startup, and proxy READY wait. Blocks 1 and 2 completed on
+`umb-b300-dp-186`; every event from all eight runs records that hostname. Orders were NATIVE/RANK-STRIPED/NODE-STREAM/
+RANK-STREAM and RANK-STRIPED/NODE-STREAM/RANK-STREAM/NATIVE. Reallocation interrupted Block 3.
+
+| Policy | Model init median (s) | Reduction | Weight session median (s) | Reduction | LLM init median (s) | Reduction | Process to first token median (s) | Reduction |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| NATIVE | 552.33 | — | 549.55 | — | 685.91 | — | 764.23 | — |
+| RANK-STRIPED | 459.02 | 16.9% | 455.33 | 17.1% | 586.72 | 14.4% | 666.15 | 12.8% |
+| NODE-STREAM | 469.76 | 15.0% | 465.69 | 15.3% | 593.80 | 13.4% | 683.22 | 10.6% |
+| RANK-STREAM | 462.83 | 16.2% | 458.94 | 16.5% | 592.51 | 13.6% | 669.54 | 12.4% |
+
+| Policy | Block 1 LLM init (s) | Block 2 LLM init (s) | Model warmup median (s) | Proxy READY wait median (s) |
+| --- | ---: | ---: | ---: | ---: |
+| NATIVE | 695.31 | 676.50 | 38.15 | 683.16 |
+| RANK-STRIPED | 582.00 | 591.45 | 35.39 | 583.99 |
+| NODE-STREAM | 593.78 | 593.82 | 36.16 | 590.92 |
+| RANK-STREAM | 593.33 | 591.69 | 38.21 | 589.95 |
+
+All optimized policies improved loading and full initialization in both completed blocks. The earlier rank-stream e2e
+regression did not reproduce: its warmup median matched NATIVE while its shorter weight session propagated through
+proxy READY. Two blocks show consistency but do not provide robust confidence intervals.
+
+### Excluded BF16 capacity diagnostic
+
+The 806.80 GB BF16 checkpoint is not operationally eligible for a four-policy speed comparison on this roughly 2 TiB
+host. During RANK-STRIPED materialization, eight ranks each consumed roughly 226-286 GiB of anonymous host memory and
+Linux SIGKILLed one rank. Bounded RANK-STREAM completed individually, demonstrating a memory-scalability advantage,
+but the unmatched observation is excluded from performance ranking.
+
 ## References
 
 - [Rank-Cooperative Checkpoint Loading](design.md)
