@@ -1119,6 +1119,7 @@ further redesign or storage-specific qualification.
 | Updated stream qualification | `aa7a616b0a` | DeepSeek-V4-Pro | Same-node strict qualification | DeepSeek-V4 rejected incremental streaming because its loader lacked `allow_partial_loading`. |
 | Four-policy Qwen qualification | `0fe10ac670` | Qwen3.5-397B FP8 (406.15 GB) | `umb-b300-dp-199`; one true-cold run per policy | First current direct/node-stream/rank-stream/native comparison; one block only. |
 | Repeated instrumented Qwen campaign | `0fe10ac670` | Qwen3.5-397B FP8 (406.15 GB) | `umb-b300-dp-186`; two complete true-cold blocks | Latest results; eight per-rank-verified same-node runs. Block 3 was interrupted. |
+| Llama 4 Maverick partial repeated campaign | `0fe10ac670` | NVIDIA Llama-4-Maverick-17B-128E FP8 (402.80 GB) | `umb-b300-dp-149`; two complete blocks plus two Block 3 stream runs | NATIVE/RANK-STRIPED have N=2; both streams have N=3. All passed; streams used 100% rank-local staging. |
 | Excluded capacity diagnostic | `0fe10ac670` | Qwen3.5-397B BF16 (806.80 GB) | B300 TP=8; roughly 2 TiB host RAM | Rank-stream completed, but rank-striped read-ahead triggered host OOM. Excluded from speed comparisons. |
 
 ### Updated-head eligibility result
@@ -1168,6 +1169,41 @@ RANK-STREAM and RANK-STRIPED/NODE-STREAM/RANK-STREAM/NATIVE. Reallocation interr
 All optimized policies improved loading and full initialization in both completed blocks. The earlier rank-stream e2e
 regression did not reproduce: its warmup median matched NATIVE while its shorter weight session propagated through
 proxy READY. Two blocks show consistency but do not provide robust confidence intervals.
+
+### Llama 4 Maverick FP8 partial repeated campaign
+
+Ten true-cold TP=8 runs completed on `umb-b300-dp-149` with the NVIDIA CI checkpoint
+`llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8` (402.80 GB, 52 shards). The similarly named
+compressed-tensors checkpoint was rejected before loading by the CUTLASS MoE backend with
+`Unsupported quantization mode: [536]` and is not a result.
+
+Blocks 1 and 2 are complete. Node reallocation interrupted Block 3 after NODE-STREAM and RANK-STREAM, so NATIVE and
+RANK-STRIPED have two observations each while both streams have three. All ten completed runs and per-rank events
+record only `umb-b300-dp-149`. The medians below expose the unequal sample counts and are not treated as one complete
+three-block aggregate.
+
+| Policy | N | Model init median (s) | Weight session median (s) | LLM init median (s) | Process to first token median (s) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NATIVE | 2 | 220.88 | 218.88 | 324.50 | 394.86 |
+| RANK-STRIPED | 2 | 151.62 | 149.33 | 247.74 | 317.05 |
+| NODE-STREAM | 3 | 423.66 | 421.59 | 519.31 | 586.64 |
+| RANK-STREAM | 3 | 426.38 | 424.05 | 517.69 | 586.34 |
+
+For the two complete paired blocks only:
+
+| Policy | Model init reduction | Weight session reduction | LLM init reduction | Process to first token reduction |
+| --- | ---: | ---: | ---: | ---: |
+| RANK-STRIPED | 31.1% | 31.5% | 23.6% | 19.7% |
+| NODE-STREAM | -92.6% | -93.4% | -60.4% | -48.0% |
+| RANK-STREAM | -92.6% | -93.4% | -60.4% | -49.1% |
+
+Both streams processed 243 atomic groups in 243 batches. On rank 0, each streamed the complete 402.80 GB payload
+through rank-local staging (`direct_bytes=0`, `staged_bytes=402.80 GB`). NODE-STREAM spent 51.40 seconds in staging
+and 304.15 seconds in materialization; RANK-STREAM spent 51.70 and 293.54 seconds respectively. This checkpoint
+therefore validates correctness and policy selection but not the direct-view Yijin path. The extra owned-buffer copy
+and per-group materialization dominate, while RANK-STRIPED preserves mmap materialization and wins both complete
+blocks. The unpaired third streaming observations reinforce their absolute repeatability but cannot add a paired
+speedup estimate without the missing Block 3 baseline and rank-striped cells.
 
 ### Excluded BF16 capacity diagnostic
 
