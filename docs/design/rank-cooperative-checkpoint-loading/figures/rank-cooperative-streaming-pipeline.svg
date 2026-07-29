@@ -1,0 +1,284 @@
+<!--
+  Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+-->
+<svg viewBox="0 0 1800 900" role="img" aria-labelledby="rank-stream-title rank-stream-desc">
+    <title id="rank-stream-title">Rank-cooperative checkpoint streaming steady-state pipeline</title>
+    <desc id="rank-stream-desc">On one node, a subset of rank processes cooperatively reads disjoint checkpoint extents through the Linux page cache into the inactive shared-buffer slot for batch N plus 1. At the same time, all local ranks consume batch N from the active slot, assemble atomic weight groups, and transfer completed groups to their GPUs. Producer publication and active-world completion consensus jointly gate the next slot swap.</desc>
+    <style>
+      svg {
+        display: block;
+        width: 100%;
+        height: auto;
+        font-family: Arial, sans-serif;
+      }
+      .lane-label {
+        fill: #5f6368;
+        font-size: 24px;
+        font-weight: 500;
+        letter-spacing: 1.2px;
+      }
+      .section-label {
+        fill: #5f6368;
+        font-size: 21px;
+        font-weight: 500;
+        letter-spacing: 0.7px;
+      }
+      .label {
+        fill: #202124;
+        font-size: 29px;
+        font-weight: 500;
+      }
+      .body {
+        fill: #202124;
+        font-size: 24px;
+        font-weight: 400;
+      }
+      .small {
+        fill: #5f6368;
+        font-size: 20px;
+        font-weight: 400;
+      }
+      .micro {
+        fill: #202124;
+        font-size: 19px;
+        font-weight: 500;
+      }
+      .box {
+        fill: #ffffff;
+        stroke: #c7cdd4;
+        stroke-width: 2;
+      }
+      .io-box {
+        fill: #e8f0fe;
+        stroke: #1a73e8;
+        stroke-width: 3;
+      }
+      .consume-box {
+        fill: #e6f4ea;
+        stroke: #188038;
+        stroke-width: 3;
+      }
+      .buffer-frame {
+        fill: #ffffff;
+        stroke: #5f6368;
+        stroke-width: 3;
+      }
+      .gate-box {
+        fill: #f1f3f4;
+        stroke: #9334e6;
+        stroke-width: 3;
+      }
+      .rank-chip {
+        fill: #ffffff;
+        stroke: #1a73e8;
+        stroke-width: 2;
+      }
+      .consumer-chip {
+        fill: #ffffff;
+        stroke: #188038;
+        stroke-width: 2;
+      }
+      .gpu-chip {
+        fill: #ffffff;
+        stroke: #188038;
+        stroke-width: 2;
+      }
+      .flow-io {
+        fill: none;
+        stroke: #1a73e8;
+        stroke-width: 5;
+        marker-end: url(#arrow-io);
+      }
+      .flow-consume {
+        fill: none;
+        stroke: #188038;
+        stroke-width: 5;
+        marker-end: url(#arrow-consume);
+      }
+      .flow-gate {
+        fill: none;
+        stroke: #9334e6;
+        stroke-width: 4;
+        stroke-dasharray: 12 10;
+        marker-end: url(#arrow-gate);
+      }
+      .flow-advance {
+        fill: none;
+        stroke: #9334e6;
+        stroke-width: 5;
+        marker-end: url(#arrow-gate);
+      }
+      .divider {
+        stroke: #c7cdd4;
+        stroke-width: 2;
+      }
+      .thread {
+        fill: #1a73e8;
+      }
+      .cache-line {
+        stroke: #5f6368;
+        stroke-width: 4;
+        stroke-linecap: round;
+      }
+      .extent-a {
+        fill: #1a73e8;
+        opacity: 0.9;
+      }
+      .extent-b {
+        fill: #9334e6;
+        opacity: 0.72;
+      }
+      .extent-c {
+        fill: #188038;
+        opacity: 0.78;
+      }
+      .extent-label {
+        fill: #ffffff;
+        font-size: 16px;
+        font-weight: 500;
+      }
+      .concurrent-band {
+        fill: #f1f3f4;
+      }
+      .concurrent-line {
+        stroke: #9334e6;
+        stroke-width: 3;
+      }
+    </style>
+
+    <defs>
+      <marker id="arrow-io" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a73e8"/>
+      </marker>
+      <marker id="arrow-consume" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#188038"/>
+      </marker>
+      <marker id="arrow-gate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#9334e6"/>
+      </marker>
+    </defs>
+
+    <rect x="52" y="36" width="1696" height="60" rx="18" class="concurrent-band"/>
+    <text x="900" y="75" text-anchor="middle" class="lane-label">ONE NODE · CONCURRENT STEADY STATE</text>
+
+    <text x="70" y="144" class="lane-label">PRODUCER LANE · FILL N+1</text>
+    <text x="1255" y="416" class="lane-label">CONSUMER LANE · MATERIALIZE N</text>
+
+    <rect x="70" y="196" width="180" height="132" rx="18" class="box"/>
+    <text x="160" y="240" text-anchor="middle" class="label">Storage</text>
+    <text x="160" y="276" text-anchor="middle" class="body">NFS / NVMe /</text>
+    <text x="160" y="307" text-anchor="middle" class="body">parallel FS</text>
+
+    <path d="M 255 262 H 290" class="flow-io"/>
+
+    <rect x="300" y="196" width="180" height="132" rx="18" class="box"/>
+    <text x="390" y="229" text-anchor="middle" class="section-label">LINUX PAGE</text>
+    <text x="390" y="253" text-anchor="middle" class="section-label">CACHE</text>
+    <line x1="340" y1="276" x2="440" y2="276" class="cache-line"/>
+    <line x1="340" y1="298" x2="440" y2="298" class="cache-line"/>
+
+    <path d="M 485 262 H 520" class="flow-io"/>
+
+    <rect x="530" y="166" width="280" height="216" rx="20" class="io-box"/>
+    <text x="670" y="202" text-anchor="middle" class="section-label">ACTIVE PRODUCER</text>
+    <text x="670" y="226" text-anchor="middle" class="section-label">RANK SUBSET</text>
+    <text x="670" y="251" text-anchor="middle" class="small">also part of the consumer set</text>
+    <rect x="564" y="268" width="58" height="40" rx="10" class="rank-chip"/>
+    <rect x="641" y="268" width="58" height="40" rx="10" class="rank-chip"/>
+    <rect x="718" y="268" width="58" height="40" rx="10" class="rank-chip"/>
+    <text x="593" y="295" text-anchor="middle" class="micro">R0</text>
+    <text x="670" y="295" text-anchor="middle" class="micro">R1</text>
+    <text x="747" y="295" text-anchor="middle" class="micro">Rk</text>
+    <circle cx="578" cy="322" r="5" class="thread"/>
+    <circle cx="596" cy="322" r="5" class="thread"/>
+    <circle cx="654" cy="322" r="5" class="thread"/>
+    <circle cx="672" cy="322" r="5" class="thread"/>
+    <circle cx="690" cy="322" r="5" class="thread"/>
+    <circle cx="731" cy="322" r="5" class="thread"/>
+    <circle cx="749" cy="322" r="5" class="thread"/>
+    <text x="670" y="348" text-anchor="middle" class="small">one node worker budget</text>
+    <text x="670" y="371" text-anchor="middle" class="small">one writer per raw extent</text>
+
+    <path d="M 815 262 H 900" class="flow-io"/>
+
+    <rect x="860" y="118" width="330" height="540" rx="24" class="buffer-frame"/>
+    <text x="1025" y="150" text-anchor="middle" class="section-label">NODE-LOCAL SHARED</text>
+    <text x="1025" y="174" text-anchor="middle" class="section-label">DOUBLE BUFFER</text>
+
+    <rect x="900" y="194" width="250" height="142" rx="18" class="io-box"/>
+    <text x="1025" y="225" text-anchor="middle" class="section-label">INACTIVE SLOT B</text>
+    <text x="1025" y="269" text-anchor="middle" class="label">FILL N+1</text>
+    <rect x="936" y="290" width="56" height="18" rx="4" class="extent-a"/>
+    <rect x="998" y="290" width="44" height="18" rx="4" class="extent-b"/>
+    <rect x="1048" y="290" width="66" height="18" rx="4" class="extent-c"/>
+    <text x="964" y="304" text-anchor="middle" class="extent-label">R0</text>
+    <text x="1020" y="304" text-anchor="middle" class="extent-label">R1</text>
+    <text x="1081" y="304" text-anchor="middle" class="extent-label">Rk</text>
+    <text x="1025" y="327" text-anchor="middle" class="small">nonoverlapping raw bytes</text>
+
+    <line x1="900" y1="382" x2="950" y2="382" class="concurrent-line"/>
+    <rect x="960" y="360" width="130" height="44" rx="15" class="concurrent-band"/>
+    <text x="1025" y="389" text-anchor="middle" class="micro">CONCURRENT</text>
+    <line x1="1100" y1="382" x2="1150" y2="382" class="concurrent-line"/>
+
+    <rect x="900" y="445" width="250" height="142" rx="18" class="consume-box"/>
+    <text x="1025" y="476" text-anchor="middle" class="section-label">ACTIVE SLOT A</text>
+    <text x="1025" y="520" text-anchor="middle" class="label">CONSUME N</text>
+    <rect x="935" y="542" width="180" height="17" rx="4" class="extent-c"/>
+    <text x="1025" y="578" text-anchor="middle" class="small">immutable published lease</text>
+    <text x="1025" y="632" text-anchor="middle" class="small">two bounded slots · no full checkpoint</text>
+
+    <path d="M 1155 265 H 1245" class="flow-io"/>
+
+    <rect x="1255" y="196" width="290" height="132" rx="18" class="io-box"/>
+    <text x="1400" y="234" text-anchor="middle" class="section-label">PRODUCER QUORUM</text>
+    <circle cx="1300" cy="278" r="19" class="rank-chip"/>
+    <path d="M 1289 278 l 8 8 l 15 -18" fill="none" stroke="#1a73e8" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="1418" y="275" text-anchor="middle" class="body">all writes visible</text>
+    <text x="1418" y="305" text-anchor="middle" class="body">publish N+1</text>
+
+    <path d="M 1155 516 H 1245" class="flow-consume"/>
+
+    <rect x="1255" y="441" width="290" height="186" rx="20" class="consume-box"/>
+    <text x="1400" y="479" text-anchor="middle" class="section-label">ALL LOCAL RANKS</text>
+    <rect x="1282" y="500" width="55" height="42" rx="10" class="consumer-chip"/>
+    <rect x="1345" y="500" width="55" height="42" rx="10" class="consumer-chip"/>
+    <rect x="1408" y="500" width="55" height="42" rx="10" class="consumer-chip"/>
+    <rect x="1471" y="500" width="47" height="42" rx="10" class="consumer-chip"/>
+    <text x="1309.5" y="529" text-anchor="middle" class="micro">R0</text>
+    <text x="1372.5" y="529" text-anchor="middle" class="micro">R1</text>
+    <text x="1435.5" y="529" text-anchor="middle" class="micro">R2</text>
+    <text x="1494.5" y="529" text-anchor="middle" class="micro">Rn</text>
+    <text x="1400" y="578" text-anchor="middle" class="body">assemble owned groups</text>
+    <text x="1400" y="609" text-anchor="middle" class="small">includes producer ranks</text>
+
+    <path d="M 1550 534 H 1580" class="flow-consume"/>
+
+    <rect x="1590" y="441" width="170" height="186" rx="20" class="consume-box"/>
+    <text x="1675" y="477" text-anchor="middle" class="section-label">GROUP READY</text>
+    <text x="1675" y="510" text-anchor="middle" class="body">transform</text>
+    <text x="1675" y="539" text-anchor="middle" class="body">+ H2D</text>
+    <rect x="1615" y="566" width="38" height="34" rx="7" class="gpu-chip"/>
+    <rect x="1657" y="566" width="38" height="34" rx="7" class="gpu-chip"/>
+    <rect x="1699" y="566" width="36" height="34" rx="7" class="gpu-chip"/>
+    <text x="1634" y="589" text-anchor="middle" class="micro">G0</text>
+    <text x="1676" y="589" text-anchor="middle" class="micro">G1</text>
+    <text x="1717" y="589" text-anchor="middle" class="micro">Gn</text>
+    <text x="1675" y="619" text-anchor="middle" class="small">no GPU broadcast</text>
+
+    <rect x="1090" y="680" width="225" height="42" rx="14" class="gate-box"/>
+    <text x="1202.5" y="708" text-anchor="middle" class="micro">✓ N+1 PUBLISHED</text>
+    <rect x="1500" y="680" width="220" height="42" rx="14" class="gate-box"/>
+    <text x="1610" y="708" text-anchor="middle" class="micro">✓ N RELEASED</text>
+    <line x1="1202.5" y1="722" x2="1202.5" y2="736" class="concurrent-line"/>
+    <line x1="1610" y1="722" x2="1610" y2="736" class="concurrent-line"/>
+
+    <rect x="1000" y="736" width="730" height="112" rx="22" class="gate-box"/>
+    <text x="1365" y="770" text-anchor="middle" class="section-label">NEXT-CYCLE GATE · READY ∧ RELEASED</text>
+    <text x="1365" y="802" text-anchor="middle" class="body">active-world completion / error consensus</text>
+    <text x="1365" y="832" text-anchor="middle" class="small">release lease · B becomes active · A becomes reusable</text>
+
+    <path d="M 1000 792 C 818 792 786 696 862 617" class="flow-advance"/>
+    <text x="853" y="765" text-anchor="middle" class="small">swap slots / advance</text>
+  </svg>
