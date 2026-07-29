@@ -1,0 +1,365 @@
+<!--
+  Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+-->
+<svg viewBox="0 0 1800 1030" role="img" aria-labelledby="checkpoint-loader-title checkpoint-loader-desc">
+    <title id="checkpoint-loader-title">Comparison of three TensorRT-LLM checkpoint-loading policies</title>
+    <desc id="checkpoint-loader-desc">Three aligned workflows contrast page-cache read-ahead with no payload handoff, a one-producer bounded batch stream, and a multi-producer bounded batch stream. The two streaming modes share the same consumer and completion protocol.</desc>
+    <style>
+      {
+        width: 100%;
+        color: #202124;
+      }
+      svg {
+        display: block;
+        width: 100%;
+        height: auto;
+        font-family: Arial, sans-serif;
+      }
+      .heading {
+        fill: #5f6368;
+        font-size: 27px;
+        font-weight: 500;
+        letter-spacing: 1.2px;
+      }
+      .policy {
+        fill: #202124;
+        font-size: 38px;
+        font-weight: 500;
+      }
+      .policy-primary {
+        fill: #1a73e8;
+      }
+      .signature {
+        fill: #5f6368;
+        font-size: 27px;
+        font-weight: 400;
+      }
+      .label {
+        fill: #202124;
+        font-size: 29px;
+        font-weight: 500;
+      }
+      .body {
+        fill: #202124;
+        font-size: 26px;
+        font-weight: 400;
+      }
+      .small {
+        fill: #5f6368;
+        font-size: 23px;
+        font-weight: 400;
+      }
+      .micro {
+        fill: #202124;
+        font-size: 21px;
+        font-weight: 500;
+      }
+      .row-rule,
+      .column-rule {
+        stroke: #c7cdd4;
+        stroke-width: 2;
+      }
+      .box {
+        fill: #ffffff;
+        stroke: #c7cdd4;
+        stroke-width: 2;
+      }
+      .neutral-box {
+        fill: #f1f3f4;
+        stroke: #5f6368;
+        stroke-width: 2;
+      }
+      .node-box {
+        fill: #ffffff;
+        stroke: #9334e6;
+        stroke-width: 3;
+      }
+      .rank-box {
+        fill: #ffffff;
+        stroke: #1a73e8;
+        stroke-width: 3;
+      }
+      .slot-a {
+        fill: #e6f4ea;
+        stroke: #188038;
+        stroke-width: 2;
+      }
+      .slot-b {
+        fill: #e8f0fe;
+        stroke: #1a73e8;
+        stroke-width: 2;
+      }
+      .row-primary-bg {
+        fill: #1a73e8;
+        opacity: 0.07;
+      }
+      .flow-neutral {
+        fill: none;
+        stroke: #5f6368;
+        stroke-width: 4;
+        marker-end: url(#arrow-neutral);
+      }
+      .flow-node {
+        fill: none;
+        stroke: #9334e6;
+        stroke-width: 4;
+        marker-end: url(#arrow-node);
+      }
+      .flow-rank {
+        fill: none;
+        stroke: #1a73e8;
+        stroke-width: 4;
+        marker-end: url(#arrow-rank);
+      }
+      .overlap-neutral {
+        fill: none;
+        stroke: #5f6368;
+        stroke-width: 3;
+        stroke-dasharray: 14 12;
+      }
+      .overlap-node {
+        fill: none;
+        stroke: #9334e6;
+        stroke-width: 4;
+      }
+      .overlap-rank {
+        fill: none;
+        stroke: #1a73e8;
+        stroke-width: 4;
+      }
+      .thread-node {
+        fill: #9334e6;
+      }
+      .thread-rank {
+        fill: #1a73e8;
+      }
+      .cache-line {
+        stroke: #5f6368;
+        stroke-width: 4;
+        stroke-linecap: round;
+      }
+      .same-contract {
+        fill: #e6f4ea;
+        stroke: #c7cdd4;
+        stroke-width: 2;
+      }
+    </style>
+
+    <defs>
+      <marker id="arrow-neutral" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#5f6368"/>
+      </marker>
+      <marker id="arrow-node" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#9334e6"/>
+      </marker>
+      <marker id="arrow-rank" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a73e8"/>
+      </marker>
+    </defs>
+
+    <text x="45" y="45" class="heading">POLICY</text>
+    <text x="338" y="45" class="heading">READ ISSUERS</text>
+    <text x="758" y="45" class="heading">HANDOFF STATE</text>
+    <text x="1180" y="45" class="heading">MATERIALIZE / H2D</text>
+    <text x="1530" y="45" class="heading">PUBLISH / REUSE</text>
+
+    <line x1="315" y1="65" x2="315" y2="1005" class="column-rule"/>
+    <line x1="735" y1="65" x2="735" y2="1005" class="column-rule"/>
+    <line x1="1155" y1="65" x2="1155" y2="1005" class="column-rule"/>
+    <line x1="1510" y1="65" x2="1510" y2="1005" class="column-rule"/>
+    <line x1="35" y1="355" x2="1765" y2="355" class="row-rule"/>
+    <line x1="35" y1="665" x2="1765" y2="665" class="row-rule"/>
+
+    <!-- RANK-STRIPED -->
+    <text x="45" y="123" class="policy">RANK-STRIPED</text>
+    <text x="45" y="164" class="signature">Page-cache read-ahead</text>
+    <text x="45" y="211" class="small">many rank readers</text>
+    <text x="45" y="242" class="small">no payload handoff</text>
+    <text x="45" y="273" class="small">opportunistic overlap</text>
+
+    <rect x="338" y="100" width="145" height="58" rx="12" class="neutral-box"/>
+    <text x="410.5" y="124" text-anchor="middle" class="micro">NFS / NVMe /</text>
+    <text x="410.5" y="148" text-anchor="middle" class="micro">parallel FS</text>
+    <path d="M 488 129 H 525" class="flow-neutral"/>
+    <rect x="535" y="92" width="165" height="116" rx="14" class="box"/>
+    <circle cx="570" cy="126" r="18" class="neutral-box"/>
+    <circle cx="618" cy="126" r="18" class="neutral-box"/>
+    <circle cx="666" cy="126" r="18" class="neutral-box"/>
+    <text x="570" y="133" text-anchor="middle" class="micro">R0</text>
+    <text x="618" y="133" text-anchor="middle" class="micro">R1</text>
+    <text x="666" y="133" text-anchor="middle" class="micro">Rk</text>
+    <text x="618" y="173" text-anchor="middle" class="body">disjoint read-ahead</text>
+    <text x="618" y="198" text-anchor="middle" class="small">fixed extents</text>
+
+    <path d="M 706 150 H 760" class="flow-neutral"/>
+    <rect x="770" y="92" width="350" height="162" rx="16" class="neutral-box"/>
+    <text x="945" y="126" text-anchor="middle" class="label">Linux page cache</text>
+    <line x1="838" y1="154" x2="1052" y2="154" class="cache-line"/>
+    <line x1="838" y1="175" x2="1052" y2="175" class="cache-line"/>
+    <line x1="838" y1="196" x2="1052" y2="196" class="cache-line"/>
+    <path d="M 1037 216 l 30 0 m -15 -15 l 0 30" class="overlap-neutral"/>
+    <line x1="1038" y1="201" x2="1066" y2="230" class="cache-line"/>
+    <text x="904" y="230" text-anchor="middle" class="small">no ready-batch signal</text>
+
+    <path d="M 1125 173 H 1180" class="flow-neutral"/>
+    <rect x="1190" y="92" width="290" height="162" rx="16" class="box"/>
+    <text x="1335" y="126" text-anchor="middle" class="label">unchanged loader</text>
+    <rect x="1215" y="154" width="70" height="45" rx="8" class="neutral-box"/>
+    <rect x="1298" y="154" width="86" height="45" rx="8" class="neutral-box"/>
+    <rect x="1397" y="154" width="58" height="45" rx="8" class="neutral-box"/>
+    <text x="1250" y="184" text-anchor="middle" class="micro">mmap</text>
+    <text x="1341" y="184" text-anchor="middle" class="micro">transform</text>
+    <text x="1426" y="184" text-anchor="middle" class="micro">H2D</text>
+    <text x="1335" y="232" text-anchor="middle" class="small">each rank follows native mapping</text>
+
+    <path d="M 1485 173 H 1530" class="flow-neutral"/>
+    <rect x="1540" y="92" width="210" height="162" rx="16" class="box"/>
+    <text x="1645" y="133" text-anchor="middle" class="body">join readers</text>
+    <text x="1645" y="176" text-anchor="middle" class="body">session error</text>
+    <text x="1645" y="207" text-anchor="middle" class="body">consensus</text>
+
+    <path d="M 470 299 H 1450" class="overlap-neutral"/>
+    <text x="960" y="330" text-anchor="middle" class="small">opportunistic: demand faults can overtake read-ahead</text>
+
+    <!-- NODE-STREAM -->
+    <text x="45" y="420" class="policy">NODE-STREAM</text>
+    <text x="45" y="461" class="signature">Single-producer stream</text>
+    <text x="45" y="508" class="small">one process + I/O pool</text>
+    <text x="45" y="539" class="small">bounded shared slots</text>
+    <text x="45" y="570" class="small">explicit N / N+1 overlap</text>
+
+    <rect x="338" y="400" width="145" height="58" rx="12" class="node-box"/>
+    <text x="410.5" y="424" text-anchor="middle" class="micro">NFS / NVMe /</text>
+    <text x="410.5" y="448" text-anchor="middle" class="micro">parallel FS</text>
+    <path d="M 488 429 H 525" class="flow-node"/>
+    <rect x="535" y="386" width="165" height="145" rx="14" class="node-box"/>
+    <text x="618" y="419" text-anchor="middle" class="label">one producer</text>
+    <text x="618" y="450" text-anchor="middle" class="small">node-local rank 0</text>
+    <circle cx="562" cy="484" r="8" class="thread-node"/>
+    <circle cx="590" cy="484" r="8" class="thread-node"/>
+    <circle cx="618" cy="484" r="8" class="thread-node"/>
+    <circle cx="646" cy="484" r="8" class="thread-node"/>
+    <circle cx="674" cy="484" r="8" class="thread-node"/>
+    <text x="618" y="516" text-anchor="middle" class="small">I/O thread pool</text>
+
+    <path d="M 706 459 H 760" class="flow-node"/>
+    <rect x="770" y="383" width="350" height="204" rx="16" class="node-box"/>
+    <rect x="798" y="399" width="294" height="55" rx="10" class="neutral-box"/>
+    <text x="945" y="422" text-anchor="middle" class="micro">buffered I/O via</text>
+    <text x="945" y="447" text-anchor="middle" class="micro">Linux page cache</text>
+    <path d="M 945 458 V 472" class="flow-node"/>
+    <rect x="798" y="480" width="136" height="76" rx="12" class="slot-a"/>
+    <rect x="956" y="480" width="136" height="76" rx="12" class="slot-b"/>
+    <text x="866" y="511" text-anchor="middle" class="micro">SLOT A</text>
+    <text x="866" y="539" text-anchor="middle" class="body">consume N</text>
+    <text x="1024" y="511" text-anchor="middle" class="micro">SLOT B</text>
+    <text x="1024" y="539" text-anchor="middle" class="body">fill N+1</text>
+    <text x="945" y="580" text-anchor="middle" class="small">producer publishes a ready batch</text>
+
+    <path d="M 1125 485 H 1180" class="flow-node"/>
+    <rect x="1190" y="383" width="290" height="204" rx="16" class="box"/>
+    <text x="1335" y="420" text-anchor="middle" class="label">all local ranks</text>
+    <rect x="1216" y="442" width="58" height="43" rx="8" class="neutral-box"/>
+    <rect x="1284" y="442" width="58" height="43" rx="8" class="neutral-box"/>
+    <rect x="1352" y="442" width="58" height="43" rx="8" class="neutral-box"/>
+    <rect x="1420" y="442" width="36" height="43" rx="8" class="neutral-box"/>
+    <text x="1245" y="471" text-anchor="middle" class="micro">R0</text>
+    <text x="1313" y="471" text-anchor="middle" class="micro">R1</text>
+    <text x="1381" y="471" text-anchor="middle" class="micro">R2</text>
+    <text x="1438" y="471" text-anchor="middle" class="micro">…</text>
+    <text x="1335" y="515" text-anchor="middle" class="body">assemble atomic group</text>
+    <text x="1335" y="551" text-anchor="middle" class="body">group ready → transform / H2D</text>
+    <text x="1335" y="579" text-anchor="middle" class="small">consumer path is rank-owned</text>
+
+    <path d="M 1485 485 H 1530" class="flow-node"/>
+    <rect x="1540" y="383" width="210" height="204" rx="16" class="box"/>
+    <text x="1645" y="426" text-anchor="middle" class="body">producer</text>
+    <text x="1645" y="457" text-anchor="middle" class="body">publishes</text>
+    <line x1="1572" y1="482" x2="1718" y2="482" class="row-rule"/>
+    <text x="1645" y="522" text-anchor="middle" class="body">all-rank ack</text>
+    <text x="1645" y="553" text-anchor="middle" class="body">gates slot reuse</text>
+
+    <line x1="474" y1="616" x2="905" y2="616" class="overlap-node"/>
+    <line x1="905" y1="635" x2="1455" y2="635" class="overlap-node"/>
+    <text x="689" y="608" text-anchor="middle" class="small">fill N+1</text>
+    <text x="1180" y="627" text-anchor="middle" class="small">consume N → transform / H2D</text>
+
+    <!-- Shared contract cue -->
+    <rect x="338" y="675" width="362" height="30" rx="15" class="same-contract"/>
+    <text x="519" y="697" text-anchor="middle" class="micro">ONLY ISSUER TOPOLOGY CHANGES</text>
+    <rect x="770" y="675" width="980" height="30" rx="15" class="same-contract"/>
+    <text x="1260" y="697" text-anchor="middle" class="micro">SAME SHARED SLOTS • CONSUMER / H2D PATH • COMPLETION PROTOCOL</text>
+
+    <!-- RANK-STREAM -->
+    <rect x="25" y="715" width="1740" height="285" rx="18" class="row-primary-bg"/>
+    <text x="45" y="772" class="policy policy-primary">RANK-STREAM</text>
+    <text x="45" y="813" class="signature">Multi-producer stream</text>
+    <text x="45" y="860" class="small">active producer ranks</text>
+    <text x="45" y="891" class="small">one node worker budget</text>
+    <text x="45" y="922" class="small">explicit N / N+1 overlap</text>
+    <text x="45" y="966" class="micro">PRIMARY DESIGN</text>
+
+    <rect x="338" y="746" width="145" height="58" rx="12" class="rank-box"/>
+    <text x="410.5" y="770" text-anchor="middle" class="micro">NFS / NVMe /</text>
+    <text x="410.5" y="794" text-anchor="middle" class="micro">parallel FS</text>
+    <path d="M 488 775 H 525" class="flow-rank"/>
+    <rect x="535" y="725" width="165" height="188" rx="14" class="rank-box"/>
+    <text x="618" y="758" text-anchor="middle" class="label">producer ranks</text>
+    <rect x="552" y="781" width="38" height="52" rx="8" class="rank-box"/>
+    <rect x="599" y="781" width="38" height="52" rx="8" class="rank-box"/>
+    <rect x="646" y="781" width="38" height="52" rx="8" class="rank-box"/>
+    <text x="571" y="814" text-anchor="middle" class="micro">P0</text>
+    <text x="618" y="814" text-anchor="middle" class="micro">P1</text>
+    <text x="665" y="814" text-anchor="middle" class="micro">Pk</text>
+    <circle cx="563" cy="854" r="7" class="thread-rank"/>
+    <circle cx="584" cy="854" r="7" class="thread-rank"/>
+    <circle cx="610" cy="854" r="7" class="thread-rank"/>
+    <circle cx="631" cy="854" r="7" class="thread-rank"/>
+    <circle cx="657" cy="854" r="7" class="thread-rank"/>
+    <circle cx="678" cy="854" r="7" class="thread-rank"/>
+    <text x="618" y="880" text-anchor="middle" class="small">subset of local ranks</text>
+    <text x="618" y="905" text-anchor="middle" class="small">shared worker budget</text>
+
+    <path d="M 706 819 H 760" class="flow-rank"/>
+    <rect x="770" y="722" width="350" height="204" rx="16" class="rank-box"/>
+    <rect x="798" y="738" width="294" height="55" rx="10" class="neutral-box"/>
+    <text x="945" y="761" text-anchor="middle" class="micro">buffered I/O via</text>
+    <text x="945" y="786" text-anchor="middle" class="micro">Linux page cache</text>
+    <path d="M 945 797 V 811" class="flow-rank"/>
+    <rect x="798" y="819" width="136" height="76" rx="12" class="slot-a"/>
+    <rect x="956" y="819" width="136" height="76" rx="12" class="slot-b"/>
+    <text x="866" y="850" text-anchor="middle" class="micro">SLOT A</text>
+    <text x="866" y="878" text-anchor="middle" class="body">consume N</text>
+    <text x="1024" y="850" text-anchor="middle" class="micro">SLOT B</text>
+    <text x="1024" y="878" text-anchor="middle" class="body">fill N+1</text>
+    <text x="945" y="919" text-anchor="middle" class="small">disjoint producer-owned extents</text>
+
+    <path d="M 1125 824 H 1180" class="flow-rank"/>
+    <rect x="1190" y="722" width="290" height="204" rx="16" class="box"/>
+    <text x="1335" y="759" text-anchor="middle" class="label">all local ranks</text>
+    <rect x="1216" y="781" width="58" height="43" rx="8" class="neutral-box"/>
+    <rect x="1284" y="781" width="58" height="43" rx="8" class="neutral-box"/>
+    <rect x="1352" y="781" width="58" height="43" rx="8" class="neutral-box"/>
+    <rect x="1420" y="781" width="36" height="43" rx="8" class="neutral-box"/>
+    <text x="1245" y="810" text-anchor="middle" class="micro">R0</text>
+    <text x="1313" y="810" text-anchor="middle" class="micro">R1</text>
+    <text x="1381" y="810" text-anchor="middle" class="micro">R2</text>
+    <text x="1438" y="810" text-anchor="middle" class="micro">…</text>
+    <text x="1335" y="854" text-anchor="middle" class="body">assemble atomic group</text>
+    <text x="1335" y="890" text-anchor="middle" class="body">group ready → transform / H2D</text>
+    <text x="1335" y="918" text-anchor="middle" class="small">same consumer path</text>
+
+    <path d="M 1485 824 H 1530" class="flow-rank"/>
+    <rect x="1540" y="722" width="210" height="204" rx="16" class="box"/>
+    <text x="1645" y="765" text-anchor="middle" class="body">producer quorum</text>
+    <text x="1645" y="796" text-anchor="middle" class="body">publishes</text>
+    <line x1="1572" y1="821" x2="1718" y2="821" class="row-rule"/>
+    <text x="1645" y="861" text-anchor="middle" class="body">all-rank ack</text>
+    <text x="1645" y="892" text-anchor="middle" class="body">gates slot reuse</text>
+
+    <line x1="474" y1="955" x2="905" y2="955" class="overlap-rank"/>
+    <line x1="905" y1="974" x2="1455" y2="974" class="overlap-rank"/>
+    <text x="689" y="947" text-anchor="middle" class="small">fill N+1</text>
+    <text x="1180" y="966" text-anchor="middle" class="small">consume N → transform / H2D</text>
+  </svg>
