@@ -10,643 +10,262 @@ SPDX-License-Identifier: Apache-2.0
 
 [< Back to README](README.md)
 
-**Status:** Active readiness and delivery plan
+**Status:** Active delivery plan
 
-**Last Updated:** 2026-07-31
+**Last updated:** 2026-07-31
 
-**Current implementation status:**
+**Tracking:** [TRTLLM-11901](https://jirasw.nvidia.com/browse/TRTLLM-11901)
 
-- [NVIDIA/TensorRT-LLM#15641](https://github.com/NVIDIA/TensorRT-LLM/pull/15641) merged on 2026-07-18 at
-  `6967d0eaf2`: optional packaging and external-server ModelExpress 0.4.1 integration.
-- [NVIDIA/TensorRT-LLM#16159](https://github.com/NVIDIA/TensorRT-LLM/pull/16159) merged on 2026-07-23 at
-  `5a69240c9e`: ArtifactIdentity v1 and SourceIdentity format v2.
-- [NVIDIA/TensorRT-LLM#16458](https://github.com/NVIDIA/TensorRT-LLM/pull/16458) merged on 2026-07-31 at
-  `731d293dd7`: exact qualification profiles, reusable lifecycle harness, transform-layout ABI, and SourceIdentity
-  format v3. It intentionally leaves Llama as the only enabled family on `main`.
-- [NVIDIA/TensorRT-LLM#16974](https://github.com/NVIDIA/TensorRT-LLM/pull/16974) at `5d670c87fa` is the first
-  model-family extension. It is a draft with full CI running and adds the initial Qwen2/Qwen2.5 dense profile plus the
-  generic runtime support matrix needed to bound family qualification.
-- [NVIDIA/TensorRT-LLM#17142](https://github.com/NVIDIA/TensorRT-LLM/pull/17142) at `c65eebe7a3` is the next stacked
-  draft. It reuses #16974's runtime matrix and adds the initial Qwen3 dense profile and Q/K-normalized lifecycle
-  qualification coverage.
-- [NVIDIA/TensorRT-LLM#17029](https://github.com/NVIDIA/TensorRT-LLM/pull/17029) is an open parallel refactor that
-  delegates MX transport to ModelExpress strategies. It overlaps loader integration, but it does not replace the
-  TRT-LLM-owned lifecycle, exact-profile, transform-ABI, or model-family qualification work in #16974/#17142.
+**Execution runbook:** [§20 ModelExpress End-to-End Verification Plan](20-mx-e2e-verification-plan.md)
 
-**Readiness accounting:** The integration, content-identity, and qualification foundation are now landed. Do not count
-Qwen2 or Qwen3 as supported until the corresponding draft merges and its exact profile completes focused CI plus a
-real ModelExpress donor/receiver no-disk run. The 2026-07-15 Llama evidence below predates the final merged stack and
-must still be repeated on current `main` before making the R1 preview claim.
+This document is the source of truth for three questions:
 
-**Companion execution runbook:** [§20 ModelExpress End-to-End Verification Plan](20-mx-e2e-verification-plan.md)
+1. Which exact ModelExpress (MX) model profiles are supported today?
+2. Which profile should be implemented next, and what does it depend on?
+3. What evidence is required before a profile counts as supported?
+
+It is not a generic model-support matrix. Every claim here is limited to an exact root, artifact, runtime layout,
+transfer scope, and transform ABI.
 
 ---
 
-## 0. Historical Live Qualification Evidence (2026-07-15)
+## 1. Executive Snapshot
 
-The §20 single-node Llama experiment completed on `umb-b300-dp-186` and `umb-b300-dp-184` using B300 GPUs,
-TinyLlama-1.1B-Chat-v1.0 BF16, TRT-LLM head `752c05c9af`, an external native ModelExpress/Redis service, and
-ModelExpress 0.4.1 with a local canonical-wire-catalog patch. The runtime used the image NIXL stack under
-`/opt/nvidia/nvda_nixl` and CUDA-enabled UCX 1.21.0 with `NIXL_UCX_TLS` unset.
+| Area | Status | Next decision or gate |
+|:--|:--|:--|
+| Integration and identity foundation | **Landed** in #15641, #16159, and #16458 | Keep unsupported profiles fail-closed and preserve exact artifact/layout identity. |
+| Llama baseline | **Enabled on `main`**, but current-main live evidence is incomplete | Repeat §20 on current `main` before making the R1 preview claim. |
+| Qwen2/Qwen2.5 dense | **Draft #16974**, tracked by TRTLLM-14879 | Finish review and real TP1/TP2 donor/receiver qualification. |
+| Qwen3 dense | **Stacked draft #17142**, tracked by TRTLLM-14880 | Rebase after #16974 settles, then run the same real-GPU gate with Q/K-normalized lifecycle checks. |
+| Next sequential family | **Mixtral**, tracked by TRTLLM-14882 | Start after the dense Qwen stack establishes the reusable runtime matrix. |
+| Parallel dense family | **Mistral**, tracked by TRTLLM-14881 | May proceed independently from the MoE sequence. |
+| Production readiness | **Open** | Permanent GPU CI, two-node RDMA, structured results, strict mode, stable MX API, concurrency, and SLOs. |
 
-| Qualification | Result and retained evidence |
-|:--|:--|
-| TP=1 baseline, donor, and full receiver | PASS. Donor published 135 canonical tensors; the receiver fetched the same source and produced the exact baseline token IDs. |
-| TP=1 no-shards receiver | PASS. The metadata-only receiver tree contained no `.safetensors`, `.bin`, `.pt`, or `.pth` weight files and still produced the exact baseline token IDs. |
-| TP=2 donor/rank matching | PASS. Donor ranks 0 and 1 independently published 135 tensors with distinct source/worker IDs. |
-| TP=2 full receiver | PASS. Receiver ranks 0 and 1 each resolved a matching worker, completed the MX/NIXL path, and produced the exact TP=2 baseline token IDs. |
-| TP=2 no-shards receiver | PASS. Both-rank P2P reception succeeded without checkpoint weight shards and matched the TP=2 baseline. |
-| Negative SourceIdentity/parallel mismatch | PASS. A TP=1 receiver did not fetch TP=2 donor metadata or initialize a target NIXL agent; it performed a complete HF disk load and matched the independent TP=1 baseline. |
-
-The retained output hashes were identical within each expected topology:
-
-- TP=1 baseline and mismatch-fallback receiver:
-  `24f0cd36473e4b1a53156c26abdcc4a9db78f662aa51fad47373b1c8387a9b8d`.
-- TP=2 baseline, donor, full receiver, and no-shards receiver:
-  `45841007c85b4496a6388cbf52d433e741ffb8dfb3048ae78b1de1e14241cabc`.
-
-### Observed Llama model-load times
-
-The retained worker artifacts also recorded elapsed `LLM(...)` construction time. These are single-run observations
-from the qualification sequence, not controlled performance benchmarks:
-
-| Topology | HF baseline | MX donor (disk load, transform, and publish) | MX full receiver | MX no-shards receiver | Receiver time difference vs. HF |
-|:--|--:|--:|--:|--:|:--|
-| TP=1 | 68.96 s | 159.58 s | 36.65 s | 37.41 s | 46.8% reduction (full); 45.8% reduction (no-shards) |
-| TP=2 | 210.08 s | 285.56 s | 167.82 s | 167.75 s | 20.1% reduction (full); 20.1% reduction (no-shards) |
-| TP=4 | 285.56 s | 461.81 s | 351.32 s | 370.72 s | 23.0% increase (full); 29.8% increase (no-shards) |
-
-The receiver measurements include MX discovery, NIXL transfer, alias setup, derived-state reconstruction, distributed
-runtime startup, and normal TRT-LLM model initialization; they are not pure transfer timings. They exclude Redis/MX
-service startup. Donor values are not directly comparable to the HF baseline because they also include cold-source
-query/fallback and publication. Test ordering, warm filesystem/JIT caches, use of different B300 allocations, HCOLL
-fallback, and disabled NCCL NVLS can materially affect the results. In particular, the TP=4 run used NVLink P2P after
-NVLS initialization was unavailable. Use repeated, randomized same-node trials with phase-level instrumentation before
-making a scaling, performance, or SLO claim.
-
-The runs exposed and validated fixes for two integration defects:
-
-1. ModelExpress's TRT-LLM publisher enumerated post-alias paths such as `next_attn` before canonical paths, causing a
-   partial 71/135 transfer. A local MX patch now excludes runtime-only alias paths, publishes canonical names, and
-   rejects any non-exact source/target catalog before NIXL writes.
-2. TRT-LLM serialized the local checkpoint path (`SourceIdentity.model_name`) into MX's exact discovery identity even
-   though that descriptor is excluded from compatibility matching. Omitting it from compatibility metadata made the
-   no-shards copy path-independent while retaining the normalized outer MX model name.
-
-This is strong historical isolated-head evidence for the bounded Llama BF16 TP=1/TP=2 profile, including no-disk and
-parallel-mismatch controls. It is not evidence for the final code now on `main`. Before crediting R1:
-
-- confirm that the canonical-catalog behavior used by this experiment is present in the selected ModelExpress release
-  and that no local runtime patch remains;
-- replace the test-only 1800-second server lease with publisher heartbeats (or otherwise prove production source
-  liveness under the normal 90-second reaper);
-- rerun the focused suites and §20 on current `main`, which now contains #15641, #16159, and #16458, with
-  ArtifactIdentity and transform-ABI controls;
-- retain server-outage and mid-transfer failure-injection controls as open MX-R9/MX-R15 evidence.
-
-## 1. Decision Summary
-
-PRs #15641, #16159, and #16458 have merged. After current `main` passes §20, TensorRT-LLM can make this bounded claim:
-
-> **Content-bound ModelExpress Llama preview:** post-transform MX transfer is functionally qualified for the explicitly
-> tested `LlamaForCausalLM` profile, immutable checkpoint artifact, ModelExpress 0.4.1, and the recorded quantization
-> and parallel configuration.
-
-That is not yet the same as saying that MX is generally ready for TensorRT-LLM. Landed `main` contains one exact
-`LlamaForCausalLM` target profile with transform protocol version 1 and ABI
-`trtllm-llama-target-layout-v1`. Other root model classes fall back to Hugging Face loading even when their nested
-Linear, Attention, MLA, MoE, or Mamba modules already implement staged hooks.
-
-PR #15641 delivered the optional standalone MX integration baseline and packages the merged Wave 5 path. It did not
-broaden the model-family qualification boundary.
-
-PR #16159 delivered the ArtifactIdentity follow-up called out by #15641 and closed the
-same-config/different-content safety gap for a single checkpoint artifact. PR #16458 then delivered the exact profile
-registry, reusable lifecycle harness, transform-layout ABI, and SourceIdentity format v3 without adding a second
-family.
-
-PR #16974 is the first model-family extension and is intentionally conservative: Qwen2/Qwen2.5 dense BF16,
-unquantized, TRTLLM attention, target-only, TP1/TP2. Its diff is larger than the normal family sizing guide because it
-also introduces the generic runtime-constraint matrix and structured runtime rejection evidence. Follow-on family
-PRs should reuse that machinery and add new generic dimensions only when a model audit proves one is missing.
-
-PR #17142 is the first demonstration of that incremental pattern. It adds a distinct Qwen3 transform ABI and exact
-profile, Q/K-normalized attention lifecycle evidence, shared runtime-negative coverage, and support documentation.
-It remains stacked on #16974 and must not be counted as supported until both PRs merge and the Qwen3 real-GPU gate
-passes.
-
-MX does not need to support every TensorRT-LLM model before it can become a supported feature. It does need:
-
-1. An explicit, machine-readable support matrix rather than an architectural resemblance claim.
-2. Safe identity for both runtime layout and immutable checkpoint contents.
-3. Qualification of representative dense, MoE, MLA/DSA, and hybrid model families.
-4. Permanent real-GPU tests, cross-node evidence for the cross-node claim, and visible fallback reasons.
-5. A stable ModelExpress client/server API and version policy.
+**Support accounting rule:** a profile is not supported merely because its modules have staged hooks, its PR is open,
+or its unit tests pass. Count it only after the exact profile is merged and the required real donor/receiver evidence is
+retained.
 
 ### Readiness levels
 
-| Level | Claim | Minimum exit gate |
+| Level | Claim | Exit gate |
 |:--|:--|:--|
-| R0 - Integration baseline | Merged PRs #15641/#16159/#16458 supply the optional standalone path, immutable artifact identity, and fail-closed exact profile/ABI foundation. | Current `main` passes required CI, a production Linux wheel and `[mx]` install, focused loader/identity tests, and base-install dependency checks; unsupported models and mismatches fall back before P2P. |
-| R1 - Content-bound Llama preview | MX works for one bounded Llama profile and immutable artifact. | §20 passes on current `main`, including exact token equality, ArtifactIdentity and transform-ABI matching/mismatch controls, and a receiver that cannot read weight shards. |
-| R2 - Multi-family beta | MX is usable across representative TRT-LLM model categories. | Llama, Qwen dense, one Qwen MoE profile, one DeepSeek/MLA profile, and one GLM or Kimi text profile pass their declared matrices. Artifact and fallback policy are implemented. |
-| R3 - Supported MX feature | MX has a maintainable production support contract. | Stable upstream API, content and transform-ABI identity, persistent GPU CI, cross-node qualification, observability, documented SLOs, and an explicit support matrix. |
+| R0 - Foundation | Optional MX integration is installed and guarded safely. | #15641, #16159, and #16458 are merged; unsupported or mismatched loads reject before P2P. **Complete.** |
+| R1 - Llama preview | One content-bound Llama profile works end to end. | Current-main §20 run with exact output, no-disk receiver, ArtifactIdentity mismatch, ABI mismatch, and fallback controls. |
+| R2 - Multi-family beta | Representative dense, MoE, and MLA/DSA families work. | Llama, Qwen dense, one Qwen MoE, one DeepSeek/MLA, and one GLM or Kimi text profile pass their declared matrices. |
+| R3 - Supported feature | MX has an operable, maintainable support contract. | Stable API/version policy, persistent GPU CI, cross-node qualification, observability, concurrency proof, and documented SLOs. |
 
-Speculative decoding, multimodal wrappers, automatic Kubernetes lifecycle, and MX-to-GMS composition should each have
-their own feature qualification. They should not be implied by R2 or R3 unless their rows are explicitly enabled.
+Speculative decoding, multimodal wrappers, managed Kubernetes lifecycle, and MX-to-GMS composition require separate
+qualification. R2 or R3 does not imply them unless their exact rows are enabled.
 
-## 2. Current Implementation Baseline
+## 2. Landed Foundation and Current Scope
 
-The following statements describe landed `main` through #16458 and the two stacked dense-family drafts:
+### Foundation timeline
 
-- The five staged-hook migration waves are merged. The loader can run `setup_aliases()`, skip
-  `transform_weights()`, and run `cache_derived_state()` for a compatible post-transform receiver.
-- `PostTransformProfileRegistry` matches the exact root class, pre-construction architecture/model type, transfer
-  scope, protocol, speculative mode, and declared feature/runtime constraints. Unregistered subclasses fail closed.
-- `LlamaForCausalLM` remains the only enabled profile on landed `main`; the registry mechanism is broader than its
-  current qualification evidence.
-- SourceIdentity format v3 covers the immutable ArtifactIdentity, resolved model/quant/backend/parallel layout, local
-  tensor layout, rank/shard identity, and transform-layout ABI.
-- ModelExpress is an optional `[mx]` extra pinned to `modelexpress==0.4.1`. The integration still uses a private MX
-  identity builder and temporary process-wide environment state.
-- A separately loaded draft model is rejected for post-transform MX transfer. The local automatic server path is
-  Docker-only and single-node.
-- The reusable qualification harness compares full versus staged parameter/buffer layout and values, transform guards,
-  family-specific state, deterministic outputs, and an unregistered-root negative control.
-- Draft #16974 adds the first runtime-bounded Qwen2 profile. Draft #17142 reuses that envelope for Qwen3 and adds
-  Q/K-normalized attention state coverage. Neither draft changes landed support yet.
-- The unit tests exercise the loader protocol, Llama gate, SourceIdentity, MX metadata, local Docker lifecycle,
-  qualification registry, lifecycle harness, and fallback behavior. They are not a substitute for real
-  donor/receiver qualification of each model family.
+| PR | Merged | Contribution |
+|:--|:--|:--|
+| [#15641](https://github.com/NVIDIA/TensorRT-LLM/pull/15641) at `6967d0eaf2` | 2026-07-18 | Optional `tensorrt_llm[mx]` packaging, external MX 0.4.1 integration, local Docker/Redis convenience path, and complete-disk fallback. |
+| [#16159](https://github.com/NVIDIA/TensorRT-LLM/pull/16159) at `5a69240c9e` | 2026-07-23 | ArtifactIdentity v1 and content-bound SourceIdentity v2. |
+| [#16458](https://github.com/NVIDIA/TensorRT-LLM/pull/16458) at `731d293dd7` | 2026-07-31 | Exact qualification profiles, reusable lifecycle harness, transform-layout ABI, and SourceIdentity v3. |
 
-The important distinction is **migrated** versus **qualified**. A module can have correctly separated staged hooks and
-still be unsafe to enable until the whole root model, every selected backend, and the real transfer path are tested.
+The five staged-hook migration waves are merged. They separate `setup_aliases()`, `transform_weights()`, and
+`cache_derived_state()` so a receiver can bind post-transform tensors without rerunning irreversible transforms.
+That migration enables qualification; it does not qualify every model automatically.
 
-### 2.1 What PR #15641 contributed
+### Non-negotiable safety contract
 
-PR #15641 closed the standalone installation and node-local usability gap while preserving the Wave 5 safety
-boundary.
+Every enabled profile must satisfy all of the following:
 
-| Area | Landed change in PR #15641 | Readiness effect | Remaining boundary |
+1. Match the exact root class and the architecture/model type captured before model construction.
+2. Match transfer scope, protocol version, speculative mode, declared features, and every layout-affecting runtime
+   constraint.
+3. Bind an immutable ArtifactIdentity and a versioned transform-layout ABI into SourceIdentity.
+4. Apply the same qualification decision before donor publication and receiver P2P.
+5. Reject unsupported, incomplete, old, or mismatched metadata before any tensor write.
+6. On transfer or finalization failure, discard staged state and perform one complete disk load. Never combine partial
+   post-transform state with raw checkpoint tensors.
+7. Rebuild aliases, derived state, and process-local runtime state on the receiver without rerunning transforms.
+8. Prove exact output and no-disk reception with a real donor/receiver run.
+
+The capability registry answers, "Has this kind of model been audited?" SourceIdentity answers, "Do these two
+concrete executions have the same artifact and layout?" Both checks are required.
+
+### Exact profiles
+
+| Profile | State | Initial envelope | Important exclusions |
 |:--|:--|:--|:--|
-| Packaging | Adds the optional `tensorrt_llm[mx]` extra with `modelexpress==0.4.1`; MX stays out of base requirements. | Establishes the correct opt-in installation contract for the currently qualified client/server pair. | Keep the exact pin while private MX APIs are used; a public versioned API and compatibility CI are still required before using a range. |
-| Configuration | Adds `mx_config.local_server` fields for enablement, port, server image, Redis image, and startup timeout. An explicit `mx_config.server_url` or `MODEL_EXPRESS_URL` takes precedence. | Makes the MX path configurable through normal TRT-LLM APIs without affecting non-MX loads. | The fields remain prototype status and do not define managed-service ownership or authentication. |
-| Node-local lifecycle | Creates/reuses a per-port Docker network, Redis container, and MX server; validates image/network/port compatibility and handles creation races. | Closes the single-node standalone-server setup gap for Docker-capable environments. | It is not a Kubernetes, multi-node service-discovery, multi-tenant, or production lifecycle manager. |
-| MX 0.4.1 integration | Supports exact-identity source queries, stable model-name resolution, source metadata, and serialized use of process-wide MX environment/identity-builder state. | Makes the released 0.4.1 client/server shape usable from TRT-LLM and preserves SourceIdentity/layout/protocol checks. | It still depends on `_build_trtllm_identity` and temporary process-wide state; this is a pinned compatibility adapter, not a stable public API. |
-| Fallback correctness | Falls back to a complete Hugging Face load on local-server failure, source incompatibility, transfer error, or partial post-transform transfer; avoids republishing workers that received MX weights. | Preserves correctness and avoids mixing a partial post-transform source with raw disk tensors. | Operators still need structured result/reason telemetry and a strict mode that makes unexpected fallback fail CI/startup. |
-| Model support | Retains `LlamaForCausalLM` protocol v1 and rejects a separately loaded draft model from the staged receive path. | Keeps the existing narrow qualification fail-safe while making it usable as a standalone feature. | Qwen remains unqualified on landed `main` while #16974/#17142 are drafts; DeepSeek, GLM, Kimi, target-plus-draft, and multimodal roots have no qualification PR in this stack. |
-| Tests and docs | Adds unit coverage for config, Docker lifecycle/races, source discovery, identity metadata, model-name handoff, fallback, and loader integration, plus a user guide. | Provides the R0 regression-test foundation and documents the intended support scope. | Current-main production Linux wheel validation, focused runtime tests, and the live Llama donor/receiver experiment remain readiness evidence, not unit-test substitutes. |
+| `llama-for-causal-lm-target-v1` | Enabled on `main`; R1 rerun pending | Exact `LlamaForCausalLM`, target-only, protocol v1, `trtllm-llama-target-layout-v1` | No separately loaded draft model; no claim beyond the recorded dtype/parallel rows. |
+| `qwen2-for-causal-lm-bf16-target-v1` | Draft [#16974](https://github.com/NVIDIA/TensorRT-LLM/pull/16974) / [TRTLLM-14879](https://jirasw.nvidia.com/browse/TRTLLM-14879) | Exact `Qwen2ForCausalLM`, BF16, unquantized weights/KV cache, TRTLLM attention, TP1/TP2, PP1/CP1/EP1, default fused RoPE, untied embeddings | FP16, quantization, alternate attention, TP>2, PP/CP/EP expansion, LoRA, sparse attention, attention DP, multi-node, YaRN, tied embeddings, and speculation. |
+| `qwen3-for-causal-lm-bf16-target-v1` | Stacked draft [#17142](https://github.com/NVIDIA/TensorRT-LLM/pull/17142) / [TRTLLM-14880](https://jirasw.nvidia.com/browse/TRTLLM-14880) | Same initial dense envelope, with a distinct Qwen3 ABI and Q/K-normalized attention lifecycle | Same exclusions as Qwen2; no support inherited from the Qwen2 profile. |
 
-### 2.2 What PR #16159 contributed
+Only the Llama row is present on landed `main`. Draft rows remain unsupported until merge and qualification.
 
-PR #16159 implemented the ArtifactIdentity follow-up that #15641 intentionally left separate. It closed the base
-checkpoint-content binding gap for MX and for the backend-neutral identity used by GMS.
+## 3. Delivery Roadmap
 
-| Area | Landed change in PR #16159 | Readiness effect | Remaining boundary |
-|:--|:--|:--|:--|
-| Artifact contract | Adds `ArtifactIdentity(format_version, scheme, digest)` with format version 1 and nests it in required SourceIdentity format v2 metadata. | Makes the immutable artifact part of global compatibility instead of relying on model name, config, shapes, and dtype alone. | Composite target/draft/language/vision/adapter components are not represented independently. |
-| Hugging Face snapshots | Derives the digest from a recognized immutable 40- or 64-hex snapshot revision plus repository-relative subpath without rereading model shards. | Preserves a fast identity path and allows an MX receiver to validate a trusted snapshot even when weight shards are unavailable. | The path must retain the canonical `models--.../snapshots/<revision>` structure; arbitrary local copies use the manifest scheme. |
-| Local checkpoints | Builds a canonical SHA-256 manifest over relative file paths, sizes, and full file contents while detecting files that change during hashing. | Gives local checkpoints content-bound, path-independent identity. | Every regular checkpoint file is read in full; large-model startup overhead and any future trusted-manifest/cache policy need explicit measurement and design. |
-| Loader and policy | Passes checkpoint provenance into SourceIdentity construction. Missing, malformed, unknown-version, incomplete, or mismatched artifact metadata rejects sharing. | MX falls back before P2P; the GMS strict gate fails before materialization. | #16159 does not add real GMS metadata publication/retrieval, committed-layout metadata, or MX/GMS composition. |
-| Tests | Adds focused construction, serialization, matching, MX fallback, and strict GMS-gate coverage; the PR reports 43 focused tests. | Provides direct regression coverage for the content-identity safety property. | The full MX/GMS loader suites, a current-main Linux wheel including #16458, and live donor/receiver validation remain required. |
+The first family PR is larger than later family PRs because #16974 also introduces the reusable runtime-constraint
+matrix. Follow-on PRs should add a profile, family-specific lifecycle evidence, and only the generic dimensions that
+their audit proves are missing.
 
-### 2.3 Post-foundation residual work
+### Active stack
 
-Read the gap register below as the state after #15641, #16159, and #16458 merged:
-
-- **Closed for the landed foundation:** MX-R2's exact profile mechanism and structured qualification reasons, MX-R3
-  for one target checkpoint artifact, and MX-R4's base transform-layout ABI and SourceIdentity binding. Runtime matrix
-  expansion and registry-to-doc consistency remain per-profile obligations rather than reasons to reopen the base
-  mechanism.
-- **Partially addressed:** MX-R1 is underway in #16974/#17142; MX-R5 retains the exact pin but private API; MX-R7 has
-  unit groundwork but no permanent real-GPU family gate; MX-R9 has safe fallback but no terminal result/strict mode;
-  MX-R12 remains local Docker only; MX-R15 performs full fallback but lacks an explicit transactional commit contract;
-  and MX-R16 still serializes process-global compatibility state.
-- **Still open:** broad per-family runtime evidence under MX-R6, cross-node MX-R8, component-scoped MX-R10/MX-R11,
-  performance/SLO work MX-R13, and separate MX-to-GMS composition MX-R14.
-- **Immediate readiness evidence:** complete #16974 CI and official review, run real Qwen2 donor/receiver TP1/TP2 and
-  no-disk controls, then rebase #17142 after #16974 changes settle and run the corresponding Qwen3 evidence. Repeat the
-  historical Llama §20 run on current `main`.
-- **Parallel integration watch:** #17029 may replace substantial checkpoint-loader transport code. If it lands first,
-  rebase the family stack and prove that TRT-LLM's exact profile decision, ABI identity, staged finalization, full
-  fallback, and tests remain intact.
-
-The merged PRs establish the integration and safety foundation. They are not Qwen/DeepSeek/GLM/Kimi qualification or
-proof of cross-node and production readiness; the family drafts are the start of that next track.
-
-## 3. Readiness Gap Register
-
-| ID | Gap | Priority | Required closure and evidence |
-|:--|:--|:--|:--|
-| MX-R1 | Landed post-transform reception is Llama-only; Qwen dense is in stacked drafts. | P0 for R2 | Land #16974 and #17142 only after their exact Qwen2/Qwen3 profiles complete CI and real donor/receiver evidence, then qualify DeepSeek, GLM, Kimi, and other priority profiles one at a time. Never enable a family only because it looks Llama-like. |
-| MX-R2 | The exact capability gate is landed; per-profile runtime matrices and doc synchronization remain ongoing. | Closed for foundation; P0 per family | #16458 replaced the class-only `isinstance` allowlist with exact profiles and one publish/receive decision. #16974 adds structured runtime constraints. Keep every profile bounded and validate the public support table against the registry. |
-| MX-R3 | One target checkpoint is content-bound on landed `main`. | Closed for base artifact; P1 for components | #16159 added ArtifactIdentity v1 and SourceIdentity v2 with immutable HF-revision or local full-manifest schemes and fail-closed MX/GMS policy. SourceIdentity is now format v3 after #16458. Keep component identities tracked under MX-R10/MX-R11. |
-| MX-R4 | Transform-layout ABI is landed and bound into SourceIdentity v3. | Closed for base ABI; P0 for ABI discipline | #16458 added `trtllm-llama-target-layout-v1`, compatibility tests, and bump rules. Every new family receives an immutable family ABI; #16974 and #17142 add distinct Qwen2 and Qwen3 IDs. |
-| MX-R5 | ModelExpress API and package policy are not stable. | P0 for R3 | #15641 added the optional extra and exact 0.4.1 pin. Keep that pin while private APIs are used. Evaluate #17029's strategy delegation without surrendering TRT-LLM profile/ABI ownership, and add compatibility CI before adopting a version range. |
-| MX-R6 | Quantization and parallel coverage is not declared per family. | P0 | Publish only combinations with evidence for the claimed dtype, quant algorithm, attention/MoE backend, TP/PP/EP/CP, attention DP, and rank mapping. |
-| MX-R7 | There is no permanent real donor/receiver GPU gate per family. | P0 | Build on #16458's reusable harness and §20 by adding scheduled or pre-merge GPU jobs. Require exact outputs, artifact/layout identity evidence, transfer evidence, and no-disk receiver proof for #16974, #17142, and every later family. |
-| MX-R8 | Single-node transfer does not prove cross-node RDMA. | P0 for a cross-node claim | Run a two-node qualification with the production NIC/NIXL path, rank-to-rank mapping, firewall settings, timeout handling, and failure injection. |
-| MX-R9 | Disk fallback is safe but too easy to miss operationally. | P0 | Preserve PR #15641's full-disk fallback semantics, then emit a structured load result and reason code, counters, and a startup summary. Add a strict `MX required` mode for CI and deployments that must not fall back. |
-| MX-R10 | Separate target-plus-draft transfer is unsupported; one-engine MTP is not broadly qualified. | P1, feature-specific | Track identity/layout per submodel, make multi-component transfer atomic, and qualify each speculative mode separately. Keep it disabled otherwise. |
-| MX-R11 | Multimodal transfer scope is undefined. | P1, required for Kimi K2.5/Qwen VL | Define whether MX transfers only the language model or the complete wrapper. Give each component identity and atomic fallback semantics. |
-| MX-R12 | Automatic lifecycle is a local Docker convenience, not a managed deployment design. | P1 | Treat PR #15641's Docker/Redis launcher as the standalone path. Document external-service ownership and add Kubernetes/managed readiness, authentication, cleanup, and multi-tenant isolation before claiming managed lifecycle support. |
-| MX-R13 | Startup performance and resource SLOs are not qualified. | P1 for R3 | Measure ArtifactIdentity construction (especially local full-manifest hashing), donor load, publication, discovery, transfer, receiver finalize, peak HBM, CPU, storage I/O, and network use against an HF baseline; define p50/p95 targets. |
-| MX-R14 | MX-to-GMS composition is not an MX-only readiness gate. | P2/separate track | Qualify MX-seeded GMS only after the native GMS committed-layout contract in §18 exists. Do not block standalone MX family work on it. |
-| MX-R15 | Receiver installation is not an explicit transactional contract. | P0 for R2 | Stage and validate the complete tensor set before committing receiver state. On any missing tensor, transfer error, identity change, alias failure, or derived-state failure, discard the staged result and perform one complete disk load. Add failure injection before, during, and after transfer and during `cache_derived_state()`. |
-| MX-R16 | The MX 0.4.1 compatibility shim relies on serialized process-global environment and private identity-builder state. | P1 for concurrent or multi-model use | Replace the shim with an explicit per-load public client context. Until then, retain serialization and stress concurrent model/rank loads to prove there is no identity, URL, model-name, or credential cross-talk. |
-
-## 4. Exact Qualification Profiles
-
-PR #16458 replaced the former class allowlist with exact qualification profiles. The constraints below explain why
-that mechanism remains mandatory as model support expands:
-
-- `DeepseekV3ForCausalLM` is registered for multiple architecture/config paths, including DeepSeek V3, DeepSeek V3.2,
-  and GLM DSA. Kimi K2 text also resolves through the DeepSeek V3-style path. One class entry would enable variants
-  whose hooks and production settings have not all been tested.
-- `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM` subclass `Qwen3NextForCausalLM`. The former `isinstance` gate would
-  have enabled both Qwen3.5 wrappers with a Qwen3-Next base entry; the exact registry prevents that inheritance.
-- Some model constructors normalize or rewrite config fields. A post-construction `model_type` alone may not preserve
-  the original architecture identity needed by the support decision.
-- Multimodal wrappers contain independently loaded language and vision submodels. The root class does not identify the
-  transfer scope.
-
-The landed backend-neutral capability profile, extended by #16974's draft runtime matrix, has the equivalent of these
-fields:
-
-```python
-@dataclass(frozen=True)
-class PostTransformProfile:
-    profile_id: str
-    root_model_class: type
-    architecture: str
-    model_type: str
-    speculative_mode: str | None
-    protocol_version: int
-    transform_abi_id: str
-    transfer_scope: str       # target, language_model, or complete_model
-    supported_features: frozenset[str]
-    runtime_constraints: PostTransformRuntimeConstraints  # #16974
+```text
+#16458  exact-profile and transform-ABI foundation [merged]
+`-- #16974 / TRTLLM-14879  Qwen2 and Qwen2.5 dense [draft]
+    `-- #17142 / TRTLLM-14880  Qwen3 dense [stacked draft]
 ```
 
-The implementation does not have to use this exact class, but it must preserve these properties:
+[#17029](https://github.com/NVIDIA/TensorRT-LLM/pull/17029) is a parallel, ready-for-review MX transport-delegation
+refactor. If it lands first, rebase the family stack and re-prove TRT-LLM-owned profile gating, ABI identity, staged
+finalization, full fallback, and tests. It does not replace model-family qualification.
 
-1. Match exact architecture profiles; do not inherit support through `isinstance` unless each subclass is covered by
-   the same qualification record.
-2. Evaluate the capability before source publication and before receiver P2P. Unsupported publishers should not
-   advertise a usable post-transform profile.
-3. Return a structured reason such as `root_model_class_not_registered`, `runtime_config_not_supported`, or
-   `feature_not_supported`, not only a boolean.
-4. Let `SourceIdentity` decide whether two executions of a qualified profile have matching layouts. The capability
-   registry says **this kind of model has been audited**; SourceIdentity says **these two concrete runs match**.
-5. Generate the user-visible support table from, or validate it against, the registry so documentation cannot drift.
+### Immediate next actions
 
-### 4.1 Delivery status and immediate work
+1. Finish #16974 review and retain real Qwen2/Qwen2.5 TP1/TP2 donor, receiver, no-disk, exact-output, identity, and
+   negative-fallback evidence.
+2. Rebase #17142 onto the settled Qwen2 change, then run the equivalent Qwen3 evidence with Q/K norm and fused-layout
+   probes.
+3. Start Mixtral as the first narrow MoE canary. It isolates expert packing and TP/EP behavior before shared-expert and
+   next-layer alias complexity.
+4. Allow Mistral dense to proceed in parallel as independent dense-root coverage.
 
-The three foundation items are complete in merged PR #16458:
+### Itemized work under TRTLLM-11901
 
-1. **Exact capability registry:** exact root/config/scope/protocol matching, structured reasons, symmetric
-   publish/receive gating, and unregistered-subclass rejection are landed.
-2. **Reusable qualification harness:** full-versus-staged tensor, alias, transform-guard, derived-state, deterministic
-   output, no-disk, negative-control, and fallback coverage are landed.
-3. **Transform-layout ABI:** the immutable ABI contract, SourceIdentity format v3 binding, old/missing/mismatched ABI
-   rejection, and initial Llama ABI are landed.
+| Wave | Work item | Tracking | Dependency and purpose |
+|:--|:--|:--|:--|
+| A1 | Qwen2/Qwen2.5 dense | [TRTLLM-14879](https://jirasw.nvidia.com/browse/TRTLLM-14879), [PR #16974](https://github.com/NVIDIA/TensorRT-LLM/pull/16974) | First family extension and shared runtime matrix. |
+| A2 | Qwen3 dense | [TRTLLM-14880](https://jirasw.nvidia.com/browse/TRTLLM-14880), [PR #17142](https://github.com/NVIDIA/TensorRT-LLM/pull/17142) | Stacked on A1; adds Q/K-normalized lifecycle and a distinct ABI. |
+| A-parallel | Mistral dense | [TRTLLM-14881](https://jirasw.nvidia.com/browse/TRTLLM-14881) | Independent exact dense root; does not inherit Llama support. |
+| B1 | Mixtral MoE canary | [TRTLLM-14882](https://jirasw.nvidia.com/browse/TRTLLM-14882) | First basic expert-layout and TP/EP qualification. |
+| B2 | Qwen3 MoE | [TRTLLM-14883](https://jirasw.nvidia.com/browse/TRTLLM-14883) | Strategic shared-expert profile after the MoE canary. |
+| B3 | Qwen2 MoE | [TRTLLM-14884](https://jirasw.nvidia.com/browse/TRTLLM-14884) | Separate Qwen2 expert layout and loader path. |
+| B3 | GLM4 MoE | [TRTLLM-14885](https://jirasw.nvidia.com/browse/TRTLLM-14885) | Custom mapping, QK normalization, aliases, and MoE state. |
+| C1 | DeepSeek V3 | [TRTLLM-14886](https://jirasw.nvidia.com/browse/TRTLLM-14886) | First narrow target-only MLA plus MoE profile. |
+| C2 | DeepSeek V3.2 | [TRTLLM-14887](https://jirasw.nvidia.com/browse/TRTLLM-14887) | Distinct configuration profile after V3. |
+| C3 | Kimi K2 text | [TRTLLM-14888](https://jirasw.nvidia.com/browse/TRTLLM-14888) | Explicit Kimi profile; do not inherit DeepSeek support by class. |
+| C3 | GLM DSA | [TRTLLM-14889](https://jirasw.nvidia.com/browse/TRTLLM-14889) | Preserve canonical pre-normalization identity and sparse state. |
+| D1 | Qwen3-Next | [TRTLLM-14891](https://jirasw.nvidia.com/browse/TRTLLM-14891) | Hybrid attention/Mamba state reconstruction. |
+| D2 | Qwen3.5 dense | [TRTLLM-14892](https://jirasw.nvidia.com/browse/TRTLLM-14892) | Exact wrapper and config-normalization profile. |
+| D3 | Qwen3.5 MoE | [TRTLLM-14893](https://jirasw.nvidia.com/browse/TRTLLM-14893) | Hybrid plus expert state; no subclass-based enablement. |
+| E | DeepSeek V4 | [TRTLLM-14894](https://jirasw.nvidia.com/browse/TRTLLM-14894) | Migrate remaining root lifecycle, then qualify V4-specific sparse/MLA/MoE state. |
+| F0 | Multimodal component contract | [TRTLLM-14895](https://jirasw.nvidia.com/browse/TRTLLM-14895) | Define component identity, scope, atomic installation, and fallback first. |
+| F1 | Qwen2-VL | [TRTLLM-14896](https://jirasw.nvidia.com/browse/TRTLLM-14896) | Depends on A1 and F0. |
+| F2 | Qwen3-VL | [TRTLLM-14897](https://jirasw.nvidia.com/browse/TRTLLM-14897) | Depends on A2 and F0. |
+| F3 | Qwen3-VL MoE | [TRTLLM-14898](https://jirasw.nvidia.com/browse/TRTLLM-14898) | Depends on Qwen3 MoE, Qwen3-VL, and F0. |
+| F3 | Kimi K2.5 | [TRTLLM-14900](https://jirasw.nvidia.com/browse/TRTLLM-14900) | Depends on Kimi K2 text and F0; qualify image/video output and atomic fallback. |
 
-The active family stack is:
+The umbrella task [TRTLLM-14727](https://jirasw.nvidia.com/browse/TRTLLM-14727) remains useful for the overall model
+family expansion, but each implementation PR should cite its itemized task above.
 
-1. **Qwen2 dense - #16974:** first family draft. It adds the Qwen2 ABI and profile, but also the generic
-   `PostTransformRuntimeConfig`/`PostTransformRuntimeConstraints` matrix and reason coverage. That foundation explains
-   why the first family PR exceeds the normal 0-50 production-line sizing guide.
-2. **Qwen3 dense - #17142:** second family draft, stacked on #16974. It reuses the shared dense-Qwen BF16 target
-   envelope. Its production delta factors the Qwen2 constraint object for reuse and adds the Qwen3 ABI/profile; the
-   remaining change is Q/K-normalized lifecycle tests and docs. Keep it draft until the parent settles and
-   focused/real-GPU validation completes.
-3. **Mixtral canary:** next target after both dense profiles merge and validate. It should introduce the first MoE
-   dimension without combining Qwen shared-expert or next-layer-alias complexity in the same review.
+## 4. Qualification Contract
 
-Do not grow the generic registry in every family PR. Add a new dimension only when the candidate's layout or lifecycle
-cannot be represented safely by the landed matrix. Keep #17029 as a transport integration dependency to rebase and
-validate against, not as a reason to duplicate family policy inside ModelExpress.
+### 4.1 Freeze one exact profile
 
-### 4.2 Migration, qualification, and enablement are different
+Record the following before code changes:
 
-Do not describe every new model profile as another staged-hook migration:
+- Root class, pre-construction architecture/model type, checkpoint, and transfer scope.
+- Producer and receiver TRT-LLM commits plus MX client/server version.
+- Dtype, weight/KV quantization, attention and MoE backends, and layout-affecting flags.
+- TP/PP/EP/CP sizes and ranks, attention DP, tied embeddings, speculative mode, and component scope.
+- Immutable ArtifactIdentity scheme/digest and a new transform ABI whenever transferred tensor semantics or receiver
+  finalization changes.
 
-- **Migration** moves lifecycle logic out of legacy `post_load_weights()` into `setup_aliases()`,
-  `transform_weights()`, or `cache_derived_state()`.
-- **Qualification** proves that the complete root model already uses those stages correctly for one exact configuration
-  and that full loading and staged reception are equivalent.
-- **Enablement** adds that proven configuration to the capability registry and public support matrix.
+Never infer support through `isinstance`, architecture resemblance, or a shared marketing family. Multiple checkpoints
+may share one profile only when an audit proves identical root/config semantics, tensor layout, ABI, feature envelope,
+and component scope.
 
-The five merged waves performed most of the shared migration for Linear, Attention, MoE, MLA, Mamba, and related
-modules. The Llama-only receiver gate is a conservative qualification boundary; it is not evidence that every other
-model requires a rewrite. A family PR should modify model lifecycle code only when its audit finds root-specific or
-backend-specific work that the waves did not stage correctly.
+### 4.2 Audit the complete lifecycle
 
-After the reusable harness exists, use these expectations instead of assuming several hundred production lines for
-every family:
+From the constructed root, inventory every reachable override of `post_load_weights()`, `setup_aliases()`,
+`transform_weights()`, `cache_derived_state()`, and `_weights_transformed`, including backend- and quantization-selected
+modules.
 
-| Work class | Likely examples, subject to audit | Expected production change | Expected tests/docs change | Typical result |
-|:--|:--|:--|:--|:--|
-| Qualification and enablement only | Qwen2/Qwen3 dense, Mistral, and potentially Mixtral | 0-50 lines | 50-200 lines | Add an exact profile and family fixture; no model-file migration. |
-| Qualification with targeted fixes | Qwen MoE, DeepSeek V3/V3.2, Kimi K2 text, GLM, Qwen3-Next/Qwen3.5 | 20-200 lines | 100-400 lines | Correct a missed alias, derived state, mapper, or backend-specific stage, then register the profile. |
-| Genuine staged-hook migration | DeepSeek V4 and any audit-discovered legacy root | 200+ lines | 200-600 lines | Move known root lifecycle logic into the proper stages before qualification. |
-| New component-transfer protocol | Qwen VL, Kimi K2.5, or separate target-plus-draft transfer | Hundreds or more | Hundreds or more | Define component identity, transactional installation, and atomic fallback; this is not ordinary hook migration. |
+Classify each action as:
 
-These are sizing guides, not commitments. A profile can require substantial GPU and failure-injection evidence while
-changing very little production code. Conversely, a small allowlist diff is not sufficient evidence by itself.
+- structural aliasing or runtime wiring, which belongs in `setup_aliases()`;
+- irreversible packing, fusion, or requantization, which belongs in guarded `transform_weights()`;
+- cache, scale alias, validation state, or non-persistent buffer reconstruction, which belongs in
+  `cache_derived_state()`; or
+- process-local communicator, stream, event, or load-balancer setup, which remains orchestrator-owned.
 
-Multiple named models may share one qualification profile when an audit proves that they have the same exact root,
-canonical configuration semantics, transform ABI, tensor layout, feature constraints, and component scope. Register
-that sharing explicitly; do not infer it from `isinstance`, architectural resemblance, or a common marketing family.
+Use a compatibility `post_load_weights()` shim only when it deliberately invokes these stages. A family PR should
+change lifecycle code only when this audit finds missing or misplaced work.
 
-## 5. Model-Family Inventory and Recommended Order
+### 4.3 Required unit evidence
 
-This table is based on landed `main` through #16458 plus the #16974/#17142 stacked drafts. Re-run the inventory at the
-start of every family PR and after transport changes such as #17029 land.
+For deterministic tiny models, compare a normal full load with a staged receiver that binds post-transform tensors:
 
-| Family/profile | Relevant TRT-LLM roots | Current staged-hook state | Main work before enablement | Suggested wave |
-|:--|:--|:--|:--|:--|
-| Llama | `LlamaForCausalLM` | Exact target profile for protocol v1 and `trtllm-llama-target-layout-v1` is landed; model aliases and common transforms are staged. | Repeat §20 on current `main`, then cover the exact production quant/TP profile and persistent CI. | Existing baseline |
-| Qwen dense | `Qwen2ForCausalLM`, `Qwen3ForCausalLM` | No model-specific legacy post-load override was found. #16974 adds the initial Qwen2/Qwen2.5 BF16 TP1/TP2 profile and shared runtime matrix; #17142 adds the corresponding Qwen3 profile and Q/K-normalized lifecycle coverage. Both are drafts. | Complete #16974 CI/review and real Qwen2 donor/receiver evidence, then rebase/validate #17142 and run the same Qwen3 evidence. Expand tied embeddings, quantization, YaRN, CP, attention DP, and speculation only as separate rows. | A - in progress |
-| Mistral dense | `MistralForCausalLM` | Uses familiar dense components but is a distinct root class and loader path. | Do not treat Llama qualification as inherited. Run the dense-family procedure and add an exact profile. | Parallel dense |
-| Qwen MoE | `Qwen2MoeForCausalLM`, `Qwen3MoeForCausalLM` | MoE modules expose staged transforms; Qwen3 next-layer aliases are in `setup_aliases()`. | After the basic Mixtral canary, qualify Qwen3 MoE as the strategic shared-expert profile; then qualify Qwen2 MoE. Cover process-local MoE finalization, TP/EP, selected MoE backends, and production quantization. | B2 |
-| Mixtral | `MixtralForCausalLM` | Uses MoE machinery but is not covered by Qwen MoE evidence. | Use it as the basic MoE canary because it isolates expert layout and TP/EP behavior before Qwen shared-expert and alias complexity. | B1 |
-| Qwen hybrid | `Qwen3NextForCausalLM`, `Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM` | Qwen3-Next aliases and Mamba derived-state reconstruction are staged; Qwen3.5 wrappers have distinct config normalization and weight mappers. | Use exact profiles to avoid subclass over-enablement. Verify Mamba caches, dense versus MoE variants, quant normalization, repeated decode, and MTP separately. | D |
-| DeepSeek V3/V3.2 | `DeepseekV3ForCausalLM` | Model aliases, MLA, and common MoE stages exist. | After the MoE foundation, qualify a narrow DeepSeek V3 target-only profile, then V3.2. Expand TP/EP/CP, attention DP, production quantization, and MTP as separate rows. | C1 |
-| GLM DSA and GLM MoE | `DeepseekV3ForCausalLM` for GLM DSA; `Glm4MoeForCausalLM` for GLM4 MoE | GLM4 aliases and sparse-attention derived-state stages exist, but the roots/loaders differ. | Preserve canonical pre-normalization architecture identity. Qualify a base GLM4 MoE profile after Qwen3 MoE and GLM DSA after DeepSeek V3/V3.2, including custom weight mapping and sparse caches. | B2/C2 |
-| Kimi K2 text | DeepSeek V3-style text path | Shares substantial MLA/MoE implementation with DeepSeek, but has a distinct config and artifact. | Add an explicit Kimi text profile after DeepSeek V3/V3.2; verify Kimi router/config/YaRN choices and real Kimi output. Do not inherit support by class alone. | C2 |
-| DeepSeek V4 | `DeepseekV4ForCausalLM` | The root still has a legacy `post_load_weights()` structural override. | Move that logic into `setup_aliases()`, audit sparse indexer/engram and MLA/MoE stages, then qualify V4-specific layouts after DeepSeek V3 and sparse DSA evidence. | E |
-| Kimi K2.5 multimodal | `KimiK25ForConditionalGeneration` containing `DeepseekV3ForCausalLM` | The outer wrapper is not a qualified MX receiver; text and vision have different loading scopes. | Reuse the qualified Kimi K2 text profile and the component-scoped multimodal contract; test image/video outputs and atomic fallback. | F3 |
-| Qwen multimodal | Qwen2/Qwen3/Qwen3.5 VL roots | A text-family pass does not qualify the outer vision-language wrapper. | Define the component-transfer contract first, then qualify Qwen2-VL, Qwen3-VL, and Qwen3-VL MoE in that order. | F1/F2 |
+1. Parameter and buffer names, shapes, dtypes, and values match.
+2. Required aliases have the same object identity.
+3. Transform guards and family-specific layout state match.
+4. Derived state and deterministic forward outputs match.
+5. No receiver `transform_weights()` method is called.
+6. An unregistered root and every unsupported runtime dimension reject with a structured reason.
+7. Artifact, rank/layout, protocol, scope, and ABI mismatches reject before P2P.
 
-The first expansion is now active as Qwen2 dense (#16974) followed by Qwen3 dense (#17142). They broaden coverage
-without introducing expert packing, MLA, hybrid state, or multimodal ownership. Once both pass their exact gates,
-Mixtral is the next target as the narrow MoE canary; Qwen3 MoE remains the strategic MoE profile that unlocks the later
-Qwen hybrid and MoE-backed multimodal branches.
+### 4.4 Required real-GPU evidence
 
-## 6. Repeatable Model-Family Qualification Procedure
+Clone §20 for the exact candidate profile:
 
-Every family PR should execute the same procedure. The output is one or more exact support profiles, not a family-wide
-wildcard.
+- Run an independent HF baseline, MX donor, full receiver, and receiver with checkpoint weight shards blocked.
+- Require exact token IDs and retain publication, discovery, transfer, and staged-finalization evidence for every rank.
+- Run unsupported-profile, artifact mismatch, ABI mismatch, parallel mismatch, partial-transfer, and server-failure
+  controls. Each control must take the declared full-fallback or required-failure path.
+- Run TP1 and TP2 for the initial dense profile. MoE profiles must also exercise the declared expert-parallel row.
+- Record every claimed dtype, quantization, backend, and topology. Untested combinations stay unsupported.
 
-### Step 1: Freeze the candidate profile
+Use pairwise expansion for a large matrix, but never advertise an untested combination.
 
-Record:
+### 4.5 Enable and keep it qualified
 
-- Root class, advertised architecture, model type, and checkpoint.
-- TRT-LLM and ModelExpress producer/receiver commits or versions.
-- Transfer scope: target only, language submodel, or complete model.
-- Dtype, quantization, attention backend, MoE backend, and all layout-affecting environment/config flags.
-- TP/PP/EP/CP sizes and ranks, attention DP, speculative mode, and whether weights are tied.
+Add the exact registry row only with its positive and negative tests. In the same PR, update the public support table,
+limitations, and fallback reasons. Add a permanent small-fixture GPU gate and a scheduled representative-checkpoint
+run so qualification does not become one-time evidence.
 
-**Goal:** Make the claim small enough that a passing test has a precise meaning.
+## 5. Family-Specific Audit Focus
 
-### Step 2: Audit the full post-load lifecycle
+| Model category | Additional proof required before enablement |
+|:--|:--|
+| Qwen dense | Fused QKV/gate-up layout; Qwen3 Q/K normalization; RoPE mode; tied versus untied head. Keep YaRN, quantization, alternate attention, CP/attention DP, and speculation as later rows. |
+| Mistral dense | Distinct root and loader path. Run the dense procedure rather than inheriting Llama evidence. |
+| Mixtral and Qwen/GLM MoE | Expert packing, shared experts, router weights, aliases, process-local MoE finalization, TP/EP rank mapping, selected MoE backend, and production quantization. |
+| DeepSeek V3/V3.2 | MLA projection/scale transforms, routed/shared experts, exact config identity, selected attention/MoE backends, and separate rows for CP, attention DP, and MTP. |
+| Kimi K2 text and GLM DSA | Preserve distinct canonical identity despite a DeepSeek-style root. Verify Kimi config/YaRN choices or GLM sparse-indexer derived state with real family checkpoints. |
+| Qwen3-Next/Qwen3.5 | Mamba cache reconstruction, stable derived-buffer behavior, repeated decode, dense versus MoE wrappers, and exact subclass profiles. |
+| DeepSeek V4 | First migrate the root's remaining structural `post_load_weights()` work, then audit sparse indexer, engram, HC mapping, MLA, and MoE state. |
+| Multimodal | Define language-only versus complete-wrapper scope, ordered component identities, all-or-fallback installation, blocked-shard proof for every transferred component, and text plus media output. |
 
-Starting from the constructed root, inventory every reachable override of:
+## 6. Readiness Gap Register
 
-- `post_load_weights()`
-- `setup_aliases()`
-- `transform_weights()`
-- `cache_derived_state()`
-- `_weights_transformed`
-
-Classify each action as structural aliasing, one-shot tensor transformation, derived-state reconstruction, or
-process-local finalization. Include modules selected only by quantization or backend configuration.
-
-**Goal:** Prove that the staged receiver will not miss legacy root logic, rerun an irreversible transform, or skip
-required process-local setup.
-
-### Step 3: Complete or correct the staged split
-
-- Move structural references and non-tensor runtime wiring to `setup_aliases()`.
-- Put irreversible packing/fusion/requantization in `transform_weights()` with a success-only
-  `_weights_transformed` guard.
-- Rebuild caches, scale aliases, validation state, and non-persistent derived buffers in `cache_derived_state()`.
-- Keep MoE load-balancer, communicator, stream/event, and other process-local finalization in the orchestrator.
-- Retain `post_load_weights()` only as a deliberate compatibility shim that invokes the staged methods.
-
-**Goal:** Make full disk load and post-transform receive two explicit, equivalent lifecycles.
-
-### Step 4: Add family-level equivalence tests
-
-Construct two identical small models with deterministic synthetic weights:
-
-1. Run the normal raw-weight plus full-post-load path on the reference.
-2. Capture the reference's post-transform parameter layout and values.
-3. Bind those post-transform values into the receiver.
-4. Run receiver alias setup and derived-state reconstruction without transforms.
-5. Compare parameter/buffer names, shapes, dtypes, values, alias object identities, transform guards, derived state,
-   and deterministic forward outputs.
-
-Also assert that no `transform_weights()` implementation is called on the receiver.
-
-**Goal:** Catch family-specific lifecycle mistakes before using NIXL or a full checkpoint.
-
-### Step 5: Close identity coverage for the profile
-
-- Mutate one layout-affecting choice at a time and verify `SourceIdentity` rejects it.
-- Audit runtime environment variables and defaults that affect transformed layout or structural wiring. Move them into
-  resolved/fingerprinted config or exclude the combination.
-- Verify producer rank N can match only receiver rank N for the same TP/PP/EP/CP layout.
-- With PR #16159 integrated, prove that two checkpoints with the same config but different tensor contents reject.
-- Verify an unsupported layout-ABI version rejects before P2P.
-
-**Goal:** Prevent a correct staged implementation from consuming the wrong transformed bytes.
-
-### Step 6: Run the real donor/receiver experiment
-
-Clone §20 for the candidate profile and retain all core gates:
-
-- HF baseline, MX donor, and MX receiver use the same immutable artifact and deterministic prompts.
-- Donor and receiver produce exactly the same token IDs as the baseline.
-- The receiver cannot read checkpoint weight shards and still succeeds.
-- Logs and structured status prove full P2P success and staged reception.
-- Identity, unsupported-profile, partial-transfer, and server-failure controls take the expected fallback path.
-
-**Goal:** Prove real publication, transfer, binding, and inference rather than only hook equivalence.
-
-### Step 7: Expand only to the declared configuration matrix
-
-| Category | Minimum beta matrix | Additional rows before claiming them supported |
+| ID | State | Closure required |
 |:--|:--|:--|
-| Dense | BF16/FP16 TP=1 and TP=2; one production quant profile if the family is advertised quantized. | PP, CP, attention DP, each extra quant scheme/backend, tied/untied embeddings. |
-| MoE | One production quant/dtype with TP and EP exercised; selected MoE backend; shared experts if present. | Alternate MoE backends, PP, attention DP, expert parallel reshapes, load balancer modes. |
-| MLA/DSA | TP plus EP where applicable, the production quant path, and the selected attention backend. | CP/helix, attention DP, sparse indexer layouts, alternate MLA kernels, MTP. |
-| Hybrid Mamba/attention | Dense or MoE base profile plus repeated decode that validates reconstructed Mamba state. | Alternate cache dtype, block reuse when supported, MTP, CUDA-graph/address-stability checks. |
-| Multimodal | Declared component scope, text and media prompts, and no-disk proof for every transferred component. | Disaggregated serving, multiple media types, language-only mixed loading, complete-wrapper transfer. |
+| MX-R1 - Model families | Active | Land and qualify the itemized profiles in roadmap order. Qwen drafts do not count until merged and proven live. |
+| MX-R2 - Exact capability gate | Base closed; per-profile | #16458 landed exact profiles and structured reasons; #16974 adds runtime constraints. Keep registry and docs synchronized. |
+| MX-R3 - Artifact identity | Base closed; components open | ArtifactIdentity v1 binds one target checkpoint. Composite target/draft/language/vision/adapter identity belongs to F0. |
+| MX-R4 - Transform ABI | Base closed; per-profile | Preserve immutable ABI IDs and add a new family/layout ID whenever transferred semantics or receiver finalization changes. |
+| MX-R5 - MX API/version policy | Open for R3 | Keep `modelexpress==0.4.1` while private APIs and process-global state are used. Require a public versioned API and compatibility CI before widening the pin. |
+| MX-R6 - Runtime matrix | Active | Publish only evidenced dtype, quantization, backend, TP/PP/EP/CP, attention-DP, and rank combinations. |
+| MX-R7 - Permanent GPU gate | Open | Add pre-merge or scheduled donor/receiver jobs with exact outputs, no-disk proof, and negative controls for every family. |
+| MX-R8 - Cross-node RDMA | Open | Run two-node qualification with production NIC/NIXL routing, rank mapping, timeout handling, and failure injection before any cross-node claim. |
+| MX-R9 - Observability/strict mode | Partial | Emit one terminal result and reason per rank plus an aggregate summary; add a required mode that cannot silently fall back. |
+| MX-R10 - Target plus draft/MTP | Open, feature-specific | Track identity/layout per submodel and make multi-component transfer atomic before enabling separate draft or MTP rows. |
+| MX-R11 - Multimodal scope | Open | Complete F0 before qualifying any VL wrapper. |
+| MX-R12 - Managed lifecycle | Local-only | Treat Docker/Redis startup as a convenience path. Define external-service ownership, authentication, cleanup, and isolation before a managed claim. |
+| MX-R13 - Performance/SLOs | Open | Measure identity construction, donor publication, discovery, transfer, receiver finalization, peak resources, and p50/p95 startup against HF. |
+| MX-R14 - MX-to-GMS | Separate track | Qualify composition only after §18's native GMS committed-layout contract. Do not block standalone family work on it. |
+| MX-R15 - Transactional receiver | Partial | Stage and validate the complete tensor set before commit; failure-inject transfer, alias, and derived-state phases and prove one complete fallback. |
+| MX-R16 - Concurrent loads | Open | Replace serialized process-global compatibility state with a per-load public client context; meanwhile stress model/rank concurrency for cross-talk. |
 
-Use pairwise coverage for a large matrix, but never present an untested combination as supported. The registry and docs
-should list the actual rows.
+## 7. Production Policy
 
-### Step 8: Enable, observe, and keep it enabled
+### Package and API
 
-- Add the exact profile to the capability registry only after Steps 1-7 pass.
-- Add a non-profile negative test next to every positive profile test.
-- Add a permanent GPU job using a small fixture and a scheduled representative-checkpoint job.
-- Update the public support table, limitations, and fallback reason documentation in the same PR.
+Keep MX optional and exactly pinned until it exports public APIs for identity construction, exact source queries,
+publication metadata, and terminal transfer results. URL, model name, timeout, and credentials must eventually become
+per-load arguments rather than temporary process-wide environment state. Any future version range needs CI for every
+admitted client/server pair.
 
-**Goal:** Make qualification durable rather than a one-time demo.
+### Result and fallback
 
-## 7. Family-Specific Closure Plans
-
-### 7.1 Qwen
-
-**Current status:** Dense wave 1 is in progress. #16974 is the Qwen2/Qwen2.5 draft and #17142 is the stacked Qwen3
-draft. Both initially claim BF16, unquantized TRTLLM attention, target-only TP1/TP2 with PP/CP/EP1, untied
-embeddings, default RoPE behavior, and no speculative or separately loaded draft model. They are qualification drafts,
-not landed support.
-
-Use three independent qualification waves:
-
-1. **Qwen2 dense and Qwen3 dense.** #16974/#17142 add separate exact profiles and ABIs for
-   `Qwen2ForCausalLM` and `Qwen3ForCausalLM`, covering fused QKV/gate-up and Qwen3 Q/K normalization. Complete focused
-   CI and real no-disk donor/receiver evidence before merging. Treat YaRN, tied embeddings, quantization, alternate
-   attention backends, CP/attention DP, speculative decoding, and multimodal wrappers as later exact rows.
-2. **Qwen2 MoE and Qwen3 MoE.** Verify expert packing, shared-expert tensors, router weights, next-layer norm aliases,
-   process-local MoE finalization, and full-fallback behavior when any expert tensor fails to transfer. Exercise TP and
-   EP with the actual production MoE backend and quantization.
-3. **Qwen3-Next and Qwen3.5.** Validate Mamba `cache_derived_state()` reconstruction, stable derived-buffer addresses,
-   dense versus MoE configs, and the Qwen3.5-specific config normalization and weight mapper. Match exact wrapper
-   classes so Qwen3-Next qualification cannot automatically enable Qwen3.5 through inheritance. Add MTP only as a
-   later profile.
-
-**Qwen exit gate:** Each advertised root has full-versus-staged equivalence, exact-token GPU E2E, no-disk proof, and a
-declared quant/parallel matrix. A text-only pass does not enable Qwen VL.
-
-### 7.2 DeepSeek
-
-For DeepSeek V3/V3.2:
-
-1. Qualify the base target with MTP, CP, and attention DP disabled first.
-2. Verify MLA fused projection/scale transforms and derived state with the production dtype/quantization.
-3. Verify routed and shared expert packing, MoE backend selection, EP rank mapping, and process-local finalization.
-4. Add TP/EP, then CP/attention-DP, then MTP as separate profile rows.
-5. Treat DeepSeek V3 and V3.2 as distinct config profiles even though they share a root class.
-
-For DeepSeek V4, first migrate the root's remaining structural `post_load_weights()` logic to `setup_aliases()`. Audit
-V4-specific sparse indexer, engram, HC mapping, MLA, and MoE paths before applying any V3 qualification evidence.
-
-**DeepSeek exit gate:** Real representative checkpoints pass the production MLA/MoE/quant/parallel rows, and no
-architecture alias becomes enabled merely because it shares `DeepseekV3ForCausalLM`.
-
-### 7.3 GLM
-
-Treat at least two paths independently:
-
-- **GLM DSA through the DeepSeek V3-style root.** Preserve a canonical architecture/profile identifier before config
-  normalization. Verify sparse-attention/indexer derived state and ensure identity cannot collapse GLM DSA into a
-  superficially similar DeepSeek V3.2 profile.
-- **`Glm4MoeForCausalLM`.** Audit its custom weight loader, QK-normalized attention, MoE expert layout, shared heads,
-  aliases, and MTP extension. Qualify the target-only profile before MTP.
-
-Other GLM generations remain unsupported until their exact TRT-LLM root and checkpoint mapper complete the same
-procedure.
-
-**GLM exit gate:** Each enabled GLM architecture has a canonical identity, an exact capability profile, sparse/MoE
-state equivalence, and real checkpoint E2E evidence.
-
-### 7.4 Kimi
-
-Split Kimi into text and multimodal milestones:
-
-1. **Kimi K2 text.** Qualify it as its own DeepSeek-style config profile. Reuse DeepSeek hook tests, but add Kimi's
-   checkpoint, router/config/YaRN choices, ArtifactIdentity, and exact inference outputs. Do not enable it automatically
-   when DeepSeek V3 is enabled.
-2. **Kimi K2.5 multimodal.** Define a component manifest for the outer wrapper. The first implementation must state
-   whether it transfers only `language_model` or both the MoonViT vision encoder and language model. Give every
-   transferred component SourceIdentity, ArtifactIdentity, layout ABI, and an all-or-fallback completion rule.
-3. For language-only transfer, explicitly prove that the vision component is loaded by the documented non-MX path and
-   cannot be confused with P2P success. For full-model transfer, block all component shards on the receiver and prove
-   successful image/video inference.
-
-**Kimi exit gate:** Text K2 has an explicit profile and real E2E evidence. K2.5 is advertised only after component
-scope, atomicity, and multimodal output tests are complete.
-
-## 8. Landed ArtifactIdentity and Transform ABI
-
-Merged PR #16159 kept ArtifactIdentity separate from model-family enablement, as recommended. SourceIdentity proves
-runtime layout compatibility; the nested ArtifactIdentity proves that source and receiver selected the same immutable
-checkpoint artifact. Merged PR #16458 then bound the transform-layout ABI and advanced SourceIdentity to format v3.
-
-### Implemented contract
-
-```python
-@dataclass(frozen=True)
-class ArtifactIdentity:
-    format_version: int
-    scheme: str
-    digest: str
-```
-
-PR #16159 defines ArtifactIdentity format version 1 and two schemes:
-
-- **`hf_snapshot_revision`:** hashes a recognized immutable 40- or 64-hex Hugging Face snapshot revision and its
-  repository-relative subpath. It does not reread the model shards.
-- **`checkpoint_manifest_sha256`:** walks a local checkpoint, hashes each retained regular file in full, and hashes the
-  canonical ordered manifest of relative path, size, and SHA-256. Absolute paths are excluded, and a file changing
-  during hashing is rejected.
-
-PR #16159's SourceIdentity format version 2 requires this value, includes it in global matching and serialization, and
-rejects unknown or old identity formats rather than silently accepting content with unknown provenance. Current
-SourceIdentity format version 3 additionally requires `transform_abi_id` and rejects old, missing, or mismatched ABI
-metadata before P2P.
-
-### What #16159 closes
-
-1. Same-config/same-shape checkpoints with different immutable revisions or local content no longer match.
-2. MX rejects missing, malformed, incomplete, unknown-version, or mismatched artifact metadata and falls back before
-   transfer.
-3. The GMS strict gate rejects the same conditions before materialization.
-4. A trusted canonical Hugging Face snapshot receiver can validate identity without opening checkpoint weight shards.
-5. Focused tests cover construction, serialization, matching, MX fallback, and strict GMS behavior.
-
-### Remaining work after #16159/#16458
-
-1. **Current-main qualification:** The integration and identity branches are merged, but the historical §20 evidence
-   predates their final combination and #16458. Run the complete loader suites and §20 on current `main` before
-   crediting R1.
-2. **Local-checkpoint cost:** the manifest scheme reads every retained file in full. Measure this on representative
-   checkpoints and decide whether a signed/trusted precomputed manifest or safe cache is needed without weakening
-   content binding.
-3. **Composite artifacts:** one ArtifactIdentity covers the checkpoint path passed to ModelLoader. Target, draft,
-   language, vision, and adapter components still need an ordered component identity and atomic transfer contract.
-4. **GMS transport:** #16159 updates the backend-neutral identity and strict gate, but intentionally does not add GMS
-   metadata publication/retrieval or committed-layout metadata.
-5. **ABI evolution:** The base transform ABI is landed. Preserve immutable IDs, add a new family/layout ID whenever
-   tensor semantics or receiver finalization changes, and keep producer/receiver compatibility tests with every bump.
-6. **Compatibility:** SourceIdentity v1/v2 publishers are intentionally incompatible with required v3 consumers.
-   Verify that mixed-version MX deployments return an explicit fallback reason and document the upgrade order.
-
-### Required current-main evidence
-
-- Build and install a production Linux wheel from current `main`.
-- Run the full focused MX/GMS loader, SourceIdentity, and ArtifactIdentity suites.
-- Run §20 with a canonical HF snapshot for the no-shards receiver gate.
-- Run an artifact-mismatch control that rejects before P2P and then completes the expected disk fallback.
-- Run an ABI-mismatch control that rejects before P2P and completes the expected disk fallback.
-- Record ArtifactIdentity scheme/digest, SourceIdentity format version, and transform ABI in the evidence bundle.
-
-## 9. ModelExpress Package and API Policy
-
-The optional extra and exact pin are the right policy for PR #15641. The feature is not universal, and the current
-integration is qualified against one client/server release and private API shape.
-
-Keep `modelexpress==0.4.1` until all of these are true:
-
-1. MX exports public APIs for identity construction, exact source query, publication metadata, and transfer result.
-2. URL, model name, timeout, and metadata are explicit arguments rather than temporary process-global environment
-   mutations.
-3. Client and server expose a capability/API version that TRT-LLM can check before transfer.
-4. TRT-LLM CI tests every client/server pair admitted by the proposed dependency range.
-5. MX publishes a compatibility and deprecation policy.
-
-Only then should the exact pin become a bounded compatible range. A broad lower bound is not appropriate while
-TRT-LLM depends on `_build_trtllm_identity` or another private symbol.
-
-## 10. Observability and Failure Policy
-
-Every load should expose one terminal result:
+Every rank should emit one terminal record and every model instance one aggregate startup summary:
 
 ```text
 source=mx_p2p | hf_disk
@@ -660,122 +279,54 @@ bytes=<transferred bytes>
 duration_ms=<transfer duration>
 ```
 
-Requirements:
+`best_effort` preserves complete disk fallback. `required` fails startup whenever MX is not used and is mandatory for
+positive CI/E2E. Partial transfer is never success unless a separate atomic mixed-layout protocol is designed and
+qualified.
 
-- Emit the result once per rank and one aggregated startup summary per model instance.
-- Export counters and latency histograms without checkpoint secrets or credentials.
-- Add `best_effort` and `required` policies. `best_effort` preserves disk fallback; `required` fails startup if MX is not
-  used and is mandatory for positive E2E/CI tests.
-- Treat a partial transfer as full fallback unless an atomic mixed-layout protocol is explicitly designed and tested.
-- Include the reason in support bundles so operators can distinguish an unavailable source from an unqualified model.
+## 8. Qualification Evidence and Exit Gates
 
-## 11. Recommended PR Sequence
+### Historical Llama evidence
 
-Introduce one new lifecycle dimension at a time. An arrow means that the downstream profile should reuse the upstream
-contract and evidence; it does not mean that every optional feature of the upstream family must already be enabled.
+The 2026-07-15 §20 experiment used TinyLlama-1.1B-Chat-v1.0 BF16 on B300 with TRT-LLM `752c05c9af` and MX 0.4.1 plus
+a local canonical-wire-catalog patch. TP1 and TP2 donor/receiver, no-shards, exact-output, rank matching, and
+parallel-mismatch fallback passed. TP4 was slower than HF and is not a supported performance claim.
 
-```mermaid
-flowchart TD
-    F["Foundation: #16458 merged"] --> Q2["Qwen2 dense: #16974 draft"]
-    Q2 --> Q3["Qwen3 dense: #17142 draft"]
-    Q3 --> M0["Mixtral: next basic MoE canary"]
-    M0 --> M1["Qwen3 MoE: strategic MoE profile"]
-    M1 --> M2["Qwen2 MoE and base GLM4 MoE"]
+Retained output hashes:
 
-    T["Parallel MX transport refactor: #17029 open"] -. rebase and verify .-> Q2
-    T -. rebase and verify .-> Q3
+- TP1 baseline and mismatch-fallback receiver: `24f0cd36473e4b1a53156c26abdcc4a9db78f662aa51fad47373b1c8387a9b8d`
+- TP2 baseline, donor, full receiver, and no-shards receiver: `45841007c85b4496a6388cbf52d433e741ffb8dfb3048ae78b1de1e14241cabc`
 
-    M1 --> D3["DeepSeek V3: target-only MLA + MoE"]
-    D3 --> D32["DeepSeek V3.2"]
-    D32 --> DK["Kimi K2 text and GLM DSA"]
+This is valuable historical evidence, not proof for final `main`. The current-main rerun must confirm that the
+canonical catalog fix is in the selected MX release, normal publisher liveness works without the test-only lease, and
+ArtifactIdentity plus transform-ABI controls pass.
 
-    M1 --> H0["Qwen3-Next: hybrid attention + Mamba"]
-    H0 --> H1["Qwen3.5 dense and MoE"]
+### R1 Llama preview
 
-    D32 --> D4["DeepSeek V4 lifecycle migration + profile"]
-    DK --> D4
+- [x] #15641, #16159, and #16458 merged.
+- [x] The exact Llama root/protocol/ABI profile is documented and registered.
+- [ ] A production Linux wheel from current `main` installs with `[mx]` and leaves the base install unchanged.
+- [ ] §20 passes on current `main` with exact output and canonical-snapshot no-disk reception.
+- [ ] Artifact, ABI, parallel, and unsupported-profile mismatches reject before P2P and take the expected fallback.
 
-    F --> MM["Component identity + atomic multimodal transfer"]
-    Q2 --> Q2VL["Qwen2-VL"]
-    MM --> Q2VL
-    Q2VL --> Q3VL["Qwen3-VL"]
-    Q3 --> Q3VL
-    Q3VL --> Q3VLM["Qwen3-VL MoE"]
-    M1 --> Q3VLM
-    Q3VL --> K25["Kimi K2.5"]
-    DK --> K25
-```
+### R2 multi-family beta
 
-Mistral dense can be qualified in parallel after the foundation; it is useful additional dense coverage but does not
-unlock one of the complex branches above. The multimodal contract can also be designed in parallel, while its first
-concrete receiver waits for the corresponding text profile.
-
-Suggested PR stack:
-
-1. **Foundation - complete in #16458:** exact matching, symmetric publish/receive gating, structured reasons, reusable
-   lifecycle harness, transform ABI, and SourceIdentity v3 are merged. Llama remains the only landed profile.
-2. **Qwen2 dense - draft #16974:** complete full CI and review, then run real Qwen2/Qwen2.5 TP1/TP2 donor/receiver,
-   no-disk, output, identity, and negative-fallback evidence. Rebase if #17029 changes the loader first.
-3. **Qwen3 dense - draft #17142:** keep stacked on #16974, reuse its runtime matrix, and run the corresponding Qwen3
-   evidence after the parent settles. Do not broaden Qwen3 support beyond the exact first row.
-4. **Parallel dense option:** Mistral may proceed after the foundation as an independent exact profile, but it does not
-   unlock the complex branches.
-5. **MoE PRs - next sequential track:** Mixtral canary, then Qwen3 MoE, followed by Qwen2 MoE and a base GLM4 MoE
-   profile. Expand EP, quantization, and alternate MoE backends as separate profile rows.
-6. **MLA PRs:** narrow DeepSeek V3 target-only profile, then V3.2, followed by separate Kimi K2 text and GLM DSA
-   profiles. Add CP, attention DP, production quantization, and MTP independently.
-7. **Hybrid PRs:** Qwen3-Next, then exact Qwen3.5 dense and MoE profiles. Do not inherit support through subclasses.
-8. **DeepSeek V4 PRs:** migrate the remaining root lifecycle and qualify V4 only after MLA/MoE and sparse-DSA evidence.
-9. **Multimodal PRs:** component identity and transactional transfer first; then Qwen2-VL, Qwen3-VL, Qwen3-VL MoE,
-   and Kimi K2.5 after their corresponding text profiles.
-10. **Production-readiness PRs:** public MX API, structured results/strict mode, transactional failure injection,
-    persistent GPU gates, scheduled representative checkpoints, concurrent-load stress, and two-node RDMA coverage.
-
-Family PRs may proceed while the public MX API and production validation are being developed; ArtifactIdentity and the
-base transform ABI are already landed. A supported R3 claim still depends on all tracks. For every family, begin with
-one canonical dtype, TP1/TP2, the default backend, target-only loading, and no MTP/speculative mode. Expand
-quantization, EP/PP/CP, alternate backends, and speculative modes as explicit follow-up profiles rather than making a
-family-wide claim.
-
-## 12. Definition of Done
-
-### Content-bound Llama-only preview
-
-- [x] PR #15641 and PR #16159 are merged with passing required CI.
-- [x] PR #16458 is merged with the exact Llama profile, reusable harness, SourceIdentity v3, and transform ABI.
-- [ ] A production wheel from current `main` contains the merged integration and identity/profile foundation.
-- [ ] §20 passes on current `main`.
-- [x] The bounded Llama root/protocol/ABI profile is published in the runtime registry and support documentation.
-- [ ] Exact token equality, matching ArtifactIdentity, canonical-snapshot no-disk receiver proof, artifact mismatch, and
-  negative fallback controls are archived.
-- [x] Documentation says exact `LlamaForCausalLM` profile, not generic Llama-style or all-model support.
-
-### Multi-family beta
-
-- [x] Structured exact capability profiles replace class-only inheritance.
-- [x] ArtifactIdentity rejects same-config/different-content sources.
-- [ ] Drafts #16974 and #17142 merge after focused CI and real Qwen2/Qwen3 donor/receiver evidence.
-- [ ] Llama, Qwen dense, one Qwen MoE profile, one DeepSeek/MLA profile, and one GLM or Kimi text profile pass.
-- [ ] Every enabled profile has full-versus-staged unit tests and real GPU no-disk E2E evidence.
-- [ ] Receiver installation is transactional: unsupported families, protocols, artifacts, draft scopes, partial
-  transfers, alias failures, and derived-state failures discard staged state and complete one full fallback load.
+- [ ] Qwen2/Qwen2.5 and Qwen3 dense merge after focused CI and real-GPU evidence.
+- [ ] Llama, Qwen dense, one Qwen MoE, one DeepSeek/MLA, and one GLM or Kimi text profile pass.
+- [ ] Every enabled row has full-versus-staged unit evidence and live no-disk donor/receiver evidence.
+- [ ] Receiver installation is transactional across transfer, alias, and derived-state failures.
 - [ ] Structured result/reason reporting makes every fallback visible.
 
-### Supported MX feature
+### R3 supported feature
 
-- [ ] The client/server API is public and versioned; dependency ranges are backed by compatibility CI.
-- [x] SourceIdentity includes content identity and a versioned transform-layout ABI.
-- [x] The public support matrix lists exact profiles and is validated against the runtime registry.
-- [ ] Single-node and two-node RDMA qualification pass on supported GPU/NIC environments.
-- [ ] Permanent GPU CI protects at least one profile from each advertised model category.
-- [ ] Concurrent model/rank load stress proves that per-load MX identity, endpoint, model name, and credentials cannot
-  cross-talk.
-- [ ] Startup performance, peak-resource, timeout, retry, and cleanup SLOs are measured and documented.
-- [ ] Multimodal, speculative, managed lifecycle, and MX+GMS claims remain explicitly off unless separately qualified.
+- [ ] Public versioned MX API and dependency compatibility CI.
+- [ ] Permanent GPU CI for each advertised model category.
+- [ ] Single-node and two-node RDMA qualification on supported environments.
+- [ ] Concurrent model/rank stress with no identity, endpoint, model-name, or credential cross-talk.
+- [ ] Startup performance, resource, timeout, retry, cleanup, and liveness SLOs.
+- [ ] Multimodal, speculative, managed lifecycle, and MX+GMS remain off unless separately qualified.
 
-## 13. Per-Profile Evidence Record
-
-Store this record with every qualification result:
+<details>
+<summary>Per-profile evidence record</summary>
 
 ```text
 profile_id:
@@ -804,21 +355,21 @@ evidence_location:
 known_exclusions:
 ```
 
-A profile is supported only when this record is complete for every row claimed in the support matrix.
+</details>
 
-## 14. References
+## 9. References
 
 - [§16 Staged Post-Load Hooks](16-staged-post-load-hooks.md)
 - [§18 GMS Integration Gaps and Concrete PR Plan](18-gms-integration-gaps-and-concrete-pr-plan.md)
 - [§20 ModelExpress End-to-End Verification Plan](20-mx-e2e-verification-plan.md)
-- [NVIDIA/TensorRT-LLM#15014 - Wave 1](https://github.com/NVIDIA/TensorRT-LLM/pull/15014)
-- [NVIDIA/TensorRT-LLM#15288 - Wave 2](https://github.com/NVIDIA/TensorRT-LLM/pull/15288)
-- [NVIDIA/TensorRT-LLM#15386 - Wave 3](https://github.com/NVIDIA/TensorRT-LLM/pull/15386)
-- [NVIDIA/TensorRT-LLM#15387 - Wave 4](https://github.com/NVIDIA/TensorRT-LLM/pull/15387)
-- [NVIDIA/TensorRT-LLM#15432 - Wave 5](https://github.com/NVIDIA/TensorRT-LLM/pull/15432)
-- [NVIDIA/TensorRT-LLM#15641 - Optional standalone MX integration](https://github.com/NVIDIA/TensorRT-LLM/pull/15641)
-- [NVIDIA/TensorRT-LLM#16159 - ArtifactIdentity and SourceIdentity v2](https://github.com/NVIDIA/TensorRT-LLM/pull/16159)
-- [NVIDIA/TensorRT-LLM#16458 - Exact-profile and transform-ABI foundation](https://github.com/NVIDIA/TensorRT-LLM/pull/16458)
-- [NVIDIA/TensorRT-LLM#16974 - Qwen2 dense MX qualification](https://github.com/NVIDIA/TensorRT-LLM/pull/16974)
-- [NVIDIA/TensorRT-LLM#17029 - ModelExpress strategy delegation](https://github.com/NVIDIA/TensorRT-LLM/pull/17029)
-- [NVIDIA/TensorRT-LLM#17142 - Qwen3 dense MX qualification](https://github.com/NVIDIA/TensorRT-LLM/pull/17142)
+- [#15014 - Wave 1](https://github.com/NVIDIA/TensorRT-LLM/pull/15014)
+- [#15288 - Wave 2](https://github.com/NVIDIA/TensorRT-LLM/pull/15288)
+- [#15386 - Wave 3](https://github.com/NVIDIA/TensorRT-LLM/pull/15386)
+- [#15387 - Wave 4](https://github.com/NVIDIA/TensorRT-LLM/pull/15387)
+- [#15432 - Wave 5](https://github.com/NVIDIA/TensorRT-LLM/pull/15432)
+- [#15641 - Optional standalone MX integration](https://github.com/NVIDIA/TensorRT-LLM/pull/15641)
+- [#16159 - ArtifactIdentity and SourceIdentity v2](https://github.com/NVIDIA/TensorRT-LLM/pull/16159)
+- [#16458 - Exact-profile and transform-ABI foundation](https://github.com/NVIDIA/TensorRT-LLM/pull/16458)
+- [#16974 - Qwen2 dense qualification](https://github.com/NVIDIA/TensorRT-LLM/pull/16974)
+- [#17029 - ModelExpress strategy delegation](https://github.com/NVIDIA/TensorRT-LLM/pull/17029)
+- [#17142 - Qwen3 dense qualification](https://github.com/NVIDIA/TensorRT-LLM/pull/17142)
