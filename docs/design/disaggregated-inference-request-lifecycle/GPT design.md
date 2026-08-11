@@ -4,223 +4,194 @@
 |---|---|
 | **Status** | Design proposal, re-baselined against `main@48df89d76` |
 | **Last updated** | 2026-08-11 |
-| **Urgent scope** | Python-native NIXL physical transfer ownership |
-| **Later scope** | Cross-side obligations, rerouting, additional Python transports/topologies, and C++ lifecycle qualification |
 
 ## Executive Summary
 
-The urgent correctness problem is local physical operation ownership, not the
-absence of a shared CTX/GEN request state machine.
+The urgent correctness problem is local physical operation ownership. A CTX or
+GEN request can become logically terminal before every NIXL or CUDA accessor is
+known to be terminal. Cancellation, consensus, timeout, session removal, or
+shutdown must therefore never be treated as proof that memory is reusable.
 
-Current TensorRT-LLM already retains many requests and KV blocks while an
-asynchronous transfer is active. However, request and session state can become
-terminal before every physical writer is known to be terminal. Cancellation,
-failure consensus, session removal, elapsed quarantine, or shutdown can
-therefore get ahead of the NIXL or CUDA work that still has access to memory.
+The work is divided into three explicit phases:
 
-The first implementation milestone introduces one common physical-owner
-abstraction, instantiated separately for each local source or destination
-accessor domain. Each owner:
+| Phase | Outcome | Delivery boundary |
+|---:|---|---|
+| **1. Ownership MVP** | Establish no-reuse-before-quiescence for one narrow context-first Python/NIXL cohort | PRs 1–3 |
+| **2. Coordinated Python lifecycle** | Add immutable attempt-level CTX/GEN coordination and qualify the priority Python scenarios | PRs 4–9 |
+| **3. Extended lifecycle and C++** | Add renewable resource obligations, rerouting, the remaining Python scenarios, and separately qualified C++ support | Explicit post-core workstreams |
 
-- serializes address publication with cancellation;
-- records every authorized resource, segment, and writer;
-- survives logical request and session termination;
-- drains all writers after the first failure;
-- supplies the physical evidence required before a transfer borrow can end or
-  an allocation can be retired; and
-- fails closed during shutdown when quiescence cannot be proven.
+The nine-PR size target applies to Phases 1–2. Phase 3 is not forced into that
+limit: doing so would bundle unrelated adapters and make C++ qualification too
+large to review safely. This is a focused refactoring of existing ownership
+paths, not a rewrite of the Python transceiver.
 
-Cross-side grants and renewable obligation leases are a second layer. They are
-not required to prevent premature memory reuse, so they must not block the
-physical-safety MVP. They become important when the system promises bounded
-peer-loss cleanup, rerouting, or explicit queue and resource accountability.
-Even then, lease expiry requests cleanup; it never proves DMA quiescence.
+Every PR or workstream targets roughly 1,500 changed lines or less. This is a
+soft reviewability target: one concern per PR takes precedence over the count,
+and splitting a row does not change its phase scope or exit gate.
 
-This is a focused refactoring of current ownership paths, not a rewrite of the
-Python transceiver.
-
-## Why the Current Code Needs Refactoring
+## Problems, Goals, and Cross-Phase Rules
 
 ### Existing protections to preserve
 
-Current `main` already provides useful pieces:
+Current `main` already reduces lifetime risk:
 
-- `AsyncTransferManager` strongly retains CTX requests. It pins V1 blocks;
-  V2 remains retained through the strong request and `kv_cache_map`/`_KVCache`
-  ownership.
-- `KvCacheTransceiverV2` retains request/session roots and has
+- `AsyncTransferManager` strongly retains CTX requests. It pins V1 blocks; V2
+  remains retained through the request and `kv_cache_map`/`_KVCache` ownership.
+- `KvCacheTransceiverV2` retains request/session roots and implements
   cancel-before-create tombstones.
-- Generation-first waits for GEN destination allocation and receiver
-  publication before CTX leaves `DISAGG_CONTEXT_WAIT_SCHEDULER`.
-- Rank consensus projects distributed logical success and failure.
+- Generation-first waits for GEN allocation and receiver readiness before CTX
+  leaves `DISAGG_CONTEXT_WAIT_SCHEDULER`.
+- Rank consensus reconciles distributed logical outcomes.
 - Bounce transfer has per-writer accounting, duplicate suppression, and
   drain-before-scatter behavior.
-- Idle iterations can progress transfers without a model batch.
+- Transfer progress can run on iterations with no model batch.
 
-These mechanisms reduce exposure, but they do not share one authoritative
-physical disposition. The design should generalize them instead of recreating
-them.
+The design generalizes these protections instead of replacing them.
 
-### Confirmed gaps
+### Confirmed problems
 
-- **P0 — Publication after cancellation.** `Receiver.setup_session()` can
-  consume a pre-cancel tombstone, yet the caller can continue through
-  `receive()` and publish addresses. Cancellation must permanently close the
-  publication gate.
-- **P0 — Logical status hides local writers.** The first failed peer operation
-  marks a multi-writer task `ERROR`; `has_transferring_tasks()` can then report
-  false while another NIXL writer is active. Fleet consensus also selects only
-  a logical outcome. Every rank must instead account for and drain its exact
-  local writer cohort.
-- **P0 — Results outlive logical owners.** Native registries use weak
-  references, so session removal can discard a late backend completion. A
-  strong operation/result owner must outlive request and session state.
-- **P0 — Timed reclamation and shutdown.** Bounce quarantine and bounded joins
-  can lead to reuse or deregistration without transport proof. Unresolved work
-  must remain unavailable or force endpoint reset.
-- **Attempt correctness — split retry identity.** `_post_with_retry()` can
-  independently regenerate the CTX or GEN `disagg_request_id`. Once acceptance
-  is possible, the paired identity is immutable and ambiguous retry must fail
-  and drain the old attempt.
-- **Liveness/accountability — incomplete terminal settlement.** The CTX status
-  path can remove a cancelled session without returning that request to
-  `AsyncTransferManager`, and no general attempt-scoped terminal ACK exists.
-  This cannot be repaired by releasing memory before local drain.
+#### Local physical safety
 
-## Relationship to NVBUG 6480621
+- **Publication after cancellation:** consuming a receive tombstone does not
+  prevent the caller from continuing into `receive()` and publishing addresses.
+- **A failed writer hides active siblings:** the first peer failure changes a
+  shared task to `ERROR`; `has_transferring_tasks()` can then report false while
+  another writer remains active.
+- **Late results can lose their owner:** native registries use weak lookups, so
+  session removal can discard later backend completion evidence.
+- **Timers are used where transport proof is required:** bounce quarantine and
+  bounded shutdown joins can reach reuse or deregistration without proving
+  that every accessor stopped.
 
-NVBUG 6480621 is not the motivation for this architecture. PR #17223 fixes the
-blocking precheck/harness ownership defect found during its investigation, and
-PR #17137 changes the existing 3-CTX, concurrency-180 proxy to enable that
-precheck and restore both timeouts from 600 seconds to 60 seconds. The former
-leaves normal `PyExecutor` polling unchanged; the latter has only a one-YAML
-unique child delta. As of 2026-08-11 both are open, and neither establishes
-closure of the original 8-CTX, concurrency-1760 workload.
+#### Cross-side consistency
 
-This document therefore makes no NVBUG 6480621 fix claim. NVBUG 6519709 is also
-only evidence that request-local Python transfer failures occur at production
-scale: this design makes retirement safe but does not reduce transport errors.
+- `_post_with_retry()` can independently remint the CTX or GEN
+  `disagg_request_id`; `max_retries=0` does not bypass its hard-coded transient
+  TCP retry budget.
+- A cancelled CTX session can disappear without settling back into
+  `AsyncTransferManager`, and there is no general attempt-scoped terminal ACK.
 
-## Goals and Non-Goals
+#### Coverage
+
+Python bounce, generation-first auxiliary state, multi-writer topologies,
+pipelining, recurrent/KDA state, PP, attention-DP, other transports, and C++ do
+not yet share one qualified ownership contract.
 
 ### Goals
 
-- Make publication, exact writer drain, late-result ownership, and shutdown
-  safe for every qualified resource.
 - Keep client-visible outcome separate from transfer release and allocation
   reuse.
-- Make paired retry identity and cross-side terminal facts unambiguous.
-- Add later cross-side accountability without coupling memory safety to a
-  coordinator or timer.
-- Define a disposition vocabulary that Python and C++ qualify separately.
+- Make publication, submission, exact writer drain, late-result settlement, and
+  shutdown safe for every explicitly qualified resource.
+- Add immutable attempt-level CTX/GEN coordination without mirroring scheduler
+  state or making a coordinator own GPU-memory truth.
+- Extend coverage one adapter or topology at a time through a common
+  conformance suite.
+- Give Python and C++ the same semantic disposition contract while qualifying
+  their implementations independently.
 
-### Non-goals for the first safety milestone
+### Non-goals
 
-- A mirrored scheduler state machine or router replacement.
-- Cross-side leases, rerouting, or fine-grained allocation detachment.
-- Fixing transport reliability.
-- Qualifying C++, every Python topology, or post-token retry in the first
-  safety milestone.
+- Fixing transport reliability or claiming that this design reduces NIXL
+  errors.
+- Replacing the router or replicating local scheduler state across workers.
+- Treating elapsed time, HTTP completion, consensus, ACK, grant expiry, or lease
+  expiry as DMA-quiescence evidence.
+- Qualifying every runtime and topology in the MVP.
+- Transparent post-token retry without preserving decoder and output state.
 
-## Ownership Model
+### Cross-phase invariants
 
-### Authoritative owners
+1. CTX source and GEN destination use the same owner abstraction but remain
+   separate local authorities; there is no shared cross-side physical owner.
+2. Only the local allocator declares memory reusable. Releasing a transfer
+   borrow is not the same as freeing an allocation.
+3. Physical settlement is keyed by `resource × segment × writer` and requires
+   a sealed cohort. Finishing all currently known writers is insufficient if a
+   later writer or segment can still be authorized.
+4. First failure may fix the logical result, but it never erases sibling
+   writers.
+5. `QUIESCED_SUCCESS`, `QUIESCED_FAILED`, and `QUIESCED_CANCELLED` permit
+   transfer-borrow release. `IN_DOUBT` does not.
+6. Cancellation permanently closes publication and submission gates after it
+   wins.
+7. Late or duplicate evidence matching the same owner generation settles that
+   retained owner exactly once. Evidence from a stale generation is inert to a
+   newer owner; contradictory same-generation evidence fails closed.
+8. Every transfer borrow is released exactly once after a quiesced
+   disposition. Duplicate completion cannot cause another release or unpin.
+9. Immutable terminal facts and renewable resource obligations are different:
+   Phase 2 coordinates the former, while Phase 3 introduces the latter.
 
-| Fact or resource | Authority |
+### Relationship to NVBUG 6480621
+
+NVBUG 6480621 is not the motivation for this architecture. PR #17223 fixes the
+blocking precheck/harness ownership defect found during its investigation and
+leaves normal `PyExecutor` polling unchanged. PR #17137 changes only the reduced
+3-CTX, concurrency-180 proxy, enables the precheck, and restores both timeouts
+from 600 seconds to 60 seconds. As of 2026-08-11, neither establishes closure
+of the original 8-CTX, concurrency-1760 workload.
+
+NVBUG 6519709 is only evidence that request-local Python transfer failures occur
+at production scale. This design makes retirement safe after such failures; it
+does not prevent the failures themselves.
+
+## Phase 1 — MVP: Local Ownership for a Limited Context-First Cohort
+
+### Objective and scope
+
+Phase 1 proves the local memory-safety invariant in the smallest end-to-end
+cohort that can exercise real Python/NIXL transfer.
+
+| Dimension | Phase 1 scope |
 |---|---|
-| Client outcome and output cursor | Frontend request supervisor |
-| Paired handoff attempt identity | Frontend attempt factory |
-| CTX compute state | CTX scheduler |
-| GEN compute state | GEN scheduler |
-| Source submission and read access | CTX send-operation owner |
-| Destination authorization and publication | GEN receive-operation owner |
-| Raw transport/CUDA completion evidence | Backend adapter |
+| Runtime | Python-native transceiver, explicitly selected on both peers |
+| Transport | Direct NIXL |
+| Scheduling | Context-first only |
+| Resource | Paged attention KV only |
+| Transfer shape | Monolithic protocol v0; `segment_id=0` |
+| Topology | One CTX worker and one GEN worker; TP1, PP1, CP1; attention-DP off |
+| Retry | Explicit disaggregated no-retry mode that also bypasses transient-TCP ID reminting |
+| Retirement | Coarse whole-request and KV-mapping retention |
+| Rollout | Disabled by default; private startup-validated opt-in |
+
+Bounce, generation-first, pipeline, PP, attention-DP, recurrent/KDA,
+auxiliary, draft, offload, and C++ paths are rejected before address
+publication. The owner supports multi-writer component tests, but Phase 1
+runtime qualification is single-writer only.
+
+Until PR 6 adds capability negotiation, matching Python runtime, build,
+protocol, and topology configuration on both peers is an operator/deployment
+precondition. Phase 1 validates its local configuration but cannot prove the
+remote peer selected the same runtime.
+
+### Design introduced in Phase 1
+
+#### Local authorities
+
+| Fact | Authority |
+|---|---|
+| CTX source submission and read access | CTX send-operation owner |
+| GEN destination authorization and publication | GEN receive-operation owner |
+| Raw NIXL/CUDA completion evidence | Backend evidence adapter |
 | Physical disposition | Corresponding local operation owner |
-| Allocation reuse | Local KV, auxiliary, or bounce allocator |
-| Later queue/resource obligation | Worker-backed grant/obligation owner |
+| Allocation reuse | Local KV allocator |
 
-The coordinator derives a lifecycle view from these facts. It does not own GPU
-memory truth.
+Each operation owner strongly outlives request/session lookup and tracks a
+process-local owner generation, endpoint role, resource, segment, and exact
+writer cohort. The GEN owner serializes destination publication with cancel;
+the CTX owner independently serializes source submission with cancel.
 
-### Physical operation identity
+For protocol v0, the receiver derives and seals the complete immutable writer
+set from validated rank-overlap metadata before publishing an address. The
+sender fences its fixed submissions after enqueue. If both peers cannot derive
+the same cohort, PR 2 must add an explicit seal and keep publication closed
+until it arrives. That seal must be piggybacked on the existing
+setup/receiver-ready exchange to preserve the no-extra-round-trip target; a new
+handshake requires an explicit performance review and a revised acceptance
+criterion.
 
-The source and destination use the same owner implementation but remain
-independent local authorities. There is no cross-side shared owner.
-
-For PRs 1–3, each retained owner has a process-local generation and tracks:
-
-```text
-current unique_rid
-local owner generation and endpoint role
-resource_id
-segment_id
-writer_id
-```
-
-`resource_id` identifies an independent physical accessor and reclamation
-domain, not merely a semantic model field. Paged KV and recurrent/KDA ranges
-coalesced into one NIXL operation may share an owner. Separate auxiliary,
-bounce, producer-CUDA, or scatter accessors require independent settlement.
-
-PR 3 adds an explicit disaggregated no-retry mode that bypasses the current
-hard-coded transient-TCP retry budget and request-ID reminting; setting
-`max_retries=0` alone is insufficient. Later identity hardening adds an
-immutable handoff-attempt UUID, endpoint incarnation,
-`transfer_session_id`, and wire-visible `operation_id` before retry, replay, or
-rerouting is enabled.
-
-The exact settlement key is:
-
-```text
-resource × segment × writer
-```
-
-For the current monolithic path, `segment_id` has one value. The model already
-supports multiple segments so pipelined transfer does not require a second
-ownership design.
-
-### Artifact manifest
-
-A handoff transfers a manifest rather than one undifferentiated KV object:
-
-```text
-ArtifactManifest
-  - paged attention KV ranges
-  - recurrent or KDA state
-  - auxiliary metadata/buffers
-  - optional draft or offloaded resources
-  - zero or more ordered segments per resource
-  - final manifest seal
-```
-
-Every manifest entry maps to one or more physical ownership records based on
-its accessor domains. The attempt can commit only after the sealed required
-set settles successfully.
-
-## Safety Invariants
-
-1. **Allocator authority:** only the local allocator declares memory reusable.
-2. **No reuse before quiescence:** publication or submission keeps the affected
-   memory unavailable until every authorized accessor settles.
-3. **Cancellation closes publication and submission:** after cancel wins either
-   local gate, no new address, segment, operation, or writer is authorized.
-4. **Exact cohort settlement:** the first writer failure fixes the logical
-   outcome but does not erase or complete sibling writers.
-5. **Logical state is not physical proof:** request state, rank consensus,
-   session destruction, timeout, and HTTP completion do not prove quiescence.
-6. **Timers do not release memory:** timeout can request abort or endpoint
-   reset; it cannot convert `IN_DOUBT` into reusable capacity.
-7. **Stale work is inert:** old local owner generations cannot affect a newer
-   owner. Before retry/reroute is enabled, this extends to attempt, session,
-   endpoint-incarnation, operation, and segment identity on the wire.
-8. **Exactly-once transfer release:** each transfer borrow is released once
-   after an accessor-quiesced disposition. Allocation reuse additionally
-   requires every non-transfer owner, such as decode, to release the resource.
-
-## Physical Transfer Lifecycle
-
-Logical outcome and physical state are orthogonal. A request may fail promptly
-while cleanup continues.
+#### Physical lifecycle
 
 ```mermaid
 stateDiagram-v2
@@ -229,107 +200,141 @@ stateDiagram-v2
     CONSTRUCTING --> ACTIVE: first address or operation authorized
     CONSTRUCTING --> SEALED_DRAINING: seal empty cohort
     ACTIVE --> SEALED_DRAINING: normal seal, failure, cancel, or shutdown
-    SEALED_DRAINING --> QUIESCED: sealed cohort fully drained
-    SEALED_DRAINING --> IN_DOUBT: backend cannot prove quiescence
-    CANCELLED_UNPUBLISHED --> RETIRED
-    QUIESCED --> RETIRED: transfer owner releases its borrow
+    SEALED_DRAINING --> QUIESCED: exact sealed cohort drained
+    SEALED_DRAINING --> IN_DOUBT: quiescence cannot be proven
+    CANCELLED_UNPUBLISHED --> OWNER_RETIRED
+    QUIESCED --> OWNER_RETIRED: release transfer borrow
     IN_DOUBT --> QUIESCED: proven endpoint-wide fence
     IN_DOUBT --> ABANDONED_BY_PROCESS_EXIT: fail-stop process exit
     ABANDONED_BY_PROCESS_EXIT --> [*]: external endpoint destruction
-    RETIRED --> [*]
+    OWNER_RETIRED --> [*]
 ```
 
-### Publication and submission gates
+An accessor-quiesced disposition releases only the transfer borrow. On receive
+success, destination KV becomes decode-owned. The allocator may free it only
+after every remaining logical owner also releases it.
 
-The GEN receive owner serializes destination publication with cancellation.
-The CTX send owner separately serializes source submission with cancellation
-and owns source-side gather/network access. Before publication/submission,
-cancellation can roll back local construction. Afterwards it closes future
-authorization and drains every already-created accessor.
+| Disposition | Required evidence |
+|---|---|
+| `QUIESCED_SUCCESS` | The writer completed and can no longer access memory |
+| `QUIESCED_FAILED` | The backend proves that the failed access ended |
+| `QUIESCED_CANCELLED` | Cancellation proves that the writer stopped or drained |
+| `IN_DOUBT` | Future or outstanding access cannot be excluded; release is forbidden |
 
-Normal completion also requires an explicit manifest seal and submission
-fence. `QUIESCED` means both that no later resource, segment, or writer can be
-authorized and that every member of the sealed cohort is terminal. Merely
-settling all currently known writers is insufficient.
+Shutdown returns `DRAINED` or `IN_DOUBT`. Phase 1 handles `IN_DOUBT` by stopping
+admission, retaining in-process registrations, and terminating the worker.
+Process exit is external containment, not an in-process transition to reusable
+capacity. The orchestrator cannot advertise replacement capacity until the old
+process exits and a new endpoint incarnation exists; partial in-process
+recovery is forbidden.
 
-For the PR 1–3 monolithic protocol-v0 cohort, no new wire message is required:
-the receive owner derives and seals the complete expected writer set from
-validated peer/rank-overlap metadata before publishing any address
-(`segment_id=0`), and the send owner fences submission after its fixed operation
-set is enqueued. If both sides cannot derive the same immutable cohort, PR 2
-must add an explicit wire seal and publication remains closed until it arrives.
+### Figure 1 — Phase 1 context-first workflow
 
-Cancel-before-create tombstones are consumed by the receive owner; consuming a
-tombstone cannot be followed by `ACTIVE` publication.
+```mermaid
+sequenceDiagram
+    participant F as Frontend
+    participant C as CTX
+    participant S as CTX send owner
+    participant R as GEN receive owner
+    participant G as GEN
 
-### Exact writer settlement
+    F->>C: Prefill no-retry paired request
+    C->>C: Produce monolithic paged KV
+    C->>S: Acquire transfer borrow and seal source cohort
+    C-->>F: Context response with transfer correlation
+    F->>G: Dispatch paired request with same current ID
+    G->>R: Allocate and open publication gate
+    R-->>S: Receiver-ready information
+    S->>R: Submit sealed KV cohort
+    S->>S: Fence submission and drain source cohort
+    R->>R: Close publication and drain receive cohort
+    R-->>G: Destination transfer access quiesced
+    G->>G: Destination becomes decode-owned
+    G-->>F: Decode response
+```
 
-The first failed writer may report the request-visible failure immediately.
-The operation owner nevertheless remains live until every sibling writer is in
-one of these physical dispositions:
+This flow has no retry, renewable lease, rerouting, or Phase 2 terminal
+protocol. CTX and GEN correlate the existing request ID, while local owners are
+the only physical-safety authority.
 
-| Disposition | Transfer borrow releasable? | Meaning |
-|---|---:|---|
-| `QUIESCED_SUCCESS` | Yes | Writer completed and can no longer access memory |
-| `QUIESCED_FAILED` | Yes | Writer failed, with backend evidence that access ended |
-| `QUIESCED_CANCELLED` | Yes | Cancellation stopped or drained the writer |
-| `IN_DOUBT` | No | Future or outstanding access cannot be excluded |
+### Phase 1 PR plan
 
-Late and duplicate backend results settle the retained operation owner, not a
-possibly removed request/session lookup. Conflicting terminal evidence fails
-the owner closed.
+| PR | Scope | Expected result |
+|---:|---|---|
+| **1** | Add a transport-neutral operation owner, backend-evidence seam, protocol-v0 cohort seal, structured dispositions, and deterministic exact-cohort tests | Disabled ownership core |
+| **2** | Wire separate CTX-send and GEN-receive owners into direct Python NIXL; serialize cancel with publication/submission; retain late results strongly | Direct accessors cannot outlive their physical owner |
+| **3** | Gate context-first executor retirement, allocator release, and shutdown on physical disposition; add true disagg no-retry mode, startup cohort validation, and fail-stop `IN_DOUBT` | First qualified opt-in MVP cohort |
 
-### Transfer release and allocation retirement
+If PR 2 cannot derive the same sealed cohort on both peers without protocol
+change, its explicit seal is part of PR 2 rather than deferred.
 
-For the initial implementation, retaining the whole request and its current KV
-mapping is acceptable. An accessor-quiesced disposition releases the transfer
-borrow; it does not by itself free the allocation. On receive success, the
-destination passes to decode ownership. On failure or request retirement, the
-executor may call `free_resources()` only after the logical resource owner no
-longer needs the allocation and the physical transfer owner permits release.
-This reuses the existing coarse `AsyncTransferManager` containment and avoids
-prematurely redesigning every KV allocator.
+### Expected Phase 1 result
 
-A later allocation-generation lease permits logical request cleanup to detach
-while only the affected allocation remains pending-free. That improves bounded
-reclamation, rerouting, and ABA protection; it is not required to establish the
-initial safety invariant.
+A disabled-by-default TP1 context-first canary in which cancellation cannot be
+followed by publication, logical retirement cannot discard completion
+evidence, and paged KV cannot be reused before the exact local accessor cohort
+quiesces. No broader Python or C++ support is implied.
 
-### Shutdown
+### Validation and exit criteria
 
-Shutdown closes admission and publication, requests drain, and returns one of:
+- Cancel before and during publication, including a consumed tombstone followed
+  by an attempted `receive()`.
+- Owner-level multi-writer component test: first writer failure while a sibling
+  remains blocked; the logical failure may emit once, but the transfer borrow
+  remains held.
+- Late, duplicate, and contradictory same-generation evidence.
+- Duplicate completion causes exactly one transfer release/unpin; a stale owner
+  generation cannot settle a newer owner.
+- Session removal before backend completion.
+- Active direct-NIXL shutdown and fail-stop `IN_DOUBT` without reuse or
+  deregistration.
+- No partial in-process recovery or replacement advertisement before old
+  process exit and a new endpoint incarnation.
+- No paged-KV release before exact sealed-cohort drain.
+- No healthy-path extra network round trip, copy, or CUDA synchronization.
+- Flag-off behavior unchanged and the TP1 canary passing with retry disabled.
 
-- `DRAINED`: all exact writers and local CUDA work are quiescent;
-- `IN_DOUBT`: at least one accessor cannot be excluded.
+Phase 1 exits only when locally detectable unsupported combinations are
+rejected before publication and all criteria above pass.
 
-`IN_DOUBT` vetoes allocation reuse and memory deregistration. Recovery requires
-a backend-qualified endpoint fence. The PR 3 canary instead uses fail-stop
-containment: stop admission, report the request/worker failure, retain all
-in-process registrations, and terminate the worker. Process exit abandons the
-old in-process owner and allocation; endpoint destruction provides the external
-containment boundary, not a normal `IN_DOUBT`-to-`QUIESCED` transition. The
-orchestrator may replace the worker only after the old process exits and the
-endpoint incarnation changes. Partial in-process capacity recovery is deferred
-until the backend can prove a stronger fence.
+### Open questions and dependencies
 
-## Attempt Integrity and Cross-Side Termination
+- Which NIXL result or endpoint fence is strong enough to prove that a failed
+  writer can no longer access registered memory?
+- Which validated setup metadata is the source of truth for the protocol-v0
+  writer cohort?
 
-### Retry rules
+## Phase 2 — Cross-Side Attempt Coordination and Extended Python Scenarios
 
-Once either worker may have accepted a paired handoff:
+### Objective and scope
 
-- the attempt ID is immutable;
-- neither CTX nor GEN can independently mint a replacement ID;
-- retry is allowed with the same ID only for a proven pre-connect failure; and
-- an ambiguous post-connect retry fails and drains the old attempt.
+Phase 2 adds cross-side coordination for immutable attempt identity and
+terminal convergence, then qualifies the ownership contract on priority Python
+scenarios:
 
-Creating a replacement attempt is later behavior. It requires both old
-endpoints to be fenced/quiesced, or separately qualified immutable-source
-concurrent-read semantics. These rules apply to both scheduling workflows.
+- direct TP2-to-TP1 multi-writer fan-in;
+- existing Python bounce, including scatter/CUDA accessors;
+- generation-first with its separate auxiliary accessor;
+- context-first and generation-first terminal handling;
+- endpoint identity, capability negotiation, autonomous progress, and phase
+  diagnostics; and
+- narrowly qualified same-ID retry for proven pre-connect failure.
 
-### Terminal facts
+This is attempt-level coordination, not a mirrored scheduler state machine.
+Renewable queue/resource grants, artifact-obligation leases, replacement
+attempts, and rerouting remain Phase 3.
 
-Cross-side terminal messages are idempotent and attempt-scoped:
+### Design introduced in Phase 2
+
+#### Immutable identity and terminal facts
+
+Before retry or replay is enabled, the wire identity expands to an immutable
+handoff attempt ID, endpoint incarnation, transfer-session ID, operation ID,
+resource ID, and writer ID. Effective runtime/capability negotiation occurs
+after model/backend resolution; `transceiver_runtime="auto"` is not proof that
+both endpoints selected Python.
+
+Cross-side terminal messages are idempotent, attempt-scoped facts:
 
 ```text
 ABORT_REQUESTED
@@ -338,297 +343,243 @@ HANDOFF_COMMITTED
 TERMINAL_ACK
 ```
 
-Missing acknowledgement retains a bounded tombstone/replay record. It does not
-retain memory once the local physical owner independently proves quiescence,
-and it does not release memory while that owner is `IN_DOUBT`.
+Missing ACK retains a bounded replay/tombstone record. It neither retains
+memory after the local owner proves quiescence nor releases memory while that
+owner remains `IN_DOUBT`.
 
-### Progress and timer semantics
+#### Retry and progress
 
-Transfer progress, cancellation, timeout detection, and retirement must run
-even when the scheduler produces no model batch.
+Once either worker may have accepted an attempt:
 
-One `kv_transfer_timeout_ms` currently covers different phases on CTX and GEN.
-Diagnostics should record at least:
+- neither CTX nor GEN independently remints its identity;
+- same-ID retry is allowed only for a proven pre-connect failure; and
+- ambiguous post-connect retry fails and drains the old attempt.
 
-```text
-frontend routing and queue
-worker queue
-GEN allocation and receiver setup
-CTX prefill
-peer rendezvous
-operation submission
-first backend progress, when observable
-physical completion
-```
+Transfer progress, cancellation, timeout detection, and terminal replay must
+continue through zero-model-batch iterations. Diagnostics distinguish frontend
+queueing, worker queueing, GEN allocation/receiver setup, CTX prefill,
+rendezvous, submission, first observable backend progress, and physical
+completion. A deadline may emit an abort intent; only the physical owner can
+emit a quiesced disposition.
 
-A phase deadline can produce a logical error or abort intent. Only the physical
-owner can produce an accessor-quiesced disposition.
+#### Extended physical adapters
 
-## Context-First and Generation-First Workflows
+The direct multi-writer topology has one TP2 CTX worker and a pool of two TP1
+GEN instances. Each attempt selects one GEN instance and therefore has an exact
+two-writer CTX cohort. Python bounce adopts the same owner instead of elapsed
+quarantine as a reuse condition. Generation-first assigns its auxiliary state
+an independent owner rather than folding it into paged-KV completion.
 
-### Context-first
+Phase 2 terminal coordination applies to both scheduling modes. Figure 1 gains
+immutable attempt identity and the terminal messages above; its local physical
+ownership flow remains unchanged.
 
-Context-first currently computes before a GEN worker has made a worker-backed
-commitment. The physical-safety layer works without changing that policy.
-
-```mermaid
-sequenceDiagram
-    participant F as Frontend
-    participant C as CTX
-    participant S as CTX send owner
-    participant R as GEN receive owner
-    participant G as GEN
-
-    F->>C: Prefill immutable attempt
-    C->>C: Build artifact manifest
-    F->>G: Dispatch same immutable attempt
-    G->>R: Allocate and open destination publication gate
-    R-->>S: Receiver-ready information
-    C->>S: Authorize source accessors
-    S->>R: Transfer sealed manifest
-    S->>S: Fence submission and drain source cohort
-    R->>R: Close publication, drain, and validate receive cohort
-    R-->>G: Transfer access quiesced
-    G->>G: HANDOFF_COMMITTED; destination becomes decode-owned
-    G-->>F: Decode response
-```
-
-A later worker-backed GEN grant can avoid wasted prefill and bound how long CTX
-retains an artifact, but it is not the memory-safety proof.
-
-### Generation-first
-
-Generation-first already has a receiver-ready data-plane handshake. GEN
-allocates destination resources and publishes receive information before CTX
-leaves its scheduler wait state.
+### Figure 2 — End-of-Phase-2 generation-first workflow
 
 ```mermaid
 sequenceDiagram
     participant F as Frontend
     participant G as GEN
-    participant R as GEN receive owner
-    participant S as CTX send owner
+    participant R as GEN KV + auxiliary receive owners
+    participant K as CTX KV send owner
+    participant A as CTX auxiliary owner
     participant C as CTX
 
     F->>G: Dispatch immutable attempt
     F->>C: Dispatch same immutable attempt
-    G->>R: Allocate destination and open publication gate
-    R-->>C: Existing receiver-ready information
-    C->>C: Begin prefill after readiness
-    C->>S: Produce and authorize manifest segments
-    S->>R: Transfer segments and final seal
-    S->>S: Fence submission and drain source cohort
-    R->>R: Close publication, drain, and validate receive cohort
-    R-->>G: Transfer access quiesced
+    G->>R: Allocate required destinations and open publication gates
+    R-->>C: Receiver-ready information bound to attempt
+    C->>C: Prefill after readiness
+    C->>K: Acquire and authorize KV cohort
+    C->>A: Acquire and authorize auxiliary cohort
+    K->>R: Transfer sealed KV cohort
+    A->>R: Transfer sealed auxiliary cohort
+    K->>K: Fence and drain KV source cohort
+    A->>A: Fence and drain auxiliary cohort
+    R->>R: Close and drain both receive cohorts
+    R-->>G: TRANSFER_RESULT after all required cohorts settle
     G->>G: HANDOFF_COMMITTED; destination becomes decode-owned
+    G-->>C: TERMINAL_ACK
     G-->>F: Decode response
 ```
 
-The later lifecycle protocol should extend this handshake with attempt scope,
-explicit reject/revoke, expiry, and acknowledgement. It should not add a
-parallel readiness protocol.
+On cancel or failure, `ABORT_REQUESTED` stops new publication/submission and
+both local owners drain independently. The terminal protocol reports the
+outcome; it does not prove or replace local quiescence.
 
-## Cross-Side Obligations — Phase 2
+### Phase 2 PR plan
 
-Cross-side coordination is layered on top of physical ownership when the
-service needs stronger liveness guarantees.
-
-### Worker-backed GEN grant
-
-A router selection is only placement and load accounting. A hard grant must be
-issued by, or backed by, the GEN worker and state exactly what it promises:
-
-- scheduler/request ownership;
-- destination KV allocation and receiver readiness; and/or
-- transport concurrency capacity, if such a capacity contract exists.
-
-Generation-first can formalize its existing receiver-ready commitment.
-Context-first requires a new worker-backed commitment if it wants to avoid
-prefill without a consumer.
-
-### Artifact obligation lease
-
-After an artifact or manifest segment exists, a renewable obligation records
-that GEN still needs CTX to retain it. Expiry lets CTX stop accepting new work
-for that consumer and begin abort/fence processing.
-
-The lease provides bounded peer-loss cleanup and resource accountability. Its
-expiry never releases an allocation or substitutes for exact writer drain.
-
-### Later capabilities
-
-Once grants, obligations, attempt identity, and allocator-generation leases are
-all available, the architecture may support safe rerouting of immutable
-artifacts. Rerouting is deliberately outside the first safety milestone.
-
-## Runtime and Integration Scope
-
-### Initial supported cohort
-
-The first canaryable safety milestone is deliberately narrower than the final
-production topology. The owner implementation and component tests support
-multiple writers, but the initial runtime qualification does not claim DSv4
-attention-DP/EP64 coverage.
-
-| Dimension | Initial scope |
-|---|---|
-| Runtime | Python-native transceiver |
-| Transport | Direct NIXL |
-| Transfer shape | Monolithic protocol v0; expected writer set sealed from setup metadata; exact cohort component-tested |
-| Resources | Paged attention KV only |
-| Scheduling | Context-first only |
-| Topology | One CTX worker and one GEN worker; TP1, PP1, CP1, attention-DP off |
-| Allocator strategy | Coarse request/mapping retention |
-| Required gates | Explicit Python runtime and matching protocol/config on both peers; new disagg no-retry mode bypasses transient-TCP retry and ID reminting; bounce, pipeline, separate auxiliary/recurrent/draft/offload, generation-first, PP, and attention-DP rejected |
-| Default rollout | Private, startup-validated opt-in |
-
-### Qualification after the initial canary
-
-- PR 4 qualifies direct multi-writer fan-in by adapting
-  the existing `disagg_config_ctxtp2_gentp1.yaml` shape: one CTX TP2 worker,
-  a pool of two TP1 GEN instances, context-first, explicit Python/direct NIXL,
-  and bounce off. Each attempt targets one GEN instance and has an exact
-  two-writer CTX cohort. Fault injection holds one CTX writer while the sibling
-  fails. Until this passes, PR 3 is only a single-writer canary skeleton.
-- PR 5 makes existing Python bounce adopt the common owner and removes
-  timer-only reuse.
-- Generation-first adds separate auxiliary ownership in PR 6.
-- Recurrent/KDA, draft, offloaded, and auxiliary resources add ownership
-  records according to their independent accessor domains.
-- PP and attention-DP qualify the same `resource × segment × writer` contract.
-- Bounce-v2 or other transports implement a backend quiescence adapter rather
-  than duplicating lifecycle state.
-- Pipelined transfer acquires ownership before waiting on each producer CUDA
-  event, treats that event as an accessor, uses an immutable segment ID and
-  final seal, and then submits the NIXL segment. Receiver slice `0` plus
-  `is_last_slice` is not sufficient for late/duplicate settlement.
-
-Landing order with PR #15727 is not a correctness dependency. If #15727 lands
-first, build the owner stack on the current pipeline code; if the owner stack
-lands first, rebase #15727 onto its segment contract. In either order,
-pipelining stays outside the qualified cohort until its ownership adapter
-passes.
-
-### Python and C++
-
-The disposition vocabulary can be common, but qualification is runtime- and
-backend-specific.
-
-Python currently supports the native NIXL path and is increasingly selected by
-model-specific `transceiver_runtime="auto"` resolution. C++ remains required
-for configurations and transports that Python does not cover. C++ lifecycle
-support must therefore be a separate effort that proves its own submission
-fence, exact completion, deregistration, and shutdown semantics.
-
-Configuring `auto` does not prove that both endpoints selected Python. Effective
-runtime and capabilities must be checked after model/backend resolution. Until
-capability negotiation lands in PR 9, every enabled cohort explicitly sets
-`transceiver_runtime=PYTHON` on both endpoints and requires matching build,
-protocol, and topology configuration before address publication.
-
-## Validation and Acceptance Criteria
-
-### PR 1–3 evidence
-
-- cancellation before and during publication;
-- cancellation tombstone consumed before `receive()`;
-- rank A fails one writer while another remains blocked and rank B completes;
-  fleet error may emit once, but rank A retains its transfer borrow;
-- duplicate, contradictory, and late results;
-- logical session removal before backend completion;
-- stale local owner-generation results;
-- shutdown with active direct NIXL work;
-- no paged-KV release before the exact cohort drains;
-- `IN_DOUBT` stops admission and terminates the worker without in-process
-  deregistration or reuse;
-- healthy direct NIXL has no additional network round trip, copy, or CUDA
-  synchronization;
-- flag-off behavior remains unchanged; and
-- the PR 3 single-writer canary passes with retry disabled.
-
-Multi-writer component tests are mandatory in PR 3, but runtime multi-writer
-qualification starts with the direct TP2-to-TP1 adapter in PR 4.
-
-### Later attempt and adapter evidence
-
-- remote GEN cancellation reaches CTX retirement and terminal acknowledgement;
-- stale attempt, session, endpoint-incarnation, operation, and segment results
-  are inert after the corresponding wire identities land;
-- shutdown with active bounce, scatter, or producer-CUDA access does not reuse
-  memory early;
-- paired CTX/GEN retry behavior is qualified in both scheduling modes after
-  immutable paired attempts land;
-- progress and cleanup continue through zero-model-batch iterations; and
-- each recurrent/KDA, auxiliary, pipeline, PP, attention-DP, and other
-  topology adapter passes the ownership conformance suite before enablement.
-
-## Landing Plan
-
-Build each slice from current `main`, keep each PR at or below roughly 1,500
-changed lines, and attach focused tests to the behavior it introduces.
-
-| PR | Scope | Result |
+| PR | Scope | Expected result |
 |---:|---|---|
-| 1 | Add compact local operation owner, backend-evidence adapter seam, protocol-v0 cohort seal, structured dispositions, and exact cohort tests | Disabled ownership core |
-| 2 | Wire separate CTX-send and GEN-receive owners into direct NIXL; serialize cancel; retain late results | Direct accessor safety |
-| 3 | Gate context-first executor retirement/shutdown on disposition; propagate cancel; add explicit disagg no-retry mode, fail-stop `IN_DOUBT`, and multi-writer component evidence | **First single-writer canary skeleton** |
-| 4 | Qualify direct TP2-to-TP1 multi-writer fan-in and fault-injected sibling drain | Multi-writer runtime safety |
-| 5 | Move Python bounce accessors onto the owner and remove timer-only reuse | Bounce retirement safety |
-| 6 | Add and qualify the separate generation-first auxiliary accessor adapter | Generation-first ownership coverage |
-| 7 | Add immutable paired attempt identity, suppress ambiguous retry, and cancel sibling work; extract the narrow #16402 behavior | Attempt-safe serving edge |
-| 8 | Add idempotent terminal replay/ACK, preserve a stable no-batch progress hook, and attach phase diagnostics | Cross-side terminal convergence |
-| 9 | Add endpoint/session/operation incarnation and capability negotiation | Stale wire-work fencing |
+| **4** | Qualify direct TP2-to-TP1 multi-writer fan-in and fault-injected sibling drain | Runtime exact-cohort safety |
+| **5** | Move Python bounce accessors onto the common owner and remove timer-only reuse | Bounce retirement safety |
+| **6** | Add the immutable attempt/capability envelope: attempt ID, endpoint incarnation, transfer-session and operation IDs, and effective-runtime negotiation | Stale wire work is fenced before terminal replay or retry |
+| **7** | Add and qualify the generation-first auxiliary owner using the final identity envelope | Generation-first local ownership coverage |
+| **8** | Add attempt-scoped abort/result/commit/ACK, idempotent replay/tombstones, and sibling cancellation | Cross-side terminal convergence |
+| **9** | Add stable no-batch progress, phase diagnostics, and same-ID retry only for proven pre-connect failure | Qualified Phase 2 Python cohort |
 
-The urgent Python chain contains nine PRs total: PRs 1–3 are the minimum viable
-local-safety core, and PRs 4–9 are six follow-ons. The MVP startup validator
-requires the explicit no-retry mode and rejects every deferred scheduling,
-resource, topology, and bounce combination. PRs 4–5 then close the known
-multi-writer and bounce P0s before less urgent protocol expansion. PR 6 can
-extend physical ownership to generation-first while retry remains disabled.
-PR 7 can land in parallel if its serving diff remains independent, but it is
-required before end-to-end lifecycle correctness is claimed.
+PRs 4–5 can be developed in parallel with PR 6, but Phase 2 enablement waits
+for PRs 6–9. The nine-PR core ends here.
 
-The nine-PR table does not include cross-side obligation leases,
-allocation-generation leases, or C++ transceiver lifecycle support. Those are
-separate future programs: allocation leases are a retirement optimization;
-cross-side grants and obligations form Phase 2; and C++ needs its own
-backend-qualified chain. Recurrent or KDA, pipeline, PP, attention-DP,
-bounce-v2, and other resource/topology adapters likewise remain independently
-reviewable qualification follow-ups.
+### Expected Phase 2 result
 
-Rollout begins disabled, then canaries only the PR 3 context-first cohort with
-retry off. Monitor live/oldest owners, writers outstanding, late results,
-`IN_DOUBT`, and shutdown outcome. Expand one adapter at a time through the same
-conformance suite. Cross-side policy and C++ qualification remain separately
-reversible from physical ownership.
+The named Python paths use one ownership contract and one attempt-scoped
+terminal vocabulary across CTX and GEN. With both endpoints available and
+within replay retention, duplicate, reordered, or transiently lost messages
+converge. Permanent peer loss falls back to local abort/fail-stop containment;
+bounded peer-loss obligations remain Phase 3. Each local physical owner remains
+the sole source of transfer-release evidence.
 
-## Open Questions
+### Validation and exit criteria
 
-1. What NIXL result or endpoint reset is strong enough to prove a failed writer
-   can no longer access registered memory?
-2. Which current recurrent, auxiliary, draft, and offloaded resources need
-   independent manifest entries versus one co-transferred operation?
-3. How should ADP elect the leader that emits one request-visible outcome while
-   every rank retains its local physical owner?
-4. Which endpoint-incarnation source works across MPI, Ray, and torch process
-   group discovery?
-5. Which #17245/#17324 progress policy will land, and what autonomous progress
-   hook remains stable for ownership cleanup?
-6. What exact capability does a future GEN grant promise: scheduler ownership,
-   destination allocation, transport capacity, or a negotiated combination?
+- TP2-to-TP1 fault injection with one blocked writer and one failed sibling;
+  one logical error is reported and no early release occurs.
+- Remote GEN cancellation reaches CTX retirement and terminal acknowledgement
+  while the peer remains reachable or delivery succeeds within replay
+  retention.
+- Active bounce/scatter shutdown never reuses memory early.
+- Generation-first paged KV and auxiliary access settle independently.
+- Stale attempt, endpoint, session, and operation messages are inert.
+- Duplicate, reordered, or transiently lost terminal messages converge through
+  replay and tombstones within endpoint-availability and retention assumptions.
+- Progress and cleanup continue through zero-model-batch iterations.
+- Capability mismatch is rejected before address publication.
+- Same-ID retry succeeds only for proven pre-connect failure; ambiguous
+  post-connect retry is rejected and drained in both scheduling modes.
+- Every enabled Phase 2 path passes the Phase 1 ownership/shutdown conformance
+  suite.
 
-## Appendix: Active PR Snapshot (2026-08-11)
+Phase 2 exits only when all named paths pass; an adapter is not implicitly
+enabled because another adapter uses the same owner abstraction.
 
-This implementation snapshot is dated and is not part of the safety contract.
-The code audit baseline is [`main@48df89d76`](https://github.com/NVIDIA/TensorRT-LLM/commit/48df89d76d44aeb598bc7bf6f58ba445fb50cb76).
+### Open questions and dependencies
 
-| PR | Relationship to this design |
-|---|---|
-| [#16396](https://github.com/NVIDIA/TensorRT-LLM/pull/16396), [#16909](https://github.com/NVIDIA/TensorRT-LLM/pull/16909) | Historical prototypes; mine focused invariants/tests, never use as branch bases |
-| [#17223](https://github.com/NVIDIA/TensorRT-LLM/pull/17223), [#17137](https://github.com/NVIDIA/TensorRT-LLM/pull/17137) | Precheck/harness ownership fix found during the NVBUG 6480621 investigation, plus a reduced 60-second proxy; neither closes the original workload |
-| [#16402](https://github.com/NVIDIA/TensorRT-LLM/pull/16402) | Extract paired retry/deadline and sibling-cancellation behavior; do not stack wholesale |
-| [#16834](https://github.com/NVIDIA/TensorRT-LLM/pull/16834), [#17482](https://github.com/NVIDIA/TensorRT-LLM/pull/17482) | Preserve ADP-safe request-local error delivery; logical failure is not physical drain |
-| [#15727](https://github.com/NVIDIA/TensorRT-LLM/pull/15727) | Rebase onto the segment-owner contract or remain disabled pending its adapter |
-| [#15780](https://github.com/NVIDIA/TensorRT-LLM/pull/15780) | Expose bounce-v2 ACK/completion through a backend quiescence adapter |
-| [#17245](https://github.com/NVIDIA/TensorRT-LLM/pull/17245), [#17324](https://github.com/NVIDIA/TensorRT-LLM/pull/17324) | Admission/progress policy is unsettled; physical safety is independent of the outcome |
-| [#16645](https://github.com/NVIDIA/TensorRT-LLM/pull/16645) | Reuse or explicitly supersede its PP endpoint/session substrate |
+- PR #16402 is a source for narrow paired-retry/deadline and sibling-cancel
+  behavior; Phase 2 should extract only that behavior rather than stack the PR.
+- PRs #16834 and #17482 preserve ADP-safe request-local error delivery; logical
+  failure remains distinct from local physical drain.
+- Which endpoint-incarnation source is stable across MPI, Ray, and torch
+  process-group discovery?
+- Which autonomous progress hook remains stable after the #17245/#17324 policy
+  settles?
+- How should attention-DP eventually elect one logical error reporter while
+  every rank retains its local physical owner?
+
+## Phase 3 — Further Scenario Coverage and C++ Qualification
+
+### Objective and scope
+
+Phase 3 extends the contract beyond the priority Python cohort:
+
+- worker-backed GEN grants and renewable artifact-obligation leases;
+- allocation-generation leases, pending-free detachment, replacement attempts,
+  and safe immutable-artifact rerouting;
+- recurrent/KDA, remaining auxiliary, draft, and offloaded resources;
+- PP, attention-DP, pipelined transfer, bounce-v2, and other transports; and
+- a separately implemented and qualified C++ lifecycle.
+
+Phase 3 is a family of focused PRs, not one omnibus PR and not an implicit
+extension of the nine-PR core.
+
+### Design introduced in Phase 3
+
+#### Renewable resource obligations
+
+A router choice is placement and load accounting, not a hard resource grant.
+A worker-backed GEN grant states exactly what it promises: scheduler/request
+ownership, destination allocation and readiness, transport capacity, or a
+negotiated combination.
+
+Generation-first formalizes and extends the Phase 2 receiver-ready handshake;
+it does not create a parallel readiness protocol. Grants and leases layer on
+that handshake and on the same local physical owners.
+
+After CTX produces an artifact, a renewable obligation records that GEN still
+needs CTX to retain it. Reject, revoke, peer loss, or expiry requests abort and
+fence processing. Lease expiry never releases memory and never substitutes for
+the local physical owner.
+
+#### Fine-grained retirement and rerouting
+
+An allocation-generation lease lets logical request cleanup detach while only
+the affected allocation remains pending-free. It prevents ABA reuse and enables
+replacement attempts only after the old attempt is fenced/quiesced, or after a
+separately qualified immutable-source concurrent-read guarantee.
+
+The full artifact manifest may include paged KV, recurrent/KDA state,
+auxiliary buffers, draft/offloaded resources, and ordered segments. Every
+independent accessor domain has its own ownership record and participates in a
+final manifest seal.
+
+Pipelining acquires ownership before waiting on a producer CUDA event, treats
+that event as an accessor, uses immutable segment IDs plus a final seal, and
+then submits NIXL work. Receiver slice `0` plus `is_last_slice` is not sufficient
+identity for late or duplicate settlement.
+
+#### C++ qualification
+
+The disposition vocabulary is shared; implementation evidence is not. C++
+must independently prove submission fencing, exact completion,
+deregistration, shutdown, and stale-result behavior for each enabled backend
+and topology. Python qualification never implies C++ qualification.
+
+### Phase 3 PR/workstream plan
+
+| Workstream | Scope | Expected result |
+|---|---|---|
+| **P3-A** | Worker-backed GEN grant and renewable artifact-obligation protocol | Bounded peer-loss detection and obligation lifetime, with explicit cleanup initiation |
+| **P3-B** | Allocation-generation lease, pending-free retirement, and reroute fencing | Fine-grained reclamation without ABA reuse |
+| **P3-C** | Pipelined segment/final-seal contract and producer-CUDA-event ownership | Safe pipelined transfer lifecycle |
+| **P3-D** | One focused PR per remaining Python resource, topology, or transport adapter | Explicitly qualified extended Python matrix |
+| **P3-C++1** | C++ transport-neutral owner and backend-evidence core | C++ lifecycle foundation |
+| **P3-C++2** | C++ direct context-first integration, allocator/shutdown gates, and first canary | First qualified C++ cohort |
+| **P3-C++3+** | One C++ transport/topology adapter per PR | Incremental C++ coverage without blanket claims |
+
+If PR #15727 lands first, Phase 3 builds the owner adapter on the current
+pipeline code. If the owner contract lands first, #15727 rebases onto the
+segment/final-seal contract. Pipelining remains disabled until that adapter
+passes. Bounce-v2 (#15780) exposes its ACK/completion through a backend evidence
+adapter instead of defining another lifecycle state machine.
+
+P3-B reroute enablement depends on P3-A plus old-attempt fence/quiescence. P3-C
+can proceed independently after the Phase 2 identity contract. Each P3-D
+adapter depends on the resource/segment contract it consumes. P3-C++2 depends
+on P3-C++1 and a frozen capability/version contract. PP work should reuse or
+explicitly supersede the endpoint/session substrate from PR #16645.
+
+### Expected Phase 3 result
+
+The ownership and coordination contract covers explicitly enumerated remaining
+Python scenarios and separately qualified C++ cohorts. Renewable obligations
+bound responsibility and support safe policy decisions, while only physical
+quiescence authorizes transfer release.
+
+### Validation and exit criteria
+
+- Grant reject, revoke, expiry, and peer loss produce bounded detection,
+  obligation termination, and explicit abort/fence initiation without treating
+  expiry as transport quiescence.
+- Allocation generations block stale access and ABA reuse.
+- Rerouting waits for old-attempt fencing/quiescence or a separately qualified
+  immutable-source concurrent-read guarantee.
+- Stale segment results cannot settle a newer pipelined operation.
+- Producer CUDA events participate in cancellation and shutdown drain.
+- Each remaining Python adapter independently passes ownership, shutdown,
+  retry, and stale-result conformance before enablement.
+- Every C++ backend/topology independently passes the same semantic suite plus
+  backend-specific deregistration and fence tests.
+- Runtime/capability mismatch fails before publication rather than silently
+  mixing Python and C++ semantics.
+
+Phase 3 has no blanket completion claim. Coverage is the union of adapters and
+C++ cohorts that have individually passed these gates.
+
+### Open questions and dependencies
+
+- What exact resource does a GEN grant promise in each scheduling mode?
+- Which recurrent, auxiliary, draft, and offloaded resources need independent
+  manifest entries rather than one co-transferred operation?
+- Which transports can prove in-process quiescence after error, and which must
+  remain fail-stop?
+- What compatibility/version contract permits Python and C++ peers to reject an
+  unsupported lifecycle combination before publication?
