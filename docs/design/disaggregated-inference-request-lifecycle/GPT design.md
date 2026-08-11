@@ -6,8 +6,9 @@
 | **Created** | 2026-07-25 |
 | **Scope** | TensorRT-LLM disaggregated prefill/decode serving |
 | **Transceivers** | Python and C++ |
-| **Related incident** | NVBUG 6480621 |
-| **Related implementation** | [PR #16396](https://github.com/NVIDIA/TensorRT-LLM/pull/16396) |
+| **Related incidents** | NVBUG 6480621; NVBUG 6519709 |
+| **Containment prototype** | [PR #16396](https://github.com/NVIDIA/TensorRT-LLM/pull/16396) |
+| **End-to-end prototype** | [PR #16909](https://github.com/NVIDIA/TensorRT-LLM/pull/16909) |
 
 ## Executive Summary
 
@@ -229,8 +230,10 @@ the deployment cannot guarantee.
 `ArtifactObligationLease` is a renewable cross-side control-plane lease:
 
 - CTX issues it for a specific artifact and GEN consumer grant.
-- GEN starts renewing it when the request enters the GEN scheduler, not when
-  the request is selected for execution.
+- GEN starts renewing it as soon as the artifact is bound to a request already
+  owned by the GEN scheduler, not when the request is selected for execution.
+- In generation-first flow, the separate GEN intent-grant keepalive covers the
+  prefill interval before an artifact obligation can exist.
 - Renewal remains active while GEN is queued, preparing a receiver, or
   transferring.
 - GEN stops renewing after commit, explicit abort/revocation, or request
@@ -678,9 +681,17 @@ It intentionally does not yet implement:
 - bounded reclamation after missing or ambiguous results;
 - equivalent lifecycle reporting for the C++ transceiver.
 
-PR #16396 should remain a reviewable Python containment step. The common
-allocator lease, structured adapter, and cross-side protocol should land as
-separate follow-ups rather than expanding that PR into a dual-runtime rewrite.
+PR #16909 carries these invariants forward and prototypes the Python lifecycle
+protocol end to end. It is the behavioral successor to PR #16396 for the
+Python-native path, but it is not a literal commit or line-by-line superset.
+PR #16396 is therefore an implementation source for the early containment
+slices below, while PR #16909 is a source prototype from which behavior should
+be extracted. Neither prototype should land unchanged.
+
+The common allocator lease, structured adapter, and cross-side protocol should
+land as separate review units rather than expanding one PR into a dual-runtime
+rewrite. Full C++ lifecycle-v1 support remains a separate qualification effort;
+the chain below keeps C++ on an explicit, fail-closed legacy-v0 contract.
 
 ## Failure Handling
 
@@ -688,7 +699,7 @@ separate follow-ups rather than expanding that PR into a dual-runtime rewrite.
 |---|---|---|
 | Client disconnect | Frontend records cancellation | Fan out abort; leases/fences backstop notification loss |
 | GEN rejects admission | Retry another GEN or fail | No GEN resource should exist |
-| GEN queues for longer than old timeout | Keep attempt live under explicit grant | GEN renews artifact obligation from scheduler insertion |
+| GEN queues for longer than old timeout | Keep attempt live under explicit grant | Renew the GEN grant before artifact binding and the artifact obligation after binding |
 | GEN revokes grant | Abort or reroute | Fence old session before destination reuse |
 | GEN dies before peer relationship | Obligation eventually expires | CTX releases only unexposed work; no peer message required |
 | CTX dies before artifact readiness | Fail/retry prefill | GEN grant expires or is explicitly released |
@@ -789,52 +800,182 @@ Add controlled cases where GEN queue wait exceeds the old 60-second timeout:
 The tests must assert actual queueing, transport engagement, and resource
 recovery rather than inferring coverage from configuration alone.
 
-## Rollout Plan
+## Implementation and Landing Plan
 
-### Phase 0 — Instrument and prove the incident timeline
+PR #16909 is an end-to-end source prototype, not a reviewable landing unit. The
+implementation should be rebuilt as a stack from current `main`; its five
+prototype commits must not be cherry-picked wholesale.
 
-- Add per-attempt phase timestamps and queue/admission metrics.
-- Reproduce NVBUG 6480621 with the exact production combination.
-- Determine whether the 60-second CTX timeout includes GEN queueing.
+### Feasibility snapshot
 
-### Phase 1 — Python fail-closed containment
+At PR #16909 head `0f0c748` against base `198252327` on 2026-08-04,
+additions plus deletions are:
 
-- Land PR #16396 in review-sized slices.
-- Preserve current behavior when quiescence is ambiguous.
-- Qualify direct and bounce paths on hardware.
+| Area | Files | Additions | Deletions | Changed lines |
+|---|---:|---:|---:|---:|
+| Production | 56 | 24,878 | 1,937 | 26,815 |
+| Tests | 42 | 20,275 | 329 | 20,604 |
+| **Total** | **98** | **45,153** | **2,266** | **47,419** |
 
-### Phase 2 — Structured lifecycle adapters
+Nine PRs at 1,500 changed lines each permit at most 13,500 changed lines. A
+mechanical split would therefore exceed the budget by 33,919 lines. Meeting the
+review-size goal requires removing or consolidating roughly 72% of the
+prototype, principally by extracting compact owners from monolithic files and
+replacing duplicated interleaving tests with table-driven cases.
 
-- Replace ambiguous cancel/shutdown booleans with structured results.
-- Add explicit capability objects for both Python and C++.
-- Add the backend-neutral conformance suite.
+The 1,500-line target counts additions plus deletions across production code,
+tests, build files, and test-list mappings. Every behavioral PR carries its own
+focused tests. If a slice cannot fit without weakening its safety evidence, its
+optional topology or backend scope is deferred; work is not hidden in an
+adjacent PR merely to satisfy the count.
 
-### Phase 3 — Shared allocator leases
+### Minimum viable scope
 
-- Implement `snapshot_and_lease()` for source and destination KV.
-- Tie leases to allocation generations.
-- Make `free_resources()` pending-free while leases remain.
+Two PRs are insufficient. Three independently reviewable concerns must be
+connected before the safety property is end to end:
 
-### Phase 4 — Generation-safe protocol
+1. one authoritative receiver owner must serialize publication and physical
+   retirement;
+2. the transfer path must retain the exact request, session, and operation
+   roots until terminal evidence; and
+3. the executor must consume that physical disposition and veto resource or
+   manager teardown while access remains possible.
 
-- Add attempt UUIDs, endpoint incarnations, transfer-session identities, and
-  bounded replay/tombstone handling.
-- Negotiate protocol capabilities before publication.
+After PR 3, the containment MVP guarantees:
 
-### Phase 5 — Cross-side obligations and explicit GEN admission
+> Once a Python-native direct-transfer destination may have been published,
+> cancellation, timeout, session destruction, or logical request completion
+> cannot release or reuse its KV allocation or tear down its registration until
+> a backend-qualified result proves the exact writer quiescent or
+> endpoint-wide quiescence is proven.
 
-- Add GEN intent grants and revocation.
-- Add artifact lease renewal from scheduler insertion.
-- Separate queue/rendezvous and active-transfer timers.
-- Add abort fan-out, submission fencing, and quiescence reporting.
+Client-visible logical failure may still be reported immediately. Ambiguous
+physical state retains the coarse request and its resources or forces endpoint
+reset; the MVP does not yet provide allocator-generation leases or bounded
+in-process reclamation.
 
-### Phase 6 — Production rollout
+The first qualified cohort is deliberately narrow:
 
-- Enable per qualified runtime/backend/topology cohort.
-- Canary with resource-age and `IN_DOUBT` alarms.
-- Expand Python preference only as its capability matrix reaches parity for the
-  target workload.
-- Retain C++ fallback and its conformance coverage.
+| Dimension | Containment MVP after PR 3 |
+|---|---|
+| Transceiver and transport | Python-native, direct NIXL |
+| Topology | One CTX and one GEN; TP1, PP1, CP1; attention-DP disabled |
+| Scheduling | Existing context-first and generation-first protocol-v0 paths without auxiliary transfer |
+| Transfer features | Overlap off; no bounce, connector, dynamic chunking, Mamba, or speculative auxiliary state |
+| KV manager | Python `KVCacheManagerV2` implementation selected with `TLLM_KV_CACHE_MANAGER_V2_BACKEND=python` |
+| Wire contract | Existing protocol v0; private containment opt-in |
+| Default behavior | Unchanged; unsupported opt-in combinations fail at startup |
+| C++ behavior | Explicit qualified legacy v0 only |
+
+This MVP contains the consequences of a real transfer failure; it does not
+reduce the transient IB/NIXL error rate reported by NVBUG 6519709, change the
+request-ID set-union vote, raise max-LBS, or prevent the client-visible transfer
+error. It also does not cover that incident's generation-first EP64/attention-DP
+combination, so PR 3 must not be described as fixing or closing the bug.
+Incident-topology qualification occurs only at the end of the stack.
+
+### Dependency chain
+
+```mermaid
+flowchart LR
+    P1["PR 1: receive owner"] --> P2["PR 2: direct-path ownership"]
+    P2 --> P3["PR 3: executor retirement — containment MVP"]
+    P3 --> P4["PR 4: bounce and writer cohorts"]
+    P4 --> P5["PR 5: identity, capabilities, replay"]
+    P5 --> P6["PR 6: allocation-generation leases"]
+    P6 --> P7["PR 7: obligation engines"]
+    P7 --> P8["PR 8: context-first coordination"]
+    P8 --> P9["PR 9: generation-first and qualification"]
+```
+
+The stack is linear for review and landing even where implementation
+dependencies could form a DAG. Each PR targets its predecessor, builds and
+tests independently, and preserves protocol-v0 defaults until its supported
+cohort is explicitly enabled.
+
+### Proposed nine-PR stack
+
+Budgets are targets for a fresh extraction, not estimates obtained by dividing
+the existing diff. Production and test budgets are both included in the total.
+
+| PR | Scope and authoritative owner | Depends on | Target production / tests | Runtime effect and required evidence |
+|---:|---|---|---:|---|
+| 1 | Add the structured logical/physical disposition vocabulary and one compact single-writer receive-ownership state machine. Publication, cancellation, terminal evidence, and backend quiescence have one local owner. | `main` | 550 / 650; **<=1,300** | Private and disabled. Table-driven tests cover cancel before/after publication, duplicate and contradictory results, shutdown admission closure, and `IN_DOUBT` retention. |
+| 2 | Wire that owner into the Python direct path. Prepare it before publication, serialize publication with cancellation, route results through it before request lookup, and retain strong request/session/operation roots. | PR 1 | 650 / 650; **<=1,400** | Still not a supported enablement. Deterministic race tests prove late results settle the original owner, duplicate results do not double-release, and the healthy data path gains no RTT, copy, or CUDA synchronization. |
+| 3 | Make `AsyncTransferManager`/`PyExecutor` defer physical retirement, free exactly once after drain, and veto shutdown while an owner is active or `IN_DOUBT`. Add the narrow startup-validated containment opt-in. | PR 2 | 650 / 700; **<=1,500** | First canaryable MVP. Fault-injected direct NIXL tests prove no reuse before terminal evidence, one logical error, exactly-once free, non-drained shutdown retention, later drain, and flag-off parity. Reuse existing 1P1D integration fixtures instead of adding large fixtures. |
+| 4 | Add bounce settlement and a common exact-writer cohort abstraction reusable by TP/PP/ADP and auxiliary transfers. Bounce slots and any qualified auxiliary mappings remain owned until their final scatter/writer is terminal. | PR 3 | 700 / 650; **<=1,450** | Protocol v0 containment expands by qualified cohort. Use one parameterized writer-cohort suite; unsupported Mamba/speculative combinations remain startup-rejected rather than forcing model-specific code into this PR. |
+| 5 | Add immutable attempt, endpoint-incarnation, session, publication, and operation identities; the Python direct-path submission-fence/quiescence adapter; capability advertisement; and bounded terminal replay/acknowledgement. Additive serialization is allowed, but negotiation remains disabled by default. | PR 4 | 700 / 650; **<=1,450** | Tests cover authorize/begin/complete/fence races, stale attempt/incarnation messages, and contradictory replay. C++ advertises only capabilities it actually proves and remains legacy v0; this PR does not claim C++ lifecycle-v1 support. |
+| 6 | Add `snapshot_and_lease()` and pending-free semantics for the allocator used by the Python-v1 cohort. Bind leases to allocation generations and settle them only from reusable physical dispositions. | PR 5 | 700 / 650; **<=1,450** | Tests cover ABA, duplicate settlement, stale generation, release while leased, and shutdown with outstanding leases. Other Python/C++ allocator implementations fail v1 startup negotiation until separately qualified. |
+| 7 | Add pure GEN-intent-grant, CTX-artifact-obligation, and receive-commit state machines with bounded tombstones. Keep transceiver fencing, HTTP, schedulers, and executors out of this layer. | PR 6 | 700 / 650; **<=1,450** | Fake-clock/failure-injection tests cover accept/reject, renew, revoke, expiry, abort/commit races, duplicate facts, and lost peers. No serving behavior changes. |
+| 8 | Add thin, authenticated control endpoints and context-first orchestration over the PR 7 engines. Separate admission/rendezvous time from active-transfer time and enable v1 only for a qualified Python cohort. | PR 7 | 750 / 650; **<=1,500** | Context-first tests cover reject/reroute, queue wait beyond 60 seconds, renewal after artifact binding, explicit revoke, abort fan-out, commit, and safe cleanup. Existing internal HMAC protects every lifecycle mutation. |
+| 9 | Add generation-first intent-grant keepalive during prefill, scheduler-insertion ownership, artifact renewal after binding, and final qualification/rollout gates. | PR 8 | 750 / 650; **<=1,500** | Exact topology tests cover writer cohorts, queue delay, peer loss, delayed/duplicate terminal delivery, shutdown, and resource recovery. The NVBUG 6480621 and NVBUG 6519709 configurations are evidence gates whenever support is claimed, not inferred coverage from configuration alone. |
+
+The target stack is approximately 12,050 changed lines, leaving headroom below
+the nine-PR maximum of 13,500. If PR 4 or PR 9 cannot include an optional
+auxiliary/model combination within budget, that combination remains
+unsupported and moves to a later qualification PR outside this chain. In that
+case PR 9 may land the core protocol, but it cannot claim support for or close
+the corresponding incident configuration.
+
+### Scope deliberately removed from the prototype
+
+The extraction preserves invariants and externally observable behavior, not
+every helper or test from PR #16909:
+
+- Do not copy the 8,368-line modified `native/transfer.py`, the 9,710-line
+  modified `py_executor.py`, or the 2,819-line modified `transceiver.py`.
+  Extract small ownership and retirement helpers and leave narrow call-site
+  patches in those files.
+- Do not recreate the 2,097-line serving controller. The PR 7 obligation
+  engines own state; PR 8 and PR 9 add thin role-specific wiring.
+- Replace one-test-per-interleaving files with table-driven transition tests,
+  shared race barriers, and a small number of end-to-end fault cases.
+- Do not add C++ lifecycle-v1 behavior, mixed Python/C++ v1, transparent
+  post-token retry, or every model/topology combination to this stack. C++ v1
+  requires backend-specific submission-fence and quiescence qualification.
+- Do not enable protocol v1 merely because its fields exist. Identity,
+  allocator lease, obligation, fence, and quiescence capabilities must all
+  negotiate before address publication.
+
+Before an artifact exists in generation-first flow, only the GEN intent grant
+can be kept alive. After `ARTIFACT_READY` binds the artifact to the grant, GEN
+also renews the separate CTX artifact obligation. These keepalives are not
+interchangeable, and neither one releases an allocation lease.
+
+### Stacking and landing discipline
+
+- Cut PR 1 from current `main`; cut each later branch from the preceding branch.
+- Keep PR #16909 open only as a reference prototype while extracting behavior.
+  Do not make it the base of the landing stack.
+- Run changed-line accounting before requesting review. If a PR exceeds 1,500,
+  first remove optional scope and duplication; never trim safety tests merely
+  to make the number green.
+- Every PR must pass pre-commit, its focused CPU/unit suite, and the smallest
+  applicable GPU stage. PR 3, PR 4, PR 8, and PR 9 additionally require the
+  topology-specific integration evidence named above.
+- Each behavioral PR adds the minimum state-transition counters needed to
+  diagnose its owner. Observability is not deferred into a large final PR.
+- After a parent merges, rebase the next PR onto `main`, retarget it, and rerun
+  its focused and required integration coverage before merging.
+- Close PR #16396 and PR #16909 only after the replacement stack preserves the
+  corresponding containment and Python-v1 behavior, respectively.
+
+## Deployment Rollout
+
+Phase instrumentation and deployment independently from code landing:
+
+1. Keep per-attempt phase timestamps and queue/admission diagnostics enabled in
+   dedicated diagnostic runs. Prove whether NVBUG 6480621 includes GEN queue
+   delay rather than inferring it from the 60-second timeout.
+2. After PR 3, canary only the containment-MVP matrix with resource-age,
+   non-drained-shutdown, and `IN_DOUBT` alarms.
+3. After PR 8, canary context-first lifecycle v1 on its qualified Python
+   backend/topology cohort.
+4. After PR 9, qualify generation-first and the exact incident combinations,
+   then expand Python preference one cohort at a time.
+5. Retain C++ legacy-v0 fallback. Land C++ lifecycle-v1 adapters only after each
+   backend can prove future-submission fencing and physical quiescence through
+   the same conformance suite.
 
 ## Open Questions
 
@@ -859,6 +1000,7 @@ recovery rather than inferring coverage from configuration alone.
 ## References
 
 - [TensorRT-LLM PR #16396: harden Python native KV transfer ownership](https://github.com/NVIDIA/TensorRT-LLM/pull/16396)
+- [TensorRT-LLM PR #16909: end-to-end Python lifecycle-v1 prototype](https://github.com/NVIDIA/TensorRT-LLM/pull/16909)
 - [vLLM NIXL KV cache lease renewal](https://docs.vllm.ai/en/stable/design/nixl_kv_cache_lease/)
 - [Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving](https://madsys.cs.tsinghua.edu.cn/publication/mooncake-a-kvcache-centric-disaggregated-architecture-for-llm-serving/ToS2025-Qin.pdf)
 - [SGLang prefill/decode disaggregation](https://docs.sglang.ai/advanced_features/pd_disaggregation.html)
@@ -878,3 +1020,6 @@ recovery rather than inferring coverage from configuration alone.
   be cited as proof of the same root cause as NVBUG 6480621.
 - NVBUG 6480621 currently motivates the instrumentation and lifecycle design;
   the precise queue-delay mechanism must still be demonstrated.
+- NVBUG 6519709 is evidence that independent partial transfer failures require
+  exact ownership and fail-closed cleanup. It is not evidence that lifecycle
+  coordination fixes the underlying IB/NIXL error rate.
