@@ -1,0 +1,178 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1040"
+     viewBox="0 0 1600 1040" role="img"
+     aria-labelledby="title description">
+  <title id="title">Phase 1 context-first disaggregated inference workflow</title>
+  <desc id="description">
+    A three-lane sequence showing the Frontend, CTX worker, and GEN worker.
+    The CTX send owner retains its transfer borrow after the context response
+    until source drain, while the independent GEN receive owner protects the
+    destination until receive drain and handoff to decode.
+  </desc>
+
+  <defs>
+    <style>
+      .canvas { fill: #ffffff; }
+      .title { fill: #17212b; font: 600 30px Arial, Helvetica, sans-serif; }
+      .subtitle { fill: #506070; font: 400 17px Arial, Helvetica, sans-serif; }
+      .lane { stroke-width: 2; }
+      .frontend-lane { fill: #f5f7fa; stroke: #7a8794; }
+      .ctx-lane { fill: #eef6ff; stroke: #3779b9; }
+      .gen-lane { fill: #eef8f0; stroke: #4b8a57; }
+      .frontend-head { fill: #e3e8ee; }
+      .ctx-head { fill: #d8eafe; }
+      .gen-head { fill: #dcefe0; }
+      .lane-title { fill: #17212b; font: 600 22px Arial, Helvetica, sans-serif; }
+      .lane-note { fill: #526171; font: 400 15px Arial, Helvetica, sans-serif; }
+      .badge { fill: #ffffff; stroke-width: 1.5; }
+      .badge-neutral { stroke: #8793a0; }
+      .badge-ctx { stroke: #3779b9; }
+      .badge-gen { stroke: #4b8a57; }
+      .badge-text { fill: #24313d; font: 600 14px Arial, Helvetica, sans-serif; }
+      .step { fill: #ffffff; stroke: #738293; stroke-width: 1.5; }
+      .owner-step-ctx { fill: #e4f1ff; stroke: #3779b9; stroke-width: 2; }
+      .owner-step-gen { fill: #e5f4e8; stroke: #4b8a57; stroke-width: 2; }
+      .success-step { fill: #e8f6eb; stroke: #3f7f4b; stroke-width: 2; }
+      .step-title { fill: #17212b; font: 600 17px Arial, Helvetica, sans-serif; }
+      .step-text { fill: #344454; font: 400 15px Arial, Helvetica, sans-serif; }
+      .small { fill: #526171; font: 400 14px Arial, Helvetica, sans-serif; }
+      .message { stroke: #344454; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }
+      .coordination { stroke: #7450a8; stroke-width: 2.5; stroke-dasharray: 8 6; fill: none; marker-end: url(#arrow-purple); }
+      .retention { stroke: #c06d22; stroke-width: 2.5; fill: none; marker-end: url(#arrow-orange); }
+      .retention-text { fill: #8d4b15; font: 600 15px Arial, Helvetica, sans-serif; }
+      .message-label { fill: #263541; font: 600 15px Arial, Helvetica, sans-serif; }
+      .coord-label { fill: #644292; font: 600 15px Arial, Helvetica, sans-serif; }
+      .time { stroke: #a4adb7; stroke-width: 2; stroke-dasharray: 5 7; marker-end: url(#arrow-muted); }
+      .time-text { fill: #6a7682; font: 600 14px Arial, Helvetica, sans-serif; letter-spacing: 1px; }
+      .callout { fill: #fff7eb; stroke: #cf8334; stroke-width: 1.5; }
+      .callout-title { fill: #814414; font: 600 16px Arial, Helvetica, sans-serif; }
+      .callout-text { fill: #4a392b; font: 400 15px Arial, Helvetica, sans-serif; }
+      .legend-line { stroke: #344454; stroke-width: 2.5; }
+      .legend-coord { stroke: #7450a8; stroke-width: 2.5; stroke-dasharray: 8 6; }
+      .legend-text { fill: #526171; font: 400 14px Arial, Helvetica, sans-serif; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#344454"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7450a8"/>
+    </marker>
+    <marker id="arrow-muted" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#a4adb7"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#c06d22"/>
+    </marker>
+  </defs>
+
+  <rect class="canvas" x="0" y="0" width="1600" height="1040"/>
+  <text class="title" x="70" y="48">Phase 1 · Context-first workflow</text>
+  <text class="subtitle" x="70" y="78">Fixed TP1 monolithic transfer · existing request correlation · retry disabled</text>
+
+  <line class="legend-line" x1="1120" y1="48" x2="1170" y2="48"/>
+  <text class="legend-text" x="1182" y="53">request or data flow</text>
+  <line class="legend-coord" x1="1360" y1="48" x2="1410" y2="48"/>
+  <text class="legend-text" x="1422" y="53">coordination</text>
+
+  <rect class="lane frontend-lane" x="70" y="110" width="440" height="825" rx="12"/>
+  <rect class="lane ctx-lane" x="580" y="110" width="440" height="825" rx="12"/>
+  <rect class="lane gen-lane" x="1090" y="110" width="440" height="825" rx="12"/>
+
+  <path class="frontend-head" d="M82 110h416a12 12 0 0 1 12 12v72H70v-72a12 12 0 0 1 12-12z"/>
+  <path class="ctx-head" d="M592 110h416a12 12 0 0 1 12 12v72H580v-72a12 12 0 0 1 12-12z"/>
+  <path class="gen-head" d="M1102 110h416a12 12 0 0 1 12 12v72h-440v-72a12 12 0 0 1 12-12z"/>
+
+  <text class="lane-title" x="290" y="143" text-anchor="middle">Frontend</text>
+  <text class="lane-note" x="290" y="169" text-anchor="middle">request supervisor</text>
+  <text class="lane-title" x="800" y="143" text-anchor="middle">CTX worker</text>
+  <text class="lane-note" x="800" y="169" text-anchor="middle">prefill + protected source access</text>
+  <text class="lane-title" x="1310" y="143" text-anchor="middle">GEN worker</text>
+  <text class="lane-note" x="1310" y="169" text-anchor="middle">protected destination + decode</text>
+
+  <rect class="badge badge-neutral" x="180" y="181" width="220" height="30" rx="15"/>
+  <text class="badge-text" x="290" y="201" text-anchor="middle">request supervisor</text>
+  <rect class="badge badge-neutral" x="610" y="181" width="165" height="30" rx="15"/>
+  <text class="badge-text" x="692" y="201" text-anchor="middle">compute / scheduler</text>
+  <rect class="badge badge-ctx" x="786" y="181" width="204" height="30" rx="15"/>
+  <text class="badge-text" x="888" y="201" text-anchor="middle">CTX send owner · source</text>
+  <rect class="badge badge-gen" x="1120" y="181" width="238" height="30" rx="15"/>
+  <text class="badge-text" x="1239" y="201" text-anchor="middle">GEN receive owner · destination</text>
+  <rect class="badge badge-neutral" x="1370" y="181" width="130" height="30" rx="15"/>
+  <text class="badge-text" x="1435" y="201" text-anchor="middle">decode</text>
+
+  <text class="time-text" x="26" y="241" transform="rotate(-90 26 241)">TIME</text>
+  <line class="time" x1="42" y1="222" x2="42" y2="900"/>
+
+  <line class="message" x1="340" y1="252" x2="700" y2="252"/>
+  <rect class="step" x="382" y="224" width="278" height="34" rx="17"/>
+  <text class="message-label" x="521" y="246" text-anchor="middle">1 · Prefill no-retry paired request</text>
+
+  <rect class="step" x="625" y="280" width="350" height="54" rx="8"/>
+  <text class="step-title" x="800" y="303" text-anchor="middle">2 · Produce monolithic paged KV</text>
+  <text class="small" x="800" y="324" text-anchor="middle">CTX compute</text>
+
+  <rect class="owner-step-ctx" x="625" y="354" width="350" height="70" rx="8"/>
+  <text class="step-title" x="800" y="378" text-anchor="middle">3 · CTX send owner</text>
+  <text class="step-text" x="800" y="399" text-anchor="middle">Acquire transfer borrow</text>
+  <text class="small" x="800" y="417" text-anchor="middle">Atomically authorize + seal fixed TP1 writer</text>
+
+  <line class="message" x1="700" y1="462" x2="340" y2="462"/>
+  <rect class="step" x="350" y="433" width="340" height="36" rx="18"/>
+  <text class="message-label" x="520" y="456" text-anchor="middle">4 · Context response + transfer correlation</text>
+
+  <line class="message" x1="340" y1="528" x2="1200" y2="528"/>
+  <rect class="step" x="620" y="499" width="390" height="36" rx="18"/>
+  <text class="message-label" x="815" y="522" text-anchor="middle">5 · Dispatch paired request with same current ID</text>
+
+  <rect class="callout" x="125" y="590" width="350" height="82" rx="9"/>
+  <text class="retention-text" x="150" y="615">CTX transfer borrow remains held</text>
+  <text class="callout-text" x="150" y="640">Past the context response in step 4;</text>
+  <text class="callout-text" x="150" y="662">released only after the step 9 source drain.</text>
+  <path class="retention" d="M475 632H545L625 784"/>
+
+  <rect class="owner-step-gen" x="1135" y="560" width="350" height="70" rx="8"/>
+  <text class="step-title" x="1310" y="584" text-anchor="middle">6 · GEN receive owner</text>
+  <text class="step-text" x="1310" y="607" text-anchor="middle">Allocate destination + open publication gate</text>
+
+  <line class="coordination" x1="1200" y1="668" x2="900" y2="668"/>
+  <rect class="step" x="905" y="639" width="290" height="36" rx="18"/>
+  <text class="coord-label" x="1050" y="662" text-anchor="middle">7 · Receiver-ready information</text>
+
+  <line class="message" x1="900" y1="723" x2="1200" y2="723"/>
+  <rect class="step" x="920" y="694" width="260" height="36" rx="18"/>
+  <text class="message-label" x="1050" y="717" text-anchor="middle">8 · Submit sealed KV cohort</text>
+
+  <rect class="owner-step-ctx" x="625" y="752" width="350" height="64" rx="8"/>
+  <text class="step-title" x="800" y="778" text-anchor="middle">9 · Fence submission</text>
+  <text class="step-text" x="800" y="800" text-anchor="middle">Drain source cohort, then release borrow</text>
+
+  <rect class="owner-step-gen" x="1135" y="752" width="350" height="64" rx="8"/>
+  <text class="step-title" x="1310" y="778" text-anchor="middle">10 · Close publication</text>
+  <text class="step-text" x="1310" y="800" text-anchor="middle">Drain destination receive cohort</text>
+
+  <rect class="owner-step-gen" x="1120" y="844" width="230" height="58" rx="8"/>
+  <text class="step-title" x="1235" y="869" text-anchor="middle">11 · Access quiesced</text>
+  <text class="small" x="1235" y="890" text-anchor="middle">receive owner settles</text>
+  <line class="message" x1="1350" y1="873" x2="1392" y2="873"/>
+  <rect class="success-step" x="1392" y="844" width="112" height="58" rx="8"/>
+  <text class="step-title" x="1448" y="868" text-anchor="middle">Decode</text>
+  <text class="small" x="1448" y="890" text-anchor="middle">owns KV</text>
+
+  <line class="message" x1="1392" y1="924" x2="340" y2="924"/>
+  <rect class="step" x="695" y="895" width="340" height="36" rx="18"/>
+  <text class="message-label" x="865" y="918" text-anchor="middle">12 · Decode response</text>
+
+  <rect class="callout" x="180" y="962" width="1240" height="54" rx="9"/>
+  <text class="callout-title" x="205" y="985">Phase 1 safety boundary</text>
+  <text class="callout-text" x="205" y="1006">
+    No retry, lease, rerouting, or terminal protocol. Only each local physical owner can prove that its memory access is quiesced.
+  </text>
+</svg>

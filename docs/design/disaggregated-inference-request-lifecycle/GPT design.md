@@ -230,28 +230,26 @@ recovery is forbidden.
 
 ### Figure 1 — Phase 1 context-first workflow
 
-```mermaid
-sequenceDiagram
-    participant F as Frontend
-    participant C as CTX
-    participant S as CTX send owner
-    participant R as GEN receive owner
-    participant G as GEN
+![Phase 1 context-first workflow with Frontend, CTX, and GEN lanes](figures/context-first-workflow.svg)
 
-    F->>C: Prefill no-retry paired request
-    C->>C: Produce monolithic paged KV
-    C->>S: Acquire transfer borrow and seal source cohort
-    C-->>F: Context response with transfer correlation
-    F->>G: Dispatch paired request with same current ID
-    G->>R: Allocate and open publication gate
-    R-->>S: Receiver-ready information
-    S->>R: Submit sealed KV cohort
-    S->>S: Fence submission and drain source cohort
-    R->>R: Close publication and drain receive cohort
-    R-->>G: Destination transfer access quiesced
-    G->>G: Destination becomes decode-owned
-    G-->>F: Decode response
-```
+<details>
+<summary>Figure 1 text equivalent</summary>
+
+1. The frontend sends a no-retry prefill request to CTX.
+2. CTX produces monolithic paged KV; its send owner acquires the transfer
+   borrow and atomically authorizes and seals the fixed TP1 writer.
+3. CTX returns the context response, but keeps the source borrow held.
+4. The frontend dispatches the paired request to GEN using the same current
+   request ID.
+5. The GEN receive owner allocates the destination and opens publication; GEN
+   then reports receiver readiness.
+6. CTX submits the sealed KV cohort. Its send owner fences and drains the
+   source before releasing the borrow; the GEN receive owner independently
+   closes publication and drains the destination cohort.
+7. Only after receive access quiesces does decode own the destination KV and
+   return the response.
+
+</details>
 
 This flow has no retry, renewable lease, rerouting, or Phase 2 terminal
 protocol. CTX and GEN correlate the existing request ID, while local owners are
@@ -376,36 +374,31 @@ ownership flow remains unchanged.
 
 ### Figure 2 — End-of-Phase-2 generation-first workflow
 
-```mermaid
-sequenceDiagram
-    participant F as Frontend
-    participant G as GEN
-    participant R as GEN KV + auxiliary receive owners
-    participant K as CTX KV send owner
-    participant A as CTX auxiliary owner
-    participant C as CTX
+![End-of-Phase-2 generation-first workflow with independent KV and auxiliary ownership](figures/generation-first-workflow.svg)
 
-    F->>G: Dispatch immutable attempt
-    F->>C: Dispatch same immutable attempt
-    G->>R: Allocate required destinations and open publication gates
-    R-->>C: Receiver-ready information bound to attempt
-    C->>C: Prefill after readiness
-    C->>K: Acquire and authorize KV cohort
-    C->>A: Acquire and authorize auxiliary cohort
-    K->>R: Transfer sealed KV cohort
-    A->>R: Transfer sealed auxiliary cohort
-    K->>K: Fence and drain KV source cohort
-    A->>A: Fence and drain auxiliary cohort
-    R->>R: Close and drain both receive cohorts
-    R-->>G: TRANSFER_RESULT after all required cohorts settle
-    G->>G: HANDOFF_COMMITTED; destination becomes decode-owned
-    G-->>C: TERMINAL_ACK
-    G-->>F: Decode response
-```
+<details>
+<summary>Figure 2 text equivalent</summary>
+
+1. The frontend dispatches the same immutable attempt to GEN and CTX.
+2. Independent GEN KV and auxiliary receive owners allocate their destinations
+   and open separate publication gates; readiness is bound to the attempt.
+3. CTX prefills only after readiness. Independent CTX KV and auxiliary send
+   owners acquire their borrows and authorize sealed cohorts.
+4. KV and auxiliary cohorts transfer independently. Each CTX owner fences and
+   drains its cohort before releasing its borrow, while each GEN owner closes
+   and drains its corresponding receive cohort.
+5. An all-cohorts-settled barrier permits `TRANSFER_RESULT`; only then can
+   `HANDOFF_COMMITTED` make the required destinations decode-owned.
+6. Attempt-scoped terminal facts use ACK and replay for logical convergence,
+   never as quiescence evidence. On cancellation or failure, all affected
+   owners stop new work and drain independently.
+
+</details>
 
 On cancel or failure, `ABORT_REQUESTED` stops new publication/submission and
-both local owners drain independently. The terminal protocol reports the
-outcome; it does not prove or replace local quiescence.
+all affected source and destination owners drain independently. The terminal
+protocol reports and replays the logical outcome; it does not prove or replace
+local quiescence.
 
 ### Phase 2 PR plan
 

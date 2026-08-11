@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1300"
+     viewBox="0 0 1600 1300" role="img"
+     aria-labelledby="title description">
+  <title id="title">End-of-Phase-2 generation-first disaggregated inference workflow</title>
+  <desc id="description">
+    A three-lane sequence showing the Frontend, CTX worker, and GEN worker.
+    Separate KV and auxiliary owners protect source and destination access.
+    Both receive cohorts must settle at a logical barrier before TRANSFER_RESULT.
+    Each source owner releases its transfer borrow only after its own drain.
+    Attempt-scoped terminal facts and acknowledgement replay coordinate CTX and
+    GEN but never provide physical quiescence evidence.
+  </desc>
+
+  <defs>
+    <style>
+      .canvas { fill: #ffffff; }
+      .title { fill: #17212b; font: 600 30px Arial, Helvetica, sans-serif; }
+      .subtitle { fill: #506070; font: 400 17px Arial, Helvetica, sans-serif; }
+      .lane { stroke-width: 2; }
+      .frontend-lane { fill: #f5f7fa; stroke: #7a8794; }
+      .ctx-lane { fill: #eef6ff; stroke: #3779b9; }
+      .gen-lane { fill: #eef8f0; stroke: #4b8a57; }
+      .frontend-head { fill: #e3e8ee; }
+      .ctx-head { fill: #d8eafe; }
+      .gen-head { fill: #dcefe0; }
+      .lane-title { fill: #17212b; font: 600 22px Arial, Helvetica, sans-serif; }
+      .lane-note { fill: #526171; font: 400 15px Arial, Helvetica, sans-serif; }
+      .badge { fill: #ffffff; stroke-width: 1.5; }
+      .badge-neutral { stroke: #8793a0; }
+      .badge-ctx { stroke: #3779b9; }
+      .badge-gen { stroke: #4b8a57; }
+      .badge-text { fill: #24313d; font: 600 13px Arial, Helvetica, sans-serif; }
+      .step { fill: #ffffff; stroke: #738293; stroke-width: 1.5; }
+      .owner-step-ctx { fill: #e4f1ff; stroke: #3779b9; stroke-width: 2; }
+      .owner-step-gen { fill: #e5f4e8; stroke: #4b8a57; stroke-width: 2; }
+      .logical-step { fill: #f2ebfb; stroke: #7450a8; stroke-width: 2; }
+      .success-step { fill: #e8f6eb; stroke: #3f7f4b; stroke-width: 2; }
+      .step-title { fill: #17212b; font: 600 16px Arial, Helvetica, sans-serif; }
+      .step-text { fill: #344454; font: 400 14px Arial, Helvetica, sans-serif; }
+      .small { fill: #526171; font: 400 13px Arial, Helvetica, sans-serif; }
+      .message { stroke: #344454; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }
+      .data-kv { stroke: #2f73b4; stroke-width: 3; fill: none; marker-end: url(#arrow-blue); }
+      .data-aux { stroke: #3f8350; stroke-width: 3; fill: none; marker-end: url(#arrow-green); }
+      .coordination { stroke: #7450a8; stroke-width: 2.5; stroke-dasharray: 8 6; fill: none; marker-end: url(#arrow-purple); }
+      .coordination-loop { stroke: #7450a8; stroke-width: 3; stroke-dasharray: 9 7; fill: none; marker-start: url(#arrow-purple); marker-end: url(#arrow-purple); }
+      .barrier-input { stroke: #4b8a57; stroke-width: 2; fill: none; marker-end: url(#arrow-green); }
+      .message-label { fill: #263541; font: 600 15px Arial, Helvetica, sans-serif; }
+      .coord-label { fill: #644292; font: 600 15px Arial, Helvetica, sans-serif; }
+      .time { stroke: #a4adb7; stroke-width: 2; stroke-dasharray: 5 7; marker-end: url(#arrow-muted); }
+      .time-text { fill: #6a7682; font: 600 14px Arial, Helvetica, sans-serif; letter-spacing: 1px; }
+      .callout { fill: #fff7eb; stroke: #cf8334; stroke-width: 1.5; }
+      .callout-title { fill: #814414; font: 600 16px Arial, Helvetica, sans-serif; }
+      .callout-text { fill: #4a392b; font: 400 15px Arial, Helvetica, sans-serif; }
+      .legend-line { stroke: #344454; stroke-width: 2.5; }
+      .legend-data { stroke: #2f73b4; stroke-width: 3; }
+      .legend-coord { stroke: #7450a8; stroke-width: 2.5; stroke-dasharray: 8 6; }
+      .legend-text { fill: #526171; font: 400 14px Arial, Helvetica, sans-serif; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#344454"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2f73b4"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#3f8350"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7450a8"/>
+    </marker>
+    <marker id="arrow-muted" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#a4adb7"/>
+    </marker>
+  </defs>
+
+  <rect class="canvas" x="0" y="0" width="1600" height="1300"/>
+  <text class="title" x="70" y="48">Phase 2 · Generation-first workflow</text>
+  <text class="subtitle" x="70" y="78">Immutable attempt identity · independent KV and auxiliary ownership · attempt-scoped terminal coordination</text>
+
+  <line class="legend-line" x1="1020" y1="48" x2="1065" y2="48"/>
+  <text class="legend-text" x="1076" y="53">request</text>
+  <line class="legend-data" x1="1165" y1="48" x2="1210" y2="48"/>
+  <text class="legend-text" x="1221" y="53">owned data</text>
+  <line class="legend-coord" x1="1340" y1="48" x2="1385" y2="48"/>
+  <text class="legend-text" x="1396" y="53">logical coordination</text>
+
+  <rect class="lane frontend-lane" x="70" y="110" width="440" height="1080" rx="12"/>
+  <rect class="lane ctx-lane" x="580" y="110" width="440" height="1080" rx="12"/>
+  <rect class="lane gen-lane" x="1090" y="110" width="440" height="1080" rx="12"/>
+
+  <path class="frontend-head" d="M82 110h416a12 12 0 0 1 12 12v100H70V122a12 12 0 0 1 12-12z"/>
+  <path class="ctx-head" d="M592 110h416a12 12 0 0 1 12 12v100H580V122a12 12 0 0 1 12-12z"/>
+  <path class="gen-head" d="M1102 110h416a12 12 0 0 1 12 12v100h-440V122a12 12 0 0 1 12-12z"/>
+
+  <text class="lane-title" x="290" y="142" text-anchor="middle">Frontend</text>
+  <text class="lane-note" x="290" y="166" text-anchor="middle">attempt supervisor</text>
+  <text class="lane-title" x="800" y="142" text-anchor="middle">CTX worker</text>
+  <text class="lane-note" x="800" y="166" text-anchor="middle">prefill + two protected source domains</text>
+  <text class="lane-title" x="1310" y="142" text-anchor="middle">GEN worker</text>
+  <text class="lane-note" x="1310" y="166" text-anchor="middle">two protected destinations + decode</text>
+
+  <rect class="badge badge-neutral" x="183" y="182" width="214" height="29" rx="14"/>
+  <text class="badge-text" x="290" y="201" text-anchor="middle">attempt supervisor</text>
+  <rect class="badge badge-neutral" x="602" y="182" width="126" height="29" rx="14"/>
+  <text class="badge-text" x="665" y="201" text-anchor="middle">compute</text>
+  <rect class="badge badge-ctx" x="738" y="182" width="119" height="29" rx="14"/>
+  <text class="badge-text" x="797" y="201" text-anchor="middle">KV send owner</text>
+  <rect class="badge badge-ctx" x="867" y="182" width="131" height="29" rx="14"/>
+  <text class="badge-text" x="932" y="201" text-anchor="middle">aux send owner</text>
+  <rect class="badge badge-gen" x="1110" y="182" width="185" height="29" rx="14"/>
+  <text class="badge-text" x="1202" y="201" text-anchor="middle">GEN KV receive owner</text>
+  <rect class="badge badge-gen" x="1305" y="182" width="205" height="29" rx="14"/>
+  <text class="badge-text" x="1407" y="201" text-anchor="middle">GEN auxiliary receive owner</text>
+
+  <text class="time-text" x="26" y="263" transform="rotate(-90 26 263)">TIME</text>
+  <line class="time" x1="42" y1="238" x2="42" y2="1150"/>
+
+  <line class="message" x1="340" y1="260" x2="1200" y2="260"/>
+  <rect class="step" x="665" y="231" width="320" height="36" rx="18"/>
+  <text class="message-label" x="825" y="254" text-anchor="middle">1 · Dispatch immutable attempt to GEN</text>
+
+  <line class="message" x1="340" y1="318" x2="700" y2="318"/>
+  <rect class="step" x="392" y="289" width="258" height="36" rx="18"/>
+  <text class="message-label" x="521" y="312" text-anchor="middle">2 · Dispatch same attempt to CTX</text>
+
+  <rect class="owner-step-gen" x="1115" y="350" width="188" height="72" rx="8"/>
+  <text class="step-title" x="1209" y="375" text-anchor="middle">3a · KV receive owner</text>
+  <text class="step-text" x="1209" y="397" text-anchor="middle">Allocate KV destination</text>
+  <text class="small" x="1209" y="415" text-anchor="middle">Open KV publication gate</text>
+  <rect class="owner-step-gen" x="1317" y="350" width="188" height="72" rx="8"/>
+  <text class="step-title" x="1411" y="375" text-anchor="middle">3b · Aux receive owner</text>
+  <text class="step-text" x="1411" y="397" text-anchor="middle">Allocate aux destination</text>
+  <text class="small" x="1411" y="415" text-anchor="middle">Open aux publication gate</text>
+
+  <line class="coordination" x1="1200" y1="458" x2="700" y2="458"/>
+  <rect class="step" x="787" y="429" width="326" height="36" rx="18"/>
+  <text class="coord-label" x="950" y="452" text-anchor="middle">4 · Receiver-ready information bound to attempt</text>
+
+  <rect class="step" x="625" y="492" width="350" height="54" rx="8"/>
+  <text class="step-title" x="800" y="515" text-anchor="middle">5 · Prefill after readiness</text>
+  <text class="small" x="800" y="536" text-anchor="middle">CTX compute</text>
+
+  <rect class="owner-step-ctx" x="604" y="576" width="194" height="72" rx="8"/>
+  <text class="step-title" x="701" y="601" text-anchor="middle">6a · KV send owner</text>
+  <text class="step-text" x="701" y="624" text-anchor="middle">Acquire transfer borrow</text>
+  <text class="small" x="701" y="642" text-anchor="middle">Authorize sealed KV cohort</text>
+  <rect class="owner-step-ctx" x="812" y="576" width="194" height="72" rx="8"/>
+  <text class="step-title" x="909" y="601" text-anchor="middle">6b · Aux send owner</text>
+  <text class="step-text" x="909" y="624" text-anchor="middle">Acquire transfer borrow</text>
+  <text class="small" x="909" y="642" text-anchor="middle">Authorize sealed aux cohort</text>
+
+  <line class="data-kv" x1="798" y1="684" x2="1209" y2="684"/>
+  <rect class="step" x="893" y="657" width="224" height="32" rx="16"/>
+  <text class="message-label" x="1005" y="678" text-anchor="middle">7a · Sealed KV cohort</text>
+  <line class="data-aux" x1="909" y1="728" x2="1411" y2="728"/>
+  <rect class="step" x="1042" y="701" width="238" height="32" rx="16"/>
+  <text class="message-label" x="1161" y="722" text-anchor="middle">7b · Sealed auxiliary cohort</text>
+
+  <rect class="owner-step-ctx" x="604" y="762" width="194" height="68" rx="8"/>
+  <text class="step-title" x="701" y="787" text-anchor="middle">8a · KV source</text>
+  <text class="step-text" x="701" y="808" text-anchor="middle">Fence + drain cohort</text>
+  <text class="small" x="701" y="826" text-anchor="middle">Release transfer borrow</text>
+  <rect class="owner-step-ctx" x="812" y="762" width="194" height="68" rx="8"/>
+  <text class="step-title" x="909" y="787" text-anchor="middle">8b · Auxiliary source</text>
+  <text class="step-text" x="909" y="808" text-anchor="middle">Fence + drain cohort</text>
+  <text class="small" x="909" y="826" text-anchor="middle">Release transfer borrow</text>
+
+  <rect class="owner-step-gen" x="1115" y="762" width="188" height="68" rx="8"/>
+  <text class="step-title" x="1209" y="787" text-anchor="middle">8c · KV destination</text>
+  <text class="step-text" x="1209" y="810" text-anchor="middle">Close gate + drain</text>
+  <rect class="owner-step-gen" x="1317" y="762" width="188" height="68" rx="8"/>
+  <text class="step-title" x="1411" y="787" text-anchor="middle">8d · Aux destination</text>
+  <text class="step-text" x="1411" y="810" text-anchor="middle">Close gate + drain</text>
+
+  <path class="barrier-input" d="M1209 830v35l67 32"/>
+  <path class="barrier-input" d="M1411 830v35l-67 32"/>
+  <polygon class="logical-step" points="1310,874 1410,918 1310,962 1210,918"/>
+  <text class="step-title" x="1310" y="910" text-anchor="middle">9 · Logical barrier</text>
+  <text class="small" x="1310" y="930" text-anchor="middle">all required cohorts settled</text>
+
+  <line class="coordination" x1="1310" y1="962" x2="1310" y2="985"/>
+  <rect class="logical-step" x="1130" y="985" width="360" height="54" rx="8"/>
+  <text class="step-title" x="1310" y="1008" text-anchor="middle">TRANSFER_RESULT may now be emitted</text>
+  <text class="small" x="1310" y="1028" text-anchor="middle">logical fact after the all-cohorts barrier</text>
+
+  <rect class="success-step" x="1160" y="1052" width="300" height="54" rx="8"/>
+  <text class="step-title" x="1310" y="1075" text-anchor="middle">10 · HANDOFF_COMMITTED</text>
+  <text class="small" x="1310" y="1095" text-anchor="middle">required destinations become decode-owned</text>
+
+  <line class="coordination-loop" x1="930" y1="1130" x2="1200" y2="1130"/>
+  <rect class="logical-step" x="936" y="1107" width="258" height="46" rx="8"/>
+  <text class="coord-label" x="1065" y="1126" text-anchor="middle">11 · Attempt-scoped terminal facts</text>
+  <text class="small" x="1065" y="1145" text-anchor="middle">ACK + replay · logical only, never quiescence</text>
+
+  <line class="message" x1="1200" y1="1174" x2="340" y2="1174"/>
+  <rect class="step" x="646" y="1145" width="250" height="36" rx="18"/>
+  <text class="message-label" x="771" y="1168" text-anchor="middle">12 · Decode response</text>
+
+  <rect class="callout" x="180" y="1215" width="1240" height="58" rx="9"/>
+  <text class="callout-title" x="205" y="1238">Cancel or failure</text>
+  <text class="callout-text" x="205" y="1261">
+    ABORT_REQUESTED closes new publication and submission; KV and auxiliary owners on both sides drain independently.
+  </text>
+</svg>
