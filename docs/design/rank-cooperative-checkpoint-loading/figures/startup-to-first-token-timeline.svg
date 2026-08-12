@@ -2,13 +2,13 @@
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
 -->
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="620" viewBox="0 0 1600 620">
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="700" viewBox="0 0 1600 700">
   <defs>
     <marker id="arrow-navy" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
       <path d="M0,0 L10,5 L0,10 Z" fill="#17324f"/>
     </marker>
     <marker id="arrow-gray" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
-      <path d="M0,0 L10,5 L0,10 Z" fill="#9badbd"/>
+      <path d="M0,0 L10,5 L0,10 Z" fill="#8093a5"/>
     </marker>
     <style>
       .label { font-family: Arial, Helvetica, sans-serif; fill: #132d49; }
@@ -18,130 +18,139 @@ SPDX-License-Identifier: Apache-2.0
     </style>
   </defs>
 
-  <rect width="1600" height="620" fill="#ffffff"/>
+  <rect width="1600" height="700" fill="#ffffff"/>
 
   <!-- End-to-end startup ruler -->
   <line x1="58" y1="82" x2="1548" y2="82" stroke="#17324f" stroke-width="2.5" marker-end="url(#arrow-navy)"/>
   <g stroke="#17324f" stroke-width="2">
     <line x1="60" y1="74" x2="60" y2="90"/>
-    <line x1="190" y1="74" x2="190" y2="90"/>
-    <line x1="740" y1="74" x2="740" y2="90"/>
-    <line x1="1290" y1="74" x2="1290" y2="90"/>
-    <line x1="1380" y1="74" x2="1380" y2="90"/>
-    <line x1="1475" y1="74" x2="1475" y2="90"/>
+    <line x1="185" y1="74" x2="185" y2="90"/>
+    <line x1="1395" y1="74" x2="1395" y2="90"/>
+    <line x1="1545" y1="74" x2="1545" y2="90"/>
   </g>
-  <text class="label" x="125" y="38" font-size="20" font-weight="700" text-anchor="middle">
-    <tspan x="125">Process</tspan><tspan x="125" dy="23">launch</tspan>
+  <text class="label" x="120" y="38" font-size="20" font-weight="700" text-anchor="middle">
+    <tspan x="120">Process</tspan><tspan x="120" dy="23">launch</tspan>
   </text>
-  <text class="label" x="465" y="49" font-size="24" font-weight="700" text-anchor="middle">LLM initialization</text>
-  <text class="label" x="1015" y="49" font-size="24" font-weight="700" text-anchor="middle">Post-LLM readiness</text>
-  <text class="label" x="1335" y="38" font-size="20" font-weight="700" text-anchor="middle">
-    <tspan x="1335">Request</tspan><tspan x="1335" dy="23">admission</tspan>
-  </text>
-  <text class="label" x="1427" y="38" font-size="20" font-weight="700" text-anchor="middle">
-    <tspan x="1427">First</tspan><tspan x="1427" dy="23">inference</tspan>
-  </text>
-  <text class="orange" x="1530" y="38" font-size="20" font-weight="800" text-anchor="middle">
-    <tspan x="1530">FIRST</tspan><tspan x="1530" dy="23">TOKEN</tspan>
-  </text>
+  <text class="label" x="790" y="49" font-size="25" font-weight="700" text-anchor="middle">LLM INITIALIZATION</text>
+  <text class="label" x="1470" y="49" font-size="22" font-weight="700" text-anchor="middle">Serve first request</text>
 
   <!-- Process launch -->
-  <rect x="66" y="250" width="108" height="76" rx="14" fill="#f5f8fa" stroke="#cbd8e3" stroke-width="2"/>
-  <text class="label" x="120" y="279" font-size="21" font-weight="700" text-anchor="middle">
-    <tspan x="120">Process</tspan><tspan x="120" dy="24">launch</tspan>
+  <rect x="60" y="282" width="108" height="76" rx="14" fill="#f5f8fa" stroke="#cbd8e3" stroke-width="2"/>
+  <text class="label" x="114" y="311" font-size="21" font-weight="700" text-anchor="middle">
+    <tspan x="114">Process</tspan><tspan x="114" dy="24">launch</tspan>
   </text>
-  <line x1="174" y1="288" x2="195" y2="288" stroke="#6f8497" stroke-width="2.5" marker-end="url(#arrow-gray)"/>
+  <line x1="168" y1="320" x2="188" y2="320" stroke="#6f8497" stroke-width="2.5" marker-end="url(#arrow-gray)"/>
 
-  <!-- LLM initialization -->
-  <rect x="196" y="124" width="544" height="390" rx="16" fill="#edf5fb" stroke="#b8cee1" stroke-width="2"/>
-  <rect x="216" y="145" width="5" height="29" fill="#27628f"/>
-  <text class="label" x="232" y="168" font-size="23" font-weight="800">LLM INITIALIZATION</text>
+  <!-- Model-engine initialization -->
+  <rect x="190" y="124" width="575" height="445" rx="16" fill="#edf5fb" stroke="#b8cee1" stroke-width="2"/>
+  <rect x="212" y="145" width="5" height="29" fill="#27628f"/>
+  <text class="label" x="228" y="168" font-size="23" font-weight="800">MODEL-ENGINE INITIALIZATION</text>
 
-  <rect x="220" y="185" width="190" height="48" rx="9" fill="#ffffff" stroke="#91b4d2" stroke-width="2"/>
-  <text class="label" x="315" y="216" font-size="20" text-anchor="middle">Model construction</text>
-  <line x1="315" y1="233" x2="315" y2="250" stroke="#27628f" stroke-width="2.2" marker-end="url(#arrow-navy)"/>
+  <rect x="216" y="190" width="523" height="52" rx="9" fill="#ffffff" stroke="#91b4d2" stroke-width="2"/>
+  <text class="label" x="477.5" y="222" font-size="20" text-anchor="middle">Model construction and configuration</text>
+  <line x1="477.5" y1="242" x2="477.5" y2="259" stroke="#27628f" stroke-width="2.2" marker-end="url(#arrow-navy)"/>
 
-  <!-- Explicit model-weight-loading target region -->
-  <rect x="220" y="250" width="496" height="240" rx="13" fill="#fff9ef" stroke="#dc7900" stroke-width="3"/>
-  <rect x="230" y="260" width="476" height="38" rx="9" fill="#c96900"/>
-  <text class="white" x="468" y="286" font-size="18" font-weight="800" text-anchor="middle">MODEL WEIGHT LOADING · RANK-STRIPED TARGET</text>
+  <!-- Policy-neutral model weight loading component -->
+  <rect x="216" y="260" width="523" height="282" rx="13" fill="#fff9ef" stroke="#dc7900" stroke-width="3"/>
+  <rect x="227" y="271" width="501" height="41" rx="9" fill="#c96900"/>
+  <text class="white" x="477.5" y="298" font-size="20" font-weight="800" text-anchor="middle">MODEL WEIGHT LOADING</text>
 
-  <!-- Storage-I/O lane -->
-  <text class="orange" x="240" y="339" font-size="16" font-weight="800">I/O</text>
-  <rect x="306" y="307" width="140" height="56" rx="8" fill="#fff1d9" stroke="#e09a44" stroke-width="2"/>
-  <text class="orange" x="376" y="331" font-size="18" font-weight="700" text-anchor="middle">
-    <tspan x="376">Discover</tspan><tspan x="376" dy="20">/ index</tspan>
+  <text class="orange" x="477.5" y="332" font-size="14" font-weight="800" text-anchor="middle">CONCEPTUAL SUBPHASES · MAY INTERLEAVE BY MODEL</text>
+  <rect x="232" y="347" width="112" height="92" rx="9" fill="#fff1d9" stroke="#e09a44" stroke-width="2"/>
+  <text class="orange" x="288" y="378" font-size="16" font-weight="700" text-anchor="middle">
+    <tspan x="288">Checkpoint</tspan><tspan x="288" dy="20">discovery</tspan><tspan x="288" dy="20">and read</tspan>
   </text>
-  <line x1="446" y1="335" x2="462" y2="335" stroke="#c96900" stroke-width="2.2" marker-end="url(#arrow-navy)"/>
-  <rect x="466" y="303" width="221" height="64" rx="9" fill="#c96900" stroke="#9e4d00" stroke-width="2"/>
-  <text class="white" x="576.5" y="316" font-size="10.5" font-weight="800" text-anchor="middle">DIRECT I/O ACCELERATION</text>
-  <text class="white" x="576.5" y="337" font-size="17" font-weight="800" text-anchor="middle">
-    <tspan x="576.5">Rank-striped parallel</tspan><tspan x="576.5" dy="19">checkpoint read-ahead</tspan>
+  <rect x="363" y="347" width="112" height="92" rx="9" fill="#fff1d9" stroke="#e09a44" stroke-width="2"/>
+  <text class="orange" x="419" y="388" font-size="16" font-weight="700" text-anchor="middle">
+    <tspan x="419">Tensor map</tspan><tspan x="419" dy="20">and shard</tspan>
   </text>
-
-  <!-- Native foreground materialization lane -->
-  <line x1="306" y1="387" x2="687" y2="387" stroke="#c96900" stroke-width="2" stroke-dasharray="7 6"/>
-  <text class="orange" x="496.5" y="382" font-size="14" font-weight="800" text-anchor="middle">PIPELINED I/O OVERLAP</text>
-  <text class="orange" x="238" y="439" font-size="14" font-weight="800">NATIVE</text>
-  <rect x="306" y="405" width="190" height="58" rx="8" fill="#fff1d9" stroke="#e09a44" stroke-width="2"/>
-  <text class="orange" x="401" y="429" font-size="17" font-weight="700" text-anchor="middle">
-    <tspan x="401">Map / transform</tspan><tspan x="401" dy="20">/ quantize</tspan>
+  <rect x="494" y="347" width="112" height="92" rx="9" fill="#fff1d9" stroke="#e09a44" stroke-width="2"/>
+  <text class="orange" x="550" y="378" font-size="16" font-weight="700" text-anchor="middle">
+    <tspan x="550">Transform</tspan><tspan x="550" dy="20">quantize</tspan><tspan x="550" dy="20">and fuse</tspan>
   </text>
-  <line x1="496" y1="434" x2="511" y2="434" stroke="#c96900" stroke-width="2.2" marker-end="url(#arrow-navy)"/>
-  <rect x="515" y="405" width="172" height="58" rx="8" fill="#fff1d9" stroke="#e09a44" stroke-width="2"/>
-  <text class="orange" x="601" y="429" font-size="17" font-weight="700" text-anchor="middle">
-    <tspan x="601">Materialize / H2D</tspan><tspan x="601" dy="20">/ finalize</tspan>
+  <rect x="625" y="347" width="98" height="92" rx="9" fill="#fff1d9" stroke="#e09a44" stroke-width="2"/>
+  <text class="orange" x="674" y="368" font-size="15" font-weight="700" text-anchor="middle">
+    <tspan x="674">Materialize</tspan><tspan x="674" dy="19">H2D</tspan><tspan x="674" dy="19">and finalize</tspan>
   </text>
 
-  <!-- Runtime readiness -->
-  <rect x="756" y="124" width="535" height="390" rx="16" fill="#f7f9fb" stroke="#ccd9e4" stroke-width="2"/>
-  <rect x="776" y="145" width="5" height="29" fill="#64798c"/>
-  <text class="muted" x="792" y="168" font-size="23" font-weight="800">RUNTIME READINESS WORK</text>
-  <line x1="1278" y1="178" x2="1278" y2="475" stroke="#17324f" stroke-width="3"/>
+  <text class="muted" x="477.5" y="484" font-size="16" text-anchor="middle">
+    <tspan x="477.5">Exact substeps and boundaries vary by model, backend,</tspan>
+    <tspan x="477.5" dy="20">quantization flow, and checkpoint format.</tspan>
+  </text>
 
-  <g font-size="19">
-    <rect x="780" y="190" width="286" height="36" rx="8" fill="#edf4fb" stroke="#2b66a0" stroke-width="2"/>
-    <text class="label" x="796" y="214">KV-cache initialization</text>
-    <line x1="1071" y1="208" x2="1271" y2="208" stroke="#9badbd" stroke-width="2" marker-end="url(#arrow-gray)"/>
+  <!-- Remaining LLM initialization: explicit runtime dependency path -->
+  <line x1="765" y1="320" x2="790" y2="320" stroke="#6f8497" stroke-width="2.5" marker-end="url(#arrow-gray)"/>
+  <rect x="792" y="124" width="585" height="445" rx="16" fill="#f7f9fb" stroke="#ccd9e4" stroke-width="2"/>
+  <rect x="814" y="145" width="5" height="29" fill="#64798c"/>
+  <text class="muted" x="830" y="168" font-size="23" font-weight="800">RUNTIME PREPARATION</text>
+  <text class="muted" x="1350" y="168" font-size="15" font-weight="700" text-anchor="end">CURRENT PYTORCH ORDER</text>
 
-    <rect x="804" y="240" width="338" height="36" rx="8" fill="#eef9f8" stroke="#138982" stroke-width="2"/>
-    <text class="label" x="820" y="264">Attention JIT / kernel compilation</text>
-    <line x1="1147" y1="258" x2="1271" y2="258" stroke="#9badbd" stroke-width="2" marker-end="url(#arrow-gray)"/>
+  <rect x="818" y="190" width="533" height="52" rx="9" fill="#edf4fb" stroke="#2b66a0" stroke-width="2"/>
+  <text class="label" x="1084.5" y="222" font-size="19" font-weight="700" text-anchor="middle">KV-cache and resource initialization</text>
+  <line x1="1084.5" y1="242" x2="1084.5" y2="258" stroke="#8093a5" stroke-width="2.2" marker-end="url(#arrow-gray)"/>
 
-    <rect x="858" y="290" width="230" height="36" rx="8" fill="#fff6e8" stroke="#d87400" stroke-width="2"/>
-    <text class="label" x="874" y="314">Autotuning</text>
-    <line x1="1093" y1="308" x2="1271" y2="308" stroke="#9badbd" stroke-width="2" marker-end="url(#arrow-gray)"/>
+  <rect x="818" y="260" width="533" height="198" rx="12" fill="#ffffff" stroke="#aebfcd" stroke-width="2"/>
+  <text class="muted" x="1084.5" y="286" font-size="16" font-weight="800" text-anchor="middle">ORDERED WARMUP AND CAPTURE PIPELINE</text>
 
-    <rect x="918" y="340" width="286" height="36" rx="8" fill="#edf4fb" stroke="#2b66a0" stroke-width="2"/>
-    <text class="label" x="934" y="364">CUDA graph capture</text>
-    <line x1="1209" y1="358" x2="1271" y2="358" stroke="#9badbd" stroke-width="2" marker-end="url(#arrow-gray)"/>
+  <rect x="835" y="307" width="112" height="104" rx="9" fill="#eef9f8" stroke="#138982" stroke-width="2"/>
+  <circle cx="850" cy="323" r="10" fill="#138982"/>
+  <text class="white" x="850" y="328" font-size="13" font-weight="800" text-anchor="middle">1</text>
+  <text class="label" x="891" y="343" font-size="15" font-weight="700" text-anchor="middle">
+    <tspan x="891">Compile &amp;</tspan><tspan x="891" dy="19">kernel-JIT</tspan><tspan x="891" dy="19">warmup</tspan>
+  </text>
+  <line x1="947" y1="359" x2="962" y2="359" stroke="#8093a5" stroke-width="2.2" marker-end="url(#arrow-gray)"/>
 
-    <rect x="780" y="390" width="218" height="36" rx="8" fill="#eef9f8" stroke="#138982" stroke-width="2"/>
-    <text class="label" x="796" y="414">Worker setup</text>
-    <line x1="1003" y1="408" x2="1271" y2="408" stroke="#9badbd" stroke-width="2" marker-end="url(#arrow-gray)"/>
+  <rect x="966" y="307" width="112" height="104" rx="9" fill="#fff6e8" stroke="#d87400" stroke-width="2"/>
+  <circle cx="981" cy="323" r="10" fill="#d87400"/>
+  <text class="white" x="981" y="328" font-size="13" font-weight="800" text-anchor="middle">2</text>
+  <text class="label" x="1022" y="353" font-size="16" font-weight="700" text-anchor="middle">
+    <tspan x="1022">Autotune</tspan><tspan x="1022" dy="20">tactics</tspan>
+  </text>
+  <line x1="1078" y1="359" x2="1093" y2="359" stroke="#8093a5" stroke-width="2.2" marker-end="url(#arrow-gray)"/>
 
-    <rect x="986" y="440" width="268" height="36" rx="8" fill="#fff6e8" stroke="#d87400" stroke-width="2"/>
-    <text class="label" x="1002" y="464">Proxy / readiness</text>
-    <line x1="1259" y1="458" x2="1271" y2="458" stroke="#9badbd" stroke-width="2" marker-end="url(#arrow-gray)"/>
-  </g>
-  <text class="label" x="1268" y="496" font-size="17" font-weight="700" text-anchor="end">readiness gate</text>
+  <rect x="1097" y="307" width="112" height="104" rx="9" fill="#edf4fb" stroke="#2b66a0" stroke-width="2"/>
+  <circle cx="1112" cy="323" r="10" fill="#2b66a0"/>
+  <text class="white" x="1112" y="328" font-size="13" font-weight="800" text-anchor="middle">3</text>
+  <text class="label" x="1153" y="353" font-size="16" font-weight="700" text-anchor="middle">
+    <tspan x="1153">CUDA graph</tspan><tspan x="1153" dy="20">capture</tspan>
+  </text>
+  <line x1="1209" y1="359" x2="1224" y2="359" stroke="#8093a5" stroke-width="2.2" marker-end="url(#arrow-gray)"/>
 
-  <!-- Admission to first token -->
-  <polygon points="1278,297 1291,310 1278,323 1265,310" fill="#17324f"/>
-  <line x1="1291" y1="310" x2="1533" y2="310" stroke="#17324f" stroke-width="3"/>
-  <circle cx="1334" cy="310" r="11" fill="#ffffff" stroke="#2b66a0" stroke-width="4"/>
-  <circle cx="1425" cy="310" r="11" fill="#ffffff" stroke="#138982" stroke-width="4"/>
-  <circle cx="1530" cy="310" r="14" fill="#c96900" stroke="#8b4300" stroke-width="2"/>
-  <text class="label" x="1334" y="356" font-size="17" font-weight="700" text-anchor="middle">admit</text>
-  <text x="1425" y="356" font-family="Arial, Helvetica, sans-serif" fill="#087c76" font-size="17" font-weight="700" text-anchor="middle">infer</text>
-  <text class="orange" x="1530" y="356" font-size="17" font-weight="800" text-anchor="middle">first token</text>
+  <rect x="1228" y="307" width="106" height="104" rx="9" fill="#eef9f8" stroke="#138982" stroke-width="2"/>
+  <circle cx="1243" cy="323" r="10" fill="#138982"/>
+  <text class="white" x="1243" y="328" font-size="13" font-weight="800" text-anchor="middle">4</text>
+  <text class="label" x="1281" y="353" font-size="15" font-weight="700" text-anchor="middle">
+    <tspan x="1281">General</tspan><tspan x="1281" dy="19">memory-pool</tspan><tspan x="1281" dy="19">warmup</tspan>
+  </text>
 
-  <!-- Legend and runtime caveat -->
-  <rect x="58" y="535" width="1484" height="62" rx="12" fill="#f7f9fb" stroke="#d2dce5"/>
-  <rect x="82" y="551" width="16" height="16" rx="3" fill="#c96900"/>
-  <text class="muted" x="108" y="565" font-size="17"><tspan font-weight="700">Directly optimized:</tspan> parallel checkpoint read-ahead</text>
-  <rect x="578" y="551" width="16" height="16" rx="3" fill="#fff1d9" stroke="#e09a44" stroke-width="2"/>
-  <text class="muted" x="604" y="565" font-size="17"><tspan font-weight="700">Overlapped native path:</tspan> mapping, transformation, quantization, materialization, and H2D</text>
-  <circle cx="88" cy="582" r="6" fill="#64798c"/>
-  <text class="muted" x="108" y="588" font-size="16">Exact ordering and overlap vary by backend, model, checkpoint layout, cache state, and deployment topology.</text>
+  <line x1="1084.5" y1="458" x2="1084.5" y2="474" stroke="#8093a5" stroke-width="2.2" marker-end="url(#arrow-gray)"/>
+  <rect x="818" y="476" width="533" height="58" rx="9" fill="#eef9f8" stroke="#138982" stroke-width="2"/>
+  <text class="label" x="1084.5" y="502" font-size="18" font-weight="700" text-anchor="middle">
+    <tspan x="1084.5">Worker / event-loop start</tspan><tspan x="1084.5" dy="21">and proxy READY</tspan>
+  </text>
+
+  <!-- Serving milestones -->
+  <line x1="1377" y1="320" x2="1410" y2="320" stroke="#17324f" stroke-width="2.8" marker-end="url(#arrow-navy)"/>
+  <rect x="1414" y="181" width="132" height="314" rx="16" fill="#f7f9fb" stroke="#ccd9e4" stroke-width="2"/>
+  <circle cx="1480" cy="238" r="15" fill="#ffffff" stroke="#2b66a0" stroke-width="4"/>
+  <text class="label" x="1480" y="276" font-size="17" font-weight="700" text-anchor="middle">
+    <tspan x="1480">Request</tspan><tspan x="1480" dy="20">admitted</tspan>
+  </text>
+  <line x1="1480" y1="290" x2="1480" y2="325" stroke="#8093a5" stroke-width="2.2" marker-end="url(#arrow-gray)"/>
+  <circle cx="1480" cy="345" r="15" fill="#ffffff" stroke="#138982" stroke-width="4"/>
+  <text class="label" x="1480" y="383" font-size="17" font-weight="700" text-anchor="middle">
+    <tspan x="1480">First</tspan><tspan x="1480" dy="20">inference</tspan>
+  </text>
+  <line x1="1480" y1="397" x2="1480" y2="429" stroke="#8093a5" stroke-width="2.2" marker-end="url(#arrow-gray)"/>
+  <circle cx="1480" cy="450" r="18" fill="#c96900" stroke="#8b4300" stroke-width="2"/>
+  <text class="orange" x="1480" y="486" font-size="18" font-weight="800" text-anchor="middle">FIRST TOKEN</text>
+
+  <!-- Legend and scope caveat -->
+  <rect x="58" y="596" width="1484" height="76" rx="12" fill="#f7f9fb" stroke="#d2dce5"/>
+  <rect x="82" y="614" width="20" height="20" rx="3" fill="#fff9ef" stroke="#dc7900" stroke-width="3"/>
+  <text class="muted" x="114" y="630" font-size="17"><tspan font-weight="700">Highlighted component:</tspan> model weight loading within LLM initialization</text>
+  <line x1="693" y1="624" x2="730" y2="624" stroke="#8093a5" stroke-width="2.2" marker-end="url(#arrow-gray)"/>
+  <text class="muted" x="744" y="630" font-size="17"><tspan font-weight="700">Arrow:</tspan> required current-path ordering, not elapsed-time scale</text>
+  <circle cx="90" cy="652" r="6" fill="#64798c"/>
+  <text class="muted" x="114" y="658" font-size="16">Runtime preparation remains inside LLM initialization; configuration may skip steps, and other backends may use a different sequence.</text>
 </svg>
