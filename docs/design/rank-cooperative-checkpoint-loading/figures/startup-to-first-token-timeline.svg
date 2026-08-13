@@ -95,8 +95,8 @@ SPDX-License-Identifier: Apache-2.0
   <rect x="835" y="307" width="112" height="104" rx="9" fill="#eef9f8" stroke="#138982" stroke-width="2"/>
   <circle cx="850" cy="323" r="10" fill="#138982"/>
   <text class="white" x="850" y="328" font-size="13" font-weight="800" text-anchor="middle">1</text>
-  <text class="label" x="891" y="343" font-size="15" font-weight="700" text-anchor="middle">
-    <tspan x="891">Compile &amp;</tspan><tspan x="891" dy="19">kernel-JIT</tspan><tspan x="891" dy="19">warmup</tspan>
+  <text class="label" x="891" y="350" font-size="15" font-weight="700" text-anchor="middle">
+    <tspan x="891">Execution-path</tspan><tspan x="891" dy="19">warmup</tspan><tspan x="891" dy="18" font-size="10.5" font-weight="600" fill="#5c7184">optional compile / JIT</tspan>
   </text>
   <line x1="947" y1="359" x2="962" y2="359" stroke="#8093a5" stroke-width="2.2" marker-end="url(#arrow-gray)"/>
 
