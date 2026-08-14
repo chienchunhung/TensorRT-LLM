@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | Design proposal, re-baselined against `main@48df89d76` |
-| **Last updated** | 2026-08-11 |
+| **Status** | Design proposal, re-baselined against `main@0946d54b8d` |
+| **Last updated** | 2026-08-14 |
 
 ## Executive Summary
 
@@ -16,7 +16,7 @@ The work is divided into three explicit phases:
 
 | Phase | Outcome | Delivery boundary |
 |---:|---|---|
-| **1. Ownership MVP** | Establish no-reuse-before-quiescence for one narrow context-first Python/NIXL cohort | PRs 1–3 |
+| **1. Ownership MVP** | Fix local publication and exact-writer retirement; enable one narrow context-first Python/NIXL canary | PRs 1–3 |
 | **2. Coordinated Python lifecycle** | Add immutable attempt-level CTX/GEN coordination and qualify the priority Python scenarios | PRs 4–9 |
 | **3. Extended lifecycle and C++** | Add renewable resource obligations, rerouting, the remaining Python scenarios, and separately qualified C++ support | Explicit post-core workstreams |
 
@@ -140,8 +140,12 @@ does not prevent the failures themselves.
 
 ### Objective and scope
 
-Phase 1 proves the local memory-safety invariant in the smallest end-to-end
-cohort that can exercise real Python/NIXL transfer.
+Phase 1 owns the minimum production fix required by the two deterministic
+regressions: cancellation must close destination publication, and one writer's
+failure must not authorize reuse while a sibling writer remains active. PRs 1–2
+deliver that fix. PR 3 completes the phase by qualifying the first enabled
+end-to-end Python/NIXL canary. The local owner is cardinality-correct from the
+start even though that canary remains deliberately narrow.
 
 | Dimension | Phase 1 scope |
 |---|---|
@@ -150,15 +154,18 @@ cohort that can exercise real Python/NIXL transfer.
 | Scheduling | Context-first only |
 | Resource | Paged attention KV only |
 | Transfer shape | Monolithic protocol v0; `segment_id=0` |
-| Topology | One CTX worker and one GEN worker; TP1, PP1, CP1; attention-DP off |
+| Topology | Enabled canary: one CTX worker and one GEN worker; TP1, PP1, CP1; attention-DP off. Owner core: sealed multi-writer cohorts in deterministic component coverage |
 | Retry | Explicit disaggregated no-retry mode that also bypasses transient-TCP ID reminting |
 | Retirement | Coarse whole-request and KV-mapping retention |
 | Rollout | Disabled by default; private startup-validated opt-in |
 
 Bounce, generation-first, pipeline, PP, attention-DP, recurrent/KDA,
 auxiliary, draft, offload, and C++ paths are rejected before address
-publication. The owner supports multi-writer component tests, but Phase 1
-runtime qualification is single-writer only.
+publication. Phase 1 production code nevertheless tracks every writer in a
+sealed local cohort and makes both the 1:1 publication regression and the
+multi-writer sibling-drain regression pass. Phase 2 PR 4 qualifies that same
+owner in real TP2-to-TP1 traffic; it does not introduce the basic safety
+mechanism.
 
 Until PR 6 adds capability negotiation, matching Python runtime, build,
 protocol, and topology configuration on both peers is an operator/deployment
@@ -259,8 +266,8 @@ the only physical-safety authority.
 
 | PR | Scope | Expected result |
 |---:|---|---|
-| **1** | Add a transport-neutral operation owner, backend-evidence seam, protocol-v0 cohort seal, structured dispositions, and deterministic exact-cohort tests | Disabled ownership core |
-| **2** | Wire separate CTX-send and GEN-receive owners into direct Python NIXL; serialize cancel with publication/submission; retain late results strongly | Direct accessors cannot outlive their physical owner |
+| **1** | Add a transport-neutral operation owner, backend-evidence seam, protocol-v0 cohort seal, structured dispositions, and lower-level 1:1 and multi-writer owner-contract tests | Disabled, cardinality-correct ownership core |
+| **2** | Wire separate CTX-send and GEN-receive owners into direct Python NIXL; serialize cancel with publication/submission; retain late results strongly; gate cancellation and failed-session cleanup on sealed-cohort drain | Both PR #17720 production-integration regressions pass and direct accessors cannot outlive their physical owner |
 | **3** | Gate context-first executor retirement, allocator release, and shutdown on physical disposition; add true disagg no-retry mode, startup cohort validation, and fail-stop `IN_DOUBT` | First qualified opt-in MVP cohort |
 
 If PR 2 cannot derive the same sealed cohort on both peers without protocol
@@ -271,7 +278,8 @@ change, its explicit seal is part of PR 2 rather than deferred.
 A disabled-by-default TP1 context-first canary in which cancellation cannot be
 followed by publication, logical retirement cannot discard completion
 evidence, and paged KV cannot be reused before the exact local accessor cohort
-quiesces. No broader Python or C++ support is implied.
+quiesces. The owner core is safe for sealed multi-writer cohorts, but no TP2,
+broader Python, or C++ runtime support is implied.
 
 ### Validation and exit criteria
 
@@ -292,8 +300,9 @@ quiesces. No broader Python or C++ support is implied.
 - No healthy-path extra network round trip, copy, or CUDA synchronization.
 - Flag-off behavior unchanged and the TP1 canary passing with retry disabled.
 
-Phase 1 exits only when locally detectable unsupported combinations are
-rejected before publication and all criteria above pass.
+Phase 1 exits only when both deterministic regressions pass, locally detectable
+unsupported combinations are rejected before publication, and all criteria
+above pass.
 
 ### Open questions and dependencies
 
@@ -364,7 +373,9 @@ emit a quiesced disposition.
 
 The direct multi-writer topology has one TP2 CTX worker and a pool of two TP1
 GEN instances. Each attempt selects one GEN instance and therefore has an exact
-two-writer CTX cohort. Python bounce adopts the same owner instead of elapsed
+two-writer CTX cohort. Phase 2 qualifies the cardinality-correct owner delivered
+in Phase 1 under this real topology, including fault injection, rollout, and
+performance validation. Python bounce adopts the same owner instead of elapsed
 quarantine as a reuse condition. Generation-first assigns its auxiliary state
 an independent owner rather than folding it into paged-KV completion.
 
@@ -404,7 +415,7 @@ local quiescence.
 
 | PR | Scope | Expected result |
 |---:|---|---|
-| **4** | Qualify direct TP2-to-TP1 multi-writer fan-in and fault-injected sibling drain | Runtime exact-cohort safety |
+| **4** | Qualify the Phase 1 owner in direct TP2-to-TP1 multi-writer fan-in with fault-injected sibling drain, rollout checks, and performance validation | Private TP2-to-TP1 qualification evidence without a second ownership mechanism |
 | **5** | Move Python bounce accessors onto the common owner and remove timer-only reuse | Bounce retirement safety |
 | **6** | Add the immutable attempt/capability envelope: attempt ID, endpoint incarnation, transfer-session and operation IDs, and effective-runtime negotiation | Stale wire work is fenced before terminal replay or retry |
 | **7** | Add and qualify the generation-first auxiliary owner using the final identity envelope | Generation-first local ownership coverage |
