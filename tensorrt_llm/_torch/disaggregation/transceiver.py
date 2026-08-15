@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import threading
 import time
 import uuid
 from collections import Counter, defaultdict
@@ -59,6 +60,18 @@ from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
+# Keep a failed-shutdown transceiver, and therefore its request/session/KV
+# roots, alive even if its caller drops the executor.  Removal requires a
+# complete physical-drain proof and successful worker shutdown.
+_NON_DRAINED_TRANSCEIVERS: set["KvCacheTransceiverV2"] = set()
+_PHYSICAL_OWNERSHIP_ENV = "TRTLLM_ENABLE_KV_TRANSFER_PHYSICAL_OWNERSHIP"
+_DISAGG_NO_RETRY_ENV = "TRTLLM_DISAGG_NO_RETRY"
+_ADMISSION_CANCELLED_ATTR = "_py_kv_transfer_admission_cancelled"
+# Keep this private copy aligned with llmapi.disagg_utils.MIN_GLOBAL_ID. Phase
+# 1 accepts only coordinator-issued service requests; local/fallback IDs do not
+# provide its required process-lifetime non-reuse contract.
+_MIN_PHASE1_GLOBAL_REQUEST_ID = 1 << 40
+
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
     frequency_map = defaultdict(int)
@@ -74,12 +87,25 @@ def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
 
 
 class KvCacheTransceiverV2(KvCacheTransceiver):
+    @property
+    def requires_physical_drain_before_request_release(self) -> bool:
+        return getattr(self, "_physical_ownership_enabled", False)
+
+    def get_physical_ownership_fault(self) -> Optional[BaseException]:
+        if not getattr(self, "_physical_ownership_enabled", False):
+            return None
+        fault = self._transfer_worker.physical_ownership_fault
+        if fault is not None:
+            _NON_DRAINED_TRANSCEIVERS.add(self)
+        return fault
+
     def __init__(
         self,
         mapping: Mapping,
         dist: Distributed,
         kv_cache_manager: KVCacheManager,
         cache_transceiver_config: CacheTransceiverConfig,
+        mamba_cache_manager=None,
     ):
         self._dist: Distributed = dist
         self._kv_cache_manager = kv_cache_manager
@@ -91,6 +117,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._sender_future_timeout_ms = (
             cache_transceiver_config.kv_transfer_sender_future_timeout_ms
         )
+        self._physical_ownership_enabled = self._supports_phase1_physical_ownership(
+            mapping,
+            kv_cache_manager,
+            cache_transceiver_config,
+            mamba_cache_manager,
+        )
+        if self._physical_ownership_enabled:
+            logger.info("Phase 1 KV transfer physical ownership enabled")
         transfer_timeout_s = self.kv_transfer_timeout_ms / 1000.0
         sender_wait_slice_s = (
             self._sender_future_timeout_ms / 1000.0
@@ -130,6 +164,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # env: TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS for plain-KV payloads,
                 # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES for recurrent-state payloads).
                 bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
+                enforce_physical_ownership=self._physical_ownership_enabled,
             )
         )
         logger.info(
@@ -148,6 +183,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._send_reqs = {}
         self._recv_reqs = {}
         self._wait_reqs = {}
+        self._lifecycle_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_started = False
+        self._shutdown = False
         self._page_table = self._transfer_worker.page_table
         # _slice_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
         # except under attention DP where the local count already is the total.
@@ -157,6 +196,63 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # per-iter tp_allgather when this transceiver never sends/receives.
         self._ever_had_send_session: bool = False
         self._ever_had_recv_session: bool = False
+
+    @staticmethod
+    def _supports_phase1_physical_ownership(
+        mapping: Mapping,
+        kv_cache_manager: KVCacheManager,
+        cache_transceiver_config: CacheTransceiverConfig,
+        mamba_cache_manager=None,
+    ) -> bool:
+        """Validate the disabled-by-default direct context-first canary."""
+        if os.getenv(_PHYSICAL_OWNERSHIP_ENV, "0") != "1":
+            return False
+
+        unsupported = []
+        if mapping.tp_size != 1:
+            unsupported.append(f"tp_size={mapping.tp_size}")
+        if mapping.pp_size != 1:
+            unsupported.append(f"pp_size={mapping.pp_size}")
+        if mapping.cp_size != 1:
+            unsupported.append(f"cp_size={mapping.cp_size}")
+        if mapping.dp_size != 1:
+            unsupported.append(f"dp_size={mapping.dp_size}")
+        if mapping.enable_attention_dp:
+            unsupported.append("attention_dp")
+        if getattr(mapping, "dwdp_enabled", False):
+            unsupported.append(f"dwdp_size={mapping.dwdp_size}")
+        if cache_transceiver_config.kv_cache_bounce_size_mb != 0:
+            unsupported.append(
+                f"kv_cache_bounce_size_mb={cache_transceiver_config.kv_cache_bounce_size_mb}"
+            )
+        if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
+            unsupported.append("synchronous_transfer")
+        if os.getenv("TRTLLM_DISAGG_LAYERWISE") == "1":
+            unsupported.append("layerwise_transfer")
+        if os.getenv(_DISAGG_NO_RETRY_ENV, "0") != "1":
+            unsupported.append(f"{_DISAGG_NO_RETRY_ENV}!=1")
+        if isinstance(kv_cache_manager, MambaHybridCacheManager):
+            unsupported.append(type(kv_cache_manager).__name__)
+        if getattr(kv_cache_manager, "is_linear_attention", False):
+            unsupported.append("linear_attention")
+        if mamba_cache_manager is not None:
+            unsupported.append(type(mamba_cache_manager).__name__)
+        if int(getattr(kv_cache_manager, "max_draft_len", 0) or 0) > 0:
+            unsupported.append("draft_tokens")
+        if getattr(kv_cache_manager, "kv_connector_manager", None) is not None:
+            unsupported.append("kv_connector_manager")
+        blocks_per_window = getattr(kv_cache_manager, "blocks_per_window", {})
+        if any(secondary > 0 for _, secondary in blocks_per_window.values()):
+            unsupported.append("host_kv_cache_offload")
+        py_config = getattr(kv_cache_manager, "kv_cache_manager_py_config", None)
+        if len(getattr(py_config, "cache_tiers", ())) > 1:
+            unsupported.append("kv_cache_offload_tiers")
+        if unsupported:
+            raise ValueError(
+                f"{_PHYSICAL_OWNERSHIP_ENV}=1 supports only the Phase 1 "
+                "direct context-first TP1/PP1/CP1 canary; unsupported: " + ", ".join(unsupported)
+            )
+        return True
 
     def _broadcast_instance_name(self) -> str:
         if self._dist.rank == 0:
@@ -239,25 +335,88 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             f"waiting_for_peer_info={len(self._wait_reqs)}"
         )
 
-    def shutdown(self):
+    def shutdown(self) -> bool:
+        shutdown_lock = getattr(self, "_shutdown_lock", None)
+        if shutdown_lock is None:
+            shutdown_lock = threading.Lock()
+            self._shutdown_lock = shutdown_lock
+        with shutdown_lock:
+            return self._shutdown_locked()
+
+    def _shutdown_locked(self) -> bool:
         if getattr(self, "_shutdown", False):
-            return
-        self._shutdown = True
-        for session in list(self._send_sessions.values()):
-            session.close()
-        for session in list(self._recv_sessions.values()):
-            session.close()
+            return True
+        if not self.requires_physical_drain_before_request_release:
+            self._shutdown = True
+            for session in list(self._send_sessions.values()):
+                session.close()
+            for session in list(self._recv_sessions.values()):
+                session.close()
+            self._send_sessions.clear()
+            self._send_reqs.clear()
+            self._recv_sessions.clear()
+            self._recv_reqs.clear()
+            self._transfer_worker.shutdown()
+            return True
+        _NON_DRAINED_TRANSCEIVERS.add(self)
+        with self._lifecycle_lock:
+            # Closing is sticky even when drain must be retried. No caller may
+            # publish another source or destination after this snapshot.
+            self._shutdown_started = True
+            send_sessions = list(self._send_sessions.values())
+            recv_sessions = list(self._recv_sessions.values())
+        for session in send_sessions + recv_sessions:
+            session.cancel_local()
+        unsafe = [
+            session.disagg_request_id
+            for session in send_sessions + recv_sessions
+            if not session.resources_drained()
+        ]
+        if unsafe:
+            # Deregistering NIXL memory or destroying the worker here would
+            # invalidate the very ownership evidence that says these accesses
+            # may still be live. The caller must retry after drain or terminate
+            # the process as the fail-stop containment boundary.
+            logger.error(
+                "Cannot shut down KV cache transceiver with outstanding physical "
+                f"operations for request(s) {unsafe}; retaining ownership roots"
+            )
+            return False
+        for session in send_sessions + recv_sessions:
+            if not session.close():
+                logger.error(
+                    f"Failed to retire drained transfer session {session.disagg_request_id}; "
+                    "retaining ownership roots"
+                )
+                return False
+        try:
+            worker_drained = self._transfer_worker.shutdown()
+        except Exception as error:
+            logger.error(
+                "KV transfer worker shutdown did not prove drain; retaining "
+                f"ownership roots: {error}"
+            )
+            return False
+        if worker_drained is not True:
+            logger.error(
+                "KV transfer worker shutdown did not prove drain; retaining ownership roots"
+            )
+            return False
         self._send_sessions.clear()
         self._send_reqs.clear()
         self._recv_sessions.clear()
         self._recv_reqs.clear()
-        self._transfer_worker.shutdown()
+        self._shutdown = True
+        _NON_DRAINED_TRANSCEIVERS.discard(self)
+        return True
 
     def __enter__(self):
         return self
 
     def __exit__(self, _exc_type, _exc_val, _exc_tb):
-        self.shutdown()
+        if not self.shutdown() and _exc_type is None:
+            raise RuntimeError("KV cache transceiver shutdown did not drain")
+        return False
 
     def _create_kv_slice(self, req: LlmRequest) -> KVSlice:
         adapter = self._reuse_adapter
@@ -453,6 +612,26 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         params = req.py_disaggregated_params
         return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
 
+    def _validate_phase1_request(
+        self,
+        req: LlmRequest,
+        *,
+        synchronous: bool = False,
+    ) -> None:
+        if not self._physical_ownership_enabled:
+            return
+        if synchronous:
+            raise ValueError("Phase 1 physical ownership does not support synchronous KV transfer")
+        if self._need_aux_transfer(req):
+            raise ValueError("Phase 1 physical ownership supports context-first transfers only")
+        params = req.py_disaggregated_params
+        rid = None if params is None else params.disagg_request_id
+        if isinstance(rid, bool) or not isinstance(rid, int) or rid < _MIN_PHASE1_GLOBAL_REQUEST_ID:
+            raise ValueError(
+                "Phase 1 physical ownership requires a coordinator-issued, "
+                "non-reused global disagg_request_id"
+            )
+
     def _ctx_consensus(self, local_ids: list) -> list:
         # TP consensus: ensure all TP ranks have peer info
         sync_size = self._dist.tp_size if self._ctx_need_tp_sync else 1
@@ -601,7 +780,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for rid, session in sessions.items():
             if session.is_completed():
                 completed.append(rid)
-            elif session.has_failed():
+            elif session.has_failed() and (
+                not self.requires_physical_drain_before_request_release
+                or session.resources_drained()
+            ):
                 failed.append(rid)
         return completed, failed
 
@@ -619,11 +801,26 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return to_process
 
     def _close_failed_sessions(self, sessions: dict, reqs: dict, failed: list):
+        retired = []
         for rid in failed:
+            # A logical failure is not proof that the backend stopped touching
+            # the request's source or destination memory. Keep the request and
+            # session roots until their local physical owner has drained.
+            requires_drain = self.requires_physical_drain_before_request_release
+            if requires_drain and not sessions[rid].resources_drained():
+                continue
             reqs[rid].state = LlmRequestState.DISAGG_TRANS_ERROR
-            sessions[rid].close()
+            closed = sessions[rid].close()
+            if requires_drain and not closed:
+                continue
             del reqs[rid]
             del sessions[rid]
+            retired.append(rid)
+        return retired
+
+    @staticmethod
+    def _locally_drained(sessions: dict, request_ids: list) -> list:
+        return [rid for rid in request_ids if sessions[rid].resources_drained()]
 
     def _apply_aux(self, session, req: LlmRequest):
         """Unpack aux tokens from session into request's context_phase_params."""
@@ -670,15 +867,42 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest):
+        self._validate_phase1_request(req)
+        if not self.requires_physical_drain_before_request_release:
+            self._ever_had_send_session = True
+            req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
+            session = self._get_or_create_send_session(req)
+            req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+            session.send(self._create_kv_slice(req))
+            self._finalize_send(req, session)
+            return
+        with self._lifecycle_lock:
+            if self._shutdown_started:
+                raise RuntimeError("KV cache transceiver is shutting down")
+            self._respond_and_send_owned(req)
+
+    def _respond_and_send_owned(self, req: LlmRequest) -> None:
+        """Publish one owned source while holding the lifecycle admission gate."""
+        rid = get_unique_rid(req)
+        assert rid is not None
+        self._raise_if_physical_ownership_fault()
+        if getattr(req, _ADMISSION_CANCELLED_ATTR, False):
+            logger.info(f"Skipping pre-cancelled KV send admission for request {rid}")
+            return
         self._ever_had_send_session = True
         req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
         session = self._get_or_create_send_session(req)
+        # Retain the request before the first source operation can be
+        # authorized.  A metadata/submission exception after that point must
+        # not leave an owner whose KV source has lost its request root.
+        self._send_reqs[rid] = req
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         session.send(self._create_kv_slice(req))
         self._finalize_send(req, session)
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
     def request_and_receive_sync(self, req: LlmRequest):
+        self._validate_phase1_request(req, synchronous=True)
         rid = get_unique_rid(req)
         if rid in self._recv_sessions:
             logger.warning(
@@ -715,9 +939,42 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
     def request_and_receive_async(self, req: LlmRequest):
+        self._validate_phase1_request(req)
+        if not self.requires_physical_drain_before_request_release:
+            self._ever_had_recv_session = True
+            req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
+            rid = get_unique_rid(req)
+            if rid in self._recv_sessions:
+                logger.warning(
+                    f"request_and_receive_async: rid={rid} already has a recv session, skipping"
+                )
+                return
+            req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+            session = self._transfer_worker.create_rx_session(req)
+            self._recv_sessions[rid] = session
+            kv_slice = self._create_kv_slice(req)
+            req.py_kv_cache_xfer_bytes = self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor
+            session.receive(kv_slice)
+            self._recv_reqs[rid] = req
+            return
+        with self._lifecycle_lock:
+            if self._shutdown_started:
+                raise RuntimeError("KV cache transceiver is shutting down")
+            prepared = self._prepare_owned_receive(req)
+        if prepared is not None:
+            session, task = prepared
+            session.dispatch_prepared_receive(task)
+
+    def _prepare_owned_receive(self, req: LlmRequest) -> Optional[tuple[Any, Any]]:
+        """Register one destination and publication token without peer I/O."""
+        rid = get_unique_rid(req)
+        assert rid is not None
+        self._raise_if_physical_ownership_fault()
+        if getattr(req, _ADMISSION_CANCELLED_ATTR, False):
+            logger.info(f"Skipping pre-cancelled KV receive admission for request {rid}")
+            return None
         self._ever_had_recv_session = True
         req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
-        rid = get_unique_rid(req)
         if rid in self._recv_sessions:
             logger.warning(
                 f"request_and_receive_async: rid={rid} already has a recv session, skipping"
@@ -726,10 +983,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
         session = self._transfer_worker.create_rx_session(req)
         self._recv_sessions[rid] = session
+        # Retain the request before receive() can publish its destination.
+        # Post-publication exceptions remain fail-closed until the owner
+        # drains, so the destination allocation must keep this root.
+        self._recv_reqs[rid] = req
         kv_slice = self._create_kv_slice(req)
         req.py_kv_cache_xfer_bytes = self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor
-        session.receive(kv_slice)
-        self._recv_reqs[rid] = req
+        task = session.prepare_receive(kv_slice)
+        return None if task is None else (session, task)
+
+    def _raise_if_physical_ownership_fault(self) -> None:
+        error = getattr(self._transfer_worker, "physical_ownership_fault", None)
+        if error is not None:
+            _NON_DRAINED_TRANSCEIVERS.add(self)
+            raise RuntimeError(
+                "KV transfer physical ownership is poisoned; refusing new admission"
+            ) from error
 
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
@@ -785,19 +1054,39 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         cancelled, failed, completed = self._ctx_consensus_outcome(
             to_process, cancelled, failed, completed
         )
+        terminal = cancelled + failed
+        requires_drain = self.requires_physical_drain_before_request_release
+        if requires_drain and terminal:
+            globally_drained = set(
+                self._ctx_consensus(self._locally_drained(self._send_sessions, terminal))
+            )
+            cancelled = [rid for rid in cancelled if rid in globally_drained]
+            failed = [rid for rid in failed if rid in globally_drained]
 
+        retired_cancelled = []
         for rid in cancelled:
-            self._send_sessions[rid].close()
+            if requires_drain and not self._send_sessions[rid].resources_drained():
+                continue
+            closed = self._send_sessions[rid].close()
+            if requires_drain and not closed:
+                continue
             del self._send_reqs[rid]
             del self._send_sessions[rid]
+            retired_cancelled.append(rid)
+        cancelled = retired_cancelled
 
+        retired_completed = []
         for rid in completed:
+            closed = self._send_sessions[rid].close()
+            if requires_drain and not closed:
+                continue
             if mark_complete:
                 self._send_reqs[rid].state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
-            self._send_sessions[rid].close()
             del self._send_reqs[rid]
             del self._send_sessions[rid]
-        self._close_failed_sessions(self._send_sessions, self._send_reqs, failed)
+            retired_completed.append(rid)
+        completed = retired_completed
+        failed = self._close_failed_sessions(self._send_sessions, self._send_reqs, failed)
 
         # Sweep orphaned RecvReqInfo entries from ADP broadcast on non-assigned
         # DP ranks (entries that will never have a TxSession created for them).
@@ -847,11 +1136,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         cancelled, failed, completed = self._gen_consensus_outcome(
             to_process, cancelled, failed, completed
         )
+        terminal = cancelled + failed
+        requires_drain = self.requires_physical_drain_before_request_release
+        if requires_drain and terminal:
+            globally_drained = set(
+                self._gen_consensus(self._locally_drained(self._recv_sessions, terminal))
+            )
+            cancelled = [rid for rid in cancelled if rid in globally_drained]
+            failed = [rid for rid in failed if rid in globally_drained]
 
         cancelled_reqs = []
         for rid in cancelled:
+            if requires_drain and not self._recv_sessions[rid].resources_drained():
+                continue
+            closed = self._recv_sessions[rid].close()
+            if requires_drain and not closed:
+                continue
             cancelled_reqs.append(self._recv_reqs[rid])
-            self._recv_sessions[rid].close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
 
@@ -869,6 +1170,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     kv_cache_size=req.kv_cache_size,
                 )
 
+        retired_completed = []
         for rid in completed:
             session = self._recv_sessions[rid]
             req = self._recv_reqs[rid]
@@ -877,16 +1179,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if self._need_aux_transfer(req):
                 self._apply_aux(session, req)
             self._assert_disagg_history_declared(req)
+            closed = session.close()
+            if requires_drain and not closed:
+                continue
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
-            session.close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
+            retired_completed.append(rid)
+        completed = retired_completed
         if failed:
             logger.warning(
                 f"Disagg gen transfer FAILED rank={self._dist.rank} "
                 f"rids={failed} gen_need_sync={self._gen_need_sync}"
             )
-        self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
+        failed = self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
 
         return completed, failed, cancelled_reqs
 
@@ -961,6 +1267,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         Returns False if any task is mid-write (TRANSFERRING); caller must
         retry next iteration. Returns True when safe to free KV memory.
         """
+        if self.requires_physical_drain_before_request_release:
+            return self._cancel_owned_request(req)
+
         rid = get_unique_rid(req)
 
         # Not yet started (generation-first wait queue).
@@ -972,23 +1281,67 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._send_sessions[rid].cancel()
             if self._send_sessions[rid].has_transferring_tasks():
                 has_transferring = True
-            else:
-                self._send_sessions[rid].close()
+            elif self._send_sessions[rid].close():
                 del self._send_reqs[rid]
                 del self._send_sessions[rid]
+            else:
+                has_transferring = True
 
         if rid in self._recv_sessions:
             self._recv_sessions[rid].cancel()
             if self._recv_sessions[rid].has_transferring_tasks():
                 has_transferring = True
-            else:
-                self._recv_sessions[rid].close()
+            elif self._recv_sessions[rid].close():
                 del self._recv_reqs[rid]
                 del self._recv_sessions[rid]
+            else:
+                has_transferring = True
 
         if has_transferring:
             return False
         return True
+
+    def _cancel_owned_request(self, req: LlmRequest) -> bool:
+        rid = get_unique_rid(req)
+        assert rid is not None
+        notifications = []
+        with self._lifecycle_lock:
+            # The request object is the lifetime root for this one-shot Phase 1
+            # admission. Keeping cancellation on that root avoids an unbounded
+            # transceiver-wide tombstone set while still fencing every delayed
+            # admission of the same request.
+            setattr(req, _ADMISSION_CANCELLED_ATTR, True)
+            self._wait_reqs.pop(rid, None)
+            send_session = self._send_sessions.get(rid)
+            recv_session = self._recv_sessions.get(rid)
+            sessions = [session for session in (send_session, recv_session) if session is not None]
+            if not sessions:
+                return True
+
+            has_transferring = False
+            for session in sessions:
+                if session.cancel_local():
+                    notifications.append((session, session.capture_cancel_targets()))
+                if session.has_transferring_tasks():
+                    has_transferring = True
+
+            if not has_transferring:
+                if send_session is not None:
+                    if send_session.close():
+                        self._send_reqs.pop(rid, None)
+                        self._send_sessions.pop(rid, None)
+                    else:
+                        has_transferring = True
+                if recv_session is not None:
+                    if recv_session.close():
+                        self._recv_reqs.pop(rid, None)
+                        self._recv_sessions.pop(rid, None)
+                    else:
+                        has_transferring = True
+
+        for session, targets in notifications:
+            session.notify_cancel(targets)
+        return not has_transferring
 
     def get_disaggregated_params(self) -> Dict[str, Any]:
         # Keep this aligned with fields populated in respond_and_send_async().

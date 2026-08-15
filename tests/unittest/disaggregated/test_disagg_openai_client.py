@@ -748,3 +748,18 @@ class TestSelectiveTransientTcpRetry:
 
         # 1 original + 5 retries
         assert session.post.call_count == 6
+
+    @pytest.mark.asyncio
+    async def test_phase1_no_retry_disables_retry_and_id_remint(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = aiohttp.ServerDisconnectedError()
+        next_id = AsyncMock(return_value=2)
+        client = self._make_client(session, max_retries=5)
+        client._disagg_id_generator = next_id
+
+        with pytest.raises(aiohttp.ServerDisconnectedError):
+            await client.send_request(self._make_request())
+
+        assert session.post.call_count == 1
+        next_id.assert_not_called()

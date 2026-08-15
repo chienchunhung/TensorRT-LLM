@@ -58,6 +58,7 @@ from tensorrt_llm.serve.router import Router
 # X-TRTLLM-Msgpack header (Content-Type stays application/json so FastAPI still
 # routes it through Request.json()). Fails loudly at import if msgspec is missing.
 _MSGSPEC_ENABLED = os.getenv("TRTLLM_SERVE_ENABLE_MSGSPEC", "0") == "1"
+_DISAGG_NO_RETRY_ENV = "TRTLLM_DISAGG_NO_RETRY"
 if _MSGSPEC_ENABLED:
     try:
         import msgspec
@@ -163,6 +164,7 @@ class OpenAIHttpClient(OpenAIClient):
             max_field_size=_PERF_METRICS_HEADER_BUDGET_BYTES,
         )
         self._max_retries = max_retries
+        self._no_retry = os.getenv(_DISAGG_NO_RETRY_ENV, "0") == "1"
         self._retry_interval_sec = retry_interval_sec
         self._disagg_id_generator = disagg_id_generator
         self._request_perf_metrics = request_perf_metrics
@@ -232,7 +234,9 @@ class OpenAIHttpClient(OpenAIClient):
         # to keep retrying.  Non-transient errors still raise on the first
         # attempt that reaches self._max_retries.
         _TRANSIENT_TCP_BUDGET = 5
-        loop_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET) + 1
+        configured_max = 0 if self._no_retry else self._max_retries
+        transient_tcp_budget = 0 if self._no_retry else _TRANSIENT_TCP_BUDGET
+        loop_max = max(configured_max, transient_tcp_budget) + 1
         for attempt in range(loop_max):
             # Regenerate disagg_request_id on retry to avoid ID collision on workers
             if attempt > 0 and self._disagg_id_generator is not None:
@@ -334,9 +338,9 @@ class OpenAIHttpClient(OpenAIClient):
                     e,
                     (aiohttp.ServerDisconnectedError, ConnectionResetError),
                 )
-                effective_max = self._max_retries
+                effective_max = configured_max
                 if is_transient_tcp:
-                    effective_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET)
+                    effective_max = max(configured_max, transient_tcp_budget)
                 if attempt >= effective_max:
                     logger.error(
                         f"Client error to {url}: {e} - last retry {attempt} of {effective_max}"

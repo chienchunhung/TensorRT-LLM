@@ -48,6 +48,7 @@ class RankInfo:
     attention: Optional[AttentionInfo] = None
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
+    physical_ownership_protocol: int = 0
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -60,6 +61,12 @@ class RankInfo:
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
+        # Preserve compatibility between disabled new workers and older
+        # workers whose RankInfo constructor does not know this field. An
+        # enabled worker advertises the field intentionally, so an older peer
+        # rejects the message instead of silently mixing ownership semantics.
+        if self.physical_ownership_protocol == 0:
+            data.pop("physical_ownership_protocol")
         return msgpack.packb(data)
 
     @classmethod

@@ -33,7 +33,9 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TxSession,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
 
 @dataclass
@@ -58,12 +60,16 @@ class _FakeSession:
         status: SessionStatus = SessionStatus.READY,
         is_completed: bool = False,
         has_failed: bool = False,
+        resources_drained: bool = True,
+        close_result: bool = True,
     ) -> None:
         self._rid = rid
         self._wait_result = wait_result
         self._status = status
         self._is_completed = is_completed
         self._has_failed = has_failed
+        self._resources_drained = resources_drained
+        self._close_result = close_result
         self.blocking_calls: list[bool] = []
         self.closed = False
         self.aux_slot: Optional[int] = 0
@@ -86,9 +92,13 @@ class _FakeSession:
     def has_failed(self) -> bool:
         return self._has_failed
 
-    def close(self) -> None:
+    def resources_drained(self) -> bool:
+        return self._resources_drained
+
+    def close(self) -> bool:
         self.closed = True
         self.aux_slot = None
+        return self._close_result
 
 
 class _FakeTask:
@@ -102,6 +112,7 @@ class _FakeTask:
         self._wait_results = list(wait_result) if isinstance(wait_result, list) else [wait_result]
         self._on_wait = on_wait
         self.wait_calls: list[Optional[float]] = []
+        self.resources_drained = True
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         self.wait_calls.append(timeout)
@@ -123,6 +134,41 @@ class _FakeClock:
     def advance(self, elapsed_s: Optional[float]) -> None:
         assert elapsed_s is not None
         self.now_s += elapsed_s
+
+
+def test_physical_ownership_opt_in_rejects_disabled_transceiver(monkeypatch) -> None:
+    monkeypatch.setenv("TRTLLM_ENABLE_KV_TRANSFER_PHYSICAL_OWNERSHIP", "1")
+
+    with pytest.raises(ValueError, match="requires an enabled Python/NIXL"):
+        create_kv_cache_transceiver(
+            mapping=None,
+            dist=None,
+            kv_cache_manager=None,
+            attention_type=None,
+            cache_transceiver_config=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("runtime", "backend"),
+    [("CPP", "NIXL"), ("PYTHON", "UCX")],
+)
+def test_physical_ownership_opt_in_rejects_unqualified_runtime(
+    monkeypatch,
+    runtime: str,
+    backend: str,
+) -> None:
+    monkeypatch.setenv("TRTLLM_ENABLE_KV_TRANSFER_PHYSICAL_OWNERSHIP", "1")
+    config = CacheTransceiverConfig(backend=backend, transceiver_runtime=runtime)
+
+    with pytest.raises(ValueError, match="supported only"):
+        create_kv_cache_transceiver(
+            mapping=None,
+            dist=None,
+            kv_cache_manager=None,
+            attention_type=None,
+            cache_transceiver_config=config,
+        )
 
 
 def _make_transceiver(
@@ -161,6 +207,7 @@ def _make_tx_session(
     session._overall_timeout_s = None
     session._deadline_monotonic_s = deadline_monotonic_s
     session._need_aux = need_aux
+    session._enforce_physical_ownership = False
     session._terminal_status = None
     session._exception = None
     session.receiver_ready = True
@@ -302,6 +349,33 @@ def test_context_transfer_status_zero_budget_processes_task_level_failure() -> N
     assert 13 not in transceiver._send_reqs
 
 
+def test_flag_off_failure_preserves_legacy_cleanup_without_drain_consensus() -> None:
+    session = _FakeSession(
+        rid=15,
+        wait_result=WaitResult.FAILED,
+        status=SessionStatus.ERROR,
+        has_failed=True,
+        resources_drained=False,
+        close_result=False,
+    )
+    req = _FakeRequest()
+    transceiver = _make_transceiver({15: session}, {15: req})
+    transceiver._physical_ownership_enabled = False
+    transceiver._ctx_consensus = Mock(side_effect=lambda ids: list(ids))
+
+    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=0)
+
+    assert completed == []
+    assert failed == [15]
+    assert session.closed
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert transceiver._send_sessions == {}
+    assert transceiver._send_reqs == {}
+    # One normal readiness consensus only. Flag-off must not conditionally
+    # enter the physical-drain collective after outcome reconciliation.
+    transceiver._ctx_consensus.assert_called_once_with([15])
+
+
 def test_context_transfer_status_skips_consensus_when_never_sent() -> None:
     # A worker that never sends skips the ctx consensus even when TP sync would need it, but still
     # sweeps so nothing leaks.
@@ -348,7 +422,7 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     transceiver._gen_consensus = Mock(return_value=[])
     transceiver._build_to_process = Mock(return_value=[])
     transceiver._gen_consensus_outcome = Mock(return_value=([], [], []))
-    transceiver._close_failed_sessions = Mock()
+    transceiver._close_failed_sessions = Mock(return_value=[])
 
     completed, failed, cancelled = transceiver.check_gen_transfer_status(at_least_request_num=0)
 
@@ -356,6 +430,42 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     assert failed == []
     assert cancelled == []
     transceiver._gen_consensus.assert_called_once_with([])
+
+
+def test_flag_off_gen_failure_preserves_legacy_cleanup_without_drain_consensus() -> None:
+    session = _FakeSession(
+        rid=17,
+        wait_result=WaitResult.FAILED,
+        status=SessionStatus.ERROR,
+        has_failed=True,
+        resources_drained=False,
+        close_result=False,
+    )
+    req = _FakeRequest()
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._physical_ownership_enabled = False
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = False
+    transceiver._recv_sessions = {17: session}
+    transceiver._recv_reqs = {17: req}
+    transceiver._gen_consensus = Mock(side_effect=lambda ids: list(ids))
+    transceiver._gen_consensus_outcome = lambda _to_process, cancelled, failed, completed: (
+        cancelled,
+        failed,
+        completed,
+    )
+    transceiver._dist = SimpleNamespace(rank=0)
+
+    completed, failed, cancelled = transceiver.check_gen_transfer_status(at_least_request_num=0)
+
+    assert completed == []
+    assert failed == [17]
+    assert cancelled == []
+    assert session.closed
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert transceiver._recv_sessions == {}
+    assert transceiver._recv_reqs == {}
+    transceiver._gen_consensus.assert_called_once_with([17])
 
 
 def test_consensus_outcome_uses_single_batched_allgather() -> None:
@@ -442,7 +552,7 @@ def test_ctx_consensus_fastpath_skips_when_idle(monkeypatch) -> None:
     transceiver._build_to_process = Mock(return_value=[])
     transceiver._ctx_consensus_outcome = Mock(return_value=([], [], []))
     transceiver._transfer_worker = _FakeTransferWorker()
-    transceiver._close_failed_sessions = Mock()
+    transceiver._close_failed_sessions = Mock(return_value=[])
 
     completed, failed = transceiver.check_context_transfer_status(at_least_request_num=0)
 
