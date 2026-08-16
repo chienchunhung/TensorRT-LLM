@@ -2635,7 +2635,7 @@ class Receiver(ReceiverBase):
             aux_slot=task._aux_slot,
             mamba_state_index=task._kv_slice.mamba_state_index,
             slice_id=task.slice_id,
-            owner_generation=task.owner_generation,
+            owner_generation=getattr(task, "owner_generation", None),
         )
 
     @staticmethod
