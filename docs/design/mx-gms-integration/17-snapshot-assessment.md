@@ -4,7 +4,11 @@
 
 **Status:** Draft
 **Created:** 2026-06-09
-**Last updated:** 2026-06-30
+**Last updated:** 2026-08-19
+
+> **Current architecture:** [§22](22-gms-snapshot-four-lane-integration-plan.md) supersedes this assessment for the GMS
+> V0/V1 boundary, Snapshot-coupled V1, restored-owner ownership, and delivery priority. This section retains the
+> higher-level component layering and historical standalone-versus-Dynamo assessment.
 
 > **GMS readiness note:** The native loading structure from PR #13926 is merged, but real RW/RO reuse remains blocked
 > on the exact API and SourceIdentity issues in [§18](18-gms-integration-gaps-and-concrete-pr-plan.md). Dynamo #7575 provides

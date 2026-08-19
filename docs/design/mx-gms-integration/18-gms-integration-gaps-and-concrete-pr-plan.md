@@ -9,8 +9,14 @@ SPDX-License-Identifier: Apache-2.0
 
 **Status:** Implementation plan
 **Created:** 2026-06-26
-**Last updated:** 2026-07-02
-**Current source of truth for:** GMS loading, sleep/wake, warm-shadow failover, and the cross-repository PR sequence
+**Last updated:** 2026-08-19
+**Current source of truth for:** GMS V0/standalone loading, V0/live-owner warm-shadow details, and its detailed PR
+sequence
+
+> [§22](22-gms-snapshot-four-lane-integration-plan.md) is the current source of truth for the GMS V0/V1 boundary,
+> shared Snapshot readiness, the TRT-LLM GMS V1 adapter, restored-owner infrastructure, and overall delivery priority.
+> This section's stable-VA, admission, multi-rank, and resource-lifecycle requirements remain applicable where §22
+> assigns them to shared Snapshot readiness or V1.
 
 ## Executive Verdict
 
