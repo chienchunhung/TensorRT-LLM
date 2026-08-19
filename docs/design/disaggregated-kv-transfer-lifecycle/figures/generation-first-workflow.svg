@@ -10,7 +10,9 @@
   <desc id="description">
     A three-lane sequence showing the Frontend, CTX worker, and GEN worker.
     Separate KV and auxiliary owners protect source and destination access.
-    Both receive cohorts must settle at a logical barrier before TRANSFER_RESULT.
+    On success, both receive cohorts must settle at a barrier before a success
+    TRANSFER_RESULT and HANDOFF_COMMITTED. A first logical failure may be
+    reported promptly while every physical owner continues draining.
     Each source owner releases its transfer borrow only after its own drain.
     Attempt-scoped terminal facts and acknowledgement replay coordinate CTX and
     GEN but never provide physical quiescence evidence.
@@ -185,13 +187,13 @@
   <path class="barrier-input" d="M1209 830v35l67 32"/>
   <path class="barrier-input" d="M1411 830v35l-67 32"/>
   <polygon class="logical-step" points="1310,874 1410,918 1310,962 1210,918"/>
-  <text class="step-title" x="1310" y="910" text-anchor="middle">9 · Logical barrier</text>
+  <text class="step-title" x="1310" y="910" text-anchor="middle">9 · Success barrier</text>
   <text class="small" x="1310" y="930" text-anchor="middle">all required cohorts settled</text>
 
   <line class="coordination" x1="1310" y1="962" x2="1310" y2="985"/>
   <rect class="logical-step" x="1130" y="985" width="360" height="54" rx="8"/>
-  <text class="step-title" x="1310" y="1008" text-anchor="middle">TRANSFER_RESULT may now be emitted</text>
-  <text class="small" x="1310" y="1028" text-anchor="middle">logical fact after the all-cohorts barrier</text>
+  <text class="step-title" x="1310" y="1008" text-anchor="middle">Success TRANSFER_RESULT</text>
+  <text class="small" x="1310" y="1028" text-anchor="middle">after the all-cohorts barrier</text>
 
   <rect class="success-step" x="1160" y="1052" width="300" height="54" rx="8"/>
   <text class="step-title" x="1310" y="1075" text-anchor="middle">10 · HANDOFF_COMMITTED</text>
@@ -209,6 +211,6 @@
   <rect class="callout" x="180" y="1215" width="1240" height="58" rx="9"/>
   <text class="callout-title" x="205" y="1238">Cancel or failure</text>
   <text class="callout-text" x="205" y="1261">
-    ABORT_REQUESTED closes new publication and submission; KV and auxiliary owners on both sides drain independently.
+    First failure may report promptly; ABORT_REQUESTED closes new work while every KV and auxiliary owner drains independently.
   </text>
 </svg>

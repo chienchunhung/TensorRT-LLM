@@ -11,7 +11,9 @@
     A three-lane sequence showing the Frontend, CTX worker, and GEN worker.
     The CTX send owner retains its transfer borrow after the context response
     until source drain, while the independent GEN receive owner protects the
-    destination until receive drain and handoff to decode.
+    destination until receive drain and handoff to decode. Ownership wire v1
+    echoes a receiver process-local generation in terminal results; it is not
+    a distributed retry or endpoint-incarnation identity.
   </desc>
 
   <defs>
@@ -75,7 +77,7 @@
 
   <rect class="canvas" x="0" y="0" width="1600" height="1040"/>
   <text class="title" x="70" y="48">Phase 1 · Context-first workflow</text>
-  <text class="subtitle" x="70" y="78">Fixed TP1 monolithic transfer · existing request correlation · retry disabled</text>
+  <text class="subtitle" x="70" y="78">Fixed TP1 monolithic transfer · ownership wire v1 result fence · retry disabled</text>
 
   <line class="legend-line" x1="1120" y1="48" x2="1170" y2="48"/>
   <text class="legend-text" x="1182" y="53">request or data flow</text>
@@ -121,46 +123,46 @@
 
   <rect class="owner-step-ctx" x="625" y="354" width="350" height="70" rx="8"/>
   <text class="step-title" x="800" y="378" text-anchor="middle">3 · CTX send owner</text>
-  <text class="step-text" x="800" y="399" text-anchor="middle">Acquire transfer borrow</text>
-  <text class="small" x="800" y="417" text-anchor="middle">Atomically authorize + seal fixed TP1 writer</text>
+  <text class="step-text" x="800" y="399" text-anchor="middle">Create owner; managers retain source roots</text>
+  <text class="small" x="800" y="417" text-anchor="middle">Coarse realization of conceptual transfer borrow</text>
 
   <line class="message" x1="700" y1="462" x2="340" y2="462"/>
   <rect class="step" x="350" y="433" width="340" height="36" rx="18"/>
-  <text class="message-label" x="520" y="456" text-anchor="middle">4 · Context response + transfer correlation</text>
+  <text class="message-label" x="520" y="456" text-anchor="middle">4 · Context response + non-reused request ID</text>
 
   <line class="message" x1="340" y1="528" x2="1200" y2="528"/>
   <rect class="step" x="620" y="499" width="390" height="36" rx="18"/>
-  <text class="message-label" x="815" y="522" text-anchor="middle">5 · Dispatch paired request with same current ID</text>
+  <text class="message-label" x="815" y="522" text-anchor="middle">5 · Dispatch paired request with same global ID</text>
 
   <rect class="callout" x="125" y="590" width="350" height="82" rx="9"/>
-  <text class="retention-text" x="150" y="615">CTX transfer borrow remains held</text>
+  <text class="retention-text" x="150" y="615">CTX retained roots remain held</text>
   <text class="callout-text" x="150" y="640">Past the context response in step 4;</text>
   <text class="callout-text" x="150" y="662">released only after the step 9 source drain.</text>
   <path class="retention" d="M475 632H545L625 784"/>
 
   <rect class="owner-step-gen" x="1135" y="560" width="350" height="70" rx="8"/>
   <text class="step-title" x="1310" y="584" text-anchor="middle">6 · GEN receive owner</text>
-  <text class="step-text" x="1310" y="607" text-anchor="middle">Allocate destination + open publication gate</text>
+  <text class="step-text" x="1310" y="607" text-anchor="middle">Associate allocated roots + open preparation gate</text>
 
   <line class="coordination" x1="1200" y1="668" x2="900" y2="668"/>
-  <rect class="step" x="905" y="639" width="290" height="36" rx="18"/>
-  <text class="coord-label" x="1050" y="662" text-anchor="middle">7 · Receiver-ready information</text>
+  <rect class="step" x="825" y="639" width="450" height="36" rx="18"/>
+  <text class="coord-label" x="1050" y="662" text-anchor="middle">7 · Seal cohort; enqueue REQUEST_DATA + ready info</text>
 
   <line class="message" x1="900" y1="723" x2="1200" y2="723"/>
-  <rect class="step" x="920" y="694" width="260" height="36" rx="18"/>
-  <text class="message-label" x="1050" y="717" text-anchor="middle">8 · Submit sealed KV cohort</text>
+  <rect class="step" x="825" y="694" width="450" height="36" rx="18"/>
+  <text class="message-label" x="1050" y="717" text-anchor="middle">8 · Validate gen; dynamically admit + submit NIXL TP1 write</text>
 
   <rect class="owner-step-ctx" x="625" y="752" width="350" height="64" rx="8"/>
   <text class="step-title" x="800" y="778" text-anchor="middle">9 · Fence submission</text>
-  <text class="step-text" x="800" y="800" text-anchor="middle">Drain source cohort, then release borrow</text>
+  <text class="step-text" x="800" y="800" text-anchor="middle">Drain source operation, then release retained roots</text>
 
   <rect class="owner-step-gen" x="1135" y="752" width="350" height="64" rx="8"/>
-  <text class="step-title" x="1310" y="778" text-anchor="middle">10 · Close publication</text>
-  <text class="step-text" x="1310" y="800" text-anchor="middle">Drain destination receive cohort</text>
+  <text class="step-title" x="1310" y="778" text-anchor="middle">10 · Destination completion</text>
+  <text class="step-text" x="1310" y="800" text-anchor="middle">Drain sealed receive cohort</text>
 
   <rect class="owner-step-gen" x="1120" y="844" width="230" height="58" rx="8"/>
   <text class="step-title" x="1235" y="869" text-anchor="middle">11 · Access quiesced</text>
-  <text class="small" x="1235" y="890" text-anchor="middle">receive owner settles</text>
+  <text class="small" x="1235" y="890" text-anchor="middle">drain-gated local commit</text>
   <line class="message" x1="1350" y1="873" x2="1392" y2="873"/>
   <rect class="success-step" x="1392" y="844" width="112" height="58" rx="8"/>
   <text class="step-title" x="1448" y="868" text-anchor="middle">Decode</text>
@@ -173,6 +175,6 @@
   <rect class="callout" x="180" y="962" width="1240" height="54" rx="9"/>
   <text class="callout-title" x="205" y="985">Phase 1 safety boundary</text>
   <text class="callout-text" x="205" y="1006">
-    No retry, lease, rerouting, or terminal protocol. Only each local physical owner can prove that its memory access is quiesced.
+    No retry, obligation lease, rerouting, or terminal protocol. Only each local physical owner can prove that its memory access is quiesced.
   </text>
 </svg>
