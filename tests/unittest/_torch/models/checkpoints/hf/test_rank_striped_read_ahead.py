@@ -67,6 +67,8 @@ def test_subclass_without_super_init_uses_native_compatibility_defaults(
     assert initial_status.requested == "native"
     assert initial_status.selected == "native"
     assert initial_status.effective == "none"
+    assert initial_status.rank_striped_eligibility == "unknown"
+    assert initial_status.rank_striped_eligibility_reason == "native_policy_not_evaluated"
     assert loader._partial_model_loading is False
 
     native_weights = {"native": object()}
@@ -109,6 +111,8 @@ def test_sessionless_rank_striped_load_uses_native_io(
     assert status.selected == "native"
     assert status.activated is False
     assert status.effective == "native"
+    assert status.rank_striped_eligibility == "ineligible"
+    assert status.rank_striped_eligibility_reason == "session_api_required"
     assert "open_weight_session" in status.fallback_reason
     open_weight_session.assert_not_called()
     reader_start.assert_not_called()
@@ -134,6 +138,7 @@ def test_checkpoint_io_status_log_escapes_multiline_fallback_reason(
     message = log_info.call_args.args[0]
     assert "\r" not in message
     assert "\n" not in message
+    assert "status_schema_version=2" in message
     assert r"fallback_reason=first line\r\nsecond line." in message
 
 
@@ -161,6 +166,59 @@ def test_extent_plan_is_complete_disjoint_and_fair(tmp_path, monkeypatch):
     workers = read_ahead.distribute_worker_budget(65)
     assert sum(workers) == 64
     assert max(workers) - min(workers) == 1
+
+
+def test_session_metrics_capture_progress_and_cancellation(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"0123456789")
+    plan = read_ahead.ReadAheadPlan((read_ahead.ReadAheadExtent(str(checkpoint), 0, 10),), 1)
+    read_started = threading.Event()
+    release_read = threading.Event()
+    original_pread = read_ahead.os.pread
+
+    def controlled_pread(file_descriptor, read_size, offset):
+        data = original_pread(file_descriptor, read_size, offset)
+        if offset == 0:
+            read_started.set()
+            assert release_read.wait(timeout=5)
+        return data
+
+    monkeypatch.setattr(read_ahead, "_READ_SIZE", 4)
+    monkeypatch.setattr(read_ahead.os, "pread", controlled_pread)
+    session = read_ahead.RankStripedReadAheadSession(
+        None,
+        None,
+        plan,
+        local_rank=2,
+        local_size=4,
+        global_rank=6,
+        world_size=8,
+    ).start()
+
+    assert read_started.wait(timeout=5)
+    cancellation_result = []
+    cancellation_thread = threading.Thread(
+        target=lambda: cancellation_result.append(session.cancel_and_close())
+    )
+    cancellation_thread.start()
+    assert session._cancel.wait(timeout=5)
+    release_read.set()
+    cancellation_thread.join(timeout=5)
+
+    assert not cancellation_thread.is_alive()
+    assert cancellation_result == [None]
+
+    metrics = session.metrics
+    assert metrics.scheduled_bytes == 10
+    assert metrics.completed_bytes == 4
+    assert metrics.cancelled_bytes == 6
+    assert metrics.reader_duration_seconds >= metrics.cancellation_tail_seconds >= 0.0
+    assert metrics.workers == 1
+    assert metrics.extents == 1
+    assert metrics.local_rank == 2
+    assert metrics.local_size == 4
+    assert metrics.global_rank == 6
+    assert metrics.world_size == 8
 
 
 @pytest.mark.parametrize(
@@ -328,13 +386,17 @@ def test_collective_native_fallback_failure_escapes_without_cleanup(
 
 
 @pytest.mark.parametrize("requested_policy", ["auto", "rank_striped_read_ahead"])
-@pytest.mark.parametrize("partial,available", [(True, 1 << 40), (False, 0)])
+@pytest.mark.parametrize(
+    "partial,available,eligibility_reason",
+    [(True, 1 << 40, "partial_model_loading"), (False, 0, "host_memory")],
+)
 def test_ineligible_request_uses_exact_native_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     requested_policy: str,
     partial: bool,
     available: int,
+    eligibility_reason: str,
 ) -> None:
     checkpoint_dir, _ = _write_checkpoint(tmp_path)
     loader = HfWeightLoader(
@@ -362,6 +424,8 @@ def test_ineligible_request_uses_exact_native_fallback(
     assert not status.activated
     assert status.effective == "native"
     assert status.fallback_reason
+    assert status.rank_striped_eligibility == "ineligible"
+    assert status.rank_striped_eligibility_reason == eligibility_reason
     reader_start.assert_not_called()
     if requested_policy == "rank_striped_read_ahead":
         warning.assert_called_once()
@@ -443,7 +507,10 @@ def test_session_overlaps_materialization_and_cancels_tail(tmp_path, monkeypatch
         assert "model.norm.weight" in weights
 
     assert stopped.is_set()
-    assert loader.last_checkpoint_io_status.effective == "rank_striped_read_ahead"
+    status = loader.last_checkpoint_io_status
+    assert status.effective == "rank_striped_read_ahead"
+    assert status.rank_striped_eligibility == "eligible"
+    assert status.rank_striped_eligibility_reason == "preflight_passed"
 
 
 def test_advisory_read_failure_keeps_materialized_weights(tmp_path, monkeypatch):

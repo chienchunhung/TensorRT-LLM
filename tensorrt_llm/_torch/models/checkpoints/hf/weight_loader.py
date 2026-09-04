@@ -35,8 +35,9 @@ from tensorrt_llm._torch.mmap_utils import populate_file_pages
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
 from tensorrt_llm._torch.models.checkpoints.hf.rank_striped_read_ahead import (
-    RankStripedReadAheadSession, build_local_plan, close_node_communicator,
-    coordinate_error, effective_available_host_memory, memory_admission)
+    RankStripedReadAheadSession, ReadAheadMetrics, build_local_plan,
+    close_node_communicator, coordinate_error, effective_available_host_memory,
+    memory_admission)
 from tensorrt_llm._torch.models.modeling_utils import (
     register_checkpoint_weight_loader, run_concurrently)
 from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, local_mpi_barrier,
@@ -50,6 +51,7 @@ _WEIGHT_CACHE_MAX_ENTRIES_ENV = "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"
 _AUTO_IO_POLICY = "auto"
 _NATIVE_IO_POLICY = "native"
 _RANK_STRIPED_IO_POLICY = "rank_striped_read_ahead"
+_CHECKPOINT_IO_STATUS_SCHEMA_VERSION = "2"
 _SUPPORTED_IO_POLICIES = (_NATIVE_IO_POLICY, _RANK_STRIPED_IO_POLICY)
 _SUPPORTED_REQUESTED_IO_POLICIES = (_AUTO_IO_POLICY, ) + _SUPPORTED_IO_POLICIES
 # Model families whose checkpoints are too large to materialize in host RAM;
@@ -75,6 +77,37 @@ _PREFETCH_LOG_INTERVAL_SEC = 60.0
 _PREFETCH_FALLBACK_LOGGED = threading.Event()
 _PREFETCH_FALLBACK_LOG_LOCK = threading.Lock()
 
+_ELIGIBILITY_ELIGIBLE = "eligible"
+_ELIGIBILITY_INELIGIBLE = "ineligible"
+_ELIGIBILITY_UNKNOWN = "unknown"
+
+
+def _rank_striped_eligibility_reason_code(reason: str | None) -> str:
+    """Map detailed preflight diagnostics to a bounded telemetry code."""
+    normalized = (reason or "").lower()
+    categories = (
+        ("open_weight_session", "session_api_required"),
+        ("mapping.world_size", "mapping_mismatch"),
+        ("active mpi communicator", "missing_communicator"),
+        ("node communicator creation", "communicator_setup_error"),
+        ("node preflight", "node_preflight_error"),
+        ("preflight", "preflight_error"),
+        ("reader setup", "reader_setup_error"),
+        ("backend", "backend"),
+        ("explicit checkpoint loader", "custom_loader"),
+        ("registered hf", "custom_loader"),
+        ("checkpoint_format", "checkpoint_format"),
+        ("load_format", "load_format"),
+        ("partial model loading", "partial_model_loading"),
+        ("lazy safetensors", "model_specific_loader"),
+        ("raw hf weight cache", "weight_cache"),
+        ("safetensors checkpoint files", "checkpoint_files"),
+        ("backing files", "checkpoint_discovery"),
+        ("host memory", "host_memory"),
+    )
+    return next((code for marker, code in categories if marker in normalized),
+                "other")
+
 
 class _LazySafetensorsWeights(ConsumableWeightsDict):
     """Keep lazy safetensors handles alive only while a load uses them."""
@@ -95,6 +128,32 @@ class _CheckpointIOStatus:
     activated: bool = False
     effective: str = "none"
     fallback_reason: str | None = None
+    rank_striped_eligibility: str = _ELIGIBILITY_UNKNOWN
+    rank_striped_eligibility_reason: str = "not_evaluated"
+
+
+def _initial_checkpoint_io_status(
+    requested: str,
+    selected: str,
+    fallback_reason: str | None,
+) -> _CheckpointIOStatus:
+    if fallback_reason is not None:
+        eligibility = _ELIGIBILITY_INELIGIBLE
+        eligibility_reason = _rank_striped_eligibility_reason_code(
+            fallback_reason)
+    elif selected == _RANK_STRIPED_IO_POLICY:
+        eligibility = _ELIGIBILITY_UNKNOWN
+        eligibility_reason = "preflight_pending"
+    else:
+        eligibility = _ELIGIBILITY_UNKNOWN
+        eligibility_reason = "native_policy_not_evaluated"
+    return _CheckpointIOStatus(
+        requested=requested,
+        selected=selected,
+        fallback_reason=fallback_reason,
+        rank_striped_eligibility=eligibility,
+        rank_striped_eligibility_reason=eligibility_reason,
+    )
 
 
 @register_checkpoint_weight_loader("MX")
@@ -112,9 +171,10 @@ class HfWeightLoader(BaseWeightLoader):
     _requested_checkpoint_io_policy = _NATIVE_IO_POLICY
     _selection_fallback_reason: str | None = None
     _partial_model_loading = False
-    _last_checkpoint_io_status = _CheckpointIOStatus(
-        requested=_NATIVE_IO_POLICY,
-        selected=_NATIVE_IO_POLICY,
+    _last_checkpoint_io_status = _initial_checkpoint_io_status(
+        _NATIVE_IO_POLICY,
+        _NATIVE_IO_POLICY,
+        None,
     )
 
     def __init__(self,
@@ -151,10 +211,11 @@ class HfWeightLoader(BaseWeightLoader):
         self._checkpoint_io_policy = checkpoint_io_policy
         self._requested_checkpoint_io_policy = requested_checkpoint_io_policy
         self._selection_fallback_reason = selection_fallback_reason
-        self._last_checkpoint_io_status = _CheckpointIOStatus(
-            requested=requested_checkpoint_io_policy,
-            selected=checkpoint_io_policy,
-            fallback_reason=selection_fallback_reason)
+        self._last_checkpoint_io_status = _initial_checkpoint_io_status(
+            requested_checkpoint_io_policy,
+            checkpoint_io_policy,
+            selection_fallback_reason,
+        )
 
     @property
     def checkpoint_io_policy(self) -> str:
@@ -165,20 +226,53 @@ class HfWeightLoader(BaseWeightLoader):
         return replace(self._last_checkpoint_io_status)
 
     def _reset_checkpoint_io_status(self) -> None:
-        self._last_checkpoint_io_status = _CheckpointIOStatus(
-            requested=self._requested_checkpoint_io_policy,
-            selected=self._checkpoint_io_policy,
-            fallback_reason=self._selection_fallback_reason,
+        self._last_checkpoint_io_status = _initial_checkpoint_io_status(
+            self._requested_checkpoint_io_policy,
+            self._checkpoint_io_policy,
+            self._selection_fallback_reason,
         )
 
-    def _log_checkpoint_io_status(self) -> None:
+    def _log_checkpoint_io_status(self,
+                                  session: RankStripedReadAheadSession
+                                  | None = None) -> None:
         status = self._last_checkpoint_io_status
+        metrics = (session.metrics if session is not None else ReadAheadMetrics(
+            scheduled_bytes=0,
+            completed_bytes=0,
+            cancelled_bytes=0,
+            reader_duration_seconds=0.0,
+            cancellation_tail_seconds=0.0,
+            workers=0,
+            extents=0,
+            local_rank=-1,
+            local_size=0,
+            global_rank=-1,
+            world_size=0,
+        ))
         fallback_reason = (status.fallback_reason
                            or "none").replace("\r", "\\r").replace("\n", "\\n")
         logger.info(
             f"Checkpoint I/O policy: requested={status.requested}, "
             f"selected={status.selected}, activated={status.activated}, "
-            f"effective={status.effective}, fallback_reason="
+            f"effective={status.effective}, "
+            "status_schema_version="
+            f"{_CHECKPOINT_IO_STATUS_SCHEMA_VERSION}, "
+            f"rank_striped_eligibility={status.rank_striped_eligibility}, "
+            "rank_striped_eligibility_reason="
+            f"{status.rank_striped_eligibility_reason}, "
+            f"read_ahead_scheduled_bytes={metrics.scheduled_bytes}, "
+            f"read_ahead_completed_bytes={metrics.completed_bytes}, "
+            f"read_ahead_cancelled_bytes={metrics.cancelled_bytes}, "
+            "read_ahead_reader_duration_seconds="
+            f"{metrics.reader_duration_seconds:.6f}, "
+            "read_ahead_cancellation_tail_seconds="
+            f"{metrics.cancellation_tail_seconds:.6f}, "
+            f"read_ahead_workers={metrics.workers}, "
+            f"read_ahead_extents={metrics.extents}, "
+            f"read_ahead_local_rank={metrics.local_rank}, "
+            f"read_ahead_local_size={metrics.local_size}, "
+            f"read_ahead_global_rank={metrics.global_rank}, "
+            f"read_ahead_world_size={metrics.world_size}, fallback_reason="
             f"{fallback_reason}.")
 
     @staticmethod
@@ -437,6 +531,8 @@ class HfWeightLoader(BaseWeightLoader):
             status.fallback_reason = (
                 "rank-striped read-ahead requires open_weight_session() to "
                 "overlap I/O with model materialization")
+            status.rank_striped_eligibility = _ELIGIBILITY_INELIGIBLE
+            status.rank_striped_eligibility_reason = "session_api_required"
             message = (
                 "Checkpoint I/O policy is falling back for a sessionless "
                 f"load: requested={status.requested}, "
@@ -480,7 +576,10 @@ class HfWeightLoader(BaseWeightLoader):
             mapping_error,
         )
         if coordinated_mapping_error is not None:
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            status = self._last_checkpoint_io_status
+            status.selected = _NATIVE_IO_POLICY
+            status.rank_striped_eligibility = _ELIGIBILITY_INELIGIBLE
+            status.rank_striped_eligibility_reason = "mapping_mismatch"
             weights = self._fallback_to_native(
                 checkpoint_dir,
                 mapping,
@@ -493,7 +592,10 @@ class HfWeightLoader(BaseWeightLoader):
             yield weights
             return
         if mapping.world_size > 1 and active_communicator is None:
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            status = self._last_checkpoint_io_status
+            status.selected = _NATIVE_IO_POLICY
+            status.rank_striped_eligibility = _ELIGIBILITY_INELIGIBLE
+            status.rank_striped_eligibility_reason = "missing_communicator"
             weights = self._fallback_to_native(
                 checkpoint_dir,
                 mapping,
@@ -532,12 +634,12 @@ class HfWeightLoader(BaseWeightLoader):
                 status.effective = "none"
                 if body_error is None:
                     status.fallback_reason = str(error)
-                    self._log_checkpoint_io_status()
+                    self._log_checkpoint_io_status(session)
                     raise
                 status.fallback_reason = (
                     "model materialization failed: "
                     f"{type(body_error).__name__}: {body_error}")
-                self._log_checkpoint_io_status()
+                self._log_checkpoint_io_status(session)
                 # Preserve the specific local error (for example, CUDA OOM) instead
                 # of finish()'s rank-coordinated wrapper.
                 logger.error(
@@ -557,7 +659,7 @@ class HfWeightLoader(BaseWeightLoader):
                         "Rank-striped read-ahead degraded after activation; "
                         "keeping the successfully materialized model: "
                         f"{read_error}")
-                self._log_checkpoint_io_status()
+                self._log_checkpoint_io_status(session)
 
     @staticmethod
     def _active_communicator():
@@ -681,7 +783,7 @@ class HfWeightLoader(BaseWeightLoader):
         if coordinated_load_error is not None:
             status.effective = "none"
             status.fallback_reason = str(coordinated_load_error)
-            self._log_checkpoint_io_status()
+            self._log_checkpoint_io_status(session)
             if coordinated_close_error is not None:
                 logger.error("Rank-striped cleanup also failed during native "
                              f"fallback: {coordinated_close_error}")
@@ -689,11 +791,11 @@ class HfWeightLoader(BaseWeightLoader):
         if coordinated_close_error is not None:
             status.effective = "none"
             status.fallback_reason = str(coordinated_close_error)
-            self._log_checkpoint_io_status()
+            self._log_checkpoint_io_status(session)
             raise coordinated_close_error
         assert weights is not None
         status.effective = _NATIVE_IO_POLICY
-        self._log_checkpoint_io_status()
+        self._log_checkpoint_io_status(session)
         return weights
 
     def _start_rank_striped_read_ahead(
@@ -721,7 +823,10 @@ class HfWeightLoader(BaseWeightLoader):
             self._close_unactivated_session(
                 None, node_communicator, active_communicator,
                 "rank-striped node communicator cleanup")
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            status = self._last_checkpoint_io_status
+            status.selected = _NATIVE_IO_POLICY
+            status.rank_striped_eligibility = _ELIGIBILITY_UNKNOWN
+            status.rank_striped_eligibility_reason = "communicator_setup_error"
             return self._fallback_to_native(checkpoint_dir, mapping,
                                             use_consolidated,
                                             str(coordinated_split_error),
@@ -755,7 +860,10 @@ class HfWeightLoader(BaseWeightLoader):
         coordinated_preflight_error = coordinate_error(
             active_communicator, "rank-striped preflight", preflight_error)
         if coordinated_preflight_error is not None:
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            status = self._last_checkpoint_io_status
+            status.selected = _NATIVE_IO_POLICY
+            status.rank_striped_eligibility = _ELIGIBILITY_UNKNOWN
+            status.rank_striped_eligibility_reason = "preflight_error"
             return self._fallback_to_native(checkpoint_dir, mapping,
                                             use_consolidated,
                                             str(coordinated_preflight_error),
@@ -789,7 +897,10 @@ class HfWeightLoader(BaseWeightLoader):
             self._close_unactivated_session(
                 None, node_communicator, active_communicator,
                 "rank-striped node preflight cleanup")
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            status = self._last_checkpoint_io_status
+            status.selected = _NATIVE_IO_POLICY
+            status.rank_striped_eligibility = _ELIGIBILITY_UNKNOWN
+            status.rank_striped_eligibility_reason = "node_preflight_error"
             return self._fallback_to_native(checkpoint_dir, mapping,
                                             use_consolidated,
                                             str(coordinated_node_error),
@@ -824,21 +935,33 @@ class HfWeightLoader(BaseWeightLoader):
                             if selection[1] is not None]
         if fallback_reasons:
             rank, reason = fallback_reasons[0]
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            status = self._last_checkpoint_io_status
+            status.selected = _NATIVE_IO_POLICY
+            status.rank_striped_eligibility = _ELIGIBILITY_INELIGIBLE
+            status.rank_striped_eligibility_reason = (
+                _rank_striped_eligibility_reason_code(reason))
             return self._fallback_to_native(checkpoint_dir, mapping,
                                             use_consolidated,
                                             f"rank {rank}: {reason}",
                                             active_communicator,
                                             node_communicator, **kwargs), None
 
-        self._last_checkpoint_io_status.selected = _RANK_STRIPED_IO_POLICY
+        status = self._last_checkpoint_io_status
+        status.selected = _RANK_STRIPED_IO_POLICY
+        status.rank_striped_eligibility = _ELIGIBILITY_ELIGIBLE
+        status.rank_striped_eligibility_reason = "preflight_passed"
         session = None
         setup_error = None
         try:
             plan = build_local_plan(file_sizes, local_rank, local_size)
-            session = RankStripedReadAheadSession(active_communicator,
-                                                  node_communicator,
-                                                  plan).start()
+            session = RankStripedReadAheadSession(
+                active_communicator,
+                node_communicator,
+                plan,
+                local_rank=local_rank,
+                local_size=local_size,
+                global_rank=mapping.rank,
+                world_size=mapping.world_size).start()
         except Exception as error:
             setup_error = error
         coordinated_setup_error = coordinate_error(active_communicator,
@@ -853,7 +976,6 @@ class HfWeightLoader(BaseWeightLoader):
                                             **kwargs), None
         assert session is not None
 
-        status = self._last_checkpoint_io_status
         status.activated = True
         logger.info("Rank-striped checkpoint read-ahead activated: "
                     f"local_rank={local_rank}, local_size={local_size}, "
@@ -882,7 +1004,7 @@ class HfWeightLoader(BaseWeightLoader):
                              f"failure: {coordinated_cleanup_error}")
             status.effective = "none"
             status.fallback_reason = str(coordinated_mapping_error)
-            self._log_checkpoint_io_status()
+            self._log_checkpoint_io_status(session)
             raise coordinated_mapping_error
         assert weights is not None
         return weights, session

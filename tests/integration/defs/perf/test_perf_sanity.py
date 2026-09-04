@@ -862,7 +862,24 @@ DRAFT_CHECKPOINT_PIPELINE_PHASES = (
 CHECKPOINT_IO_POLICY_PATTERN = re.compile(
     r"Checkpoint I/O policy: requested=(?P<requested>[^,]+), "
     r"selected=(?P<selected>[^,]+), activated=(?P<activated>True|False), "
-    r"effective=(?P<effective>[^,]+), fallback_reason=(?P<fallback_reason>.*)\."
+    r"effective=(?P<effective>[^,]+), "
+    r"(?:status_schema_version=(?P<status_schema_version>[^,]+), "
+    r"rank_striped_eligibility=(?P<rank_striped_eligibility>[^,]+), "
+    r"rank_striped_eligibility_reason=(?P<rank_striped_eligibility_reason>[^,]+), "
+    r"read_ahead_scheduled_bytes=(?P<read_ahead_scheduled_bytes>\d+), "
+    r"read_ahead_completed_bytes=(?P<read_ahead_completed_bytes>\d+), "
+    r"read_ahead_cancelled_bytes=(?P<read_ahead_cancelled_bytes>\d+), "
+    r"read_ahead_reader_duration_seconds="
+    r"(?P<read_ahead_reader_duration_seconds>\d+(?:\.\d+)?), "
+    r"read_ahead_cancellation_tail_seconds="
+    r"(?P<read_ahead_cancellation_tail_seconds>\d+(?:\.\d+)?), "
+    r"read_ahead_workers=(?P<read_ahead_workers>\d+), "
+    r"read_ahead_extents=(?P<read_ahead_extents>\d+), "
+    r"read_ahead_local_rank=(?P<read_ahead_local_rank>-?\d+), "
+    r"read_ahead_local_size=(?P<read_ahead_local_size>\d+), "
+    r"read_ahead_global_rank=(?P<read_ahead_global_rank>-?\d+), "
+    r"read_ahead_world_size=(?P<read_ahead_world_size>\d+), )?"
+    r"fallback_reason=(?P<fallback_reason>.*)\."
 )
 CHECKPOINT_IO_EXPERIMENT_VERSION = "checkpoint-io-v1-75-auto-25-native"
 CHECKPOINT_IO_EXPERIMENT_OVERRIDE_ENV = "TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY"
@@ -875,6 +892,49 @@ STARTUP_METADATA_NAMES = (
     "checkpoint_weight_loader_kind",
     "checkpoint_source_kind",
     "load_format",
+)
+CHECKPOINT_IO_MECHANISM_INTEGER_FIELDS = (
+    "read_ahead_scheduled_bytes",
+    "read_ahead_completed_bytes",
+    "read_ahead_cancelled_bytes",
+    "read_ahead_workers",
+    "read_ahead_extents",
+    "read_ahead_local_rank",
+    "read_ahead_local_size",
+    "read_ahead_global_rank",
+    "read_ahead_world_size",
+)
+CHECKPOINT_IO_MECHANISM_DURATION_FIELDS = (
+    "read_ahead_reader_duration_seconds",
+    "read_ahead_cancellation_tail_seconds",
+)
+CHECKPOINT_IO_ELIGIBILITY_VALUES = frozenset(("eligible", "ineligible", "unknown"))
+CHECKPOINT_IO_ELIGIBILITY_REASON_VALUES = frozenset(
+    (
+        "backend",
+        "checkpoint_discovery",
+        "checkpoint_files",
+        "checkpoint_format",
+        "communicator_setup_error",
+        "custom_loader",
+        "host_memory",
+        "legacy_status",
+        "load_format",
+        "mapping_mismatch",
+        "missing_communicator",
+        "model_specific_loader",
+        "native_policy_not_evaluated",
+        "node_preflight_error",
+        "not_evaluated",
+        "other",
+        "partial_model_loading",
+        "preflight_error",
+        "preflight_passed",
+        "preflight_pending",
+        "reader_setup_error",
+        "session_api_required",
+        "weight_cache",
+    )
 )
 
 
@@ -1014,6 +1074,25 @@ def parse_checkpoint_io_policies(log_paths: List[str]) -> List[dict]:
                 for match in CHECKPOINT_IO_POLICY_PATTERN.finditer(line):
                     status = match.groupdict()
                     status["activated"] = status["activated"] == "True"
+                    status["status_schema_version"] = status.get("status_schema_version") or "1"
+                    status["rank_striped_eligibility"] = (
+                        status.get("rank_striped_eligibility") or "unknown"
+                    )
+                    status["rank_striped_eligibility_reason"] = (
+                        status.get("rank_striped_eligibility_reason") or "legacy_status"
+                    )
+                    for field in CHECKPOINT_IO_MECHANISM_INTEGER_FIELDS:
+                        value = status.get(field)
+                        if value is None:
+                            status.pop(field, None)
+                        else:
+                            status[field] = int(value)
+                    for field in CHECKPOINT_IO_MECHANISM_DURATION_FIELDS:
+                        value = status.get(field)
+                        if value is None:
+                            status.pop(field, None)
+                        else:
+                            status[field] = float(value)
                     status["fallback_category"] = checkpoint_io_fallback_category(
                         status["fallback_reason"]
                     )
@@ -1133,10 +1212,38 @@ def _is_valid_startup_observation(observation: object) -> bool:
         return False
     if not isinstance(policies, list) or not all(isinstance(policy, dict) for policy in policies):
         return False
-    string_fields = ("requested", "selected", "effective", "fallback_category", "fallback_reason")
+    string_fields = (
+        "requested",
+        "selected",
+        "effective",
+        "fallback_category",
+        "fallback_reason",
+        "status_schema_version",
+        "rank_striped_eligibility",
+        "rank_striped_eligibility_reason",
+    )
     return all(
         all(field not in policy or isinstance(policy[field], str) for field in string_fields)
         and ("activated" not in policy or isinstance(policy["activated"], bool))
+        and ("status_schema_version" not in policy or policy["status_schema_version"] in ("1", "2"))
+        and (
+            "rank_striped_eligibility" not in policy
+            or policy["rank_striped_eligibility"] in CHECKPOINT_IO_ELIGIBILITY_VALUES
+        )
+        and (
+            "rank_striped_eligibility_reason" not in policy
+            or policy["rank_striped_eligibility_reason"] in CHECKPOINT_IO_ELIGIBILITY_REASON_VALUES
+        )
+        and all(
+            field not in policy
+            or (isinstance(policy[field], int) and not isinstance(policy[field], bool))
+            for field in CHECKPOINT_IO_MECHANISM_INTEGER_FIELDS
+        )
+        and all(
+            field not in policy
+            or (isinstance(policy[field], (int, float)) and not isinstance(policy[field], bool))
+            for field in CHECKPOINT_IO_MECHANISM_DURATION_FIELDS
+        )
         for policy in policies
     )
 
@@ -1315,6 +1422,96 @@ def add_startup_metric_values(
     new_data[f"s_{field_prefix}checkpoint_io_fallback_reason"] = (
         " | ".join(fallback_reasons) or "unknown"
     )
+    for eligibility_field in (
+        "status_schema_version",
+        "rank_striped_eligibility",
+        "rank_striped_eligibility_reason",
+    ):
+        values = sorted(
+            {str(policy[eligibility_field]) for policy in policies if policy.get(eligibility_field)}
+        )
+        new_data[f"s_{field_prefix}checkpoint_io_{eligibility_field}"] = (
+            ",".join(values) or "unknown"
+        )
+
+    mechanism_values = {
+        field: [
+            policy[field]
+            for policy in policies
+            if isinstance(policy.get(field), (int, float)) and not isinstance(policy[field], bool)
+        ]
+        for field in (
+            *CHECKPOINT_IO_MECHANISM_INTEGER_FIELDS,
+            *CHECKPOINT_IO_MECHANISM_DURATION_FIELDS,
+        )
+    }
+    for field in (
+        "read_ahead_scheduled_bytes",
+        "read_ahead_completed_bytes",
+        "read_ahead_cancelled_bytes",
+        "read_ahead_workers",
+        "read_ahead_extents",
+    ):
+        values = mechanism_values[field]
+        if values:
+            new_data[f"l_{field_prefix}checkpoint_io_{field}"] = int(sum(values))
+    for field in CHECKPOINT_IO_MECHANISM_DURATION_FIELDS:
+        values = mechanism_values[field]
+        if values:
+            new_data[f"d_{field_prefix}checkpoint_io_{field}"] = float(max(values))
+    scheduled_bytes = mechanism_values["read_ahead_scheduled_bytes"]
+    completed_bytes = mechanism_values["read_ahead_completed_bytes"]
+    total_scheduled_bytes = sum(scheduled_bytes)
+    if total_scheduled_bytes > 0 and completed_bytes:
+        new_data[f"d_{field_prefix}checkpoint_io_read_ahead_completion_ratio"] = (
+            sum(completed_bytes) / total_scheduled_bytes
+        )
+    mechanism_statuses_by_observation = [
+        (observation_index, policy)
+        for observation_index, entry in enumerate(successful)
+        for policy in entry.get("checkpoint_io_policies", [])
+        if all(
+            field in policy
+            for field in (
+                *CHECKPOINT_IO_MECHANISM_INTEGER_FIELDS,
+                *CHECKPOINT_IO_MECHANISM_DURATION_FIELDS,
+            )
+        )
+    ]
+    mechanism_statuses = [policy for _, policy in mechanism_statuses_by_observation]
+    new_data[f"l_{field_prefix}checkpoint_io_read_ahead_metrics_status_count"] = len(
+        mechanism_statuses
+    )
+    new_data[f"b_{field_prefix}checkpoint_io_read_ahead_metrics_complete"] = bool(policies) and len(
+        mechanism_statuses
+    ) == len(policies)
+
+    by_rank = {}
+    for observation_index, policy in mechanism_statuses_by_observation:
+        global_rank = policy["read_ahead_global_rank"]
+        if global_rank < 0:
+            continue
+        rank_metrics = by_rank.setdefault(
+            (observation_index, global_rank),
+            {
+                "read_ahead_scheduled_bytes": 0,
+                "read_ahead_completed_bytes": 0,
+                "read_ahead_workers": 0,
+            },
+        )
+        for field in rank_metrics:
+            rank_metrics[field] += policy[field]
+    for field in (
+        "read_ahead_scheduled_bytes",
+        "read_ahead_completed_bytes",
+        "read_ahead_workers",
+    ):
+        rank_values = [metrics[field] for metrics in by_rank.values()]
+        if rank_values:
+            new_data[f"l_{field_prefix}checkpoint_io_{field}_rank_skew"] = int(
+                max(rank_values) - min(rank_values)
+            )
+    new_data[f"l_{field_prefix}checkpoint_io_read_ahead_rank_metric_count"] = len(by_rank)
     new_data[f"s_{field_prefix}checkpoint_io_experiment_classification"] = (
         classify_checkpoint_io_experiment(assignment, policies)
     )

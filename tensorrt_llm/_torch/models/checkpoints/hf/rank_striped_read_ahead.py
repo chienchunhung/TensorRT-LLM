@@ -5,6 +5,7 @@
 
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,23 @@ class ReadAheadPlan:
     @property
     def assigned_bytes(self) -> int:
         return sum(extent.length for extent in self.extents)
+
+
+@dataclass(frozen=True)
+class ReadAheadMetrics:
+    """One rank's bounded read-ahead mechanism measurements."""
+
+    scheduled_bytes: int
+    completed_bytes: int
+    cancelled_bytes: int
+    reader_duration_seconds: float
+    cancellation_tail_seconds: float
+    workers: int
+    extents: int
+    local_rank: int
+    local_size: int
+    global_rank: int
+    world_size: int
 
 
 def coordinate_error(communicator, phase: str, error: BaseException | None) -> RuntimeError | None:
@@ -202,15 +220,34 @@ def close_node_communicator(node_communicator) -> None:
 class RankStripedReadAheadSession:
     """Own background POSIX reads and their node-local communicator."""
 
-    def __init__(self, active_communicator, node_communicator, plan: ReadAheadPlan) -> None:
+    def __init__(
+        self,
+        active_communicator,
+        node_communicator,
+        plan: ReadAheadPlan,
+        *,
+        local_rank: int,
+        local_size: int,
+        global_rank: int,
+        world_size: int,
+    ) -> None:
         self._active_communicator = active_communicator
         self._node_communicator = node_communicator
         self._plan = plan
+        self._local_rank = local_rank
+        self._local_size = local_size
+        self._global_rank = global_rank
+        self._world_size = world_size
         self._cancel = threading.Event()
         self._thread: threading.Thread | None = None
         self._file_descriptors: dict[str, int] = {}
         self._read_error: BaseException | None = None
         self._closed = False
+        self._metrics_lock = threading.Lock()
+        self._completed_bytes = 0
+        self._reader_started_at: float | None = None
+        self._reader_finished_at: float | None = None
+        self._cancellation_started_at: float | None = None
 
         try:
             for path in {extent.path for extent in plan.extents}:
@@ -226,30 +263,73 @@ class RankStripedReadAheadSession:
             target=self._run, name="trtllm-rank-striped-read-ahead", daemon=True
         )
         try:
+            with self._metrics_lock:
+                self._reader_started_at = time.monotonic()
             self._thread.start()
         except Exception:
+            with self._metrics_lock:
+                self._reader_started_at = None
             self._thread = None
             self._close_file_descriptors()
             raise
         return self
+
+    @property
+    def metrics(self) -> ReadAheadMetrics:
+        """Return a consistent snapshot without blocking reader progress."""
+        with self._metrics_lock:
+            completed_bytes = self._completed_bytes
+            reader_started_at = self._reader_started_at
+            reader_finished_at = self._reader_finished_at
+            cancellation_started_at = self._cancellation_started_at
+        reader_duration_seconds = 0.0
+        if reader_started_at is not None and reader_finished_at is not None:
+            reader_duration_seconds = max(0.0, reader_finished_at - reader_started_at)
+        cancellation_tail_seconds = 0.0
+        if cancellation_started_at is not None and reader_finished_at is not None:
+            cancellation_tail_seconds = max(0.0, reader_finished_at - cancellation_started_at)
+        scheduled_bytes = self._plan.assigned_bytes
+        return ReadAheadMetrics(
+            scheduled_bytes=scheduled_bytes,
+            completed_bytes=completed_bytes,
+            cancelled_bytes=max(0, scheduled_bytes - completed_bytes),
+            reader_duration_seconds=reader_duration_seconds,
+            cancellation_tail_seconds=cancellation_tail_seconds,
+            workers=self._plan.workers,
+            extents=len(self._plan.extents),
+            local_rank=self._local_rank,
+            local_size=self._local_size,
+            global_rank=self._global_rank,
+            world_size=self._world_size,
+        )
+
+    def _request_cancellation(self) -> None:
+        with self._metrics_lock:
+            if not self._cancel.is_set():
+                self._cancellation_started_at = time.monotonic()
+            self._cancel.set()
 
     def _read_extent(self, extent: ReadAheadExtent) -> int:
         file_descriptor = self._file_descriptors[extent.path]
         offset = extent.offset
         remaining = extent.length
         completed = 0
-        while remaining > 0 and not self._cancel.is_set():
-            read_size = min(remaining, _READ_SIZE)
-            data = os.pread(file_descriptor, read_size, offset)
-            if not data:
-                raise OSError(
-                    f"Unexpected EOF while reading {extent.path} at byte offset {offset}."
-                )
-            bytes_read = len(data)
-            offset += bytes_read
-            remaining -= bytes_read
-            completed += bytes_read
-        return completed
+        try:
+            while remaining > 0 and not self._cancel.is_set():
+                read_size = min(remaining, _READ_SIZE)
+                data = os.pread(file_descriptor, read_size, offset)
+                if not data:
+                    raise OSError(
+                        f"Unexpected EOF while reading {extent.path} at byte offset {offset}."
+                    )
+                bytes_read = len(data)
+                offset += bytes_read
+                remaining -= bytes_read
+                completed += bytes_read
+            return completed
+        finally:
+            with self._metrics_lock:
+                self._completed_bytes += completed
 
     def _run(self) -> None:
         try:
@@ -265,12 +345,15 @@ class RankStripedReadAheadSession:
                             break
                         future.result()
                 except Exception:
-                    self._cancel.set()
+                    self._request_cancellation()
                     for future in futures:
                         future.cancel()
                     raise
         except Exception as error:
             self._read_error = error
+        finally:
+            with self._metrics_lock:
+                self._reader_finished_at = time.monotonic()
 
     def _close_file_descriptors(self) -> BaseException | None:
         first_error = None
@@ -309,7 +392,7 @@ class RankStripedReadAheadSession:
 
     def cancel_reads(self) -> BaseException | None:
         """Stop background work while leaving the node communicator usable."""
-        self._cancel.set()
+        self._request_cancellation()
         if self._thread is not None:
             self._thread.join()
         return self._close_file_descriptors()
@@ -324,7 +407,7 @@ class RankStripedReadAheadSession:
         # cannot improve first-token latency. Bound the remaining I/O volume
         # to the currently executing small pread on each worker; synchronous
         # storage latency itself is not cancellable here.
-        self._cancel.set()
+        self._request_cancellation()
         if self._thread is not None:
             self._thread.join()
 

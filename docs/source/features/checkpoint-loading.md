@@ -179,6 +179,22 @@ control. Multiple client rows can share one server startup; use
 `s_startup_observation_id` to group them and filter
 `b_startup_observation_primary_row:true` to count each startup once.
 
+Version 2 checkpoint-I/O policy logs also expose a bounded, tri-state eligibility
+result and mechanism measurements. An activated `auto` load reports
+`eligible/preflight_passed`; a coordinated preflight fallback reports
+`ineligible` with a stable reason code; and a `native` control reports
+`unknown/native_policy_not_evaluated`. Native controls deliberately do not infer
+counterfactual eligibility because file discovery, cgroup-aware memory admission,
+and communicator consensus are not executed in that arm.
+
+For each observed rank, CI records scheduled, completed, and cancelled read-ahead
+bytes; reader and cancellation-tail durations; worker and extent counts; and the
+rank coordinates used for aggregation. Uploaded totals, slowest-rank durations,
+and per-server rank skews retain the existing startup observation ID and primary
+row marker, so mechanism analysis can be deduplicated without changing the
+intent-to-treat assignment. These counters describe the executed read-ahead
+session; they do not reclassify an `auto` fallback as a native control.
+
 This policy remains separate from ModelStreamer, MX, GMS, or snapshot
 integrations. Those systems may change the source or bypass raw loading without
 requiring a new combined checkpoint format.

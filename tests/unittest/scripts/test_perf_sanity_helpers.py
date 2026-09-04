@@ -336,6 +336,9 @@ def test_make_startup_observation_combines_checkpoint_phases(
             "effective": "rank_striped_read_ahead",
             "fallback_reason": "none",
             "fallback_category": "none",
+            "status_schema_version": "1",
+            "rank_striped_eligibility": "unknown",
+            "rank_striped_eligibility_reason": "legacy_status",
         }
     ]
 
@@ -362,8 +365,168 @@ def test_parse_checkpoint_io_policies_preserves_escaped_multiline_reason(
             "effective": "native",
             "fallback_reason": r"RuntimeError: first line\nsecond line",
             "fallback_category": "other",
+            "status_schema_version": "1",
+            "rank_striped_eligibility": "unknown",
+            "rank_striped_eligibility_reason": "legacy_status",
         }
     ]
+
+
+def test_parse_checkpoint_io_policies_records_mechanism_metrics(tmp_path: Path) -> None:
+    server_log = tmp_path / "trtllm-serve.0.log"
+    server_log.write_text(
+        "Checkpoint I/O policy: requested=auto, "
+        "selected=rank_striped_read_ahead, activated=True, "
+        "effective=rank_striped_read_ahead, "
+        "status_schema_version=2, "
+        "rank_striped_eligibility=eligible, "
+        "rank_striped_eligibility_reason=preflight_passed, "
+        "read_ahead_scheduled_bytes=100, read_ahead_completed_bytes=75, "
+        "read_ahead_cancelled_bytes=25, "
+        "read_ahead_reader_duration_seconds=1.250000, "
+        "read_ahead_cancellation_tail_seconds=0.125000, "
+        "read_ahead_workers=2, read_ahead_extents=4, "
+        "read_ahead_local_rank=1, read_ahead_local_size=8, "
+        "read_ahead_global_rank=9, read_ahead_world_size=16, "
+        "fallback_reason=none.\n",
+        encoding="utf-8",
+    )
+
+    status = perf_sanity.parse_checkpoint_io_policies([str(server_log)])[0]
+
+    assert status["status_schema_version"] == "2"
+    assert status["rank_striped_eligibility"] == "eligible"
+    assert status["rank_striped_eligibility_reason"] == "preflight_passed"
+    assert status["read_ahead_scheduled_bytes"] == 100
+    assert status["read_ahead_completed_bytes"] == 75
+    assert status["read_ahead_cancelled_bytes"] == 25
+    assert status["read_ahead_reader_duration_seconds"] == 1.25
+    assert status["read_ahead_cancellation_tail_seconds"] == 0.125
+    assert status["read_ahead_workers"] == 2
+    assert status["read_ahead_extents"] == 4
+    assert status["read_ahead_local_rank"] == 1
+    assert status["read_ahead_local_size"] == 8
+    assert status["read_ahead_global_rank"] == 9
+    assert status["read_ahead_world_size"] == 16
+
+
+def test_add_startup_metric_values_aggregates_mechanism_metrics() -> None:
+    policies = [
+        {
+            "requested": "auto",
+            "selected": "rank_striped_read_ahead",
+            "activated": True,
+            "effective": "rank_striped_read_ahead",
+            "status_schema_version": "2",
+            "rank_striped_eligibility": "eligible",
+            "rank_striped_eligibility_reason": "preflight_passed",
+            "read_ahead_scheduled_bytes": 100,
+            "read_ahead_completed_bytes": 80,
+            "read_ahead_cancelled_bytes": 20,
+            "read_ahead_reader_duration_seconds": 2.0,
+            "read_ahead_cancellation_tail_seconds": 0.25,
+            "read_ahead_workers": 2,
+            "read_ahead_extents": 4,
+            "read_ahead_local_rank": 0,
+            "read_ahead_local_size": 2,
+            "read_ahead_global_rank": 0,
+            "read_ahead_world_size": 2,
+        },
+        {
+            "requested": "auto",
+            "selected": "rank_striped_read_ahead",
+            "activated": True,
+            "effective": "rank_striped_read_ahead",
+            "status_schema_version": "2",
+            "rank_striped_eligibility": "eligible",
+            "rank_striped_eligibility_reason": "preflight_passed",
+            "read_ahead_scheduled_bytes": 120,
+            "read_ahead_completed_bytes": 120,
+            "read_ahead_cancelled_bytes": 0,
+            "read_ahead_reader_duration_seconds": 1.5,
+            "read_ahead_cancellation_tail_seconds": 0.1,
+            "read_ahead_workers": 3,
+            "read_ahead_extents": 5,
+            "read_ahead_local_rank": 1,
+            "read_ahead_local_size": 2,
+            "read_ahead_global_rank": 1,
+            "read_ahead_world_size": 2,
+        },
+    ]
+    observations = [{"role": "aggregate", "metrics": {}, "checkpoint_io_policies": policies}]
+    new_data = {}
+
+    perf_sanity.add_startup_metric_values(new_data, observations, _assignment())
+
+    assert new_data["s_checkpoint_io_status_schema_version"] == "2"
+    assert new_data["s_checkpoint_io_rank_striped_eligibility"] == "eligible"
+    assert new_data["s_checkpoint_io_rank_striped_eligibility_reason"] == "preflight_passed"
+    assert new_data["l_checkpoint_io_read_ahead_scheduled_bytes"] == 220
+    assert new_data["l_checkpoint_io_read_ahead_completed_bytes"] == 200
+    assert new_data["l_checkpoint_io_read_ahead_cancelled_bytes"] == 20
+    assert new_data["d_checkpoint_io_read_ahead_completion_ratio"] == pytest.approx(200 / 220)
+    assert new_data["d_checkpoint_io_read_ahead_reader_duration_seconds"] == 2.0
+    assert new_data["d_checkpoint_io_read_ahead_cancellation_tail_seconds"] == 0.25
+    assert new_data["l_checkpoint_io_read_ahead_workers"] == 5
+    assert new_data["l_checkpoint_io_read_ahead_extents"] == 9
+    assert new_data["l_checkpoint_io_read_ahead_scheduled_bytes_rank_skew"] == 20
+    assert new_data["l_checkpoint_io_read_ahead_completed_bytes_rank_skew"] == 40
+    assert new_data["l_checkpoint_io_read_ahead_workers_rank_skew"] == 1
+    assert new_data["l_checkpoint_io_read_ahead_rank_metric_count"] == 2
+    assert new_data["l_checkpoint_io_read_ahead_metrics_status_count"] == 2
+    assert new_data["b_checkpoint_io_read_ahead_metrics_complete"] is True
+
+
+def test_native_control_keeps_counterfactual_activation_unknown() -> None:
+    policies = [
+        {
+            "requested": "native",
+            "selected": "native",
+            "activated": False,
+            "effective": "native",
+            "status_schema_version": "2",
+            "rank_striped_eligibility": "unknown",
+            "rank_striped_eligibility_reason": "native_policy_not_evaluated",
+        }
+    ]
+    observations = [{"role": "aggregate", "metrics": {}, "checkpoint_io_policies": policies}]
+    new_data = {}
+
+    perf_sanity.add_startup_metric_values(new_data, observations, _assignment("native"))
+
+    assert new_data["s_checkpoint_io_experiment_classification"] == "randomized_control"
+    assert new_data["s_checkpoint_io_rank_striped_eligibility"] == "unknown"
+    assert (
+        new_data["s_checkpoint_io_rank_striped_eligibility_reason"] == "native_policy_not_evaluated"
+    )
+
+
+def test_rank_skew_distinguishes_repeated_ranks_across_servers() -> None:
+    def policy(scheduled_bytes: int) -> dict:
+        return {
+            "read_ahead_scheduled_bytes": scheduled_bytes,
+            "read_ahead_completed_bytes": scheduled_bytes,
+            "read_ahead_cancelled_bytes": 0,
+            "read_ahead_reader_duration_seconds": 1.0,
+            "read_ahead_cancellation_tail_seconds": 0.0,
+            "read_ahead_workers": 1,
+            "read_ahead_extents": 1,
+            "read_ahead_local_rank": 0,
+            "read_ahead_local_size": 1,
+            "read_ahead_global_rank": 0,
+            "read_ahead_world_size": 1,
+        }
+
+    observations = [
+        {"role": "ctx", "metrics": {}, "checkpoint_io_policies": [policy(100)]},
+        {"role": "ctx", "metrics": {}, "checkpoint_io_policies": [policy(160)]},
+    ]
+    new_data = {}
+
+    perf_sanity.add_startup_metric_values(new_data, observations, _assignment(), role="ctx")
+
+    assert new_data["l_ctx_checkpoint_io_read_ahead_scheduled_bytes_rank_skew"] == 60
+    assert new_data["l_ctx_checkpoint_io_read_ahead_rank_metric_count"] == 2
 
 
 def test_add_startup_metric_values_uses_slowest_disagg_worker() -> None:
@@ -569,6 +732,18 @@ def test_read_startup_observations_rejects_non_dict_entries(tmp_path: Path) -> N
         {"role": "aggregate", "checkpoint_io_policies": {}},
         {"role": "aggregate", "checkpoint_io_policies": ["native"]},
         {"role": "aggregate", "checkpoint_io_policies": [{"requested": []}]},
+        {
+            "role": "aggregate",
+            "checkpoint_io_policies": [{"read_ahead_scheduled_bytes": True}],
+        },
+        {
+            "role": "aggregate",
+            "checkpoint_io_policies": [{"read_ahead_scheduled_bytes": 1.5}],
+        },
+        {
+            "role": "aggregate",
+            "checkpoint_io_policies": [{"rank_striped_eligibility_reason": "free form"}],
+        },
     ],
 )
 def test_read_startup_observations_rejects_malformed_nested_fields(
